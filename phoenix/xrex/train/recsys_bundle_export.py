@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import re
 import time
 import typing
@@ -27,6 +28,21 @@ logger = logging.getLogger(__name__)
 BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_DIR = "export"
 MANIFEST_NAME = f"{BUNDLE_DIR}/MANIFEST.json"
+KIND_RANKING = "recsys_ranking_forward"
+KIND_RETRIEVAL = "recsys_retrieval_forward"
+
+POST_TABLE_KEY = "post_embeddings.embeddings"
+POST_DATASET_TYPES_KEY = "post_embeddings.dataset_types"
+POST_IDS_KEY = "post_embeddings.post_ids"
+AUTHOR_IDS_KEY = "post_embeddings.author_ids"
+
+_RETRIEVAL_RUNNER_ATTRS = (
+    "large_k",
+    "retrieval_dataset_types",
+    "enable_async_topk",
+    "enable_radix_select_topk",
+    "enable_dataset_slice_topk",
+)
 
 REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
     {
@@ -119,6 +135,44 @@ class PackedGeometry(NamedTuple):
 class BundleFile:
     name: str
     data: bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class RetrievalExport:
+    large_k: int
+    target_dataset_types: tuple[tuple[str, int], ...]
+    use_async_topk: bool
+    use_radix_select_topk: bool
+    post_table_shape: tuple[int, int]
+    post_table_dtype: str
+    dataset_types_shape: tuple[int, ...]
+    dataset_types_dtype: str
+
+    @property
+    def output_names(self) -> list[str]:
+        names = []
+        for name, _ in self.target_dataset_types:
+            names.append(f"indices_{name}")
+            names.append(f"scores_{name}")
+        return names
+
+    def manifest_block(self) -> dict[str, Any]:
+        return {
+            "large_k": self.large_k,
+            "target_dataset_types": [
+                {"name": name, "value": value} for name, value in self.target_dataset_types
+            ],
+            "post_table": {
+                "key": POST_TABLE_KEY,
+                "rows": self.post_table_shape[0],
+                "width": self.post_table_shape[1],
+                "dtype": self.post_table_dtype,
+            },
+            "dataset_types_key": POST_DATASET_TYPES_KEY,
+            "post_ids_key": POST_IDS_KEY,
+            "author_ids_key": AUTHOR_IDS_KEY,
+            "topk_unordered": self.use_radix_select_topk,
+        }
 
 
 _parameter_serialization_registered = False
@@ -231,7 +285,36 @@ def _serving_sequence_len(
     return prefix_tokens + history_seq_len + candidate_seq_len
 
 
-def _make_export_config(trainer: RecsysTrainer, history_seq_len: int, candidate_seq_len: int):
+def _user_tower_sequence_len(
+    *,
+    training_seq_len: int,
+    training_history_seq_len: int,
+    num_user_prefix_tokens: int,
+    history_seq_len: int,
+) -> int:
+    prefix_tokens = training_seq_len - training_history_seq_len
+    if prefix_tokens != num_user_prefix_tokens:
+        raise ValueError(
+            f"cannot derive the serving user-tower sequence_len: sequence_len "
+            f"{training_seq_len} - history_seq_len {training_history_seq_len} = {prefix_tokens} "
+            f"prefix tokens, but the model reserves num_user_prefix_tokens="
+            f"{num_user_prefix_tokens}. The user tower is built as prefix + history; if "
+            "history_seq_len was overridden for serving, also override "
+            "model_config.user_tower_config.model_config.sequence_len to "
+            f"{num_user_prefix_tokens + history_seq_len} (prefix + serving history), as the "
+            "jax slot does — otherwise the attention kernel cannot be sized for serving"
+        )
+    return prefix_tokens + history_seq_len
+
+
+def _make_export_config(
+    trainer: RecsysTrainer,
+    history_seq_len: int,
+    candidate_seq_len: int,
+    *,
+    two_tower: bool = False,
+    mesh_devices: int = 1,
+):
     from xrex.configs.config_loader import replace_cli_subs
 
     init_params = trainer.to_dict()
@@ -239,35 +322,51 @@ def _make_export_config(trainer: RecsysTrainer, history_seq_len: int, candidate_
     export_cfg = type(trainer).from_dict(init_params, ensure_class=type(trainer))
 
     dataset = trainer.dataset
-    serving_seq_len = _serving_sequence_len(
-        training_seq_len=int(trainer.model_config.model_config.sequence_len),
-        training_history_seq_len=int(dataset.history_seq_len),
-        training_candidate_seq_len=int(dataset.candidate_seq_len),
-        num_negatives_per_example=int(getattr(dataset, "num_negatives_per_example", 0)),
-        num_global_negatives_per_example=int(
-            getattr(dataset, "num_global_negatives_per_example", 0)
-        ),
-        num_user_prefix_tokens=int(trainer.model_config.num_user_prefix_tokens),
-        history_seq_len=history_seq_len,
-        candidate_seq_len=candidate_seq_len,
-    )
+    if two_tower:
+        serving_seq_len = _user_tower_sequence_len(
+            training_seq_len=int(trainer.model_config.model_config.sequence_len),
+            training_history_seq_len=int(dataset.history_seq_len),
+            num_user_prefix_tokens=int(trainer.model_config.num_user_prefix_tokens),
+            history_seq_len=history_seq_len,
+        )
+        seq_len_field = "model_config.user_tower_config.model_config"
+    else:
+        serving_seq_len = _serving_sequence_len(
+            training_seq_len=int(trainer.model_config.model_config.sequence_len),
+            training_history_seq_len=int(dataset.history_seq_len),
+            training_candidate_seq_len=int(dataset.candidate_seq_len),
+            num_negatives_per_example=int(getattr(dataset, "num_negatives_per_example", 0)),
+            num_global_negatives_per_example=int(
+                getattr(dataset, "num_global_negatives_per_example", 0)
+            ),
+            num_user_prefix_tokens=int(trainer.model_config.num_user_prefix_tokens),
+            history_seq_len=history_seq_len,
+            candidate_seq_len=candidate_seq_len,
+        )
+        seq_len_field = "model_config.model_config"
 
+    if mesh_devices < 1:
+        raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")
     overrides = [
-        "num_devices_per_process=1",
-        "ep=1",
+        f"num_devices_per_process={mesh_devices}",
+        f"ep={mesh_devices}",
         "dp=1",
         "num_negatives_per_example=0",
         "num_global_negatives_per_example=0",
         f"history_seq_len={history_seq_len}",
         f"candidate_seq_len={candidate_seq_len}",
-        f"model_config.model_config.sequence_len={serving_seq_len}",
-        f"model_config.model_config.attn_config.sequence_len={serving_seq_len}",
+        f"{seq_len_field}.sequence_len={serving_seq_len}",
+        f"{seq_len_field}.attn_config.sequence_len={serving_seq_len}",
     ]
     export_cfg, used = replace_cli_subs(export_cfg, overrides)
     unused = [k for k, v in used.items() if not v]
     if unused:
         raise ValueError(f"StableHLO bundle export overrides did not match config: {unused}")
     return export_cfg
+
+
+def _token_feature_config(model_config: Any, *, two_tower: bool) -> Any:
+    return model_config.user_tower_config if two_tower else model_config
 
 
 def _batch_template(export_cfg: Any, bs: int, *, packed: bool) -> Any:
@@ -288,8 +387,11 @@ def _batch_template(export_cfg: Any, bs: int, *, packed: bool) -> Any:
     return batch
 
 
-def _batch_avals(export_cfg: Any, bs: int, *, packed: bool, template: Any = None) -> Any:
+def _batch_avals(
+    export_cfg: Any, bs: int, *, packed: bool, template: Any = None, two_tower: bool = False
+) -> Any:
     model_config = export_cfg.model_config
+    features = _token_feature_config(model_config, two_tower=two_tower)
     if template is None:
         template = _batch_template(export_cfg, bs, packed=packed)
 
@@ -298,15 +400,15 @@ def _batch_avals(export_cfg: Any, bs: int, *, packed: bool, template: Any = None
     if model_config.multimodal_embedding_type is not None:
         cand_post = batch["candidate_seq"]["post_hashes"]
         batch["candidate_seq"]["embedding"] = jax.ShapeDtypeStruct(
-            (cand_post.shape[0], cand_post.shape[1], model_config.multimodal_embedding_dim),
+            (cand_post.shape[0], cand_post.shape[1], features.multimodal_embedding_dim),
             np.float32,
         )
 
-    if model_config.use_post_sid and model_config.sid_num_levels > 0:
+    if features.use_post_sid and features.sid_num_levels > 0:
         for seq_name in ("history_seq", "candidate_seq"):
             post_hashes = batch[seq_name]["post_hashes"]
             batch[seq_name]["post_sids"] = jax.ShapeDtypeStruct(
-                (post_hashes.shape[0], post_hashes.shape[1], model_config.sid_num_levels),
+                (post_hashes.shape[0], post_hashes.shape[1], features.sid_num_levels),
                 np.uint16,
             )
 
@@ -367,6 +469,53 @@ def _packed_embedding_slices(
     return slices, geometry
 
 
+def _recsys_embeddings_from_merged(
+    merged_embeddings: jax.Array,
+    sl: EmbeddingSlices,
+    packed_geometry: PackedGeometry | None,
+) -> RecsysEmbeddings:
+    if packed_geometry is None:
+        return RecsysEmbeddings(
+            history_post_embeddings=merged_embeddings[:, : sl.hist_post_end, :],
+            history_author_embeddings=merged_embeddings[:, sl.hist_post_end : sl.hist_auth_end, :],
+            candidate_post_embeddings=merged_embeddings[:, sl.hist_auth_end : sl.cand_post_end, :],
+            candidate_author_embeddings=merged_embeddings[
+                :, sl.cand_post_end : sl.cand_auth_end, :
+            ],
+            user_embeddings=merged_embeddings[:, sl.cand_auth_end : sl.user_end, :],
+            user_ip_embeddings=(
+                merged_embeddings[:, sl.user_end : sl.user_ip_end, :]
+                if sl.user_ip_end > sl.user_end
+                else None
+            ),
+        )
+
+    g = packed_geometry
+    merged = merged_embeddings
+
+    def _section(start: int, end: int, rows: int) -> jax.Array:
+        return merged[:, start:end, :].reshape(merged.shape[0], rows, -1, merged.shape[-1])
+
+    return RecsysEmbeddings(
+        history_post_embeddings=_section(0, sl.hist_post_end, g.packed_history_len),
+        history_author_embeddings=_section(
+            sl.hist_post_end, sl.hist_auth_end, g.packed_history_len
+        ),
+        candidate_post_embeddings=_section(
+            sl.hist_auth_end, sl.cand_post_end, g.packed_candidate_len
+        ),
+        candidate_author_embeddings=_section(
+            sl.cand_post_end, sl.cand_auth_end, g.packed_candidate_len
+        ),
+        user_embeddings=_section(sl.cand_auth_end, sl.user_end, g.bs_per_device),
+        user_ip_embeddings=(
+            _section(sl.user_end, sl.user_ip_end, g.bs_per_device)
+            if sl.user_ip_end > sl.user_end
+            else None
+        ),
+    )
+
+
 def _make_forward_fn(
     export_cfg: Any,
     embedding_slices: EmbeddingSlices,
@@ -378,56 +527,11 @@ def _make_forward_fn(
 
     model_config = export_cfg.model_config
 
-    def _packed_recsys_embeddings(merged: jax.Array, sl: EmbeddingSlices) -> RecsysEmbeddings:
-        assert packed_geometry is not None
-        g = packed_geometry
-
-        def _section(start: int, end: int, rows: int) -> jax.Array:
-            return merged[:, start:end, :].reshape(merged.shape[0], rows, -1, merged.shape[-1])
-
-        return RecsysEmbeddings(
-            history_post_embeddings=_section(0, sl.hist_post_end, g.packed_history_len),
-            history_author_embeddings=_section(
-                sl.hist_post_end, sl.hist_auth_end, g.packed_history_len
-            ),
-            candidate_post_embeddings=_section(
-                sl.hist_auth_end, sl.cand_post_end, g.packed_candidate_len
-            ),
-            candidate_author_embeddings=_section(
-                sl.cand_post_end, sl.cand_auth_end, g.packed_candidate_len
-            ),
-            user_embeddings=_section(sl.cand_auth_end, sl.user_end, g.bs_per_device),
-            user_ip_embeddings=(
-                _section(sl.user_end, sl.user_ip_end, g.bs_per_device)
-                if sl.user_ip_end > sl.user_end
-                else None
-            ),
-        )
-
     @hk.transform
     def forward_fn(batch: Any, merged_embeddings: jax.Array):
-        sl = embedding_slices
-        if packed_geometry is not None:
-            recsys_embeddings = _packed_recsys_embeddings(merged_embeddings, sl)
-        else:
-            recsys_embeddings = RecsysEmbeddings(
-                history_post_embeddings=merged_embeddings[:, : sl.hist_post_end, :],
-                history_author_embeddings=merged_embeddings[
-                    :, sl.hist_post_end : sl.hist_auth_end, :
-                ],
-                candidate_post_embeddings=merged_embeddings[
-                    :, sl.hist_auth_end : sl.cand_post_end, :
-                ],
-                candidate_author_embeddings=merged_embeddings[
-                    :, sl.cand_post_end : sl.cand_auth_end, :
-                ],
-                user_embeddings=merged_embeddings[:, sl.cand_auth_end : sl.user_end, :],
-                user_ip_embeddings=(
-                    merged_embeddings[:, sl.user_end : sl.user_ip_end, :]
-                    if sl.user_ip_end > sl.user_end
-                    else None
-                ),
-            )
+        recsys_embeddings = _recsys_embeddings_from_merged(
+            merged_embeddings, embedding_slices, packed_geometry
+        )
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
         logits, candidate_continuous_predictions = model.forward(batch, recsys_embeddings)
         log_probs = jax.nn.log_sigmoid(logits).astype(jnp.bfloat16).astype(jnp.float32)
@@ -438,10 +542,138 @@ def _make_forward_fn(
     return forward_fn
 
 
+def _make_retrieval_forward_fn(
+    export_cfg: Any,
+    embedding_slices: EmbeddingSlices,
+    mesh: jax.sharding.Mesh,
+    retrieval: RetrievalExport,
+    packed_geometry: PackedGeometry | None = None,
+):
+    import haiku as hk
+
+    model_config = export_cfg.model_config
+    target_values = tuple(value for _, value in retrieval.target_dataset_types)
+
+    @hk.transform
+    def forward_fn(
+        batch: Any, merged_embeddings: jax.Array, post_table: jax.Array, dataset_types: jax.Array
+    ):
+        recsys_embeddings = _recsys_embeddings_from_merged(
+            merged_embeddings, embedding_slices, packed_geometry
+        )
+        model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
+        results = model.forward(
+            batch,
+            recsys_embeddings,
+            post_table,
+            dataset_types,
+            retrieval.large_k,
+            target_values,
+            dataset_ranges=None,
+            use_async_topk=retrieval.use_async_topk,
+            use_radix_select_topk=retrieval.use_radix_select_topk,
+            post_scales=None,
+        )
+        flat: list[jax.Array] = []
+        for indices, scores in results:
+            flat.append(indices)
+            flat.append(scores)
+        return tuple(flat)
+
+    return forward_fn
+
+
 def _scan_custom_call_targets(lowered_text: str) -> list[str]:
     targets = set(re.findall(r"stablehlo\.custom_call\s*@([\w.$-]+)", lowered_text))
     targets |= set(re.findall(r'call_target_name\s*=\s*"([^"]+)"', lowered_text))
     return sorted(targets)
+
+
+SHARDING_REPLICATED: dict[str, Any] = {"kind": "replicated"}
+
+
+def _export_mesh(export_cfg: Any, mesh_devices: int) -> jax.sharding.Mesh:
+    axis_names = export_cfg.parallel_config.mesh_axis_names()
+    mesh_shape = export_cfg.parallel_config.mesh_shape()
+    if int(np.prod(mesh_shape)) != mesh_devices:
+        raise AssertionError(f"export mesh {mesh_shape} does not have {mesh_devices} devices")
+    devices = jax.local_devices()
+    if len(devices) < mesh_devices:
+        raise ValueError(
+            f"the export needs {mesh_devices} local devices for the serving mesh, "
+            f"{len(devices)} visible (CUDA_VISIBLE_DEVICES?)"
+        )
+    return jax.sharding.Mesh(np.array(devices[:mesh_devices]).reshape(mesh_shape), axis_names)
+
+
+def _retrieval_shardings(
+    mesh: Any,
+    data_axis: tuple[str, ...],
+    bs: int,
+    params_avals: Any,
+    batch_avals: Any,
+    num_outputs: int,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    replicated = NamedSharding(mesh, PartitionSpec())
+    rows = NamedSharding(mesh, PartitionSpec(data_axis))
+
+    def batch_leaf_sharding(path: Any, leaf: Any) -> Any:
+        if len(leaf.shape) < 1 or int(leaf.shape[0]) != bs:
+            raise ValueError(
+                f"batch leaf {jax.tree_util.keystr(path)} has shape {tuple(leaf.shape)}, "
+                f"expected a leading batch dim of {bs} for the mesh export"
+            )
+        return rows
+
+    batch_shardings = jax.tree_util.tree_map_with_path(batch_leaf_sharding, batch_avals)
+    params_shardings = jax.tree.map(lambda _: replicated, params_avals)
+    in_shardings = (
+        params_shardings,
+        replicated,
+        batch_shardings,
+        rows,
+        rows,
+        replicated,
+    )
+    return in_shardings, (replicated,) * num_outputs
+
+
+def _sharding_entry(hlo_sharding: Any, ndim: int, num_devices: int, what: str) -> dict[str, Any]:
+    if num_devices == 1 or hlo_sharding is None or hlo_sharding.is_replicated():
+        if hlo_sharding is None and num_devices != 1:
+            raise AssertionError(f"{what}: the mesh export left the sharding unspecified")
+        return dict(SHARDING_REPLICATED)
+    if not hlo_sharding.is_tiled():
+        raise NotImplementedError(f"{what}: unsupported sharding {hlo_sharding}")
+    dims = [int(d) for d in hlo_sharding.tile_assignment_dimensions()]
+    if hlo_sharding.replicate_on_last_tile_dim():
+        if dims[-1] != 1:
+            raise NotImplementedError(f"{what}: partially replicated sharding {hlo_sharding}")
+        dims = dims[:-1]
+    if len(dims) != ndim:
+        raise AssertionError(f"{what}: sharding {hlo_sharding} does not match rank {ndim}")
+    tiled = [i for i, d in enumerate(dims) if d != 1]
+    if len(tiled) != 1 or dims[tiled[0]] != num_devices:
+        raise NotImplementedError(
+            f"{what}: sharding {hlo_sharding} is not a single-dim split over {num_devices} devices"
+        )
+    devices = [int(d) for d in hlo_sharding.tile_assignment_devices()]
+    if devices != list(range(num_devices)):
+        raise NotImplementedError(
+            f"{what}: sharding {hlo_sharding} does not place block i on partition i"
+        )
+    return {"kind": "tiled", "dim": tiled[0]}
+
+
+def _mesh_block(mesh: Any, use_shardy: bool) -> dict[str, Any]:
+    return {
+        "num_devices": int(mesh.size),
+        "axis_names": [str(n) for n in mesh.axis_names],
+        "axis_sizes": [int(mesh.shape[n]) for n in mesh.axis_names],
+        "use_shardy": bool(use_shardy),
+    }
 
 
 def _input_spec(
@@ -450,6 +682,7 @@ def _input_spec(
     batch_avals: Any,
     merged_aval: Any,
     batch_template: Any,
+    retrieval_avals: tuple[Any, Any] | None = None,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
@@ -495,23 +728,109 @@ def _input_spec(
     spec.append(
         {"kind": "merged_embeddings", "key": "merged_embeddings", **_aval_entry(merged_aval)}
     )
+    if retrieval_avals is not None:
+        post_table_aval, dataset_types_aval = retrieval_avals
+        spec.append({"kind": "post_table", "key": POST_TABLE_KEY, **_aval_entry(post_table_aval)})
+        spec.append(
+            {
+                "kind": "dataset_types",
+                "key": POST_DATASET_TYPES_KEY,
+                **_aval_entry(dataset_types_aval),
+            }
+        )
     return spec
 
 
-def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
+def _retrieval_export(runner: Any) -> RetrievalExport:
+    missing = [name for name in _RETRIEVAL_RUNNER_ATTRS if not hasattr(runner, name)]
+    if missing:
+        raise NotImplementedError(
+            "two-tower StableHLO export needs a RetrievalModelRunner (host-side "
+            f"export_native_bundle); trainer lacks {missing}"
+        )
+    unsupported = [
+        flag
+        for flag in ("enable_int8_post_table", "enable_bloom_filter", "enable_topic_filter")
+        if getattr(runner, flag, False)
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            f"two-tower StableHLO export does not support {unsupported}; the native runtime "
+            "feeds the bf16 post table and applies no per-post filters"
+        )
+    if runner.enable_dataset_slice_topk:
+        logger.warning(
+            "enable_dataset_slice_topk=True is ignored by the StableHLO export: the slice path "
+            "compiles the checkpoint's per-dataset post-table ranges into the program; the "
+            "exported program masks by dataset type instead (same results, top-k over the "
+            "whole table)"
+        )
+    if os.environ.get("DEBUG_ALLOW_RANDOM_INIT") == "1":
+        raise ValueError(
+            "DEBUG_ALLOW_RANDOM_INIT=1 would export a two-tower program without the dataset "
+            "type mask; unset it for the export"
+        )
+    large_k = int(runner.large_k)
+    if large_k < 1:
+        raise ValueError(f"invalid large_k for the two-tower export: {large_k}")
+    datasets = tuple(runner.retrieval_dataset_types)
+    if not datasets:
+        raise ValueError("two-tower export needs at least one retrieval dataset type")
+    post_embeddings = runner.state_shape.post_embeddings
+    table = post_embeddings.embeddings.x
+    if len(table.shape) != 2:
+        raise ValueError(f"post table must be [rows, width], got {tuple(table.shape)}")
+    dataset_types_rows = int(post_embeddings.dataset_types.shape[0])
+    if int(table.shape[0]) != dataset_types_rows:
+        raise ValueError(
+            f"post table has {int(table.shape[0])} rows (padded to training_ep="
+            f"{int(getattr(runner, 'training_ep', 0) or 0)}) but dataset_types has "
+            f"{dataset_types_rows}; the retrieval forward needs them to agree, so max_posts "
+            "must be a multiple of training_ep"
+        )
+    return RetrievalExport(
+        large_k=large_k,
+        target_dataset_types=tuple((ds.name, int(ds.value)) for ds in datasets),
+        use_async_topk=bool(runner.enable_async_topk),
+        use_radix_select_topk=bool(runner.enable_radix_select_topk),
+        post_table_shape=(int(table.shape[0]), int(table.shape[1])),
+        post_table_dtype=_dtype_name(table.dtype),
+        dataset_types_shape=tuple(int(d) for d in post_embeddings.dataset_types.shape),
+        dataset_types_dtype=_dtype_name(post_embeddings.dataset_types.dtype),
+    )
+
+
+def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[BundleFile]:
     import flatbuffers
     from jax import export as jax_export
 
     from xrex.models.recsys_gen_recs_model import RecsysGenRecsModelConfig
     from xrex.models.recsys_model import RecsysAggregatedModelConfig
+    from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
 
     model_config = trainer.model_config
-    if not isinstance(model_config, RecsysAggregatedModelConfig) or isinstance(
-        model_config, RecsysGenRecsModelConfig
+    two_tower = isinstance(model_config, RecsysTwoTowerModelConfig)
+    if not two_tower and (
+        not isinstance(model_config, RecsysAggregatedModelConfig)
+        or isinstance(model_config, RecsysGenRecsModelConfig)
     ):
         raise NotImplementedError(
-            "StableHLO bundle export supports ranking (RecsysAggregatedModelConfig) only, "
-            f"got {type(model_config).__name__}"
+            "StableHLO bundle export supports ranking (RecsysAggregatedModelConfig) and "
+            f"retrieval (RecsysTwoTowerModelConfig) only, got {type(model_config).__name__}"
+        )
+    retrieval = _retrieval_export(trainer) if two_tower else None
+    if mesh_devices < 1:
+        raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")
+    if not two_tower and mesh_devices != 1:
+        raise NotImplementedError(
+            "ranking programs are single-device (one executable per GPU); "
+            f"mesh_devices={mesh_devices} is only for retrieval bundles"
+        )
+    if two_tower and trainer.using_seqpack:
+        raise NotImplementedError(
+            "the two-tower export supports dense batches only (use_seqpack=False): a packed "
+            "batch is laid out per device by the packer, which the SPMD retrieval program "
+            "does not model"
         )
     if trainer.using_seqpack and trainer.using_fa4:
         raise NotImplementedError(
@@ -535,12 +854,18 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
     if trainer.using_seqpack:
         block = int(trainer._seqpack_block_size)
         prefix = int(model_config.num_user_prefix_tokens)
-        total = prefix + candidate_seq_len + history_seq_len
+        if two_tower:
+            total = prefix + history_seq_len
+            terms = f"{prefix} + {history_seq_len}"
+            what = "num_user_prefix_tokens + history_seq_len"
+        else:
+            total = prefix + candidate_seq_len + history_seq_len
+            terms = f"{prefix} + {candidate_seq_len} + {history_seq_len}"
+            what = "num_user_prefix_tokens + candidate_seq_len + history_seq_len"
         if total % block:
             raise ValueError(
-                f"seqpack export needs (num_user_prefix_tokens + candidate_seq_len + "
-                f"history_seq_len) to be a multiple of the attention block size "
-                f"{block}, got {prefix} + {candidate_seq_len} + {history_seq_len} = {total}; "
+                f"seqpack export needs ({what}) to be a multiple of the attention block size "
+                f"{block}, got {terms} = {total}; "
                 "set export_bundle_candidate_seq_len / export_bundle_history_seq_len "
                 "to block-aligned serving lengths"
             )
@@ -548,14 +873,31 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
     ensure_parameter_serialization_registered()
     if trainer.using_seqpack:
         ensure_packing_layout_serialization_registered()
-    export_cfg = _make_export_config(trainer, history_seq_len, candidate_seq_len)
+    export_cfg = _make_export_config(
+        trainer, history_seq_len, candidate_seq_len, two_tower=two_tower, mesh_devices=mesh_devices
+    )
 
-    axis_names = export_cfg.parallel_config.mesh_axis_names()
-    mesh_shape = export_cfg.parallel_config.mesh_shape()
-    if int(np.prod(mesh_shape)) != 1:
-        raise AssertionError(f"export mesh must be single-device, got {mesh_shape}")
-    device = jax.local_devices()[0]
-    mesh = jax.sharding.Mesh(np.array([device]).reshape(mesh_shape), axis_names)
+    mesh = _export_mesh(export_cfg, mesh_devices)
+    device = mesh.devices.flat[0]
+    mesh_export = two_tower
+    use_shardy = False
+    data_axis: tuple[str, ...] = ()
+    if mesh_export:
+        use_shardy = bool(getattr(jax.config, "jax_use_shardy_partitioner"))
+        assert retrieval is not None
+        table_rows = retrieval.post_table_shape[0]
+        if table_rows % mesh_devices:
+            raise ValueError(
+                f"post table rows {table_rows} are not divisible by the {mesh_devices}-device "
+                "mesh; the runner shards the table evenly over the devices"
+            )
+        data_axis = ("stage", *model_config.model_config.data_axis)
+        logger.info(
+            "Exporting retrieval programs for a %d-device mesh %s (shardy=%s)",
+            mesh_devices,
+            dict(zip(mesh.axis_names, mesh.devices.shape)),
+            use_shardy,
+        )
 
     packed = bool(trainer.using_seqpack)
     dense_slices = (
@@ -567,14 +909,29 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
     )
     rng_aval = jax.ShapeDtypeStruct((2,), np.uint32)
 
+    retrieval_avals: tuple[Any, Any] | None = None
+    if retrieval is not None:
+        retrieval_avals = (
+            jax.ShapeDtypeStruct(retrieval.post_table_shape, np.dtype(retrieval.post_table_dtype)),
+            jax.ShapeDtypeStruct(
+                retrieval.dataset_types_shape, np.dtype(retrieval.dataset_types_dtype)
+            ),
+        )
+    output_names = (
+        ("log_probs", "cont_preds", "has_nan") if retrieval is None else retrieval.output_names
+    )
+
     files: list[BundleFile] = []
     programs: dict[str, Any] = {}
     all_custom_call_targets: set[str] = set()
 
-    for bs in buckets:
+    for bs_per_device in buckets:
         start = time.perf_counter()
+        bs = bs_per_device * mesh_devices
         batch_template = _batch_template(export_cfg, bs, packed=packed)
-        batch_avals = _batch_avals(export_cfg, bs, packed=packed, template=batch_template)
+        batch_avals = _batch_avals(
+            export_cfg, bs, packed=packed, template=batch_template, two_tower=two_tower
+        )
         if packed:
             embedding_slices, packed_geometry = _packed_embedding_slices(export_cfg, batch_avals)
             merged_batch = packed_geometry.merged_batch
@@ -582,15 +939,30 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
             assert dense_slices is not None
             embedding_slices, packed_geometry = dense_slices, None
             merged_batch = bs
-        forward_fn = _make_forward_fn(export_cfg, embedding_slices, mesh, packed_geometry)
         merged_aval = jax.ShapeDtypeStruct(
             (merged_batch, embedding_slices.user_ip_end, model_config.emb_table_width),
             model_config.embedding_dtype,
         )
-        args = (params_avals, rng_aval, batch_avals, merged_aval)
+        if retrieval is None:
+            forward_fn = _make_forward_fn(export_cfg, embedding_slices, mesh, packed_geometry)
+            args = (params_avals, rng_aval, batch_avals, merged_aval)
+        else:
+            forward_fn = _make_retrieval_forward_fn(
+                export_cfg, embedding_slices, mesh, retrieval, packed_geometry
+            )
+            assert retrieval_avals is not None
+            args = (params_avals, rng_aval, batch_avals, merged_aval, *retrieval_avals)
 
         with mesh:
-            jitted = jax.jit(forward_fn.apply)
+            if mesh_export:
+                in_shardings, out_shardings = _retrieval_shardings(
+                    mesh, data_axis, bs, params_avals, batch_avals, len(output_names)
+                )
+                jitted = jax.jit(
+                    forward_fn.apply, in_shardings=in_shardings, out_shardings=out_shardings
+                )
+            else:
+                jitted = jax.jit(forward_fn.apply)
             lowered_text = jitted.lower(*args).as_text(dialect="stablehlo")
             custom_call_targets = _scan_custom_call_targets(lowered_text)
             exported = jax_export.export(
@@ -601,7 +973,20 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
                 ],
             )(*args)
 
-        spec = _input_spec(params_avals, rng_aval, batch_avals, merged_aval, batch_template)
+        if mesh_export:
+            if int(exported.nr_devices) != mesh_devices:
+                raise AssertionError(
+                    f"bs={bs}: exported for {exported.nr_devices} devices, mesh has {mesh_devices}"
+                )
+            if ("sdy.mesh" in lowered_text) != use_shardy:
+                raise AssertionError(
+                    f"bs={bs}: module Shardy attributes do not match "
+                    f"jax_use_shardy_partitioner={use_shardy}"
+                )
+
+        spec = _input_spec(
+            params_avals, rng_aval, batch_avals, merged_aval, batch_template, retrieval_avals
+        )
         if len(spec) != len(exported.in_avals):
             raise AssertionError(
                 f"input spec mismatch for bs={bs}: {len(spec)} != {len(exported.in_avals)}"
@@ -612,6 +997,42 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
                 raise AssertionError(
                     f"input spec mismatch for bs={bs} {entry['key']}: {entry} vs {expected}"
                 )
+        if len(exported.out_avals) != len(output_names):
+            raise AssertionError(
+                f"output count mismatch for bs={bs}: {len(exported.out_avals)} != "
+                f"{len(output_names)} {output_names}"
+            )
+        outputs = [
+            {"name": name, **_aval_entry(aval)}
+            for name, aval in zip(output_names, exported.out_avals, strict=True)
+        ]
+        if mesh_export:
+            kept = {int(i) for i in exported.module_kept_var_idx}
+            for i, (entry, aval, hlo) in enumerate(
+                zip(spec, exported.in_avals, exported.in_shardings_hlo, strict=True)
+            ):
+                if i not in kept:
+                    entry["sharding"] = dict(SHARDING_REPLICATED)
+                    continue
+                entry["sharding"] = _sharding_entry(
+                    hlo, len(aval.shape), mesh_devices, f"bs={bs} input {entry['key']}"
+                )
+                expected = (
+                    SHARDING_REPLICATED
+                    if entry["kind"] in ("weight", "rng", "dataset_types")
+                    else {"kind": "tiled", "dim": 0}
+                )
+                if mesh_devices > 1 and entry["sharding"] != expected:
+                    raise AssertionError(
+                        f"bs={bs} input {entry['key']}: sharding {entry['sharding']}, "
+                        f"expected {expected}"
+                    )
+            for entry, aval, hlo in zip(
+                outputs, exported.out_avals, exported.out_shardings_hlo, strict=True
+            ):
+                entry["sharding"] = _sharding_entry(
+                    hlo, len(aval.shape), mesh_devices, f"bs={bs} output {entry['name']}"
+                )
 
         mlir_name = f"{BUNDLE_DIR}/forward_bs{bs}.mlirbc"
         jax_export_name = f"{BUNDLE_DIR}/forward_bs{bs}.jax_export"
@@ -621,10 +1042,6 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
         files.append(BundleFile(jax_export_name, jax_export_bytes))
         all_custom_call_targets.update(custom_call_targets)
 
-        outputs = [
-            {"name": name, **_aval_entry(aval)}
-            for name, aval in zip(("log_probs", "cont_preds", "has_nan"), exported.out_avals)
-        ]
         programs[str(bs)] = {
             "batch_size": bs,
             "mlir_module": {"file": mlir_name, "adler32": zlib.adler32(mlir_bytes)},
@@ -641,9 +1058,11 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
             ),
         }
         logger.info(
-            "Exported StableHLO ranking forward bs=%d in %.1fs (%d inputs, %d kept, "
+            "Exported StableHLO %s forward bs=%d (%d/device) in %.1fs (%d inputs, %d kept, "
             "custom_calls=%s)",
+            "retrieval" if retrieval is not None else "ranking",
             bs,
+            bs_per_device,
             time.perf_counter() - start,
             len(spec),
             len(exported.module_kept_var_idx),
@@ -660,6 +1079,8 @@ def build_bundle(trainer: RecsysTrainer) -> list[BundleFile]:
         candidate_seq_len,
         sorted(all_custom_call_targets),
         packed=packed,
+        retrieval=retrieval,
+        mesh=_mesh_block(mesh, use_shardy) if mesh_export else None,
     )
     files.insert(0, BundleFile(MANIFEST_NAME, json.dumps(manifest, indent=2).encode()))
     return files
@@ -673,15 +1094,34 @@ def _leaf_width(tree: Any, key: str, axis: int) -> int:
 
 
 def _prep_spec(
-    export_cfg: Any, history_seq_len: int, candidate_seq_len: int, *, packed: bool
+    export_cfg: Any,
+    history_seq_len: int,
+    candidate_seq_len: int,
+    *,
+    packed: bool,
+    two_tower: bool = False,
 ) -> dict[str, Any]:
     dataset = export_cfg.dataset
     model_config = export_cfg.model_config
+    features = _token_feature_config(model_config, two_tower=two_tower)
     ht = dataset.hash_table
     hk = ht.hash_keys
-    batch = _batch_avals(export_cfg, 1, packed=False)
+    batch = _batch_avals(export_cfg, 1, packed=False, two_tower=two_tower)
     hist = batch["history_seq"]
     cand = batch["candidate_seq"]
+
+    if two_tower:
+        template_width = _leaf_width(hist, "continuous_actions", 2)
+        if template_width != int(features.num_continuous_actions):
+            raise ValueError(
+                f"two-tower num_continuous_actions mismatch: user tower "
+                f"{features.num_continuous_actions} vs batch template {template_width}"
+            )
+        transformer_candidate_seq_len = 0
+    else:
+        transformer_candidate_seq_len = (
+            (0 if cand.get("post_ids") is not None else candidate_seq_len) if packed else 0
+        )
 
     return {
         "user_id_table_size": int(ht.user_id_table_size),
@@ -702,7 +1142,7 @@ def _prep_spec(
         "ip_biases": [int(x) for x in hk.ip_biases],
         "ip_modulus": int(hk.ip_modulus),
         "output_vocab_size": int(dataset.output_vocab_size),
-        "num_continuous_actions": int(model_config.num_continuous_actions),
+        "num_continuous_actions": int(features.num_continuous_actions),
         "search_query_embedding_dim": _leaf_width(cand, "search_query_embeddings", 2),
         "num_user_categorical_features": _leaf_width(batch, "user_categorical_features", 1),
         "num_user_bool_features": _leaf_width(batch, "user_bool_features", 1),
@@ -714,7 +1154,7 @@ def _prep_spec(
         "num_post_float_features": _leaf_width(hist, "float_features", 2),
         "num_post_int64_features": _leaf_width(hist, "int64_features", 2),
         "enable_stale_post": bool(
-            getattr(getattr(model_config, "feature_prep", None), "enable_stale_post", False)
+            getattr(getattr(features, "feature_prep", None), "enable_stale_post", False)
         ),
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,
@@ -725,9 +1165,7 @@ def _prep_spec(
         "use_seqpack": packed,
         "seqpack_block_size": int(export_cfg._seqpack_block_size) if packed else 0,
         "num_user_prefix_tokens": (int(model_config.num_user_prefix_tokens) if packed else 0),
-        "transformer_candidate_seq_len": (
-            (0 if cand.get("post_ids") is not None else candidate_seq_len) if packed else 0
-        ),
+        "transformer_candidate_seq_len": transformer_candidate_seq_len,
     }
 
 
@@ -750,18 +1188,22 @@ def _build_manifest(
     custom_call_targets: list[str],
     *,
     packed: bool,
+    retrieval: RetrievalExport | None = None,
+    mesh: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import jaxlib
 
     model_config = export_cfg.model_config
+    two_tower = retrieval is not None
+    features = _token_feature_config(model_config, two_tower=two_tower)
     dataset = export_cfg.dataset
 
     emb_rows, ep = _emb_table_geometry(trainer)
     emb_rows_padded = -(-emb_rows // ep) * ep
 
-    return {
+    manifest = {
         "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
-        "kind": "recsys_ranking_forward",
+        "kind": KIND_RETRIEVAL if two_tower else KIND_RANKING,
         "name": trainer.name,
         "model_config_class": type(trainer.model_config).__name__,
         "created_timestamp": time.time(),
@@ -775,9 +1217,11 @@ def _build_manifest(
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,
         "output_vocab_size": int(dataset.output_vocab_size),
-        "num_continuous_actions": int(model_config.num_continuous_actions),
+        "num_continuous_actions": int(features.num_continuous_actions),
         "use_seqpack": packed,
-        "prep_spec": _prep_spec(export_cfg, history_seq_len, candidate_seq_len, packed=packed),
+        "prep_spec": _prep_spec(
+            export_cfg, history_seq_len, candidate_seq_len, packed=packed, two_tower=two_tower
+        ),
         "programs": programs,
         "embedding": {
             "table_key": "emb_table",
@@ -790,3 +1234,11 @@ def _build_manifest(
             "hash_table": dataset.hash_table.to_dict(),
         },
     }
+    if retrieval is not None:
+        manifest["retrieval"] = retrieval.manifest_block()
+        if mesh is None:
+            raise AssertionError("retrieval manifests are mesh exports")
+        manifest["mesh"] = mesh
+    elif mesh is not None:
+        raise AssertionError("ranking manifests carry no mesh block")
+    return manifest

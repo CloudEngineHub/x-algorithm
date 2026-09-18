@@ -1,12 +1,14 @@
 use crate::clients::gizmoduck_client::GizmoduckLookup;
-use crate::hydration::batch::{AuthorHydrationBatch, HydrationBatch, TweetHydrationBatch};
+use crate::hydration::batch::{
+    AuthorHydrationBatch, Completeness, HydrationBatch, TweetHydrationBatch,
+};
 use crate::hydration::fallback_cache::FallbackCache;
 use crate::hydration::metrics::{record_author_labels, record_batch_size, timed_results};
 use crate::hydration::{keyed_by_author, tweets_per_author};
 use crate::models::{AuthorFeatures, AuthorId, AuthorLabel, AuthorLabelSet, TweetCandidateInput};
 use crate::rules::SafetyLevel;
 use std::time::Duration;
-use xai_core_entities::entities::GizmoduckUserResult;
+use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
 use xai_core_entities::gizmoduck_client::QueryFields;
 use xai_x_thrift::user_labels::LabelValue;
 
@@ -16,13 +18,13 @@ const CACHE_CAPACITY: usize = 1_000_000;
 
 pub struct GizmoduckAuthorHydrator {
     pub gizmoduck_client: GizmoduckLookup,
-    fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
+    fallback_cache: Option<FallbackCache<AuthorId, Completeness<AuthorFeatures>>>,
 }
 
 impl GizmoduckAuthorHydrator {
     pub(crate) fn new(
         gizmoduck_client: GizmoduckLookup,
-        fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
+        fallback_cache: Option<FallbackCache<AuthorId, Completeness<AuthorFeatures>>>,
     ) -> Self {
         Self {
             gizmoduck_client,
@@ -30,7 +32,7 @@ impl GizmoduckAuthorHydrator {
         }
     }
 
-    pub(crate) fn fallback_cache() -> FallbackCache<AuthorId, AuthorFeatures> {
+    pub(crate) fn fallback_cache() -> FallbackCache<AuthorId, Completeness<AuthorFeatures>> {
         FallbackCache::new("author", CACHE_CAPACITY)
     }
 
@@ -38,7 +40,7 @@ impl GizmoduckAuthorHydrator {
         &self,
         candidates: &[TweetCandidateInput],
         safety_level: SafetyLevel,
-    ) -> TweetHydrationBatch<AuthorFeatures> {
+    ) -> TweetHydrationBatch<Completeness<AuthorFeatures>> {
         let cache_request = self
             .fallback_cache
             .as_ref()
@@ -69,7 +71,7 @@ impl GizmoduckAuthorHydrator {
 
         let mut label_counts = LabelCounts::default();
         let author_features =
-            user_results.map(|user_result| author_features(user_result, &mut label_counts));
+            user_results.map(|result| evaluable_author_features(result, &mut label_counts));
         record_author_labels(label_counts.mapped, label_counts.unmapped);
         let author_features = if let Some((cache, generation)) = cache_request {
             cache.resolve_hydration_batch(generation, author_features)
@@ -84,6 +86,17 @@ impl GizmoduckAuthorHydrator {
 struct LabelCounts {
     mapped: usize,
     unmapped: usize,
+}
+
+fn evaluable_author_features(
+    result: GizmoduckUserResult,
+    counts: &mut LabelCounts,
+) -> Completeness<AuthorFeatures> {
+    let complete = !matches!(
+        result.response_state,
+        None | Some(UserResponseState::Failed) | Some(UserResponseState::Partial)
+    );
+    Completeness::new(complete, author_features(result, counts))
 }
 
 fn author_features(user_result: GizmoduckUserResult, counts: &mut LabelCounts) -> AuthorFeatures {
@@ -261,7 +274,7 @@ mod tests {
                 features.hydrated(&tweet_id),
                 Some(Hydrated::NotFound)
             ));
-            let feature = features.get_or_default(&tweet_id);
+            let feature = features.get_or_default(&tweet_id).into_value();
             assert!(!feature.is_suspended);
             assert!(!feature.is_deactivated);
             assert!(!feature.is_protected);
@@ -284,12 +297,49 @@ mod tests {
         let first = hydrator
             .hydrate(&candidates, SafetyLevel::TimelineHome)
             .await;
-        assert!(first.get_or_default(&TweetId(1)).is_suspended);
+        assert!(first.get_or_default(&TweetId(1)).into_value().is_suspended);
 
         let second = hydrator
             .hydrate(&candidates, SafetyLevel::TimelineHome)
             .await;
-        assert!(second.get_or_default(&TweetId(1)).is_suspended);
+        assert!(second.get_or_default(&TweetId(1)).into_value().is_suspended);
+    }
+
+    #[test]
+    fn only_failed_partial_or_missing_response_states_are_incomplete() {
+        let suspended = GizmoduckUserResult {
+            user: Some(GizmoduckUser {
+                safety: Safety {
+                    suspended: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (state, complete) in [
+            (Some(UserResponseState::Found), true),
+            (Some(UserResponseState::NotFound), true),
+            (Some(UserResponseState::DeactivatedUser), true),
+            (Some(UserResponseState::SuspendedUser), true),
+            (Some(UserResponseState::ProtectedUser), true),
+            (Some(UserResponseState::ErasedUser), true),
+            (Some(UserResponseState::OffboardedUser), true),
+            (Some(UserResponseState::UnsafeUser), true),
+            (Some(UserResponseState::Partial), false),
+            (Some(UserResponseState::Failed), false),
+            (None, false),
+        ] {
+            let features = evaluable_author_features(
+                GizmoduckUserResult {
+                    response_state: state,
+                    ..suspended.clone()
+                },
+                &mut LabelCounts::default(),
+            );
+            assert_eq!(features.is_complete(), complete, "{state:?}");
+            assert!(features.value().is_suspended, "{state:?}");
+        }
     }
 
     fn user_with_labels(label_values: &[i32]) -> GizmoduckUserResult {

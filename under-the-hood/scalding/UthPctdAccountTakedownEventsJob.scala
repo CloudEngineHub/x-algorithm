@@ -158,8 +158,6 @@ object UthPctdAccountTakedownEventsApp {
   private def countryOf(reason: TakedownLabels.Reason): String =
     reason.countryCode.getOrElse(TakedownLabels.WorldwideCopyrightCountryCode)
 
-  private[under_the_hood] val ExcludedArm = "-"
-
   private[under_the_hood] val TakedownsJsonField = "takedowns.asJson"
 
   private[under_the_hood] def parseTakedownsJson(json: String): Option[Takedowns] =
@@ -169,10 +167,9 @@ object UthPctdAccountTakedownEventsApp {
     ).toOption
 
   private[under_the_hood] def takedownsArms(t: Takedowns): Seq[(String, String)] =
-    t.takedownCountryReasons.toSeq.flatten.map { td =>
-      TakedownLabels.fromWithholdingArm(td.takedownReason) match {
-        case Some(reason) => (countryOf(reason), reason.reasonType.name)
-        case None => (TakedownLabels.WorldwideCountryCode, ExcludedArm)
+    t.takedownCountryReasons.toSeq.flatten.flatMap { td =>
+      TakedownLabels.fromWithholdingArm(td.takedownReason).map { reason =>
+        (countryOf(reason), reason.reasonType.name)
       }
     }
 
@@ -184,26 +181,20 @@ object UthPctdAccountTakedownEventsApp {
 
   private[under_the_hood] val TakedownsReasonsField = "takedowns.takedownCountryReasons"
 
-  private val CountryArmPattern =
-    """(LegalRequest|BystanderReport|UnspecifiedReason)\(\1\(([A-Za-z]{2})\)\)""".r
-  private val DmcaArmPattern = """Dmca\(Dmca\(""".r
-  private val ExcludedArmPattern = """(HatefulImagery|SensitiveImagery)\(\1\(""".r
+  private val ArmPattern = """(\w+)\(\1\(([^()]*)\)\)""".r
 
-  private[under_the_hood] def parseTakedownsToString(s: String): Seq[(String, String)] = {
-    val scoped = CountryArmPattern
+  private[under_the_hood] def parseTakedownsToString(s: String): Seq[(String, String)] =
+    ArmPattern
       .findAllMatchIn(s)
-      .map(m => (TakedownLabels.normalizeCountryCode(m.group(2)), m.group(1)))
+      .flatMap { m =>
+        ReasonType.fromName(m.group(1)).collect {
+          case t if t.countryScoped => (TakedownLabels.normalizeCountryCode(m.group(2)), t.name)
+          case ReasonType.Dmca =>
+            (TakedownLabels.WorldwideCopyrightCountryCode, ReasonType.Dmca.name)
+        }
+      }
       .toSeq
-    val dmca =
-      if (DmcaArmPattern.findFirstIn(s).isDefined)
-        Seq((TakedownLabels.WorldwideCopyrightCountryCode, ReasonType.Dmca.name))
-      else Nil
-    val excluded =
-      if (ExcludedArmPattern.findFirstIn(s).isDefined)
-        Seq((TakedownLabels.WorldwideCountryCode, ExcludedArm))
-      else Nil
-    (scoped ++ dmca ++ excluded).distinct
-  }
+      .distinct
 
   private[under_the_hood] def takedownDiffs(
     mods: TypedPipe[UserModification],
@@ -309,22 +300,14 @@ object UthPctdAccountTakedownEventsApp {
     def reasonAt(dayStartMs: Long): Option[ReasonType] =
       armAt(dayStartMs).flatMap(ReasonType.fromName)
 
-    def resolutionAt(dayStartMs: Long): String =
-      armAt(dayStartMs) match {
-        case Some(ExcludedArm) => DroppedExcludedArm
-        case Some(arm) =>
-          ReasonType.fromName(arm).fold(DroppedUnknownArm)(r => s"reported:${r.name}")
-        case None => DroppedUnknownArm
-      }
-
-    def resolution(dayStarts: Seq[Long]): String = {
-      val outcomes = dayStarts.filter(withheldAt).map(resolutionAt).distinct.sorted
-      if (outcomes.isEmpty) "not_withheld" else outcomes.mkString(",")
-    }
+    def reportedOverRange(dayStarts: Seq[Long]): String =
+      dayStarts
+        .filter(withheldAt)
+        .map(t => reasonAt(t).fold("none")(_.name))
+        .distinct
+        .sorted
+        .mkString(",")
   }
-
-  private[under_the_hood] val DroppedExcludedArm = "dropped:excluded_arm"
-  private[under_the_hood] val DroppedUnknownArm = "dropped:unknown_arm"
 
   private[under_the_hood] def resolveKeys(
     deltas: TypedPipe[((Long, String), Delta)],
@@ -389,7 +372,7 @@ object UthPctdAccountTakedownEventsApp {
         .map { case (ts, isAfter, arm) => s"$ts:${if (isAfter == 1) "after" else "before"}:$arm" }
         .mkString(","),
       k.auditReason.map(_.name).getOrElse(""),
-      k.resolution(dayStarts),
+      k.reportedOverRange(dayStarts),
       k.deltas
         .map {
           case (ms, applied, arm) =>

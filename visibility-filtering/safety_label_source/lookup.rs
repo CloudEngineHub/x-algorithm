@@ -70,6 +70,9 @@ impl RemoteSource {
         let mut warm_ids = Vec::new();
 
         for &tweet_id in ids {
+            if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {
+                continue;
+            }
             match twemcache_results.remove(&tweet_id) {
                 Some(TwemcacheOutcome::Hit(label_map)) => {
                     results.insert(tweet_id, Ok(label_map));
@@ -242,6 +245,21 @@ mod tests {
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(twemcache.calls(), vec![vec![42]]);
         assert_eq!(manhattan.calls(), vec![Vec::<u64>::new()]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_ids_resolve_once_without_a_phantom_miss() {
+        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));
+        let manhattan = FakeManhattan::new(HashMap::from([(
+            42,
+            ManhattanOutcome::Resolved(empty_label_map()),
+        )]));
+        let source = RemoteSource::new(twemcache.clone(), manhattan.clone());
+
+        let results = source.get(&[42, 42]).await;
+
+        assert!(results.get(&42).unwrap().is_ok());
+        assert_eq!(manhattan.calls(), vec![vec![42]]);
     }
 
     #[tokio::test]

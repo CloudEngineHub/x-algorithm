@@ -2,7 +2,6 @@ use crate::models::candidate::{PhoenixScores, PostCandidate, SlateContext};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::AuthorColdStart;
-use crate::scorers::value_model_gate::GateModel;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -11,10 +10,8 @@ use tonic::async_trait;
 use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
 use xai_candidate_pipeline::scorer::Scorer;
 
-const DWELL_REGRET_SIGMOID_MODE: &str = "dwell_regret_sigmoid";
-const GATED_DWELL_REGRET_MODE: &str = "gated_dwell_regret";
-const DWELL_REGRET_MEAN_EPS: f64 = 1e-9;
-const DWELL_REGRET_MIN_TEMPERATURE: f64 = 1e-6;
+pub(crate) const WEIGHTED_VALUE_MODEL_MODE: &str = "weighted";
+
 pub(crate) struct ScoringWeights {
     favorite: f64,
     reply: f64,
@@ -334,42 +331,6 @@ impl ScoringWeights {
     }
 }
 
-pub(crate) struct DwellRegretWeights {
-    alpha_favorite: f64,
-    alpha_reply: f64,
-    alpha_retweet: f64,
-    alpha_quote: f64,
-    alpha_share: f64,
-    alpha_share_via_dm: f64,
-    alpha_share_via_copy_link: f64,
-    neg_not_interested: f64,
-    neg_block_author: f64,
-    neg_mute_author: f64,
-    neg_report: f64,
-    temperature: f64,
-    dwell_floor: f64,
-}
-
-impl DwellRegretWeights {
-    pub(crate) fn from_params(params: &xai_feature_switches::Params) -> Self {
-        Self {
-            alpha_favorite: params.get(DwellRegretAlphaFavorite),
-            alpha_reply: params.get(DwellRegretAlphaReply),
-            alpha_retweet: params.get(DwellRegretAlphaRetweet),
-            alpha_quote: params.get(DwellRegretAlphaQuote),
-            alpha_share: params.get(DwellRegretAlphaShare),
-            alpha_share_via_dm: params.get(DwellRegretAlphaShareViaDm),
-            alpha_share_via_copy_link: params.get(DwellRegretAlphaShareViaCopyLink),
-            neg_not_interested: params.get(DwellRegretNegNotInterested),
-            neg_block_author: params.get(DwellRegretNegBlockAuthor),
-            neg_mute_author: params.get(DwellRegretNegMuteAuthor),
-            neg_report: params.get(DwellRegretNegReport),
-            temperature: params.get(DwellRegretTemperature),
-            dwell_floor: params.get(DwellRegretDwellFloor),
-        }
-    }
-}
-
 pub struct RankingScorer {
     pub author_cold_start: AuthorColdStart,
 }
@@ -521,85 +482,6 @@ impl RankingScorer {
         }
     }
 
-    pub(crate) fn compute_dwell_regret_base_scores(
-        w: &DwellRegretWeights,
-        candidates: &[PostCandidate],
-    ) -> Vec<f64> {
-        let n = candidates.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let inv_n = 1.0 / n as f64;
-
-        let mut mean_favorite = 0.0;
-        let mut mean_reply = 0.0;
-        let mut mean_retweet = 0.0;
-        let mut mean_quote = 0.0;
-        let mut mean_share = 0.0;
-        let mut mean_share_via_dm = 0.0;
-        let mut mean_share_via_copy_link = 0.0;
-        for c in candidates {
-            let ps = &c.phoenix_scores;
-            mean_favorite += ps.favorite_score.unwrap_or(0.0);
-            mean_reply += ps.reply_score.unwrap_or(0.0);
-            mean_retweet += ps.retweet_score.unwrap_or(0.0);
-            mean_quote += ps.quote_score.unwrap_or(0.0);
-            mean_share += ps.share_score.unwrap_or(0.0);
-            mean_share_via_dm += ps.share_via_dm_score.unwrap_or(0.0);
-            mean_share_via_copy_link += ps.share_via_copy_link_score.unwrap_or(0.0);
-        }
-        mean_favorite *= inv_n;
-        mean_reply *= inv_n;
-        mean_retweet *= inv_n;
-        mean_quote *= inv_n;
-        mean_share *= inv_n;
-        mean_share_via_dm *= inv_n;
-        mean_share_via_copy_link *= inv_n;
-
-        let temperature = w.temperature.max(DWELL_REGRET_MIN_TEMPERATURE);
-
-        candidates
-            .iter()
-            .map(|c| {
-                let ps = &c.phoenix_scores;
-                let positive = w.alpha_favorite
-                    * Self::centered_ratio(ps.favorite_score, mean_favorite)
-                    + w.alpha_reply * Self::centered_ratio(ps.reply_score, mean_reply)
-                    + w.alpha_retweet * Self::centered_ratio(ps.retweet_score, mean_retweet)
-                    + w.alpha_quote * Self::centered_ratio(ps.quote_score, mean_quote)
-                    + w.alpha_share * Self::centered_ratio(ps.share_score, mean_share)
-                    + w.alpha_share_via_dm
-                        * Self::centered_ratio(ps.share_via_dm_score, mean_share_via_dm)
-                    + w.alpha_share_via_copy_link
-                        * Self::centered_ratio(
-                            ps.share_via_copy_link_score,
-                            mean_share_via_copy_link,
-                        );
-                let negative = w.neg_not_interested * ps.not_interested_score.unwrap_or(0.0)
-                    + w.neg_block_author * ps.block_author_score.unwrap_or(0.0)
-                    + w.neg_mute_author * ps.mute_author_score.unwrap_or(0.0)
-                    + w.neg_report * ps.report_score.unwrap_or(0.0);
-                let modulation = 2.0
-                    * Self::sigmoid(positive / temperature)
-                    * (negative.min(0.0) / temperature).exp();
-                let dwell = ps.dwell_time.unwrap_or(0.0).max(w.dwell_floor).max(0.0);
-                dwell * modulation
-            })
-            .collect()
-    }
-
-    fn centered_ratio(p: Option<f64>, mean: f64) -> f64 {
-        if mean < DWELL_REGRET_MEAN_EPS {
-            0.0
-        } else {
-            p.unwrap_or(0.0) / mean - 1.0
-        }
-    }
-
-    fn sigmoid(x: f64) -> f64 {
-        1.0 / (1.0 + (-x).exp())
-    }
-
     fn diversity_multiplier(decay_factor: f64, floor: f64, exponent: f64) -> f64 {
         (1.0 - floor) * decay_factor.powf(exponent) + floor
     }
@@ -691,29 +573,14 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
         let weights = ScoringWeights::from_params(&query.params).perturbed(query);
         let enable_author_diversity = query.params.get(EnableAuthorDiversity);
 
-        let use_dwell_regret = match query.params.get(ValueModelMode).as_str() {
-            DWELL_REGRET_SIGMOID_MODE => true,
-            GATED_DWELL_REGRET_MODE => GateModel::from_params(&query.params)
-                .is_some_and(|gate| gate.serve_new_scoring(query)),
-            _ => false,
-        };
-        let weighted_parts: Vec<(f64, f64)> = if use_dwell_regret {
-            Vec::new()
-        } else {
-            candidates
-                .iter()
-                .map(|c| Self::compute_weighted_parts(&weights, query, c))
-                .collect()
-        };
-        let weighted_scores: Vec<f64> = if use_dwell_regret {
-            let dr_weights = DwellRegretWeights::from_params(&query.params);
-            Self::compute_dwell_regret_base_scores(&dr_weights, candidates)
-        } else {
-            weighted_parts
-                .iter()
-                .map(|&(pos, neg)| Self::offset_score(pos - neg, &weights))
-                .collect()
-        };
+        let weighted_parts: Vec<(f64, f64)> = candidates
+            .iter()
+            .map(|c| Self::compute_weighted_parts(&weights, query, c))
+            .collect();
+        let weighted_scores: Vec<f64> = weighted_parts
+            .iter()
+            .map(|&(pos, neg)| Self::offset_score(pos - neg, &weights))
+            .collect();
 
         let effective_oon = Self::effective_oon_weight(query);
         let deboost_in_network_replies_retweets = query
@@ -736,7 +603,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                     .flatten()
             });
 
-        if !use_dwell_regret && query.params.get(MultiplierPreOffset) {
+        if query.params.get(MultiplierPreOffset) {
             let diversity_multipliers: Vec<f64> = if enable_author_diversity {
                 let counts = Self::author_pool_counts(candidates, &weighted_scores);
                 Self::author_diversity_multipliers(query, &counts)
@@ -823,8 +690,6 @@ mod tests {
     use crate::util::author_rules::AuthorRulesEvaluator;
     use std::sync::Arc;
 
-    const GATE_WEIGHTS_ALL_ZERO: &str = "seq_len:0,n_fav:0,n_reply:0,n_rt_quote:0,n_vqv:0,n_click:0,n_bm_share:0,n_profile_follow:0,n_photo:0,n_negfb:0,n_7d:0,n_1d:0,active_days:0,active_days_7d:0,days_since_last:0,span_days:0,followers:0,followings:0,account_age_years:0";
-
     fn test_scorer() -> RankingScorer {
         let fs = Arc::new(xai_feature_switches::FeatureSwitches::new(vec![]).unwrap());
         RankingScorer {
@@ -885,7 +750,6 @@ mod tests {
             ("rust_home_mixer_enable_author_diversity", "true"),
             ("rust_home_mixer_author_diversity_decay", "0.5"),
             ("rust_home_mixer_author_diversity_floor", "0.25"),
-            ("rust_home_mixer_value_model_mode", "weighted"),
         ]);
         let scored = scorer.score(&query, &candidates).await;
 
@@ -949,7 +813,6 @@ mod tests {
             ("rust_home_mixer_enable_author_diversity", "true"),
             ("rust_home_mixer_author_diversity_decay", "0.5"),
             ("rust_home_mixer_author_diversity_floor", "0.25"),
-            ("rust_home_mixer_value_model_mode", "weighted"),
         ]);
         query.has_cached_posts = true;
 
@@ -967,10 +830,7 @@ mod tests {
         let scorer = test_scorer();
         let candidates = vec![candidate(1, Some(true)), candidate(2, Some(false))];
 
-        let query = query_with_flags(&[
-            ("rust_home_mixer_oon_weight_factor", "0.75"),
-            ("rust_home_mixer_value_model_mode", "weighted"),
-        ]);
+        let query = query_with_flags(&[("rust_home_mixer_oon_weight_factor", "0.75")]);
         let scored = scorer.score(&query, &candidates).await;
 
         let in_network_score = scored[0].as_ref().unwrap().score.unwrap();
@@ -1282,7 +1142,6 @@ mod tests {
                 "true",
             ),
             ("rust_home_mixer_oon_weight_factor", "0.75"),
-            ("rust_home_mixer_value_model_mode", "weighted"),
         ]);
 
         let scored = scorer.score(&query, &candidates).await;
@@ -1297,317 +1156,5 @@ mod tests {
         assert!((reply - original * expected_oon).abs() < 1e-9);
         assert!((retweet - original * expected_oon).abs() < 1e-9);
         assert!((oon - original * expected_oon).abs() < 1e-9);
-    }
-
-    fn dr_weights() -> DwellRegretWeights {
-        DwellRegretWeights {
-            alpha_favorite: 1.0,
-            alpha_reply: 1.0,
-            alpha_retweet: 1.0,
-            alpha_quote: 1.0,
-            alpha_share: 1.0,
-            alpha_share_via_dm: 1.0,
-            alpha_share_via_copy_link: 1.0,
-            neg_not_interested: -50.0,
-            neg_block_author: -50.0,
-            neg_mute_author: -80.0,
-            neg_report: -1000.0,
-            temperature: 1.0,
-            dwell_floor: 1.0,
-        }
-    }
-
-    fn dr_candidate(author_id: u64, scores: PhoenixScores) -> PostCandidate {
-        PostCandidate {
-            author_id,
-            in_network: Some(true),
-            phoenix_scores: scores,
-            ..Default::default()
-        }
-    }
-
-    fn dwell_regret_query() -> ScoredPostsQuery {
-        let mut query = ScoredPostsQuery::default();
-        let fs = xai_feature_switches::FeatureSwitches::new(vec![]).unwrap();
-        let mut results =
-            fs.match_recipient(&xai_feature_switches::RecipientBuilder::new().build());
-        results.override_fs(
-            "rust_home_mixer_value_model_mode".to_string(),
-            "dwell_regret_sigmoid",
-        );
-        results.override_fs(
-            "rust_home_mixer_enable_author_diversity".to_string(),
-            "false",
-        );
-        query.params = results.into();
-        query
-    }
-
-    #[test]
-    fn dwell_regret_neutral_post_scores_dwell() {
-        let s = PhoenixScores {
-            favorite_score: Some(0.1),
-            reply_score: Some(0.02),
-            dwell_time: Some(20.0),
-            ..Default::default()
-        };
-        let candidates = vec![dr_candidate(1, s.clone()), dr_candidate(2, s)];
-        let scores = RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &candidates);
-        assert!((scores[0] - 20.0).abs() < 1e-9, "score={}", scores[0]);
-        assert!((scores[1] - 20.0).abs() < 1e-9, "score={}", scores[1]);
-    }
-
-    #[test]
-    fn dwell_regret_above_average_likeable_is_boosted() {
-        let a = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.3),
-                dwell_time: Some(10.0),
-                ..Default::default()
-            },
-        );
-        let b = dr_candidate(
-            2,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: Some(10.0),
-                ..Default::default()
-            },
-        );
-        let scores = RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &[a, b]);
-        assert!((scores[0] - 12.449_186_63).abs() < 1e-6, "a={}", scores[0]);
-        assert!((scores[1] - 7.550_813_37).abs() < 1e-6, "b={}", scores[1]);
-        assert!(scores[0] > 10.0 && scores[1] < 10.0);
-    }
-
-    #[test]
-    fn dwell_regret_report_sinks_candidate() {
-        let clean = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: Some(10.0),
-                ..Default::default()
-            },
-        );
-        let reported = dr_candidate(
-            2,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                report_score: Some(0.01),
-                dwell_time: Some(10.0),
-                ..Default::default()
-            },
-        );
-        let scores =
-            RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &[clean, reported]);
-        assert!((scores[0] - 10.0).abs() < 1e-9, "clean={}", scores[0]);
-        assert!(scores[1] < 0.01, "reported={}", scores[1]);
-        assert!(scores[1] < scores[0]);
-    }
-
-    #[test]
-    fn dwell_regret_floor_applies_to_low_dwell() {
-        let none_dwell = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: None,
-                ..Default::default()
-            },
-        );
-        let zero_dwell = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: Some(0.0),
-                ..Default::default()
-            },
-        );
-        let none_scores =
-            RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &[none_dwell]);
-        let zero_scores =
-            RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &[zero_dwell]);
-        assert!(
-            (none_scores[0] - 1.0).abs() < 1e-9,
-            "none={}",
-            none_scores[0]
-        );
-        assert!(
-            (zero_scores[0] - 1.0).abs() < 1e-9,
-            "zero={}",
-            zero_scores[0]
-        );
-    }
-
-    #[test]
-    fn dwell_regret_per_request_normalization_amplifies_for_low_engagement_set() {
-        let target = || {
-            dr_candidate(
-                1,
-                PhoenixScores {
-                    favorite_score: Some(0.03),
-                    dwell_time: Some(10.0),
-                    ..Default::default()
-                },
-            )
-        };
-        let low_set = vec![
-            target(),
-            dr_candidate(
-                2,
-                PhoenixScores {
-                    favorite_score: Some(0.003),
-                    dwell_time: Some(10.0),
-                    ..Default::default()
-                },
-            ),
-        ];
-        let high_set = vec![
-            target(),
-            dr_candidate(
-                2,
-                PhoenixScores {
-                    favorite_score: Some(0.09),
-                    dwell_time: Some(10.0),
-                    ..Default::default()
-                },
-            ),
-        ];
-        let low = RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &low_set);
-        let high = RankingScorer::compute_dwell_regret_base_scores(&dr_weights(), &high_set);
-        assert!(
-            low[0] > high[0],
-            "low-set target {} should beat high-set target {}",
-            low[0],
-            high[0]
-        );
-        assert!(
-            low[0] > 10.0,
-            "stands out → boosted above dwell: {}",
-            low[0]
-        );
-        assert!(high[0] < 10.0, "below mean → damped: {}", high[0]);
-    }
-
-    #[tokio::test]
-    async fn score_uses_dwell_regret_mode_when_selected() {
-        let scorer = test_scorer();
-        let s = PhoenixScores {
-            favorite_score: Some(0.1),
-            dwell_time: Some(20.0),
-            ..Default::default()
-        };
-        let candidates = vec![dr_candidate(1, s.clone()), dr_candidate(2, s)];
-        let scored = scorer.score(&dwell_regret_query(), &candidates).await;
-        let s0 = scored[0].as_ref().unwrap().score.unwrap();
-        assert!((s0 - 20.0).abs() < 1e-9, "score={s0}");
-    }
-
-    #[tokio::test]
-    async fn gated_mode_routes_by_gate_decision() {
-        let scorer = test_scorer();
-        let s = PhoenixScores {
-            favorite_score: Some(0.1),
-            dwell_time: Some(20.0),
-            ..Default::default()
-        };
-        let candidates = vec![dr_candidate(1, s.clone()), dr_candidate(2, s)];
-
-        let mut query = query_with_flags(&[
-            ("rust_home_mixer_value_model_mode", "gated_dwell_regret"),
-            ("rust_home_mixer_enable_author_diversity", "false"),
-            (
-                "rust_home_mixer_dwell_regret_gate_weights",
-                GATE_WEIGHTS_ALL_ZERO,
-            ),
-            ("rust_home_mixer_dwell_regret_gate_bias", "0.0"),
-            ("rust_home_mixer_dwell_regret_gate_hysteresis_band", "0.0"),
-            ("rust_home_mixer_dwell_regret_gate_threshold", "-1000.0"),
-            ("rust_home_mixer_dwell_regret_dwell_floor", "1.0"),
-        ]);
-        query.user_id = 7;
-        let scored = scorer.score(&query, &candidates).await;
-        let s0 = scored[0].as_ref().unwrap().score.unwrap();
-        assert!(
-            (s0 - 20.0).abs() < 1e-9,
-            "gate-open should use dwell-regret: {s0}"
-        );
-
-        let mut query = query_with_flags(&[
-            ("rust_home_mixer_value_model_mode", "gated_dwell_regret"),
-            ("rust_home_mixer_enable_author_diversity", "false"),
-            (
-                "rust_home_mixer_dwell_regret_gate_weights",
-                GATE_WEIGHTS_ALL_ZERO,
-            ),
-            ("rust_home_mixer_dwell_regret_gate_bias", "0.0"),
-            ("rust_home_mixer_dwell_regret_gate_hysteresis_band", "0.0"),
-            ("rust_home_mixer_dwell_regret_gate_threshold", "1000.0"),
-            ("rust_home_mixer_favorite_weight", "1.0"),
-            ("rust_home_mixer_cont_dwell_time_weight", "0.0"),
-        ]);
-        query.user_id = 7;
-        let scored = scorer.score(&query, &candidates).await;
-        let w0 = scored[0].as_ref().unwrap().weighted_score.unwrap();
-        assert!(w0 < 1.0, "gate-closed should use weighted: {w0}");
-    }
-
-    #[tokio::test]
-    async fn gated_mode_with_invalid_gate_config_falls_back_to_weighted() {
-        let scorer = test_scorer();
-        let candidate = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: Some(20.0),
-                ..Default::default()
-            },
-        );
-        let query = query_with_flags(&[
-            ("rust_home_mixer_value_model_mode", "gated_dwell_regret"),
-            ("rust_home_mixer_enable_author_diversity", "false"),
-            (
-                "rust_home_mixer_dwell_regret_gate_weights",
-                "seq_len:not_a_number",
-            ),
-            ("rust_home_mixer_favorite_weight", "1.0"),
-            ("rust_home_mixer_cont_dwell_time_weight", "0.0"),
-        ]);
-        let scored = scorer.score(&query, std::slice::from_ref(&candidate)).await;
-        let w0 = scored[0].as_ref().unwrap().weighted_score.unwrap();
-        assert!(
-            w0 < 1.0,
-            "invalid gate config must fall back to weighted: {w0}"
-        );
-    }
-
-    #[tokio::test]
-    async fn weighted_mode_uses_weighted_scorer() {
-        let scorer = test_scorer();
-        let candidate = dr_candidate(
-            1,
-            PhoenixScores {
-                favorite_score: Some(0.1),
-                dwell_time: Some(20.0),
-                ..Default::default()
-            },
-        );
-        let scored = scorer
-            .score(
-                &query_with_flags(&[
-                    ("rust_home_mixer_value_model_mode", "weighted"),
-                    ("rust_home_mixer_favorite_weight", "1.0"),
-                    ("rust_home_mixer_cont_dwell_time_weight", "0.0"),
-                ]),
-                std::slice::from_ref(&candidate),
-            )
-            .await;
-        let weighted = scored[0].as_ref().unwrap().weighted_score.unwrap();
-        assert!(
-            weighted < 1.0,
-            "weighted-mode score should be small: {weighted}"
-        );
     }
 }

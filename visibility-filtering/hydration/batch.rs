@@ -5,6 +5,51 @@ use std::fmt::Display;
 use std::hash::Hash;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completeness<V> {
+    Complete(V),
+    Incomplete(V),
+}
+
+impl<V> Completeness<V> {
+    pub fn new(complete: bool, value: V) -> Self {
+        if complete {
+            Self::Complete(value)
+        } else {
+            Self::Incomplete(value)
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+
+    pub fn value(&self) -> &V {
+        match self {
+            Self::Complete(value) | Self::Incomplete(value) => value,
+        }
+    }
+
+    pub fn into_value(self) -> V {
+        match self {
+            Self::Complete(value) | Self::Incomplete(value) => value,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(V) -> U) -> Completeness<U> {
+        match self {
+            Self::Complete(value) => Completeness::Complete(f(value)),
+            Self::Incomplete(value) => Completeness::Incomplete(f(value)),
+        }
+    }
+}
+
+impl<V: Default> Default for Completeness<V> {
+    fn default() -> Self {
+        Self::Incomplete(V::default())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HydrationError {
     MissingResponse,
     Timeout,
@@ -104,6 +149,10 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
 
     pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {
         self.results.get(key)
+    }
+
+    pub(crate) fn is_failed(&self, key: &K) -> bool {
+        matches!(self.hydrated(key), None | Some(Hydrated::Failed(_)))
     }
 
     pub(crate) fn into_hydrated(self) -> HashMap<K, Hydrated<V>> {

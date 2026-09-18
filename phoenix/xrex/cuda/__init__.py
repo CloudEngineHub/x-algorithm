@@ -22,10 +22,17 @@ shape:
 * the **CUDA/C++ source** under ``<kernel>/src/``, with the shared XLA-FFI
   helpers under ``xla_utils/``. Each subpackage tries to import a nanobind
   extension named after the file (``adler32_api``, ``unique_api``,
-  ``top_k_by_key_api``) from its own ``src/`` at import time. When the import
-  succeeds the kernel is registered as an XLA FFI target and used instead of
-  the reference; when it fails the reference stands. Nothing in this tree
-  builds those three extensions, so the reference path is what runs.
+  ``top_k_by_key_api``) at import time. When the import succeeds the kernel
+  is registered as an XLA FFI target and used instead of the reference; when
+  it fails (``ModuleNotFoundError``) the reference stands.
+
+  All three are built: each ``<kernel>/src/BUILD`` feeds the
+  ``xrex-cuda-kernels`` wheel and the loader imports
+  ``xrex_cuda_kernels.<api>``, so an environment with the package runs the
+  compiled kernel and one without it runs the reference — and logs a warning
+  saying so, because a venv quietly on the reference path is the failure mode
+  this layout exists to prevent. ``wheel_inventory_test.py`` fails if a kernel
+  is added here without its build, its wheel entry and its loader import.
 
 The FFI target names are prefixed ``xrex_``.
 

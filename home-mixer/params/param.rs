@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-17T20:46:44Z
+// mirrored from config feature-switch defaults; last sync 2026-09-18T16:21:20Z
 use xai_feature_switches::param;
 
 param!(
@@ -12,6 +12,12 @@ param!(
     bool,
     "rust_home_mixer_enable_phoenix_source",
     true
+);
+param!(
+    PhoenixColdStartMaxResults,
+    u32,
+    "rust_home_mixer_phoenix_cold_start_max_results",
+    0
 );
 
 param!(
@@ -165,7 +171,7 @@ param!(
     PhoenixRetrievalMOEInferenceClusterId,
     String,
     "rust_home_mixer_phoenix_retrieval_moe_inference_cluster_id",
-    "Experiment2Memy04"
+    "Experiment3Memy04"
 );
 param!(
     PhoenixMOEMaxResults,
@@ -462,12 +468,6 @@ param!(
 );
 
 param!(
-    ValueModelMode,
-    String,
-    "rust_home_mixer_value_model_mode",
-    "weighted"
-);
-param!(
     WeightPerturbationSigma,
     f64,
     "rust_home_mixer_weight_perturbation_sigma",
@@ -478,108 +478,6 @@ param!(
     String,
     "rust_home_mixer_weight_perturbation_salt",
     ""
-);
-param!(
-    DwellRegretTemperature,
-    f64,
-    "rust_home_mixer_dwell_regret_temperature",
-    10.0
-);
-param!(
-    DwellRegretDwellFloor,
-    f64,
-    "rust_home_mixer_dwell_regret_dwell_floor",
-    1.0
-);
-param!(
-    DwellRegretAlphaFavorite,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_favorite",
-    1.0
-);
-param!(
-    DwellRegretAlphaReply,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_reply",
-    1.0
-);
-param!(
-    DwellRegretAlphaRetweet,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_retweet",
-    1.0
-);
-param!(
-    DwellRegretAlphaQuote,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_quote",
-    1.0
-);
-param!(
-    DwellRegretAlphaShare,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share",
-    1.0
-);
-param!(
-    DwellRegretAlphaShareViaDm,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share_via_dm",
-    1.0
-);
-param!(
-    DwellRegretAlphaShareViaCopyLink,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share_via_copy_link",
-    1.0
-);
-param!(
-    DwellRegretNegNotInterested,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_not_interested",
-    -10000.0
-);
-param!(
-    DwellRegretNegBlockAuthor,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_block_author",
-    -8000.0
-);
-param!(
-    DwellRegretNegMuteAuthor,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_mute_author",
-    -15000.0
-);
-param!(
-    DwellRegretNegReport,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_report",
-    -60000.0
-);
-param!(
-    DwellRegretGateWeights,
-    String,
-    "rust_home_mixer_dwell_regret_gate_weights",
-    "seq_len:0.530298,n_fav:-0.082139,n_reply:0.485541,n_rt_quote:0.056561,n_vqv:-0.072778,n_click:-0.176675,n_bm_share:-0.167574,n_profile_follow:-0.221285,n_photo:-0.106004,n_negfb:0.031839,n_7d:-0.075799,n_1d:-0.241730,active_days:0.047017,active_days_7d:-0.126896,days_since_last:-0.034238,span_days:-0.052186,followers:-0.066642,followings:0.064140,account_age_years:-0.045455"
-);
-param!(
-    DwellRegretGateBias,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_bias",
-    1.033918
-);
-param!(
-    DwellRegretGateThreshold,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_threshold",
-    -0.634264
-);
-param!(
-    DwellRegretGateHysteresisBand,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_hysteresis_band",
-    0.0
 );
 
 param!(

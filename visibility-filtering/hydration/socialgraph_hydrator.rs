@@ -92,8 +92,8 @@ mod tests {
             &self,
             _viewer_id: u64,
             _author_ids: &[u64],
-        ) -> HashMap<u64, bool> {
-            HashMap::new()
+        ) -> Option<HashMap<u64, bool>> {
+            Some(HashMap::new())
         }
     }
 

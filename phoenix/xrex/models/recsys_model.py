@@ -426,12 +426,7 @@ def metric_ratio_pos(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) ->
     del p
     total_valid = valid_mask.sum()
     num_pos = (valid_mask * y).sum()
-    return jax.lax.cond(
-        total_valid > 0,
-        lambda _, n=num_pos, t=total_valid: n / jnp.maximum(t, 1),
-        lambda _: 0.0,
-        None,
-    )
+    return jnp.where(total_valid > 0, num_pos / jnp.maximum(total_valid, 1), 0.0)
 
 
 def metric_ndcg(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
@@ -457,27 +452,18 @@ def metric_ndcg(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.
     ndcg_scores = jax.vmap(compute_single_ndcg)(p, y, valid_mask)
 
     valid_queries = jnp.sum(valid_mask, axis=1) >= 1
-    return jax.lax.cond(
-        jnp.sum(valid_queries) > 0,
-        lambda _, scores=ndcg_scores, valid=valid_queries: (
-            jnp.sum(jnp.where(valid, scores, 0.0)) / jnp.sum(valid)
-        ),
-        lambda _: 0.0,
-        None,
+    num_valid_queries = jnp.sum(valid_queries)
+    return jnp.where(
+        num_valid_queries > 0,
+        jnp.sum(jnp.where(valid_queries, ndcg_scores, 0.0)) / num_valid_queries,
+        0.0,
     )
 
 
 def metric_calib(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
     num_pos = (valid_mask * y).sum() + _CALIB_POS_BASE
     num_prob_pos = (valid_mask * p).sum()
-    return jax.lax.cond(
-        num_pos > 0,
-        lambda _, num_prob_pos=num_prob_pos, num_pos=num_pos: (
-            num_prob_pos / jnp.maximum(num_pos, 1)
-        ),
-        lambda _: 0.0,
-        None,
-    )
+    return jnp.where(num_pos > 0, num_prob_pos / jnp.maximum(num_pos, 1), 0.0)
 
 
 def engagement_metrics(p, y, masks, auc_thresholds):

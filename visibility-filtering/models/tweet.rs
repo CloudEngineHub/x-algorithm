@@ -1,14 +1,10 @@
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CoreFeature {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "retained for the upcoming muted-keyword rule")
-    )]
     pub text: String,
     pub source_tweet_id: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaFeature {
     pub has_media: bool,
     pub has_dmca_media: bool,
@@ -16,13 +12,13 @@ pub struct MediaFeature {
     pub geo_deny_list: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NsfwFeature {
     pub user: bool,
     pub admin: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TweetFeatures {
     pub core: CoreFeature,
     pub media: MediaFeature,

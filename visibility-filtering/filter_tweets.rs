@@ -10,13 +10,13 @@ use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct FilterTweetsEndpoint {
-    filter_tweets: FilterTweets,
+    filter_tweets: Arc<FilterTweets>,
     reference_compare: Option<Arc<ReferenceCompareHarness>>,
 }
 
 impl FilterTweetsEndpoint {
     pub(crate) fn new(
-        filter_tweets: FilterTweets,
+        filter_tweets: Arc<FilterTweets>,
         reference_compare: Option<Arc<ReferenceCompareHarness>>,
     ) -> Self {
         Self {
@@ -32,7 +32,7 @@ impl FilterTweetsEndpoint {
         let request_metrics = RequestMetricsGuard::new();
         let grpc_timeout = parse_grpc_timeout(request.metadata());
         let req = request.into_inner();
-        ft_metrics::record_batch_size(req.tweets.len());
+        ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());
         let viewer_id = normalize_viewer_id(req.viewer_id);
         ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
 
@@ -96,7 +96,7 @@ impl FilterTweetsEndpoint {
     }
 }
 
-fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
+pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
     raw.filter(|&id| id as i64 > 0)
 }
 
@@ -151,6 +151,7 @@ mod tests {
                 action,
                 decided_by: Some("test"),
             },
+            status: crate::filter::EvaluationStatus::Evaluated,
             safety_labels: None,
         }
     }
@@ -160,7 +161,9 @@ mod tests {
             xai_core_entities::gizmoduck_client::MockGizmoduckClient::default(),
         );
         let endpoint = FilterTweetsEndpoint::new(
-            crate::filter::test_support::filter_tweets_with_gizmoduck(gizmoduck.clone()),
+            Arc::new(crate::filter::test_support::filter_tweets_with_gizmoduck(
+                gizmoduck.clone(),
+            )),
             None,
         );
         let response = endpoint

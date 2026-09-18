@@ -98,6 +98,13 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &moe_cluster,
                     &experiment_buckets,
                 );
+                record_phoenix_retrieval_cold_stats(
+                    receiver.as_ref(),
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                    &retrieval_cluster,
+                    &experiment_buckets,
+                );
             }
         } else {
             if random::<f64>() < DEFAULT_SAMPLING_RATE {
@@ -397,6 +404,24 @@ fn record_phoenix_retrieval_moe_stats(
         experiment_buckets,
         ServedType::ForYouPhoenixRetrievalMoe,
         "PhoenixRetrievalMoeTweets",
+    );
+}
+
+fn record_phoenix_retrieval_cold_stats(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    record_retrieval_source_stats(
+        receiver,
+        selected_candidates,
+        non_selected_candidates,
+        retrieval_cluster,
+        experiment_buckets,
+        ServedType::ForYouPhoenixRetrievalCold,
+        "PhoenixRetrievalColdTweets",
     );
 }
 

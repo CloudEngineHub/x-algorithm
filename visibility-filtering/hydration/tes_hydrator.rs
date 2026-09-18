@@ -1,6 +1,7 @@
 use crate::hydration::batch::{Hydrated, HydrationBatch, TweetHydrationBatch};
 use crate::hydration::fallback_cache::FallbackCache;
 use crate::hydration::metrics::{record_batch_size, timed_results};
+use crate::hydration::tes_composite::{TweetForVisibility, TweetForVisibilitySource};
 use crate::models::{
     CoreFeature, MediaFeature, NsfwFeature, TweetCandidateInput, TweetFeatures, TweetId,
 };
@@ -8,7 +9,7 @@ use crate::rules::SafetyLevel;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use xai_core_entities::entities::{EditControl, MediaEntities, PureCoreData, TakedownReason};
+use xai_core_entities::entities::{MediaEntities, PureCoreData};
 use xai_core_entities::tweet_entity_service_client::TESClient;
 
 const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
@@ -17,7 +18,8 @@ const CLIENT: &str = "tes";
 pub(crate) type AuthorIdFallbackCache = FallbackCache<TweetId, u64>;
 
 pub struct TesHydrator {
-    pub tes_client: Arc<dyn TESClient + Send + Sync>,
+    tes_client: Arc<dyn TESClient + Send + Sync>,
+    tweet_source: Arc<dyn TweetForVisibilitySource>,
     author_id_cache: Option<AuthorIdFallbackCache>,
 }
 
@@ -27,24 +29,15 @@ pub(crate) struct PureCoreHydration {
     pub(crate) recovered_authors: HashMap<TweetId, u64>,
 }
 
-#[derive(Default)]
-pub(crate) struct TweetHydration {
-    pub(crate) nullcast: TweetHydrationBatch<bool>,
-    pub(crate) community: TweetHydrationBatch<i64>,
-    pub(crate) nsfw_user: TweetHydrationBatch<bool>,
-    pub(crate) nsfw_admin: TweetHydrationBatch<bool>,
-    pub(crate) takedown_reasons: TweetHydrationBatch<Vec<TakedownReason>>,
-    pub(crate) edit_control: TweetHydrationBatch<EditControl>,
-    pub(crate) media: TweetHydrationBatch<MediaFeature>,
-}
-
 impl TesHydrator {
     pub(crate) fn new(
         tes_client: Arc<dyn TESClient + Send + Sync>,
+        tweet_source: Arc<dyn TweetForVisibilitySource>,
         author_id_cache: Option<AuthorIdFallbackCache>,
     ) -> Self {
         Self {
             tes_client,
+            tweet_source,
             author_id_cache,
         }
     }
@@ -84,93 +77,26 @@ impl TesHydrator {
         &self,
         tweet_ids: &[TweetId],
         safety_level: SafetyLevel,
-    ) -> TweetHydration {
+    ) -> TweetHydrationBatch<TweetForVisibility> {
         let candidate_count_by_key = candidates_per_tweet(tweet_ids);
         let raw_ids: Vec<u64> = candidate_count_by_key.keys().copied().collect();
-
-        let (
-            nullcast,
-            community,
-            nsfw_user,
-            nsfw_admin,
-            takedown_reasons,
-            edit_control,
-            media_entities,
-        ) = tokio::join!(
-            timed_results(
-                CLIENT,
-                "get_nullcast",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_nullcast(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_community",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_community(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_nsfw_user",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_nsfw_user(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_nsfw_admin",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_nsfw_admin(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_takedown_reasons",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_takedown_reasons(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_edit_control",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_edit_control(raw_ids.clone()),
-            ),
-            timed_results(
-                CLIENT,
-                "get_tweet_media_entities",
-                safety_level,
-                &candidate_count_by_key,
-                CLIENT_TIMEOUT,
-                self.tes_client.get_tweet_media_entities(raw_ids.clone()),
-            ),
-        );
-
-        TweetHydration {
-            nullcast: nullcast.map_keys(TweetId),
-            community: community.map_keys(TweetId),
-            nsfw_user: nsfw_user.map_keys(TweetId),
-            nsfw_admin: nsfw_admin.map_keys(TweetId),
-            takedown_reasons: takedown_reasons.map_keys(TweetId),
-            edit_control: edit_control.map_keys(TweetId),
-            media: media_entities.map_keys(TweetId).map(media_feature),
-        }
+        timed_results(
+            CLIENT,
+            "get_tweets_for_visibility",
+            safety_level,
+            &candidate_count_by_key,
+            CLIENT_TIMEOUT,
+            self.tweet_source.get_tweets_for_visibility(&raw_ids),
+        )
+        .await
+        .map_keys(TweetId)
     }
 
     pub(crate) fn assemble_tweet_features(
         &self,
         candidates: &[TweetCandidateInput],
         core_datas: &HashMap<TweetId, PureCoreData>,
-        tweet_keyed: &TweetHydration,
+        tweet_keyed: &TweetHydrationBatch<TweetForVisibility>,
     ) -> HashMap<TweetId, TweetFeatures> {
         candidates
             .iter()
@@ -236,40 +162,37 @@ fn resolve_pure_core(
 fn build_tweet_features(
     tweet_id: TweetId,
     core_datas: &HashMap<TweetId, PureCoreData>,
-    tweet_keyed: &TweetHydration,
+    tweet_keyed: &TweetHydrationBatch<TweetForVisibility>,
 ) -> TweetFeatures {
-    let id = tweet_id;
-
-    let media = tweet_keyed.media.get_or_default(&id);
-    let is_nullcast = tweet_keyed.nullcast.get(&id).copied().unwrap_or(false);
-    let is_community_tweet = tweet_keyed.community.get(&id).is_some();
-    let takedown_reasons = tweet_keyed.takedown_reasons.get_or_default(&id);
-    let nsfw = NsfwFeature {
-        user: tweet_keyed.nsfw_user.get(&id).copied().unwrap_or(false),
-        admin: tweet_keyed.nsfw_admin.get(&id).copied().unwrap_or(false),
+    let tweet = tweet_keyed.get(&tweet_id);
+    let core = CoreFeature {
+        text: core_datas
+            .get(&tweet_id)
+            .map(|core| core.text.clone())
+            .unwrap_or_default(),
+        source_tweet_id: tweet.and_then(|tweet| tweet.source_tweet_id),
     };
-    let edit_control = tweet_keyed.edit_control.get(&id).cloned();
-
-    let core = core_datas
-        .get(&tweet_id)
-        .map(|core_data| CoreFeature {
-            text: core_data.text.clone(),
-            source_tweet_id: core_data.source_tweet_id,
-        })
-        .unwrap_or_default();
-
-    TweetFeatures {
-        core,
-        media,
-        takedown_reasons,
-        nsfw,
-        is_nullcast,
-        is_community_tweet,
-        edit_control,
+    match tweet {
+        Some(tweet) => TweetFeatures {
+            core,
+            media: tweet.media.clone(),
+            takedown_reasons: tweet.takedown_reasons.clone(),
+            nsfw: NsfwFeature {
+                user: tweet.nsfw_user,
+                admin: tweet.nsfw_admin,
+            },
+            is_nullcast: tweet.is_nullcast,
+            is_community_tweet: tweet.is_community_tweet,
+            edit_control: tweet.edit_control.clone(),
+        },
+        None => TweetFeatures {
+            core,
+            ..Default::default()
+        },
     }
 }
 
-fn media_feature(entities: MediaEntities) -> MediaFeature {
+pub(crate) fn media_feature(entities: MediaEntities) -> MediaFeature {
     let mut feature = MediaFeature {
         has_media: !entities.is_empty(),
         ..Default::default()
@@ -299,10 +222,10 @@ fn media_feature(entities: MediaEntities) -> MediaFeature {
 mod tests {
     use super::*;
     use crate::hydration::batch::HydrationError;
+    use crate::hydration::tes_composite::MockTweetForVisibilitySource;
     use crate::models::{resolve_candidate, RawCandidate};
-    use xai_core_entities::entities::{MediaEntity, PureCoreData};
+    use xai_core_entities::entities::{EditControl, PureCoreData, TakedownReason};
     use xai_core_entities::tweet_entity_service_client::MockTESClient;
-    use xai_x_thrift::media_information::{AdditionalMetadata, Restrictions};
 
     fn found<V>(id: u64, value: V) -> TweetHydrationBatch<V> {
         TweetHydrationBatch::from_results(
@@ -331,7 +254,27 @@ mod tests {
     }
 
     fn hydrator() -> TesHydrator {
-        TesHydrator::new(Arc::new(MockTESClient::default()), None)
+        TesHydrator::new(
+            Arc::new(MockTESClient::default()),
+            Arc::new(MockTweetForVisibilitySource::default()),
+            None,
+        )
+    }
+
+    fn tweet() -> TweetForVisibility {
+        TweetForVisibility {
+            author_id: 100,
+            source_tweet_id: None,
+            is_nullcast: false,
+            nsfw_user: false,
+            nsfw_admin: false,
+            has_takedown: false,
+            takedown_reasons: Vec::new(),
+            media: MediaFeature::default(),
+            is_community_tweet: false,
+            edit_control: None,
+            exclusive_conversation_author_id: None,
+        }
     }
 
     #[test]
@@ -407,208 +350,55 @@ mod tests {
         assert!(second.recovered_authors.is_empty());
     }
 
-    fn dmca_media_entity(has_media_key: bool) -> MediaEntity {
-        MediaEntity {
-            media_key: has_media_key.then(Default::default),
-            additional_metadata: Some(AdditionalMetadata {
-                restrictions: Some(Restrictions {
-                    is_dmca: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
     #[test]
-    fn assemble_flattens_media_geo_restrictions_from_tes() {
-        use xai_core_entities::entities::MediaEntity;
-        use xai_x_thrift::media_information::{AdditionalMetadata, GeoRestrictions, Restrictions};
+    fn assemble_preserves_composite_features_when_core_missing() {
         let candidates = vec![candidate(10, 100)];
-        let core_datas = HashMap::from([(
-            TweetId(10),
-            PureCoreData {
-                author_id: 100,
-                ..Default::default()
-            },
-        )]);
-        let entity = |has_media_key: bool, allow: &[&str], deny: &[&str]| MediaEntity {
-            media_key: has_media_key.then(Default::default),
-            additional_metadata: Some(AdditionalMetadata {
-                restrictions: Some(Restrictions {
-                    is_dmca: Some(false),
-                    geo_restrictions: Some(GeoRestrictions {
-                        whitelisted_country_codes: Some(
-                            allow.iter().map(|s| s.to_string()).collect(),
-                        ),
-                        blacklisted_country_codes: Some(
-                            deny.iter().map(|s| s.to_string()).collect(),
-                        ),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let tweet_keyed = TweetHydration {
-            media: found(
-                10,
-                media_feature(vec![
-                    entity(true, &["us"], &["de"]),
-                    entity(true, &["gb"], &["fr"]),
-                    entity(false, &["ignored"], &["ignored"]),
-                    MediaEntity::default(),
-                ]),
-            ),
-            ..Default::default()
-        };
-
-        let features = hydrator().assemble_tweet_features(&candidates, &core_datas, &tweet_keyed);
-
-        let f = &features[&TweetId(10)];
-        assert_eq!(f.media.geo_allow_list, vec!["us", "gb"]);
-        assert_eq!(f.media.geo_deny_list, vec!["de", "fr"]);
-    }
-
-    #[test]
-    fn assemble_defaults_geo_lists_when_media_entities_missing() {
-        let candidates = vec![candidate(10, 100)];
-        let core_datas = HashMap::from([(
-            TweetId(10),
-            PureCoreData {
-                author_id: 100,
-                ..Default::default()
-            },
-        )]);
-
-        let features = hydrator().assemble_tweet_features(
-            &candidates,
-            &core_datas,
-            &TweetHydration::default(),
-        );
-
-        let f = &features[&TweetId(10)];
-        assert!(f.media.geo_allow_list.is_empty());
-        assert!(f.media.geo_deny_list.is_empty());
-    }
-
-    #[test]
-    fn assemble_hydrates_dmca_media() {
-        let candidates = vec![candidate(10, 100)];
-        let core_datas = HashMap::from([(
-            TweetId(10),
-            PureCoreData {
-                author_id: 100,
-                ..Default::default()
-            },
-        )]);
-        let tweet_keyed = TweetHydration {
-            media: found(10, media_feature(vec![dmca_media_entity(true)])),
-            ..Default::default()
-        };
-
-        let features = hydrator().assemble_tweet_features(&candidates, &core_datas, &tweet_keyed);
-
-        assert!(features[&TweetId(10)].media.has_dmca_media);
-        assert!(features[&TweetId(10)].media.has_media);
-    }
-
-    #[test]
-    fn assemble_derives_has_media_from_media_entities() {
-        let candidates = vec![candidate(10, 100), candidate(11, 100)];
-        let core_datas = HashMap::from([
-            (
-                TweetId(10),
-                PureCoreData {
-                    author_id: 100,
+        let tweet_keyed = found(
+            10,
+            TweetForVisibility {
+                source_tweet_id: Some(9),
+                is_nullcast: true,
+                is_community_tweet: true,
+                nsfw_user: true,
+                nsfw_admin: true,
+                has_takedown: true,
+                takedown_reasons: vec![TakedownReason::Dmca],
+                edit_control: Some(EditControl::Initial(Default::default())),
+                media: MediaFeature {
+                    has_media: true,
+                    has_dmca_media: true,
                     ..Default::default()
                 },
-            ),
-            (
-                TweetId(11),
-                PureCoreData {
-                    author_id: 100,
-                    ..Default::default()
-                },
-            ),
-        ]);
-        let tweet_keyed = TweetHydration {
-            media: TweetHydrationBatch::from_results(
-                [TweetId(10), TweetId(11)],
-                HashMap::from([
-                    (
-                        TweetId(10),
-                        Ok::<_, anyhow::Error>(Some(media_feature(vec![MediaEntity::default()]))),
-                    ),
-                    (
-                        TweetId(11),
-                        Ok::<_, anyhow::Error>(Some(media_feature(Vec::<MediaEntity>::new()))),
-                    ),
-                ]),
-            ),
-            ..Default::default()
-        };
-
-        let features = hydrator().assemble_tweet_features(&candidates, &core_datas, &tweet_keyed);
-
-        assert!(features[&TweetId(10)].media.has_media);
-        assert!(!features[&TweetId(11)].media.has_media);
-    }
-
-    #[test]
-    fn dmca_metadata_without_media_key_is_ignored() {
-        let feature = media_feature(vec![dmca_media_entity(false)]);
-        assert!(!feature.has_dmca_media);
-    }
-
-    #[test]
-    fn assemble_hydrates_text_from_core_data() {
-        let candidates = vec![candidate(10, 100)];
-        let core_datas = HashMap::from([(
-            TweetId(10),
-            PureCoreData {
-                author_id: 100,
-                text: "muted words".to_string(),
-                ..Default::default()
+                ..tweet()
             },
-        )]);
-
-        let features = hydrator().assemble_tweet_features(
-            &candidates,
-            &core_datas,
-            &TweetHydration::default(),
         );
-
-        assert_eq!(features[&TweetId(10)].core.text, "muted words");
-    }
-
-    #[test]
-    fn assemble_preserves_independent_features_when_core_missing() {
-        let candidates = vec![candidate(10, 100)];
-        let tweet_keyed = TweetHydration {
-            nullcast: found(10, true),
-            community: found(10, 1),
-            nsfw_user: found(10, true),
-            nsfw_admin: found(10, true),
-            takedown_reasons: found(10, vec![TakedownReason::Dmca]),
-            edit_control: found(10, EditControl::Initial(Default::default())),
-            media: found(10, media_feature(vec![dmca_media_entity(true)])),
-        };
 
         let features =
             hydrator().assemble_tweet_features(&candidates, &HashMap::new(), &tweet_keyed);
 
-        let f = &features[&TweetId(10)];
-        assert!(f.core.text.is_empty());
-        assert_eq!(f.core.source_tweet_id, None);
-        assert!(f.is_nullcast);
-        assert!(f.is_community_tweet);
-        assert!(f.nsfw.user && f.nsfw.admin);
-        assert_eq!(f.takedown_reasons, vec![TakedownReason::Dmca]);
-        assert!(f.edit_control.is_some());
-        assert!(f.media.has_media && f.media.has_dmca_media);
+        assert_eq!(
+            features[&TweetId(10)],
+            TweetFeatures {
+                core: CoreFeature {
+                    text: String::new(),
+                    source_tweet_id: Some(9),
+                },
+                media: MediaFeature {
+                    has_media: true,
+                    has_dmca_media: true,
+                    geo_allow_list: Vec::new(),
+                    geo_deny_list: Vec::new(),
+                },
+                takedown_reasons: vec![TakedownReason::Dmca],
+                nsfw: NsfwFeature {
+                    user: true,
+                    admin: true
+                },
+                is_nullcast: true,
+                is_community_tweet: true,
+                edit_control: Some(EditControl::Initial(Default::default())),
+            }
+        );
     }
 
     #[test]
@@ -640,10 +430,13 @@ mod tests {
                 let features = hydrator().assemble_tweet_features(
                     &[candidate],
                     &pure_core.core,
-                    &TweetHydration {
-                        nullcast: found(10, is_nullcast),
-                        ..Default::default()
-                    },
+                    &found(
+                        10,
+                        TweetForVisibility {
+                            is_nullcast,
+                            ..tweet()
+                        },
+                    ),
                 );
                 let hydrated = HydratedTweetCandidate {
                     tweet_id: candidate.tweet_id.0,

@@ -189,6 +189,20 @@ fn record_keyed_hydrator_request(
     );
 }
 
+pub(crate) fn record_tes_join_latency(safety_level: SafetyLevel, elapsed: Duration) {
+    observe(
+        HYDRATOR_LATENCY_MS,
+        &[
+            ("client", "tes"),
+            ("method", "join"),
+            ("hydrator", "tes"),
+            ("safety_level", safety_level.into()),
+        ],
+        elapsed.as_secs_f64() * 1000.0,
+        HistogramBuckets::Bucket50To500,
+    );
+}
+
 pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
     for (result, count) in [("mapped", mapped), ("unmapped", unmapped)] {
         incr_nonzero(AUTHOR_LABELS, &[("result", result)], count as u64);

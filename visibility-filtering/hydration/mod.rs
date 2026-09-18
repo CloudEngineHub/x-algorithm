@@ -5,6 +5,7 @@ pub mod gizmoduck_hydrator;
 pub mod metrics;
 pub mod safety_label_hydrator;
 pub mod socialgraph_hydrator;
+pub mod tes_composite;
 pub mod tes_hydrator;
 pub mod viewer_hydrator;
 
@@ -17,15 +18,16 @@ use crate::models::{
 };
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::SafetyLabelSource;
-use batch::TweetHydrationBatch;
+use batch::{Completeness, Hydrated, TweetHydrationBatch};
 use exclusive_content_hydrator::ExclusiveContentHydrator;
 use fallback_cache::FallbackCache;
 use gizmoduck_hydrator::GizmoduckAuthorHydrator;
 use safety_label_hydrator::{SafetyLabelHydration, SafetyLabelHydrator};
 use socialgraph_hydrator::SocialgraphHydrator;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tes_composite::TweetForVisibilitySource;
 use tes_hydrator::{AuthorIdFallbackCache, TesHydrator};
 use viewer_hydrator::ViewerHydrator;
 use xai_core_entities::gizmoduck_client::GizmoduckClient;
@@ -59,10 +61,10 @@ impl<'a> HydrationRequest<'a> {
 
 struct CandidateFeatures {
     tweet_features: HashMap<TweetId, TweetFeatures>,
-    author_features: TweetHydrationBatch<AuthorFeatures>,
+    author_features: TweetHydrationBatch<Completeness<AuthorFeatures>>,
     safety_labels: HashMap<TweetId, SafetyLabelMap>,
     relationships: TweetHydrationBatch<ViewerAuthorRelationship>,
-    exclusive_content: HashMap<TweetId, Option<ExclusiveContentFeatures>>,
+    exclusive_content: HashMap<TweetId, Completeness<ExclusiveContentFeatures>>,
 }
 
 impl CandidateFeatures {
@@ -76,7 +78,9 @@ impl CandidateFeatures {
                         .get(&c.tweet_id)
                         .cloned()
                         .unwrap_or_default(),
-                    self.author_features.get_or_default(&c.tweet_id),
+                    self.author_features
+                        .get_or_default(&c.tweet_id)
+                        .into_value(),
                     self.safety_labels
                         .get(&c.tweet_id)
                         .cloned()
@@ -84,8 +88,7 @@ impl CandidateFeatures {
                     self.relationships.get_or_default(&c.tweet_id),
                     self.exclusive_content
                         .get(&c.tweet_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                        .map(|exclusive| exclusive.value().clone()),
                 )
             })
             .collect()
@@ -129,22 +132,24 @@ pub(crate) struct HydrationOutput {
     pub(crate) viewer_features: ViewerFeatures,
     pub(crate) candidates: Vec<HydratedTweetCandidate>,
     pub(crate) safety_labels: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
+    pub(crate) failed_ids: HashSet<TweetId>,
 }
 
 impl HydrationPipeline {
     pub(crate) fn new(
         tes_client: Arc<dyn TESClient + Send + Sync>,
+        tweet_source: Arc<dyn TweetForVisibilitySource>,
         gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
         socialgraph_client: Arc<dyn SocialgraphClient + Send + Sync>,
         safety_label_source: Arc<SafetyLabelSource>,
-        fallback_cache: Option<FallbackCache<AuthorId, AuthorFeatures>>,
+        fallback_cache: Option<FallbackCache<AuthorId, Completeness<AuthorFeatures>>>,
         author_id_fallback_cache: Option<AuthorIdFallbackCache>,
     ) -> Self {
         Self {
             viewer_hydrator: ViewerHydrator {
                 gizmoduck_client: gizmoduck_client.clone(),
             },
-            tes_hydrator: TesHydrator::new(tes_client.clone(), author_id_fallback_cache),
+            tes_hydrator: TesHydrator::new(tes_client, tweet_source, author_id_fallback_cache),
             gizmoduck_author_hydrator: GizmoduckAuthorHydrator::new(
                 GizmoduckLookup::new(gizmoduck_client),
                 fallback_cache,
@@ -156,7 +161,6 @@ impl HydrationPipeline {
                 source: safety_label_source,
             },
             exclusive_content_hydrator: ExclusiveContentHydrator {
-                tes_client,
                 sg_client: socialgraph_client,
             },
         }
@@ -175,12 +179,35 @@ impl HydrationPipeline {
             .hydrate(viewer_id, country_code, safety_level);
         let candidate_hydration = async {
             let tweet_ids: Vec<TweetId> = raw_candidates.iter().map(|c| c.tweet_id).collect();
+            let tes_started = Instant::now();
+            let (exclusive_tx, exclusive_rx) = tokio::sync::oneshot::channel();
             let independent_group = async {
                 tokio::join!(
                     self.safety_label_hydrator.hydrate(&tweet_ids, safety_level),
-                    self.tes_hydrator.hydrate_tweets(&tweet_ids, safety_level),
-                    self.exclusive_content_hydrator
-                        .hydrate(&tweet_ids, viewer, safety_level),
+                    async {
+                        let tweets = self
+                            .tes_hydrator
+                            .hydrate_tweets(&tweet_ids, safety_level)
+                            .await;
+                        let tes_elapsed = tes_started.elapsed();
+                        let conversation_authors = tweet_ids
+                            .iter()
+                            .filter_map(|id| {
+                                tweets
+                                    .get(id)?
+                                    .exclusive_conversation_author_id
+                                    .map(|author| (*id, author))
+                            })
+                            .collect();
+                        let _ = exclusive_tx.send(conversation_authors);
+                        (tweets, tes_elapsed)
+                    },
+                    async {
+                        let conversation_authors = exclusive_rx.await.unwrap_or_default();
+                        self.exclusive_content_hydrator
+                            .hydrate(conversation_authors, tweet_ids.len(), viewer, safety_level)
+                            .await
+                    },
                 )
             };
 
@@ -189,6 +216,7 @@ impl HydrationPipeline {
                     .tes_hydrator
                     .fetch_pure_core(&tweet_ids, safety_level)
                     .await;
+                let tes_elapsed = tes_started.elapsed();
                 let candidates = resolve_candidates(
                     raw_candidates,
                     &pure_core.core,
@@ -200,13 +228,20 @@ impl HydrationPipeline {
                     self.socialgraph_hydrator
                         .hydrate(&candidates, viewer, safety_level),
                 );
-                (pure_core.core, candidates, author_features, relationships)
+                (
+                    pure_core.core,
+                    candidates,
+                    author_features,
+                    relationships,
+                    tes_elapsed,
+                )
             };
 
             let (
-                (safety_labels, tes_tweet_keyed, exclusive_content),
-                (core_datas, candidates, author_features, relationships),
+                (safety_labels, (tes_tweet_keyed, composite_elapsed), exclusive_content),
+                (core_datas, candidates, author_features, relationships, core_elapsed),
             ) = tokio::join!(independent_group, author_hop);
+            metrics::record_tes_join_latency(safety_level, core_elapsed.max(composite_elapsed));
 
             let SafetyLabelHydration {
                 label_types,
@@ -219,6 +254,23 @@ impl HydrationPipeline {
                 &tes_tweet_keyed,
             );
 
+            let failed_ids: HashSet<TweetId> = candidates
+                .iter()
+                .map(|candidate| candidate.tweet_id)
+                .filter(|id| {
+                    !core_datas.contains_key(id)
+                        || !matches!(
+                            author_features.hydrated(id),
+                            Some(Hydrated::Found(Completeness::Complete(_)) | Hydrated::NotFound)
+                        )
+                        || relationships.is_failed(id)
+                        || tes_tweet_keyed.is_failed(id)
+                        || !label_response.contains_key(id)
+                        || exclusive_content
+                            .get(id)
+                            .is_some_and(|exclusive| !exclusive.is_complete())
+                })
+                .collect();
             let features = CandidateFeatures {
                 tweet_features,
                 author_features,
@@ -228,16 +280,20 @@ impl HydrationPipeline {
             };
             let hydrated_candidates = features.assemble(&candidates);
 
-            (hydrated_candidates, label_response)
+            (hydrated_candidates, label_response, failed_ids)
         };
 
-        let (viewer_features, (candidates, safety_labels)) =
+        let (viewer, (candidates, safety_labels, mut failed_ids)) =
             tokio::join!(viewer_hydration, candidate_hydration);
+        if !viewer.is_complete() {
+            failed_ids.extend(candidates.iter().map(|c| TweetId(c.tweet_id)));
+        }
 
         HydrationOutput {
-            viewer_features,
+            viewer_features: viewer.into_value(),
             candidates,
             safety_labels,
+            failed_ids,
         }
     }
 }
@@ -282,10 +338,10 @@ mod tests {
                 [TweetId(2)],
                 HashMap::from([(
                     TweetId(2),
-                    Ok::<_, anyhow::Error>(Some(AuthorFeatures {
+                    Ok::<_, anyhow::Error>(Some(Completeness::Complete(AuthorFeatures {
                         is_suspended: true,
                         ..Default::default()
-                    })),
+                    }))),
                 )]),
             ),
             safety_labels: HashMap::from([

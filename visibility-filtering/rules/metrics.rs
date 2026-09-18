@@ -9,7 +9,7 @@ use crate::rules::{SafetyLevel, Verdict};
 
 const REQUESTS: &str = "filter_tweets_requests";
 const LATENCY_MS: &str = "filter_tweets_latency_ms";
-const BATCH_SIZE: &str = "filter_tweets_batch_size";
+pub(crate) const BATCH_SIZE: &str = "filter_tweets_batch_size";
 const VERDICTS: &str = "filter_tweets_verdicts";
 const VERDICTS_BY_RULE: &str = "filter_tweets_verdicts_by_rule";
 const LOGGED_OUT_VIEWER: &str = "filter_tweets_logged_out_viewer";
@@ -82,21 +82,33 @@ pub(crate) fn record_verdicts<'a>(
 }
 
 pub(crate) struct RequestMetricsGuard {
+    requests: &'static str,
+    latency_ms: &'static str,
     start: Instant,
-    success: Cell<bool>,
+    outcome: Cell<&'static str>,
 }
 
 impl RequestMetricsGuard {
     pub(crate) fn new() -> Self {
-        incr(REQUESTS, &[("outcome", "started")], 1);
+        Self::named(REQUESTS, LATENCY_MS)
+    }
+
+    pub(crate) fn named(requests: &'static str, latency_ms: &'static str) -> Self {
+        incr(requests, &[("outcome", "started")], 1);
         Self {
+            requests,
+            latency_ms,
             start: Instant::now(),
-            success: Cell::new(false),
+            outcome: Cell::new("cancelled"),
         }
     }
 
     pub(crate) fn mark_success(&self) {
-        self.success.set(true);
+        self.outcome.set("success");
+    }
+
+    pub(crate) fn mark_failure(&self) {
+        self.outcome.set("failure");
     }
 
     pub(crate) fn record_deadline(&self, grpc_timeout: Option<Duration>) {
@@ -125,23 +137,13 @@ fn millis(d: Duration) -> f64 {
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        let outcome = if self.success.get() {
-            "success"
-        } else {
-            "cancelled"
-        };
-        incr(REQUESTS, &[("outcome", outcome)], 1);
-        observe_vm(LATENCY_MS, &[], millis(self.start.elapsed()));
+        incr(self.requests, &[("outcome", self.outcome.get())], 1);
+        observe_vm(self.latency_ms, &[], millis(self.start.elapsed()));
     }
 }
 
-pub(crate) fn record_batch_size(size: usize) {
-    observe(
-        BATCH_SIZE,
-        &[],
-        size as f64,
-        HistogramBuckets::Bucket50To500,
-    );
+pub(crate) fn record_batch_size(metric: &str, size: usize) {
+    observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);
 }
 
 fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {

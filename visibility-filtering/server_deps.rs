@@ -1,11 +1,13 @@
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
-use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
+use crate::evaluate_tweets::EvaluateTweetsEndpoint;
+use crate::filter::{EvaluationStatus, FilterRequest, FilterResponse, FilterTweets};
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
+use crate::hydration::tes_composite::ProdTweetForVisibilitySource;
 use crate::hydration::HydrationPipeline;
 use crate::models::{RawCandidate, TweetId};
 use crate::reference_compare::ReferenceCompareHarness;
-use crate::rules::{SafetyLevel, Verdict};
+use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
 use crate::safety_label_source::twemcache::TwemcacheSource;
@@ -119,9 +121,7 @@ pub async fn build_prod_server(
         )
     });
 
-    let tes_client: Arc<
-        dyn xai_core_entities::tweet_entity_service_client::TESClient + Send + Sync,
-    > = Arc::new(
+    let tes_client = Arc::new(
         init_client_with_retry("tes", init_deadline, || async move {
             let strato = build_xds_strato(
                 XdsStratoParams {
@@ -254,8 +254,12 @@ pub async fn build_prod_server(
     let remote = Arc::new(remote);
     let safety_label_source = Arc::new(SafetyLabelSource::new(remote));
 
+    let tweet_source = Arc::new(ProdTweetForVisibilitySource {
+        grpc_client: tes_client.grpc_client.clone(),
+    });
     let hydration_pipeline = HydrationPipeline::new(
         tes_client,
+        tweet_source,
         gizmoduck_client,
         sg_client,
         safety_label_source.clone(),
@@ -268,7 +272,7 @@ pub async fn build_prod_server(
     gating_countries.spawn_refresh(feature_switches, fs_path);
     let rule_engine = crate::rules::RuleEngine::with_nsfw_gating_countries(gating_countries);
     let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
-    let filter_tweets = FilterTweets::new(hydration_pipeline, rule_engine);
+    let filter_tweets = Arc::new(FilterTweets::new(hydration_pipeline, rule_engine));
 
     warm_filter_tweets(&filter_tweets).await;
 
@@ -283,6 +287,7 @@ pub async fn build_prod_server(
     );
 
     VFServer::from_endpoints(
+        EvaluateTweetsEndpoint::new(filter_tweets.clone()),
         FilterTweetsEndpoint::new(filter_tweets, reference_compare),
         GetSafetyLabelsEndpoint::new(safety_label_source),
     )
@@ -493,7 +498,7 @@ fn filter_tweets_response_is_warm(response: &FilterResponse) -> bool {
     response
         .outcomes
         .iter()
-        .all(|outcome| outcome.verdict.decided_by != Verdict::unresolved_author().decided_by)
+        .all(|outcome| outcome.status != EvaluationStatus::UnresolvedAuthor)
 }
 
 async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
@@ -549,6 +554,7 @@ mod tests {
     use super::*;
     use crate::filter::FilterOutcome;
     use crate::models::VfAction;
+    use crate::rules::Verdict;
     use std::cell::Cell;
     use xai_visibility_filtering::models::FilteredReason;
 
@@ -653,6 +659,11 @@ mod tests {
             .into_iter()
             .map(|verdict| FilterOutcome {
                 tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
+                status: if verdict.decided_by == Verdict::unresolved_author().decided_by {
+                    EvaluationStatus::UnresolvedAuthor
+                } else {
+                    EvaluationStatus::Evaluated
+                },
                 verdict,
                 safety_labels: None,
             })

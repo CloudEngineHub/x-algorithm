@@ -26,7 +26,7 @@ pub trait SocialgraphClient: Send + Sync {
         &self,
         viewer_id: u64,
         author_ids: &[u64],
-    ) -> HashMap<u64, bool>;
+    ) -> Option<HashMap<u64, bool>>;
 }
 
 #[cfg(test)]
@@ -50,11 +50,13 @@ impl SocialgraphClient for FakeSocialgraphClient {
         &self,
         _viewer_id: u64,
         author_ids: &[u64],
-    ) -> HashMap<u64, bool> {
-        author_ids
-            .iter()
-            .map(|&author_id| (author_id, false))
-            .collect()
+    ) -> Option<HashMap<u64, bool>> {
+        Some(
+            author_ids
+                .iter()
+                .map(|&author_id| (author_id, false))
+                .collect(),
+        )
     }
 }
 
@@ -132,7 +134,7 @@ async fn select_edge_set(
     client: &FlockClient,
     query: SelectQuery,
     label: &'static str,
-) -> HashSet<u64> {
+) -> Option<HashSet<u64>> {
     let request = SelectRequest {
         queries: vec![query],
         ancestor_client_id: None,
@@ -140,15 +142,16 @@ async fn select_edge_set(
         quota_name: None,
     };
     match client.inner().clone().select(request).await {
-        Ok(resp) => resp
-            .into_inner()
-            .results
-            .first()
-            .map(|r| decode_packed_ids(&r.ids))
-            .unwrap_or_default(),
+        Ok(resp) => Some(
+            resp.into_inner()
+                .results
+                .first()
+                .map(|r| decode_packed_ids(&r.ids))
+                .unwrap_or_default(),
+        ),
         Err(e) => {
             warn!(error = %e, label, "FlockDB select failed, defaulting to empty set");
-            HashSet::new()
+            None
         }
     }
 }
@@ -216,7 +219,7 @@ impl SocialgraphClient for ProdSocialgraphClient {
         &self,
         viewer_id: u64,
         author_ids: &[u64],
-    ) -> HashMap<u64, bool> {
+    ) -> Option<HashMap<u64, bool>> {
         let dest_ids: Vec<i64> = author_ids.iter().map(|&id| id as i64).collect();
 
         let super_set = select_edge_set(
@@ -224,12 +227,14 @@ impl SocialgraphClient for ProdSocialgraphClient {
             edge_membership_query(viewer_id, SUPER_FOLLOWS_GRAPH_ID, &dest_ids),
             "super_follows",
         )
-        .await;
+        .await?;
 
-        author_ids
-            .iter()
-            .map(|&author_id| (author_id, super_set.contains(&author_id)))
-            .collect()
+        Some(
+            author_ids
+                .iter()
+                .map(|&author_id| (author_id, super_set.contains(&author_id)))
+                .collect(),
+        )
     }
 }
 

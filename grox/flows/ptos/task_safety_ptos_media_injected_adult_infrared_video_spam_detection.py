@@ -20,6 +20,8 @@ from grox.core.lm.convo import (
 from grox.core.lm.post import PostRenderer
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
+from grox.flows.ptos.classifier import _strip_thinking_restrictions
+from grox.flows.ptos.constants import MEDIA_INJECTED_REASONING_FAV
 from grox.flows.ptos.prompts import (
     media_injected_adult_infrared_video_spam_detection_prompt,
 )
@@ -106,13 +108,14 @@ class TaskSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(TaskWithPost):
             )
             return
 
+        use_reasoning = post.get_fav_count() >= MEDIA_INJECTED_REASONING_FAV
         Metrics.counter(f"{_METRIC_PREFIX}.invoked.count").add(1)
-        convo = cls.build_convo(post, bundle)
+        convo = cls.build_convo(post, bundle, use_reasoning)
         raw = await cls.llm().sample(
             convo.interleave(), conversation_id=convo.conversation_id
         )
         logger.info(
-            f"{FLOW_NAME} result for post {post.id} bundle={bundle.version}/{bundle.digest} conversation_id={convo.conversation_id}: {raw}"
+            f"{FLOW_NAME} result for post {post.id} use_reasoning={use_reasoning} bundle={bundle.version}/{bundle.digest} conversation_id={convo.conversation_id}: {raw}"
         )
 
         verdict = cls.parse_verdict(raw)
@@ -126,14 +129,15 @@ class TaskSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(TaskWithPost):
         cls.apply_verdict(ctx.state(SafetyPtosState), verdict)
 
     @classmethod
-    def build_convo(cls, post: Post, bundle: MediaReferenceBundle) -> Conversation:
+    def build_convo(
+        cls, post: Post, bundle: MediaReferenceBundle, use_reasoning: bool = False
+    ) -> Conversation:
         convo = Conversation(conversation_id=uuid.uuid4().hex)
-        convo.messages.append(
-            Message(
-                role=Role.SYSTEM,
-                content=[media_injected_adult_infrared_video_spam_detection_prompt()],
-            )
+        prompt = media_injected_adult_infrared_video_spam_detection_prompt()
+        system_prompt = (
+            _strip_thinking_restrictions(prompt) if use_reasoning else prompt
         )
+        convo.messages.append(Message(role=Role.SYSTEM, content=[system_prompt]))
 
         user_msg = Message(role=Role.USER, content=[])
         user_msg.content.append(
@@ -149,8 +153,9 @@ class TaskSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(TaskWithPost):
             f"\n\nCompare the video storyboard(s) of post {post.id} against the reference storyboards and provide the requested JSON object.{THINKING_CONTROL_START}"
         )
         convo.messages.append(user_msg)
+        assistant_content = [] if use_reasoning else [THINKING_CONTROL_END]
         convo.messages.append(
-            Message(role=Role.ASSISTANT, content=[THINKING_CONTROL_END], separator="")
+            Message(role=Role.ASSISTANT, content=assistant_content, separator="")
         )
         return convo
 

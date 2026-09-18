@@ -11,7 +11,7 @@ val postLabels = Map(
     about =
       "Post detected by automated systems or in response to a user report as likely to contain content subject to X's Adult Content policy.",
     effect =
-      "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users.",
+      "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users. In India, this content is shown as restricted due to local law(s).",
   },
   "NSFW_TEXT" -> {
     about =
