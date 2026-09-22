@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-18T16:21:20Z
+// mirrored from config feature-switch defaults; last sync 2026-09-21T16:23:47Z
 use xai_feature_switches::param;
 
 param!(
@@ -107,6 +107,18 @@ param!(
     false
 );
 param!(
+    RetrievalCandidatesKafkaSamplePercent,
+    f64,
+    "rust_home_mixer_retrieval_candidates_kafka_sample_percent",
+    5.0
+);
+param!(
+    RetrievalCandidatesKafkaMaxCandidates,
+    u32,
+    "rust_home_mixer_retrieval_candidates_kafka_max_candidates",
+    200
+);
+param!(
     EnableResponseDiversityStatsExperimentBucket,
     bool,
     "rust_home_mixer_enable_response_diversity_stats_experiment_bucket",
@@ -178,6 +190,12 @@ param!(
     u32,
     "rust_home_mixer_phoenix_moe_max_results",
     200
+);
+param!(
+    PhoenixMoeColdStartMaxResults,
+    u32,
+    "rust_home_mixer_phoenix_moe_cold_start_max_results",
+    0
 );
 param!(
     AuthorPhoenixMoeEnabled,
@@ -292,6 +310,12 @@ param!(
     u64,
     "rust_home_mixer_new_user_age_threshold_secs",
     0
+);
+param!(
+    NewUserOonWeightFactor,
+    f64,
+    "rust_home_mixer_new_user_oon_weight_factor",
+    0.00001
 );
 
 // These weights reflect a combination of how much an action is
@@ -536,6 +560,18 @@ param!(
     150
 );
 param!(
+    VMRankerSendValueModelInputs,
+    bool,
+    "rust_home_mixer_vm_ranker_send_value_model_inputs",
+    false
+);
+param!(
+    VMRankerComputeValueModel,
+    bool,
+    "rust_home_mixer_vm_ranker_compute_value_model",
+    false
+);
+param!(
     ColdStartImpressionThreshold,
     u32,
     "rust_home_mixer_cold_start_impression_threshold",
@@ -673,6 +709,12 @@ param!(
     usize,
     "rust_home_mixer_engagement_signals_max_per_type",
     15
+);
+param!(
+    SimclustersMaxCandidateAgeHours,
+    i32,
+    "rust_home_mixer_simclusters_max_candidate_age_hours",
+    48
 );
 
 param!(

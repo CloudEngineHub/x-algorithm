@@ -34,7 +34,23 @@ use xai_core_entities::gizmoduck_client::GizmoduckClient;
 use xai_core_entities::tweet_entity_service_client::TESClient;
 use xai_visibility_filtering_proto as vf_pb;
 
-pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_millis(390);
+pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_REQUEST_BUDGET: Duration = Duration::from_millis(400);
+pub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);
+
+pub(crate) fn request_context(
+    entered: tokio::time::Instant,
+    grpc_timeout: Option<Duration>,
+) -> xai_x_rpc::CallContext {
+    xai_x_rpc::CallContext {
+        deadline: Some(
+            entered
+                + grpc_timeout
+                    .unwrap_or(DEFAULT_REQUEST_BUDGET)
+                    .saturating_sub(INBOUND_ALLOWANCE),
+        ),
+    }
+}
 
 pub(crate) struct HydrationRequest<'a> {
     viewer_id: Option<u64>,

@@ -4,9 +4,11 @@ use crate::params::{
     EnablePhoenixRetrievalStatsExperimentBucket, EnablePhoenixScoreStatsExperimentBucket,
     PhoenixRetrievalInferenceClusterId, PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
 };
+use crate::scorers::phoenix_scorer::PhoenixScorer;
+use crate::sources::phoenix_source::PhoenixSource;
 
 use rand::random;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
@@ -20,6 +22,8 @@ const PRESENT_SCOPE: [(&str, &str); 1] = [("score_status", "present")];
 const MISSING_SCOPE: [(&str, &str); 1] = [("score_status", "missing")];
 
 const HEAVY_RANKER_TOP_K: &[usize] = &[1, 10, 35];
+
+const PHOENIX_RETRIEVAL_TOP_K: &[u32] = &[10, 100, 200, 500, 1000];
 
 const DEFAULT_SAMPLING_RATE: f64 = 0.05;
 
@@ -105,6 +109,17 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &retrieval_cluster,
                     &experiment_buckets,
                 );
+                if input.query.request_type != RequestType::PhoenixScores
+                    && !input.query.in_network_only
+                {
+                    record_retrieval_source_contribution(
+                        receiver.as_ref(),
+                        &input.selected_candidates,
+                        &format!("{:?}", PhoenixSource::resolve_cluster(&input.query)),
+                        &format!("{:?}", PhoenixScorer::resolve_cluster(&input.query)),
+                        &experiment_buckets,
+                    );
+                }
             }
         } else {
             if random::<f64>() < DEFAULT_SAMPLING_RATE {
@@ -134,6 +149,80 @@ fn record_served_by_source(receiver: &dyn StatsReceiverExt, selected_candidates:
         );
     }
     receiver.incr(&key, &[("type", "requests")], 1);
+}
+
+fn record_retrieval_source_contribution(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    ranker_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    let empty_bucket = ExperimentBucket::new("", "");
+    let buckets: &[&ExperimentBucket] = if experiment_buckets.is_empty() {
+        &[&empty_bucket]
+    } else {
+        experiment_buckets
+    };
+    let selected_key = format!("{METRIC_PREFIX}.RetrievalContribution.Selected");
+    let top_k_key = format!("{METRIC_PREFIX}.RetrievalContribution.PhoenixTopK");
+    let total_key = format!("{METRIC_PREFIX}.RetrievalContribution.SelectedTotal");
+
+    let mut sources = HashSet::new();
+    for c in selected_candidates {
+        sources.extend(c.served_type);
+        sources.extend(c.retrieval_sources.iter().map(|s| s.served_type));
+    }
+    let count = |source: ServedType, k: Option<u32>| -> [(&'static str, u64); 2] {
+        let (mut credited, mut inclusive) = (0, 0);
+        for c in selected_candidates {
+            let is_credited = c.served_type == Some(source);
+            if within_top_k(c, source, k) || (is_credited && k.is_none()) {
+                inclusive += 1;
+                credited += u64::from(is_credited);
+            }
+        }
+        [("credited", credited), ("inclusive", inclusive)]
+    };
+
+    for b in buckets {
+        let common = [
+            ("retrieval_cluster", retrieval_cluster),
+            ("ranker_cluster", ranker_cluster),
+            ("ddg", b.experiment.as_str()),
+            ("bucket", b.bucket.as_str()),
+        ];
+        let incr = |key: &str, scopes: &[(&str, &str)], value: u64| {
+            receiver.incr(key, &[scopes, &common].concat(), value)
+        };
+
+        incr(
+            &total_key,
+            &[("type", "sum")],
+            selected_candidates.len() as u64,
+        );
+        incr(&total_key, &[("type", "requests")], 1);
+
+        for source in &sources {
+            for (mode, value) in count(*source, None) {
+                let scopes = [("source", source.as_str_name()), ("mode", mode)];
+                incr(&selected_key, &scopes, value);
+            }
+        }
+
+        for k in PHOENIX_RETRIEVAL_TOP_K {
+            for (mode, value) in count(ServedType::ForYouPhoenixRetrieval, Some(*k)) {
+                incr(&top_k_key, &[("k", &k.to_string()), ("mode", mode)], value);
+            }
+        }
+    }
+}
+
+fn within_top_k(candidate: &PostCandidate, source: ServedType, k: Option<u32>) -> bool {
+    candidate
+        .retrieval_sources
+        .iter()
+        .any(|s| s.served_type == source && k.is_none_or(|k| s.position.is_some_and(|p| p <= k)))
 }
 
 fn record_head(

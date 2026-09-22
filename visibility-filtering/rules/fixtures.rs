@@ -1,41 +1,81 @@
 use crate::models::{
-    AuthorFeatures, AuthorLabel, HydratedTweetCandidate, NsfwFeature, SafetyLabelMap,
-    SafetyLabelType, TweetFeatures, VfAction, Viewer, ViewerAuthorRelationship, ViewerFeatures,
+    AuthorFeatures, AuthorLabel, Decided, HydratedTweetCandidate, SafetyLabelMap, SafetyLabelType,
+    TweetFeatures, Verdict, Viewer, ViewerAuthorRelationship, ViewerFeatures, Withholding,
 };
-use crate::rules::rule_spec::RuleSpec;
+use crate::rules::registry::Policy;
+use crate::rules::rule_spec::RuleClause;
 use crate::rules::test_context;
 use std::collections::HashSet;
+use std::slice::from_ref;
 use xai_visibility_filtering::models::FilteredReason;
 
 const TWEET_ID: u64 = 1;
 const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
-pub(super) fn assert_drops(
-    spec: &RuleSpec,
+pub(super) fn clauses_verdict(
+    clauses: &[RuleClause],
+    viewer: &ViewerFeatures,
+    candidate: &HydratedTweetCandidate,
+) -> Verdict {
+    Policy::new(&[clauses]).evaluate(&test_context(viewer, candidate))
+}
+
+pub(super) fn assert_clauses_drop(
+    clauses: &[RuleClause],
     viewer: &ViewerFeatures,
     candidate: &HydratedTweetCandidate,
     expected: &FilteredReason,
 ) {
-    let action = spec.evaluate(&test_context(viewer, candidate));
+    let verdict = clauses_verdict(clauses, viewer, candidate);
     assert!(
-        matches!(&action, VfAction::Drop(reason) if reason == expected),
-        "{} should drop with {expected:?}, got {action:?}",
-        spec.name()
+        matches!(
+            &verdict,
+            Verdict::Withheld(Decided { value: Withholding::Drop(reason), .. }) if reason == expected
+        ),
+        "{} should drop with {expected:?}, got {verdict:?}",
+        clauses
+            .first()
+            .map_or("<no clauses>", |clause| clause.rule_name)
     );
 }
 
-pub(super) fn assert_allows(
-    spec: &RuleSpec,
+pub(super) fn assert_clauses_allow(
+    clauses: &[RuleClause],
     viewer: &ViewerFeatures,
     candidate: &HydratedTweetCandidate,
 ) {
-    let action = spec.evaluate(&test_context(viewer, candidate));
+    let verdict = clauses_verdict(clauses, viewer, candidate);
     assert!(
-        matches!(action, VfAction::Allow),
-        "{} should allow, got {action:?}",
-        spec.name()
+        matches!(
+            verdict,
+            Verdict::Shown {
+                media: None,
+                engagement: None,
+            }
+        ),
+        "{} should allow, got {verdict:?}",
+        clauses
+            .first()
+            .map_or("<no clauses>", |clause| clause.rule_name)
     );
+}
+
+pub(super) fn assert_drops(
+    spec: &RuleClause,
+    viewer: &ViewerFeatures,
+    candidate: &HydratedTweetCandidate,
+    expected: &FilteredReason,
+) {
+    assert_clauses_drop(from_ref(spec), viewer, candidate, expected);
+}
+
+pub(super) fn assert_allows(
+    spec: &RuleClause,
+    viewer: &ViewerFeatures,
+    candidate: &HydratedTweetCandidate,
+) {
+    assert_clauses_allow(from_ref(spec), viewer, candidate);
 }
 
 pub(crate) fn viewer(id: u64) -> ViewerFeatures {
@@ -137,49 +177,4 @@ impl CandidateBuilder {
         }
         candidate
     }
-}
-
-pub(super) fn nsfw_flag_media_candidates() -> [HydratedTweetCandidate; 4] {
-    let author_user = candidate()
-        .with_media()
-        .with_author_features(AuthorFeatures {
-            is_nsfw_user: true,
-            ..Default::default()
-        })
-        .build();
-    let tweet_user = candidate()
-        .with_tweet_features(TweetFeatures {
-            nsfw: NsfwFeature {
-                user: true,
-                admin: false,
-            },
-            ..Default::default()
-        })
-        .with_media()
-        .build();
-    let tweet_admin = candidate()
-        .with_tweet_features(TweetFeatures {
-            nsfw: NsfwFeature {
-                user: false,
-                admin: true,
-            },
-            ..Default::default()
-        })
-        .with_media()
-        .build();
-    let both = candidate()
-        .with_author_features(AuthorFeatures {
-            is_nsfw_admin: true,
-            ..Default::default()
-        })
-        .with_tweet_features(TweetFeatures {
-            nsfw: NsfwFeature {
-                user: true,
-                admin: false,
-            },
-            ..Default::default()
-        })
-        .with_media()
-        .build();
-    [author_user, tweet_user, tweet_admin, both]
 }

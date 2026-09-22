@@ -1,14 +1,13 @@
 use crate::filter::{EvaluationStatus, FilterOutcome, FilterRequest, FilterTweets};
-use crate::models::{RawCandidate, TweetId, VfAction};
-use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard};
+use crate::models::{RawCandidate, TweetId};
+use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
+use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use vf_pb::tweet_evaluation::Outcome;
-use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering_proto as vf_pb;
-use xai_x_thrift::action::{self, Action, DropReason};
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
 
 const REQUESTS: &str = "evaluate_tweets_requests";
@@ -28,8 +27,13 @@ impl EvaluateTweetsEndpoint {
         &self,
         request: Request<vf_pb::EvaluateTweetsRequest>,
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
+        let entered = tokio::time::Instant::now();
         let request_metrics = RequestMetricsGuard::named(REQUESTS, LATENCY_MS);
-        match self.handle_inner(request.into_inner()).await {
+        let context = crate::hydration::request_context(
+            entered,
+            crate::filter_tweets::parse_grpc_timeout(request.metadata()),
+        );
+        match context.scope(self.handle_inner(request.into_inner())).await {
             Ok(response) => {
                 request_metrics.mark_success();
                 Ok(Response::new(response))
@@ -53,6 +57,7 @@ impl EvaluateTweetsEndpoint {
             ThriftLevel::FILTER_ALL => SafetyLevel::FilterAll,
             ThriftLevel::TIMELINE_HOME => SafetyLevel::TimelineHome,
             ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS => SafetyLevel::TimelineHomeRecommendations,
+            ThriftLevel::TIMELINE_HOME_HYDRATION => SafetyLevel::TimelineHomeHydration,
             _ => return Err(Status::unimplemented("safety level has no Rust policy")),
         };
         ft_metrics::record_batch_size(BATCH_SIZE, req.tweets.len());
@@ -72,6 +77,7 @@ impl EvaluateTweetsEndpoint {
                 country_code: req.country_code,
                 safety_level,
                 candidates,
+                rpc: Rpc::EvaluateTweets,
             })
             .await;
         let outcomes: HashMap<TweetId, FilterOutcome> = response
@@ -91,7 +97,7 @@ impl EvaluateTweetsEndpoint {
                             status: EvaluationStatus::Evaluated,
                             verdict,
                             ..
-                        }) => match canonical_action(&verdict.action, safety_level) {
+                        }) => match treatment::thrift_action(verdict, safety_level) {
                             Some(action) => match xai_x_thrift::serialize_compact(&action) {
                                 Ok(bytes) => Outcome::ActionThriftCompact(bytes.into()),
                                 Err(_) => Outcome::Failed(vf_pb::Failed {}),
@@ -111,43 +117,13 @@ impl EvaluateTweetsEndpoint {
     }
 }
 
-fn canonical_action(verdict: &VfAction, level: SafetyLevel) -> Option<Action> {
-    let reason = match verdict {
-        VfAction::Allow => return Some(Action::Allow(action::Allow::new())),
-        VfAction::Interstitial(_) => return None,
-        VfAction::Drop(reason) => reason,
-    };
-    let drop_reason = match reason {
-        FilteredReason::AuthorIsProtected => DropReason::ProtectedAuthor(true),
-        FilteredReason::AuthorIsSuspended => DropReason::SuspendedAuthor(true),
-        FilteredReason::AuthorBlockViewer => DropReason::AuthorBlocksViewer(true),
-        FilteredReason::ViewerBlocksAuthor => DropReason::ViewerBlocksAuthor(true),
-        FilteredReason::ViewerMutesAuthor => DropReason::ViewerMutesAuthor(true),
-        FilteredReason::ExclusiveTweet => DropReason::ExclusiveTweet(true),
-        FilteredReason::UnspecifiedReason if level == SafetyLevel::FilterAll => {
-            DropReason::Unspecified(true)
-        }
-        FilteredReason::UnspecifiedReason
-        | FilteredReason::ContainNsfwMedia
-        | FilteredReason::PossiblyUndesirable
-        | FilteredReason::AuthorAccountIsInactive
-        | FilteredReason::AuthorIsUnsafe
-        | FilteredReason::ReportedTweet
-        | FilteredReason::TweetMatchesViewerMutedKeyword(_)
-        | FilteredReason::TweetIsBounced
-        | FilteredReason::SafetyResult(_)
-        | FilteredReason::AuthorIsDeactivated
-        | FilteredReason::TweetIsNullcast => return None,
-    };
-    Some(Action::Drop(action::Drop::new(Some(drop_reason), None)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use xai_core_entities::entities::PureCoreData;
     use xai_core_entities::gizmoduck_client::MockGizmoduckClient;
     use xai_core_entities::tweet_entity_service_client::MockTESClient;
+    use xai_x_thrift::action::{self, Action, DropReason};
 
     #[tokio::test]
     async fn evaluate_tweets_gates_levels_and_maps_outcomes_in_order() {
@@ -170,7 +146,7 @@ mod tests {
         ));
         for (level, code) in [
             (0, tonic::Code::Unimplemented),
-            (82, tonic::Code::Unimplemented),
+            (4, tonic::Code::Unimplemented),
             (9999, tonic::Code::InvalidArgument),
         ] {
             let error = endpoint
@@ -195,64 +171,44 @@ mod tests {
             tweet(3, None),
             tweet(3, None),
         ];
-        let response = endpoint
-            .handle(Request::new(vf_pb::EvaluateTweetsRequest {
-                safety_level: 16,
-                tweets: tweets.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            response
-                .results
-                .iter()
-                .map(|r| r.tweet.unwrap())
-                .collect::<Vec<_>>(),
-            tweets
-        );
-        let filter_all_drop = xai_x_thrift::serialize_compact(&Action::Drop(action::Drop::new(
-            Some(DropReason::Unspecified(true)),
-            None,
-        )))
-        .unwrap();
-        assert_eq!(
-            response
-                .results
-                .into_iter()
-                .map(|r| r.outcome.unwrap())
-                .collect::<Vec<_>>(),
-            vec![
-                Outcome::Failed(vf_pb::Failed {}),
-                Outcome::NotEvaluated(vf_pb::NotEvaluated {}),
-                Outcome::ActionThriftCompact(filter_all_drop.clone().into()),
-                Outcome::ActionThriftCompact(filter_all_drop.into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn canonical_action_never_substitutes_lossy_treatments() {
-        assert!(canonical_action(
-            &VfAction::Interstitial(FilteredReason::ContainNsfwMedia),
-            SafetyLevel::TimelineHome
-        )
-        .is_none());
-        assert!(canonical_action(
-            &VfAction::Drop(FilteredReason::UnspecifiedReason),
-            SafetyLevel::TimelineHome
-        )
-        .is_none());
-        assert_eq!(
-            canonical_action(
-                &VfAction::Drop(FilteredReason::AuthorIsProtected),
-                SafetyLevel::TimelineHome
+        for (level, action) in [
+            (
+                16,
+                Action::Drop(action::Drop::new(Some(DropReason::Unspecified(true)), None)),
             ),
-            Some(Action::Drop(action::Drop::new(
-                Some(DropReason::ProtectedAuthor(true)),
-                None
-            )))
-        );
+            (82, Action::Allow(action::Allow::new())),
+        ] {
+            let response = endpoint
+                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+                    safety_level: level,
+                    tweets: tweets.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response
+                    .results
+                    .iter()
+                    .map(|r| r.tweet.unwrap())
+                    .collect::<Vec<_>>(),
+                tweets
+            );
+            let bytes = xai_x_thrift::serialize_compact(&action).unwrap();
+            assert_eq!(
+                response
+                    .results
+                    .into_iter()
+                    .map(|r| r.outcome.unwrap())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Outcome::Failed(vf_pb::Failed {}),
+                    Outcome::NotEvaluated(vf_pb::NotEvaluated {}),
+                    Outcome::ActionThriftCompact(bytes.clone().into()),
+                    Outcome::ActionThriftCompact(bytes.into()),
+                ]
+            );
+        }
     }
 }

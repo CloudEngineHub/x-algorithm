@@ -179,16 +179,19 @@ fn author_corpus(
     author_rules: &AuthorRulesEvaluator,
     candidates: &[PostCandidate],
 ) -> Vec<AuthorCorpus> {
+    let mut by_author = HashMap::<u64, AuthorCorpus>::new();
     candidates
         .iter()
         .map(|c| {
-            let is_treatment = author_rules.get(c.author_id, AuthorIsTreatment);
-            let is_control = author_rules.get(c.author_id, AuthorIsControl);
-            match (is_treatment, is_control) {
-                (true, _) => AuthorCorpus::Treatment,
-                (false, true) => AuthorCorpus::Control,
-                (false, false) => AuthorCorpus::NotBucketed,
-            }
+            *by_author.entry(c.author_id).or_insert_with(|| {
+                let is_treatment = author_rules.get(c.author_id, AuthorIsTreatment);
+                let is_control = author_rules.get(c.author_id, AuthorIsControl);
+                match (is_treatment, is_control) {
+                    (true, _) => AuthorCorpus::Treatment,
+                    (false, true) => AuthorCorpus::Control,
+                    (false, false) => AuthorCorpus::NotBucketed,
+                }
+            })
         })
         .collect()
 }
@@ -198,8 +201,9 @@ fn apply_moe_ranking_policy(
     candidates: &[PostCandidate],
     corpus: &[AuthorCorpus],
     scores: &[f64],
-) -> Vec<f64> {
+) -> (Vec<f64>, Vec<bool>) {
     let mut out = scores.to_vec();
+    let mut zeroed = vec![false; scores.len()];
     for (i, c) in candidates.iter().enumerate() {
         if !is_phoenix_moe(c) {
             continue;
@@ -207,12 +211,13 @@ fn apply_moe_ranking_policy(
         let keep = matches!(arm, ViewerArm::Treatment) && corpus[i] == AuthorCorpus::Treatment;
         if !keep {
             out[i] = 0.0;
+            zeroed[i] = true;
         }
     }
-    out
+    (out, zeroed)
 }
 
-fn cold_start_target(params: &ColdStartParams, scores: &[f64]) -> Option<f64> {
+fn cold_start_target(params: &ColdStartParams, scores: &[f64]) -> Option<(usize, f64)> {
     let mut ranked = scores.to_vec();
     ranked.sort_by(|a, b| b.total_cmp(a));
     let hi = params.slot_max.min(ranked.len());
@@ -220,7 +225,8 @@ fn cold_start_target(params: &ColdStartParams, scores: &[f64]) -> Option<f64> {
     if lo >= hi {
         return None;
     }
-    Some(ranked[rand::rng().random_range(lo..hi)])
+    let rank = rand::rng().random_range(lo..hi);
+    Some((rank, ranked[rank]))
 }
 
 fn cold_start_corpus_eligible(arm: ViewerArm, c: &PostCandidate, corpus: AuthorCorpus) -> bool {
@@ -286,7 +292,7 @@ fn apply_cold_start(
     scores: &[f64],
     corpus: &[AuthorCorpus],
     target: f64,
-) -> Vec<f64> {
+) -> (Vec<f64>, Option<usize>) {
     let arm = params.arm;
     let (positions, nonzero) = positions_among_nonzero(scores);
     let max_cold_start_slot = (params.max_position_ratio * nonzero as f64) as usize;
@@ -322,13 +328,33 @@ fn apply_cold_start(
     };
 
     let Some(best_idx) = best_idx else {
-        return scores.to_vec();
+        return (scores.to_vec(), None);
     };
 
     let mut effective = scores.to_vec();
     effective[best_idx] = effective[best_idx].max(target);
     record_cold_started_posts(is_phoenix_moe(&candidates[best_idx]), arm.as_str(), 1);
-    effective
+    (effective, Some(best_idx))
+}
+
+pub(crate) struct ColdStartLift {
+    pub index: usize,
+    pub rank: usize,
+}
+
+pub(crate) struct ColdStartOutcome {
+    pub scores: Vec<f64>,
+    pub author_policy_zeroed: Vec<bool>,
+    pub lift: Option<ColdStartLift>,
+}
+
+impl ColdStartOutcome {
+    pub fn lift_to_rank(&self, index: usize) -> Option<u32> {
+        self.lift
+            .as_ref()
+            .filter(|lift| lift.index == index)
+            .map(|lift| lift.rank as u32)
+    }
 }
 
 #[derive(Clone)]
@@ -337,12 +363,22 @@ pub struct AuthorColdStart {
 }
 
 impl AuthorColdStart {
-    pub(crate) fn apply(
+    #[cfg(test)]
+    fn apply(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
         scores: &[f64],
     ) -> Vec<f64> {
+        self.apply_with_decisions(query, candidates, scores).scores
+    }
+
+    pub(crate) fn apply_with_decisions(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        scores: &[f64],
+    ) -> ColdStartOutcome {
         let params = ColdStartParams::read(query);
         record_tracked_ids(candidates, &params.tracked_ids);
         let corpus = match params.arm {
@@ -353,16 +389,29 @@ impl AuthorColdStart {
         };
 
         if !params.enabled {
-            return scores.to_vec();
+            return ColdStartOutcome {
+                scores: scores.to_vec(),
+                author_policy_zeroed: vec![false; scores.len()],
+                lift: None,
+            };
         }
 
         let arm = params.arm;
 
-        let mut effective = apply_moe_ranking_policy(arm, candidates, &corpus, scores);
-        if let Some(target) = cold_start_target(&params, scores) {
-            effective = apply_cold_start(&params, candidates, &effective, &corpus, target);
+        let (mut effective, author_policy_zeroed) =
+            apply_moe_ranking_policy(arm, candidates, &corpus, scores);
+        let mut lift = None;
+        if let Some((rank, target)) = cold_start_target(&params, scores) {
+            let (lifted, index) =
+                apply_cold_start(&params, candidates, &effective, &corpus, target);
+            effective = lifted;
+            lift = index.map(|index| ColdStartLift { index, rank });
         }
-        effective
+        ColdStartOutcome {
+            scores: effective,
+            author_policy_zeroed,
+            lift,
+        }
     }
 }
 
@@ -619,6 +668,22 @@ rust_home_mixer:
         assert_eq!(result[1], 100.0);
         assert_eq!(result[2], 90.0);
         assert_eq!(result[3], 0.0);
+    }
+
+    #[test]
+    fn control_viewer_dedups_author_rules_eval_for_duplicate_authors() {
+        let author_cold_start = cold_start_with_arms(vec![], vec![1]);
+        let candidates = vec![
+            cold_start_candidate(1, minutes(10), 3),
+            cold_start_candidate(1, minutes(20), 3),
+            cold_start_candidate(1, minutes(30), 3),
+        ];
+        let result = author_cold_start.apply(
+            &codivert_query(true, false),
+            &candidates,
+            &[40.0, 100.0, 90.0],
+        );
+        assert_eq!(result, vec![40.0, 100.0, 90.0]);
     }
 
     #[test]

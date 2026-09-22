@@ -46,7 +46,7 @@ from xrex.data.parquet_recsys import (
 from xrex.data.recsys import recsys_batch
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import pack_batch
-from xrex.data.retrieval_dataset import RetrievalDataset
+from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
 from xrex.inference import debug_logger, service_registry
 from xrex.inference.h2d import (
     EmbeddingSlices,
@@ -60,12 +60,21 @@ from xrex.inference.h2d import (
     parallel_copyto,
     prefault_memmap,
 )
+from xrex.inference.int8_post_table import (
+    quantize_post_table as _quantize_post_table,
+)
 from xrex.inference.metrics import MetricsPublisher, get_metrics_publisher
 from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.sharding_context import make_legacy_sharding_context
+from xrex.models.topic_categories import (
+    NUM_TOPIC_INT32S,
+    TOPIC_ID_TO_BITS,
+    bitmaps_to_int32_array,
+    topic_ids_to_bitmap,
+)
 from xrex.train.embedding_loader import load_embedding_table
 from xrex.train.misc import PostEmbeddings, RecsysInferenceState
 from xrex.train.trainer import Trainer
@@ -82,6 +91,16 @@ from xrex.utils.profiler import start_trace, stop_trace
 from xrex.utils.utils import get_peak_bytes_in_use
 
 logger = logging.getLogger(__name__)
+
+_TOPIC_PARQUET_DIR = str(PHOENIX_INDEX_BASE / "post_creation_snapshots_topic")
+_TOPIC_PARQUET_PATHS: dict[int, str] = {
+    0: f"{_TOPIC_PARQUET_DIR}/1fav_topic_1day.parquet",
+    1: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_1_1day.parquet",
+    2: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_2_1day.parquet",
+    3: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_3_1day.parquet",
+    4: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_4_1day.parquet",
+    5: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_5_1day.parquet",
+}
 
 
 def get_model_checkpoint_timestamp(ctx):
@@ -516,6 +535,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     embedding_gather_threads: int = 16
     use_pinned_d2h: bool = True
     pinned_d2h_num_buffers: int = 3
+
+    enable_bloom_filter: bool = False
 
     log_rotate: bool = False
     log_rotate_max_bytes: int = 3 * 1024 * 1024 * 1024
@@ -1165,10 +1186,6 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self._live_pe_meta_plan = []
             self._gpu_pe_slots = [None, None]
 
-    @property
-    def _live_swap_blocked_by_candidate_filters(self) -> bool:
-        return False
-
     def _live_swap_two_tower_supported(self) -> bool:
         assert isinstance(self.state, RecsysInferenceState)
         if self.state.post_embeddings is None or self._pending_post_embeddings is None:
@@ -1179,10 +1196,11 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         if self._pe_staging_size <= 0:
             logger.info("[hotswap-live] no post_embeddings staging buffer -> drained finalize path")
             return False
-        if self._live_swap_blocked_by_candidate_filters:
-            logger.info(
-                "[hotswap-live] serving-time candidate filters enabled -> drained finalize path"
-            )
+        if getattr(self, "enable_topic_filter", False):
+            logger.info("[hotswap-live] topic filter enabled -> drained finalize path")
+            return False
+        if getattr(self, "enable_bloom_filter", False):
+            logger.info("[hotswap-live] bloom filter enabled -> drained finalize path")
             return False
         return True
 
@@ -4340,9 +4358,21 @@ class RetrievalModelRunner(
     all_post_ids: npt.NDArray[np.int64] | None = None
     all_author_ids: npt.NDArray[np.int64] | None = None
     all_dataset_types: npt.NDArray[np.int32] | None = None
+    enable_topic_filter: bool = False
     enable_dataset_slice_topk: bool = False
     enable_async_topk: bool = False
     enable_radix_select_topk: bool = False
+    enable_int8_post_table: bool = False
+    _int8_post_table_cache: tuple | None = field(default=None, init=False)
+    _all_topic_bitmaps: dict[int, jax.Array] = field(default_factory=dict)
+
+    _mask_pinned_by_bs: dict[int, jax.Array] = field(default_factory=dict)
+    _mask_shard_views_by_bs: dict[int, tuple[npt.NDArray[np.uint8], ...]] = field(
+        default_factory=dict
+    )
+    _all_post_ids_np: npt.NDArray[np.int64] | None = None
+    _all_dataset_types_np: npt.NDArray[np.int32] | None = None
+    _mask_missing_warned: set[int] = field(default_factory=set, init=False)
 
     _dataset_ranges_by_type: dict[int, tuple[int, int]] | None = field(default=None, init=False)
 
@@ -4409,6 +4439,8 @@ class RetrievalModelRunner(
     ) -> tuple[tuple[int, int], ...] | None:
         if not self.enable_dataset_slice_topk:
             return None
+        if self.enable_bloom_filter or self.enable_topic_filter:
+            return None
         ranges = ranges_override if ranges_override is not None else self._dataset_ranges_by_type
         if not ranges:
             return None
@@ -4438,7 +4470,64 @@ class RetrievalModelRunner(
                 self.state.post_embeddings.dataset_types, dtype=np.int32
             )
             self._compute_dataset_ranges()
+            if self.enable_topic_filter:
+                self._reload_topic_bitmaps()
+            if self.enable_bloom_filter and self.all_post_ids is not None:
+                self._init_bloom_filter_pinned_buffer()
         return new_ckpt_loaded, elapsed_samples, _
+
+    def _reload_topic_bitmaps(self) -> None:
+        new_bitmaps: dict[int, jax.Array] = {}
+        for option, path in _TOPIC_PARQUET_PATHS.items():
+            bitmap = self._load_topic_bitmaps_from_parquet(path)
+            if bitmap is not None:
+                new_bitmaps[option] = bitmap
+                logger.info(f"Loaded topic bitmaps for option {option}: shape={bitmap.shape}")
+        if not new_bitmaps:
+            logger.warning(
+                "No topic bitmaps loaded from any parquet file; "
+                "topic filtering will silently pass through all candidates."
+            )
+        self._all_topic_bitmaps = new_bitmaps
+
+    def _load_topic_bitmaps_from_parquet(self, parquet_path: str) -> jax.Array | None:
+        if self.all_post_ids is None:
+            return None
+
+        if not os.path.exists(parquet_path):
+            logger.warning(f"Topic parquet file not found: {parquet_path}")
+            return None
+
+        logger.info(f"Loading topic bitmaps from parquet: {parquet_path}")
+
+        try:
+            table = pq.read_table(parquet_path, columns=["post_id", "topic_entity_ids"])
+            parquet_post_ids = table.column("post_id").to_numpy()
+            topic_ids_list = table.column("topic_entity_ids").to_pylist()
+
+            raw_bitmaps = [topic_ids_to_bitmap(tids) for tids in topic_ids_list]
+            parquet_bitmaps = bitmaps_to_int32_array(raw_bitmaps)
+
+            sort_idx = np.argsort(parquet_post_ids)
+            sorted_ids = parquet_post_ids[sort_idx]
+            sorted_bitmaps = parquet_bitmaps[sort_idx]
+
+            indices = np.searchsorted(sorted_ids, self.all_post_ids)
+            clamped_indices = np.minimum(indices, len(sorted_ids) - 1)
+            valid = (indices < len(sorted_ids)) & (sorted_ids[clamped_indices] == self.all_post_ids)
+
+            bitmaps = np.zeros((len(self.all_post_ids), NUM_TOPIC_INT32S), dtype=np.int32)
+            bitmaps[valid] = sorted_bitmaps[clamped_indices[valid]]
+
+            matched_count = np.sum(valid)
+            logger.info(
+                f"Loaded topic bitmaps: {matched_count}/{len(self.all_post_ids)} posts matched"
+            )
+            return jnp.array(bitmaps, dtype=jnp.int32)
+
+        except Exception as e:
+            logger.error(f"Failed to load topic bitmaps from parquet: {e}")
+            return None
 
     def _on_post_hotswap(self) -> None:
         assert isinstance(self.state, RecsysInferenceState)
@@ -4452,7 +4541,11 @@ class RetrievalModelRunner(
                 self.state.post_embeddings.dataset_types, dtype=np.int32
             )
             self._compute_dataset_ranges()
-            logger.info("[hotswap] Rebuilt retrieval metadata (post_ids, author_ids)")
+            if self.enable_bloom_filter:
+                self._init_bloom_filter_pinned_buffer()
+            if self.enable_topic_filter:
+                self._reload_topic_bitmaps()
+            logger.info("[hotswap] Rebuilt retrieval metadata (post_ids, author_ids, bloom filter)")
 
     def _prepare_live_swap_derived_state(self, staged_meta: dict[str, np.ndarray]) -> None:
         self._staged_live_retrieval_meta = None
@@ -4524,6 +4617,9 @@ class RetrievalModelRunner(
                     emb_sds,
                     pe_sds,
                     dtypes_sds,
+                    eligible_sds,
+                    topic_sds,
+                    topic_user_sds,
                 ) = sds
                 with self.mesh:
                     lowered = self._forward_jit_for_bucket(bs).lower(
@@ -4535,6 +4631,9 @@ class RetrievalModelRunner(
                         dtypes_sds,
                         self.large_k,
                         target_dataset_types,
+                        eligible_sds,
+                        topic_sds,
+                        topic_user_sds,
                         ranges_tuple,
                     )
                     compiled = JittedOrCompiled(
@@ -4554,6 +4653,51 @@ class RetrievalModelRunner(
                     e,
                 )
         self._staged_live_forward_compiled = staged or None
+
+    def _init_bloom_filter_pinned_buffer(self) -> None:
+        from xai_checkpointing.common import (
+            _unsafe_jax2np,
+        )
+
+        M = len(self.all_post_ids)
+
+        self._mask_pinned_by_bs = {}
+        self._mask_shard_views_by_bs = {}
+        for bs in self.sorted_buckets:
+            with self.mesh:
+                pinned = jnp.empty(
+                    (bs, M),
+                    dtype=jnp.bool_,
+                    device=self.data_sharding.with_memory_kind("pinned_host"),
+                )
+
+            views = tuple(
+                np.ndarray(
+                    shape=(shard.data.size,),
+                    dtype=np.uint8,
+                    buffer=_unsafe_jax2np(shard.data),
+                )
+                for shard in pinned.addressable_shards
+            )
+            assert bs % len(views) == 0, (
+                f"bloom bucket {bs} must divide evenly across {len(views)} mask shards"
+            )
+            for view in views:
+                view[:] = 1
+            self._mask_pinned_by_bs[bs] = pinned
+            self._mask_shard_views_by_bs[bs] = views
+
+        self._all_post_ids_np = np.ascontiguousarray(self.all_post_ids, dtype=np.int64)
+        self._all_dataset_types_np = np.ascontiguousarray(
+            np.asarray(self.all_dataset_types).reshape(-1), dtype=np.int32
+        )
+
+        total_mb = sum(bs * M for bs in self.sorted_buckets) / 1e6
+        logger.info(
+            f"Allocated pinned bloom filter masks: buckets={self.sorted_buckets}, "
+            f"M={M}, total={total_mb:.1f} MB, "
+            f"num_shards={len(next(iter(self._mask_shard_views_by_bs.values())))}"
+        )
 
     def _get_persistent_buffer(
         self, request_in_flight_id: int, bucket_size: int | None = None
@@ -4603,6 +4747,75 @@ class RetrievalModelRunner(
             history_post_sids=persistent_buffer["history_seq"].get("post_sids"),
         )
 
+    def _build_eligible_mask(
+        self,
+        request: xai_recsys_engine.RetrieveRequestBatch | None,
+        batch_id: int,
+        bucket_size: int | None = None,
+    ) -> jax.Array | None:
+        if not self.enable_bloom_filter:
+            return None
+
+        bs = bucket_size if bucket_size is not None else self.inference_batch_size
+        pinned = self._mask_pinned_by_bs.get(bs)
+        shard_views = self._mask_shard_views_by_bs.get(bs)
+        if pinned is None or shard_views is None:
+            if request is not None and bs not in self._mask_missing_warned:
+                self._mask_missing_warned.add(bs)
+                logger.warning(
+                    "[BloomFilter] no pinned mask buffer for bucket %d "
+                    "(initialized buckets: %s); serving UNFILTERED",
+                    bs,
+                    sorted(self._mask_pinned_by_bs),
+                )
+            return None
+
+        import time
+
+        t0 = time.monotonic()
+
+        if request is None or self.all_post_ids is None:
+            for view in shard_views:
+                view[:] = 1
+        else:
+            post_ids = (
+                self._all_post_ids_np
+                if self._all_post_ids_np is not None
+                else (np.ascontiguousarray(self.all_post_ids, dtype=np.int64))
+            )
+            ds_types = getattr(self, "_all_dataset_types_np", None)
+            if ds_types is None:
+                ds_types = np.ascontiguousarray(
+                    np.asarray(self.all_dataset_types).reshape(-1), dtype=np.int32
+                )
+            request.build_eligible_mask_into_shards(
+                post_ids,
+                ds_types,
+                bs,
+                list(shard_views),
+            )
+
+        t1 = time.monotonic()
+
+        result = jax.device_put(pinned, self.data_sharding)
+
+        t2 = time.monotonic()
+        rust_ms = (t1 - t0) * 1000
+        h2d_ms = (t2 - t1) * 1000
+        logger.info(
+            f"[BloomFilter] batch_id={batch_id} bucket={bs} | "
+            f"rust_build={rust_ms:.1f}ms, h2d={h2d_ms:.1f}ms, total={rust_ms + h2d_ms:.1f}ms"
+        )
+        return result
+
+    def _build_eligible_mask_pipelined(
+        self,
+        request: xai_recsys_engine.RetrieveRequestBatch | None,
+        batch_id: int,
+        bucket_size: int | None = None,
+    ) -> jax.Array | None:
+        return self._build_eligible_mask(request, batch_id, bucket_size)
+
     def _forward_jit_for_bucket(self, bucket_size: int | None) -> JittedOrCompiled:
         bs = bucket_size if bucket_size is not None else self.inference_batch_size
         return self.two_tower_forward_jit_by_bs[bs]
@@ -4621,6 +4834,7 @@ class RetrievalModelRunner(
         if self._live_swap_enabled:
             state = self.state
         forward_jit = self._forward_jit_for_bucket(bucket_size)
+        bs = bucket_size if bucket_size is not None else self.inference_batch_size
         assert state.post_embeddings is not None
         h2d_state = self._get_h2d_state(request_in_flight_id, bucket_size)
         with jax_profiler.TraceAnnotation(
@@ -4646,7 +4860,53 @@ class RetrievalModelRunner(
 
         dataset_ranges = self._get_dataset_ranges(target_dataset_types)
 
-        bs = bucket_size if bucket_size is not None else self.inference_batch_size
+        if eligible_mask is None:
+            eligible_mask = self._build_eligible_mask(request, batch_id, bucket_size)
+        if eligible_mask is not None:
+            assert eligible_mask.shape[0] == bs, (
+                f"eligible_mask rows {eligible_mask.shape[0]} != bucket {bs}; "
+                "per-bucket mask build must match the bucket forward"
+            )
+
+        topic_bitmaps = None
+        topic_user_bitmasks = None
+        if self.enable_topic_filter:
+            topic_filter_mode = 0
+            if request is not None:
+                topic_filter_mode = request.get_topic_filter_mode()
+
+            topic_bitmaps = self._all_topic_bitmaps.get(topic_filter_mode)
+            if topic_bitmaps is None:
+                if topic_filter_mode != 0:
+                    logger.warning(
+                        "topic_filter_mode=%d not loaded in _all_topic_bitmaps; "
+                        "falling back to mode 0",
+                        topic_filter_mode,
+                    )
+                topic_bitmaps = self._all_topic_bitmaps.get(0)
+
+            if topic_bitmaps is None and state.post_embeddings is not None:
+                N = state.post_embeddings.embeddings.x.shape[0]
+                topic_bitmaps = jnp.zeros((N, NUM_TOPIC_INT32S), dtype=jnp.int32)
+
+            batch_size = batch["user_hashes"].shape[0]
+            if request is not None and self._all_topic_bitmaps:
+                topic_entity_id_list = request.get_topic_entity_ids()
+                raw_bitmasks = [0] * batch_size
+                for i, tids in enumerate(topic_entity_id_list):
+                    if i >= batch_size:
+                        break
+                    mask = 0
+                    for tid in tids:
+                        if tid != 0 and tid in TOPIC_ID_TO_BITS:
+                            for bit in TOPIC_ID_TO_BITS[tid]:
+                                mask |= 1 << bit
+                    raw_bitmasks[i] = mask
+                topic_user_bitmasks = jnp.array(
+                    bitmaps_to_int32_array(raw_bitmasks), dtype=jnp.int32
+                )
+            else:
+                topic_user_bitmasks = jnp.zeros((batch_size, NUM_TOPIC_INT32S), dtype=jnp.int32)
 
         if self.enable_hotswap and bs not in self._live_forward_sds:
 
@@ -4660,8 +4920,11 @@ class RetrievalModelRunner(
                 _sds(rng),
                 _sds(batch),
                 _sds(recsys_embeddings),
-                _sds(state.post_embeddings.embeddings.x),
+                _sds(self._post_table_forward_arg(state)),
                 _sds(state.post_embeddings.dataset_types),
+                _sds(eligible_mask),
+                _sds(topic_bitmaps),
+                _sds(topic_user_bitmasks),
             )
 
         live_compiled = (
@@ -4680,8 +4943,11 @@ class RetrievalModelRunner(
                         rng,
                         batch,
                         recsys_embeddings,
-                        state.post_embeddings.embeddings.x,
+                        self._post_table_forward_arg(state),
                         state.post_embeddings.dataset_types,
+                        eligible_mask,
+                        topic_bitmaps,
+                        topic_user_bitmasks,
                     )
                 except Exception:
                     logger.exception(
@@ -4697,16 +4963,36 @@ class RetrievalModelRunner(
                     rng,
                     batch,
                     recsys_embeddings,
-                    state.post_embeddings.embeddings.x,
+                    self._post_table_forward_arg(state),
                     state.post_embeddings.dataset_types,
                     self.large_k,
                     target_dataset_types,
+                    eligible_mask,
+                    topic_bitmaps,
+                    topic_user_bitmasks,
                     dataset_ranges,
                 )
         results_dict = {
             ds_type: result for ds_type, result in zip(target_dataset_types, results_tuple)
         }
         return results_dict
+
+    def _post_table_forward_arg(self, state: RecsysInferenceState):
+        x = state.post_embeddings.embeddings.x
+        if not self.enable_int8_post_table:
+            return x
+        cache = self._int8_post_table_cache
+        if cache is None or cache[0] is not x:
+            t0 = time.time()
+            q8, scales = jax.block_until_ready(_quantize_post_table(x))
+            logger.info(
+                "enable_int8_post_table: quantized post table %s bf16 -> int8 in %.0fms",
+                x.shape,
+                (time.time() - t0) * 1e3,
+            )
+            cache = (x, q8, scales)
+            self._int8_post_table_cache = cache
+        return (cache[1], cache[2])
 
     def reply_request(
         self,
@@ -4896,13 +5182,19 @@ class RetrievalModelRunner(
         def two_tower_forward_fn(
             batch: RecsysFeaturesBatch,
             merged_embeddings: jax.Array,
-            post_embeddings: jax.Array,
+            post_embeddings: jax.Array | tuple[jax.Array, jax.Array],
             dataset_types: jax.Array,
             large_k: int,
             target_dataset_types: tuple[int, ...],
+            eligible_mask: jax.Array | None = None,
+            topic_bitmaps: jax.Array | None = None,
+            topic_user_bitmasks: jax.Array | None = None,
             dataset_ranges: tuple[tuple[int, int], ...] | None = None,
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
+            post_scales = None
+            if isinstance(post_embeddings, tuple):
+                post_embeddings, post_scales = post_embeddings
             sl = embedding_slices
 
             if self.using_seqpack:
@@ -4934,10 +5226,22 @@ class RetrievalModelRunner(
                 dataset_types,
                 large_k,
                 target_dataset_types,
+                eligible_mask,
+                topic_bitmaps=topic_bitmaps,
+                topic_user_bitmasks=topic_user_bitmasks,
                 dataset_ranges=dataset_ranges,
                 use_async_topk=self.enable_async_topk,
                 use_radix_select_topk=self.enable_radix_select_topk,
+                post_scales=post_scales,
             )
+
+        if self.enable_int8_post_table:
+            post_table_in_sharding = (
+                self.data_sharding,
+                jax.sharding.NamedSharding(self.data_sharding.mesh, P(self.data_sharding.spec[0])),
+            )
+        else:
+            post_table_in_sharding = self.data_sharding
 
         return JittedOrCompiled(
             jax.jit(
@@ -4947,11 +5251,18 @@ class RetrievalModelRunner(
                     None,
                     self.data_sharding,
                     self.data_sharding,
-                    self.data_sharding,
+                    post_table_in_sharding,
+                    None,
+                    self.data_sharding if self.enable_bloom_filter else None,
+                    None,
                     None,
                 ),
                 out_shardings=None,
-                static_argnums=[6, 7, 8],
+                static_argnums=[
+                    6,
+                    7,
+                    11,
+                ],
             ),
             name=f"two_tower_forward_fn_bs{bs}",
         )

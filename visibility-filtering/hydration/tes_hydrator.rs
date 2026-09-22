@@ -403,7 +403,9 @@ mod tests {
 
     #[test]
     fn missing_core_keeps_nullcast_drop_for_supplied_and_recovered_authors() {
-        use crate::models::{HydratedTweetCandidate, VfAction, ViewerFeatures};
+        use crate::models::{
+            Decided, HydratedTweetCandidate, Verdict, ViewerFeatures, Withholding,
+        };
         use crate::rules::RuleEngine;
 
         let cache = author_id_cache();
@@ -450,10 +452,21 @@ mod tests {
                 ] {
                     let verdict = engine.evaluate(level, &ViewerFeatures::default(), &hydrated);
                     if is_nullcast {
-                        assert!(matches!(verdict.action, VfAction::Drop(_)));
-                        assert_eq!(verdict.decided_by, Some("NullcastedTweetDropRule"));
+                        assert!(matches!(
+                            verdict,
+                            Verdict::Withheld(Decided {
+                                value: Withholding::Drop(_),
+                                by: "NullcastedTweetDropRule",
+                            })
+                        ));
                     } else {
-                        assert!(matches!(verdict.action, VfAction::Allow));
+                        assert_eq!(
+                            verdict,
+                            Verdict::Shown {
+                                media: None,
+                                engagement: None,
+                            }
+                        );
                     }
                 }
             }

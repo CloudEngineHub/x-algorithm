@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
+use xai_x_rpc::WithBudget;
 
 const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 
@@ -29,12 +30,11 @@ impl ViewerHydrator {
         let lookup = match viewer_id {
             Some(vid) => {
                 let start = Instant::now();
-                let result = tokio::time::timeout(
-                    CLIENT_TIMEOUT,
-                    self.gizmoduck_client
-                        .get_viewer_data_with_fields(vid, &VIEWER_QUERY_FIELDS),
-                )
-                .await;
+                let result = self
+                    .gizmoduck_client
+                    .get_viewer_data_with_fields(vid, &VIEWER_QUERY_FIELDS)
+                    .with_budget(CLIENT_TIMEOUT)
+                    .await;
                 let outcome = match &result {
                     Ok(Ok(_)) => HydratorOutcome::Success,
                     Ok(Err(_)) => HydratorOutcome::Error,

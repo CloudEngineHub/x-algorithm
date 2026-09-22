@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
+use xai_x_rpc::WithBudget;
 
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
 use crate::rules::SafetyLevel;
@@ -252,7 +253,7 @@ pub(crate) async fn timed_rpc<T: Default>(
     fut: impl Future<Output = T>,
 ) -> T {
     let start = Instant::now();
-    let (outcome, body) = match tokio::time::timeout(timeout, fut).await {
+    let (outcome, body) = match fut.with_budget(timeout).await {
         Ok(body) => {
             let outcome = classify(&body);
             (outcome, body)
@@ -330,7 +331,7 @@ where
     K: Copy + Eq + Hash,
 {
     let start = Instant::now();
-    let batch = match tokio::time::timeout(timeout, fut).await {
+    let batch = match fut.with_budget(timeout).await {
         Ok(body) => into_batch(body),
         Err(_) => HydrationBatch::timed_out(candidate_count_by_key.keys().copied()),
     };
@@ -387,6 +388,27 @@ mod tests {
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_cancels_a_hop_before_the_static_ceiling() {
+        let start = tokio::time::Instant::now();
+        let context = crate::hydration::request_context(start, Some(Duration::from_millis(40)));
+        let result = context
+            .scope(std::future::pending::<()>().with_budget(crate::hydration::HYDRATION_TIMEOUT))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), Duration::from_millis(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hop_without_caller_deadline_uses_the_static_ceiling() {
+        let ceiling = crate::hydration::HYDRATION_TIMEOUT;
+        let seen = async { xai_x_rpc::remaining() }
+            .with_budget(ceiling)
+            .await
+            .unwrap();
+        assert_eq!(seen, Some(ceiling));
     }
 
     #[test]

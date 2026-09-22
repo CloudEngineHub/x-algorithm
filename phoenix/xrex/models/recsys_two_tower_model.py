@@ -57,6 +57,7 @@ from xrex.models.recsys_model import (
 )
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import ShardingContext
+from xrex.models.topic_categories import NUM_TOPIC_INT32S
 from xrex.pallas.ranker_attention_utils import HISTORY_SEGMENT_ID, PADDING_SEGMENT_ID
 from xrex.train.misc import PostEmbeddings
 from xrex.utils.utils import Summary
@@ -291,7 +292,7 @@ class RecsysCandidateModelConfig(Config):
             emb_init = jnp.empty((self.max_posts, self.emb_table_width), dtype=jnp.bfloat16)
         post_embeddings = Parameter(
             x=emb_init,
-            pspec=P(("expert", "replica"), ("seq", "model")),
+            pspec=P(("stage", "expert", "replica", "data"), ("seq", "model")),
         )
         return PostEmbeddings(
             post_ids=all_post_ids,
@@ -1330,6 +1331,9 @@ class RecsysTwoTowerModel(hk.Module):
         dataset_types: jax.Array | None,
         top_k: int = 0,
         target_dataset_types: tuple[int, ...] = (1,),
+        eligible_mask: jax.Array | None = None,
+        topic_bitmaps: jax.Array | None = None,
+        topic_user_bitmasks: jax.Array | None = None,
         eval_bs_per_device: int = 0,
         dataset_ranges: tuple[tuple[int, int], ...] | None = None,
         use_async_topk: bool = False,
@@ -1361,6 +1365,8 @@ class RecsysTwoTowerModel(hk.Module):
                 use_radix_select=use_radix_select_topk,
             )
 
+        use_topic_filter = topic_bitmaps is not None and topic_user_bitmasks is not None
+
         def _trim_eval_users(user_embedding: jax.Array) -> jax.Array:
             if eval_bs_per_device > 0:
                 users_per_expert = user_embedding.shape[0] // mesh.shape[saxis]
@@ -1385,18 +1391,44 @@ class RecsysTwoTowerModel(hk.Module):
             )
             return scores
 
+        mask_in_spec = P(saxis) if eligible_mask is not None else P()
+
+        topic_bitmaps_in_spec = P(saxis, None) if use_topic_filter else P()
+        topic_user_bitmasks_in_spec = P(None, None) if use_topic_filter else P()
+
         @shard_map(
             mesh=mesh,
-            in_specs=(P(), P()),
+            in_specs=(P(), P(), mask_in_spec, topic_bitmaps_in_spec, topic_user_bitmasks_in_spec),
             out_specs=(P(), P()),
             check_vma=False,
         )
         def mask_and_top_k(
             all_scores: jax.Array,
             type_mask: jax.Array,
+            user_eligible_mask: jax.Array,
+            topic_bitmaps_shard: jax.Array,
+            topic_user_bitmasks_full: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            combined = type_mask
+            combined = type_mask & user_eligible_mask
             masked_scores = jnp.where(combined, all_scores, jnp.finfo(jnp.bfloat16).min)
+
+            if use_topic_filter:
+                topic_bitmaps_full = jax.lax.all_gather(
+                    topic_bitmaps_shard, axis_name=saxis, axis=0, tiled=True
+                )
+                B_local = masked_scores.shape[0]
+                shard_idx = jax.lax.axis_index(saxis)
+                start_idx = shard_idx * B_local
+                user_bitmasks_local = jax.lax.dynamic_slice(
+                    topic_user_bitmasks_full, (start_idx, 0), (B_local, NUM_TOPIC_INT32S)
+                )
+                topic_mask = jnp.any(
+                    (topic_bitmaps_full[None, :, :] & user_bitmasks_local[:, None, :]) != 0,
+                    axis=-1,
+                )
+                no_filter_mask = jnp.all(user_bitmasks_local == 0, axis=-1)[:, None]
+                topic_mask = jnp.where(no_filter_mask, True, topic_mask)
+                masked_scores = jnp.where(topic_mask, masked_scores, jnp.finfo(jnp.bfloat16).min)
 
             sorted_scores, sorted_indices = local_top_k(masked_scores, top_k)
             top_k_scores = jax.lax.all_gather(sorted_scores, axis_name=saxis, axis=0, tiled=True)
@@ -1432,7 +1464,12 @@ class RecsysTwoTowerModel(hk.Module):
         else:
             all_scores = compute_top_k(post_embeddings, user_representation)
 
-        use_slice_path = dataset_ranges is not None and not skip_dataset_mask
+        use_slice_path = (
+            dataset_ranges is not None
+            and eligible_mask is None
+            and not use_topic_filter
+            and not skip_dataset_mask
+        )
         if use_slice_path:
             assert len(dataset_ranges) == len(target_dataset_types), (
                 f"dataset_ranges ({len(dataset_ranges)}) must align with "
@@ -1458,6 +1495,13 @@ class RecsysTwoTowerModel(hk.Module):
                 results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
             return tuple(results)
 
+        B = all_scores.shape[0]
+        M = post_embeddings.shape[0]
+        if eligible_mask is None:
+            user_eligible_mask = jnp.ones((B, M), dtype=jnp.bool_)
+        else:
+            user_eligible_mask = eligible_mask
+
         results = []
         for ds_type in target_dataset_types:
             if dataset_types is not None and not skip_dataset_mask:
@@ -1465,7 +1509,13 @@ class RecsysTwoTowerModel(hk.Module):
             else:
                 type_mask = jnp.ones(post_embeddings.shape[0], dtype=jnp.bool_)
 
-            top_k_scores, top_k_indices = mask_and_top_k(all_scores, type_mask)
+            _topic_bitmaps = topic_bitmaps if use_topic_filter else jnp.zeros((), dtype=jnp.int32)
+            _topic_user_bitmasks = (
+                topic_user_bitmasks if use_topic_filter else jnp.zeros((), dtype=jnp.int32)
+            )
+            top_k_scores, top_k_indices = mask_and_top_k(
+                all_scores, type_mask, user_eligible_mask, _topic_bitmaps, _topic_user_bitmasks
+            )
             results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
 
         return tuple(results)

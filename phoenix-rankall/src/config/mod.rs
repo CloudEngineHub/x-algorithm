@@ -109,7 +109,6 @@ pub enum PipelineKind {
     Sid,
     #[value(name = "sid-tail")]
     SidTail,
-    MmMetadata,
     Ads,
     Analysis,
 }
@@ -119,7 +118,7 @@ impl PipelineKind {
         match self {
             Self::Main | Self::Sid => "phoenix_rank_all_indexing_event",
             Self::Topic => "phoenix_rank_all_indexing_event_backup",
-            Self::Metadata | Self::MmMetadata | Self::SidTail => "phoenix_rankall_metadata_event",
+            Self::Metadata | Self::SidTail => "phoenix_rankall_metadata_event",
             Self::Analysis => "home_mixer_phoenix_scored_candidates",
             Self::Ads => "",
         }
@@ -171,11 +170,6 @@ impl PipelineKind {
                 WindowConfig::new("metadata", 48),
                 WindowConfig::new("metadata", 72),
             ],
-            Self::MmMetadata => vec![
-                WindowConfig::new("mm_emb_metadata", 24),
-                WindowConfig::new("mm_emb_metadata_video", 48),
-                WindowConfig::new("mm_emb_metadata_video", 96),
-            ],
             Self::Sid => vec![
                 WindowConfig::new("1fav", 24),
                 WindowConfig::new("1fav_video", 48),
@@ -205,7 +199,6 @@ impl fmt::Display for PipelineKind {
             Self::Main => write!(f, "main"),
             Self::Topic => write!(f, "topic"),
             Self::Metadata => write!(f, "metadata"),
-            Self::MmMetadata => write!(f, "mm_metadata"),
             Self::Ads => write!(f, "ads"),
             Self::Analysis => write!(f, "analysis"),
             Self::Sid => write!(f, "sid"),
@@ -350,7 +343,6 @@ mod tests {
         assert!(PipelineKind::Sid.is_implemented());
         assert!(PipelineKind::SidTail.is_implemented());
         assert!(PipelineKind::SidTail.needs_sid_endpoint());
-        assert!(!PipelineKind::MmMetadata.is_implemented());
         assert!(!PipelineKind::Ads.is_implemented());
     }
 

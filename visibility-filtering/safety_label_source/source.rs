@@ -1,3 +1,4 @@
+use crate::models::tweet_timestamp_ms;
 use quanta::Clock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,14 +12,12 @@ use super::metrics::{self, BatchStage, CacheResult, CacheTier};
 
 const CACHE_CAPACITY: usize = 1_000_000;
 
-const SNOWFLAKE_EPOCH_MS: u64 = 1288834974657;
-const SNOWFLAKE_TIMESTAMP_SHIFT: u32 = 22;
 const YOUNG_TWEET_AGE: Duration = Duration::from_secs(5 * 60);
 const SHORT_TTL: Duration = Duration::from_secs(30);
 const LONG_TTL: Duration = Duration::from_secs(60);
 
 fn tweet_age(tweet_id: u64, now: SystemTime) -> Option<Duration> {
-    let created_ms = (tweet_id >> SNOWFLAKE_TIMESTAMP_SHIFT).checked_add(SNOWFLAKE_EPOCH_MS)?;
+    let created_ms = tweet_timestamp_ms(tweet_id);
     let created_at = UNIX_EPOCH.checked_add(Duration::from_millis(created_ms))?;
     now.duration_since(created_at).ok()
 }
@@ -247,7 +246,7 @@ mod tests {
             .checked_mul(1000)
             .and_then(|secs_ms| secs_ms.checked_add(u64::from(since_epoch.subsec_millis())))
             .unwrap();
-        created_ms.checked_sub(SNOWFLAKE_EPOCH_MS).unwrap() << SNOWFLAKE_TIMESTAMP_SHIFT
+        created_ms.checked_sub(tweet_timestamp_ms(0)).unwrap() << 22
     }
 
     fn future_tweet_id() -> u64 {

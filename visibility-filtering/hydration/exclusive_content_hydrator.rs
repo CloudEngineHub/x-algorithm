@@ -103,7 +103,7 @@ mod tests {
         sg_client: Arc<dyn SocialgraphClient + Send + Sync>,
     ) -> HashMap<TweetId, Completeness<ExclusiveContentFeatures>> {
         tokio::time::timeout(
-            Duration::from_secs(1),
+            CLIENT_TIMEOUT * 2,
             ExclusiveContentHydrator { sg_client }.hydrate(
                 HashMap::from([(TweetId(1), 10)]),
                 2,

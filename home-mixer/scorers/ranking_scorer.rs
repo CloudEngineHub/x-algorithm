@@ -552,7 +552,7 @@ impl RankingScorer {
             && query.user_features.followed_user_ids.len() >= NEW_USER_MIN_FOLLOWING;
 
         if is_eligible_new_user {
-            NEW_USER_OON_WEIGHT_FACTOR
+            query.params.get(NewUserOonWeightFactor)
         } else {
             oon_weight_factor
         }
@@ -623,15 +623,19 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                     Self::offset_score(scaled, &weights)
                 })
                 .collect();
-            let final_scores = self.author_cold_start.apply(query, candidates, &scores);
+            let cold_start = self
+                .author_cold_start
+                .apply_with_decisions(query, candidates, &scores);
             return weighted_scores
                 .iter()
-                .zip(final_scores)
+                .zip(&cold_start.scores)
                 .enumerate()
-                .map(|(i, (&weighted, score))| {
+                .map(|(i, (&weighted, &score))| {
                     Ok(PostCandidate {
                         weighted_score: Some(weighted),
                         score: Some(score),
+                        author_policy_zeroed: cold_start.author_policy_zeroed[i],
+                        cold_start_lift_to_rank: cold_start.lift_to_rank(i),
                         slate_context: persisted_contexts.as_ref().map(|contexts| contexts[i]),
                         ..Default::default()
                     })
@@ -639,9 +643,10 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                 .collect();
         }
 
-        let adjusted_scores = self
-            .author_cold_start
-            .apply(query, candidates, &weighted_scores);
+        let cold_start =
+            self.author_cold_start
+                .apply_with_decisions(query, candidates, &weighted_scores);
+        let adjusted_scores = cold_start.scores.clone();
 
         let diversity_adjusted = if enable_author_diversity {
             Self::apply_author_diversity(query, candidates, &adjusted_scores)
@@ -670,6 +675,8 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                 Ok(PostCandidate {
                     weighted_score: Some(weighted),
                     score: Some(score),
+                    author_policy_zeroed: cold_start.author_policy_zeroed[i],
+                    cold_start_lift_to_rank: cold_start.lift_to_rank(i),
                     slate_context: persisted_contexts.as_ref().map(|contexts| contexts[i]),
                     ..Default::default()
                 })
@@ -680,6 +687,8 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
     fn update(&self, candidate: &mut PostCandidate, scored: PostCandidate) {
         candidate.weighted_score = scored.weighted_score;
         candidate.score = scored.score;
+        candidate.author_policy_zeroed = scored.author_policy_zeroed;
+        candidate.cold_start_lift_to_rank = scored.cold_start_lift_to_rank;
         candidate.slate_context = scored.slate_context;
     }
 }
@@ -1156,5 +1165,77 @@ mod tests {
         assert!((reply - original * expected_oon).abs() < 1e-9);
         assert!((retweet - original * expected_oon).abs() < 1e-9);
         assert!((oon - original * expected_oon).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn new_user_applies_new_user_oon_weight() {
+        let scorer = test_scorer();
+        let candidates = vec![candidate(1, Some(true)), candidate(2, Some(false))];
+
+        let mut query = query_with_flags(&[
+            ("rust_home_mixer_new_user_age_threshold_secs", "3600"),
+            ("rust_home_mixer_new_user_oon_weight_factor", "0.5"),
+            ("rust_home_mixer_oon_weight_factor", "0.75"),
+            (
+                "rust_home_mixer_enable_oon_rescore_for_in_network_replies_retweets",
+                "false",
+            ),
+        ]);
+        query.user_id =
+            xai_candidate_pipeline::component_library::utils::current_time_to_id() as u64;
+        query.user_features.followed_user_ids = vec![1, 2, 3, 4, 5];
+
+        let scored = scorer.score(&query, &candidates).await;
+        let inn = scored[0].as_ref().unwrap().score.unwrap();
+        let oon = scored[1].as_ref().unwrap().score.unwrap();
+        assert!((oon - inn * 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn new_user_oon_weight_skipped_when_threshold_zero() {
+        let scorer = test_scorer();
+        let candidates = vec![candidate(1, Some(true)), candidate(2, Some(false))];
+
+        let mut query = query_with_flags(&[
+            ("rust_home_mixer_new_user_age_threshold_secs", "0"),
+            ("rust_home_mixer_new_user_oon_weight_factor", "0.5"),
+            ("rust_home_mixer_oon_weight_factor", "0.75"),
+            (
+                "rust_home_mixer_enable_oon_rescore_for_in_network_replies_retweets",
+                "false",
+            ),
+        ]);
+        query.user_id =
+            xai_candidate_pipeline::component_library::utils::current_time_to_id() as u64;
+        query.user_features.followed_user_ids = vec![1, 2, 3, 4, 5];
+
+        let scored = scorer.score(&query, &candidates).await;
+        let inn = scored[0].as_ref().unwrap().score.unwrap();
+        let oon = scored[1].as_ref().unwrap().score.unwrap();
+        assert!((oon - inn * 0.75).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn new_user_oon_weight_skipped_below_min_following() {
+        let scorer = test_scorer();
+        let candidates = vec![candidate(1, Some(true)), candidate(2, Some(false))];
+
+        let mut query = query_with_flags(&[
+            ("rust_home_mixer_new_user_age_threshold_secs", "3600"),
+            ("rust_home_mixer_new_user_oon_weight_factor", "0.5"),
+            ("rust_home_mixer_oon_weight_factor", "0.75"),
+            (
+                "rust_home_mixer_enable_oon_rescore_for_in_network_replies_retweets",
+                "false",
+            ),
+        ]);
+        query.user_id =
+            xai_candidate_pipeline::component_library::utils::current_time_to_id() as u64;
+        query.user_features.followed_user_ids = vec![1, 2, 3, 4];
+
+        let scored = scorer.score(&query, &candidates).await;
+        let inn = scored[0].as_ref().unwrap().score.unwrap();
+        let oon = scored[1].as_ref().unwrap().score.unwrap();
+        assert!((oon - inn * 0.75).abs() < 1e-9);
     }
 }

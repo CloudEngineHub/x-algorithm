@@ -1,332 +1,449 @@
-use crate::models::{SafetyLabelType, VfAction};
-use crate::rules::rule_spec::{RuleAction, RuleSpec};
-use crate::rules::RuleContext;
+use crate::models::SafetyLabelType;
+use crate::rules::rule_spec::{
+    ActionSpec, Audience, AuthorPredicate, Condition, Predicate, RelationshipPredicate, RuleClause,
+    TweetPredicate, ViewerPredicate,
+};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
+use xai_x_thrift::action::InterstitialReason;
 
 const NSFW_HIGH_PRECISION_REASON: FilteredReason = FilteredReason::SafetyResult(SafetyResult {
     reason: Some(SafetyResultReason::NsfwHighPrecision),
     action: Action::Drop(DropReason {}),
 });
 
-pub(super) const TWEET_LABEL_DROPS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "PdnaTweetLabelRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::PDNA),
-        action: RuleAction::Drop(NSFW_HIGH_PRECISION_REASON),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "BounceTweetLabelRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::BOUNCE),
-        action: RuleAction::Drop(FilteredReason::TweetIsBounced),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "SpamTweetLabelRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::SPAM),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "ForEmergencyUseOnlyDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOR_EMERGENCY_USE_ONLY),
-        action: RuleAction::Drop(FilteredReason::UnspecifiedReason),
-        exempt_author: false,
-    },
-    RuleSpec::Tweet {
-        name: "FosnrHatefulConductDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "FosnrViolentSpeechDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_VIOLENT_SPEECH),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "FosnrAbuseDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_ABUSE),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "FosnrCivicIntegrityDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-];
-
-pub(super) const NSFW_MEDIA_INTERSTITIALS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "NsfwHighPrecisionInterstitialRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_HIGH_PRECISION),
-        action: RuleAction::SensitiveMediaInterstitial(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "GoreAndViolenceInterstitialRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-        action: RuleAction::SensitiveMediaInterstitial(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "NsfwCardImageInterstitialRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_CARD_IMAGE),
-        action: RuleAction::SensitiveMediaInterstitial(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-];
-
-pub(super) const OON_TWEET_FLAG_DROPS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "TweetNsfwUserDropRule",
-        when: |tweet| tweet.has_nsfw_user_flag(),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: false,
-    },
-    RuleSpec::Tweet {
-        name: "TweetNsfwAdminDropRule",
-        when: |tweet| tweet.has_nsfw_admin_flag(),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: false,
-    },
-];
-
-pub(super) const OON_TWEET_LABEL_DROPS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "NsfwHighRecallDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_HIGH_RECALL),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "NsfwHighPrecisionOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_HIGH_PRECISION),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "GoreAndViolenceOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "NsfwCardImageOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_CARD_IMAGE),
-        action: RuleAction::Drop(FilteredReason::ContainNsfwMedia),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "DoNotAmplifyOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::DO_NOT_AMPLIFY),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "MaliciousUrlOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::MALICIOUS_URL),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "SpamHighRecallDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::SPAM_HIGH_RECALL),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "NsfwTextTweetLabelDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::NSFW_TEXT),
-        action: RuleAction::Drop(NSFW_HIGH_PRECISION_REASON),
-        exempt_author: true,
-    },
-    RuleSpec::Tweet {
-        name: "FosnrAbuseInsultsOonDropRule",
-        when: |tweet| tweet.has_safety_label(SafetyLabelType::FOSNR_ABUSE_INSULTS),
-        action: RuleAction::Drop(FilteredReason::PossiblyUndesirable),
-        exempt_author: true,
-    },
-];
-
-fn drop_exclusive_tweet_content(context: &RuleContext<'_>) -> VfAction {
-    if !context.tweet().is_exclusive() {
-        return VfAction::Allow;
-    }
-
-    if context.viewer().is_logged_out() {
-        return VfAction::Drop(FilteredReason::ExclusiveTweet);
-    }
-
-    if context.viewer().is_conversation_author() {
-        return VfAction::Allow;
-    }
-
-    if context.viewer().super_follows_author() {
-        return VfAction::Allow;
-    }
-
-    if !context.tweet().is_retweet() && context.viewer().is_author() {
-        return VfAction::Allow;
-    }
-
-    VfAction::Drop(FilteredReason::ExclusiveTweet)
+const fn label(label: SafetyLabelType) -> Condition {
+    Condition::Holds(Predicate::Tweet(TweetPredicate::HasSafetyLabel(label)))
 }
 
-pub(super) const EXCLUSIVE_TWEET_DROP: &[RuleSpec] = &[RuleSpec::Custom {
-    name: "DropExclusiveTweetContentRule",
-    evaluate: drop_exclusive_tweet_content,
+const HAS_MEDIA: Condition = Condition::Holds(Predicate::Tweet(TweetPredicate::HasMedia));
+const NOT_RETWEET: Condition = Condition::Not(Predicate::Tweet(TweetPredicate::IsRetweet));
+const SENSITIVE_MEDIA_DISABLED: Condition =
+    Condition::Not(Predicate::Viewer(ViewerPredicate::AllowsSensitiveMedia));
+const LOGGED_OUT: Condition = Condition::Holds(Predicate::Viewer(ViewerPredicate::LoggedOut));
+const UNDERAGE: Condition = Condition::Holds(Predicate::Viewer(ViewerPredicate::Underage));
+const NO_STATED_AGE: Condition = Condition::Holds(Predicate::Viewer(ViewerPredicate::NoStatedAge));
+const IN_NSFW_GATING_COUNTRY: Condition =
+    Condition::Holds(Predicate::Viewer(ViewerPredicate::InNsfwGatingCountry));
+const NSFW_MEDIA_LABEL: Condition = Condition::AnyOf(&[
+    Predicate::Tweet(TweetPredicate::HasSafetyLabel(
+        SafetyLabelType::NSFW_HIGH_PRECISION,
+    )),
+    Predicate::Tweet(TweetPredicate::HasSafetyLabel(
+        SafetyLabelType::NSFW_HIGH_RECALL,
+    )),
+    Predicate::Tweet(TweetPredicate::HasSafetyLabel(
+        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+    )),
+]);
+const NSFW_FLAGGED: Condition = Condition::AnyOf(&[
+    Predicate::Author(AuthorPredicate::IsNsfwUser),
+    Predicate::Author(AuthorPredicate::IsNsfwAdmin),
+    Predicate::Tweet(TweetPredicate::NsfwUserFlag),
+    Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
+]);
+const NSFW_TEXT_OR_CARD_LABEL: Condition = Condition::AnyOf(&[
+    Predicate::Tweet(TweetPredicate::HasSafetyLabel(SafetyLabelType::NSFW_TEXT)),
+    Predicate::Tweet(TweetPredicate::HasSafetyLabel(
+        SafetyLabelType::NSFW_CARD_IMAGE,
+    )),
+]);
+const HAS_EXCLUSIVE_CONTENT: Condition =
+    Condition::Holds(Predicate::Tweet(TweetPredicate::HasExclusiveContent));
+const NOT_CONVERSATION_AUTHOR: Condition = Condition::Not(Predicate::Relationship(
+    RelationshipPredicate::ViewerIsConversationAuthor,
+));
+const NOT_SUPER_FOLLOWER: Condition = Condition::Not(Predicate::Relationship(
+    RelationshipPredicate::ViewerSuperFollowsAuthor,
+));
+
+pub(super) const TWEET_LABEL_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "PdnaTweetLabelRule",
+        when: &[label(SafetyLabelType::PDNA)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(NSFW_HIGH_PRECISION_REASON),
+    },
+    RuleClause {
+        rule_name: "BounceTweetLabelRule",
+        when: &[label(SafetyLabelType::BOUNCE)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::TweetIsBounced),
+    },
+    RuleClause {
+        rule_name: "SpamTweetLabelRule",
+        when: &[label(SafetyLabelType::SPAM)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "ForEmergencyUseOnlyDropRule",
+        when: &[label(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
+    },
+    RuleClause {
+        rule_name: "FosnrHatefulConductDropRule",
+        when: &[label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "FosnrViolentSpeechDropRule",
+        when: &[label(SafetyLabelType::FOSNR_VIOLENT_SPEECH)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "FosnrAbuseDropRule",
+        when: &[label(SafetyLabelType::FOSNR_ABUSE)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "FosnrCivicIntegrityDropRule",
+        when: &[label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+];
+
+const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
+
+pub(super) const NSFW_MEDIA_INTERSTITIALS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "NsfwHighPrecisionAdultInterstitialRule",
+        when: &[
+            label(SafetyLabelType::NSFW_HIGH_PRECISION),
+            Condition::Holds(Predicate::Tweet(TweetPredicate::CreatedAfter(
+                NSFW_HIGH_PRECISION_CHANGED_AT,
+            ))),
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Nudity(true),
+        },
+    },
+    RuleClause {
+        rule_name: "NsfwHighPrecisionInterstitialRule",
+        when: &[
+            label(SafetyLabelType::NSFW_HIGH_PRECISION),
+            Condition::Not(Predicate::Tweet(TweetPredicate::CreatedAfter(
+                NSFW_HIGH_PRECISION_CHANGED_AT,
+            ))),
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Sensitive(true),
+        },
+    },
+    RuleClause {
+        rule_name: "GoreAndViolenceInterstitialRule",
+        when: &[
+            label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Violence(true),
+        },
+    },
+    RuleClause {
+        rule_name: "NsfwCardImageInterstitialRule",
+        when: &[
+            label(SafetyLabelType::NSFW_CARD_IMAGE),
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Sensitive(true),
+        },
+    },
+];
+
+pub(super) const OON_TWEET_FLAG_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "TweetNsfwUserDropRule",
+        when: &[Condition::Holds(Predicate::Tweet(
+            TweetPredicate::NsfwUserFlag,
+        ))],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+    RuleClause {
+        rule_name: "TweetNsfwAdminDropRule",
+        when: &[Condition::Holds(Predicate::Tweet(
+            TweetPredicate::NsfwAdminFlag,
+        ))],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+];
+
+pub(super) const OON_TWEET_LABEL_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "NsfwHighRecallDropRule",
+        when: &[label(SafetyLabelType::NSFW_HIGH_RECALL)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+    RuleClause {
+        rule_name: "NsfwHighPrecisionOonDropRule",
+        when: &[label(SafetyLabelType::NSFW_HIGH_PRECISION)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+    RuleClause {
+        rule_name: "GoreAndViolenceOonDropRule",
+        when: &[label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+    RuleClause {
+        rule_name: "NsfwCardImageOonDropRule",
+        when: &[label(SafetyLabelType::NSFW_CARD_IMAGE)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    },
+    RuleClause {
+        rule_name: "DoNotAmplifyOonDropRule",
+        when: &[label(SafetyLabelType::DO_NOT_AMPLIFY)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "MaliciousUrlOonDropRule",
+        when: &[label(SafetyLabelType::MALICIOUS_URL)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "SpamHighRecallDropRule",
+        when: &[label(SafetyLabelType::SPAM_HIGH_RECALL)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+    RuleClause {
+        rule_name: "NsfwTextTweetLabelDropRule",
+        when: &[label(SafetyLabelType::NSFW_TEXT)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(NSFW_HIGH_PRECISION_REASON),
+    },
+    RuleClause {
+        rule_name: "FosnrAbuseInsultsOonDropRule",
+        when: &[label(SafetyLabelType::FOSNR_ABUSE_INSULTS)],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
+    },
+];
+
+pub(super) const EXCLUSIVE_TWEET_DROP: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "DropExclusiveTweetContentRule",
+        when: &[HAS_EXCLUSIVE_CONTENT, LOGGED_OUT],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ExclusiveTweet),
+    },
+    RuleClause {
+        rule_name: "DropExclusiveTweetContentRule",
+        when: &[
+            HAS_EXCLUSIVE_CONTENT,
+            NOT_CONVERSATION_AUTHOR,
+            NOT_SUPER_FOLLOWER,
+            Condition::Holds(Predicate::Tweet(TweetPredicate::IsRetweet)),
+        ],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ExclusiveTweet),
+    },
+    RuleClause {
+        rule_name: "DropExclusiveTweetContentRule",
+        when: &[
+            HAS_EXCLUSIVE_CONTENT,
+            NOT_CONVERSATION_AUTHOR,
+            NOT_SUPER_FOLLOWER,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ExclusiveTweet),
+    },
+];
+
+pub(super) const NSFW_AUTHOR_INTERSTITIAL: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "NsfwAdminInterstitialRule",
+        when: &[
+            Condition::AnyOf(&[
+                Predicate::Author(AuthorPredicate::IsNsfwAdmin),
+                Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
+            ]),
+            HAS_MEDIA,
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Sensitive(true),
+        },
+    },
+    RuleClause {
+        rule_name: "NsfwUserInterstitialRule",
+        when: &[
+            Condition::AnyOf(&[
+                Predicate::Author(AuthorPredicate::IsNsfwUser),
+                Predicate::Tweet(TweetPredicate::NsfwUserFlag),
+            ]),
+            HAS_MEDIA,
+            SENSITIVE_MEDIA_DISABLED,
+        ],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::SensitiveUser(true),
+        },
+    },
+];
+
+const fn sensitive_viewer_drop(rule_name: &'static str, when: &'static [Condition]) -> RuleClause {
+    RuleClause {
+        rule_name,
+        when,
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::ContainNsfwMedia),
+    }
+}
+
+pub(super) const SENSITIVE_VIEWER_DROPS: &[RuleClause] = &[
+    sensitive_viewer_drop(
+        "SensitiveViewerLoggedOutDropRule",
+        &[LOGGED_OUT, HAS_MEDIA, NSFW_MEDIA_LABEL],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerLoggedOutDropRule",
+        &[LOGGED_OUT, HAS_MEDIA, NOT_RETWEET, NSFW_FLAGGED],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerLoggedOutDropRule",
+        &[LOGGED_OUT, NSFW_TEXT_OR_CARD_LABEL],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerUnderageDropRule",
+        &[UNDERAGE, HAS_MEDIA, NSFW_MEDIA_LABEL],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerUnderageDropRule",
+        &[UNDERAGE, HAS_MEDIA, NOT_RETWEET, NSFW_FLAGGED],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerUnderageDropRule",
+        &[UNDERAGE, NSFW_TEXT_OR_CARD_LABEL],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerNoStatedAgeDropRule",
+        &[
+            NO_STATED_AGE,
+            IN_NSFW_GATING_COUNTRY,
+            HAS_MEDIA,
+            NSFW_MEDIA_LABEL,
+        ],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerNoStatedAgeDropRule",
+        &[
+            NO_STATED_AGE,
+            IN_NSFW_GATING_COUNTRY,
+            HAS_MEDIA,
+            NOT_RETWEET,
+            NSFW_FLAGGED,
+        ],
+    ),
+    sensitive_viewer_drop(
+        "SensitiveViewerNoStatedAgeDropRule",
+        &[
+            NO_STATED_AGE,
+            IN_NSFW_GATING_COUNTRY,
+            NSFW_TEXT_OR_CARD_LABEL,
+        ],
+    ),
+];
+
+pub(super) const NULLCAST_DROP: &[RuleClause] = &[RuleClause {
+    rule_name: "NullcastedTweetDropRule",
+    when: &[
+        Condition::Holds(Predicate::Tweet(TweetPredicate::IsNullcast)),
+        NOT_RETWEET,
+        Condition::Not(Predicate::Tweet(TweetPredicate::IsCommunityTweet)),
+    ],
+    applies_to: Audience::Everyone,
+    action: ActionSpec::Drop(FilteredReason::TweetIsNullcast),
 }];
 
-pub(super) const NSFW_AUTHOR_INTERSTITIAL: &[RuleSpec] = &[RuleSpec::Tweet {
-    name: "NsfwAuthorInterstitialRule",
-    when: |tweet| tweet.is_nsfw_flagged() && tweet.has_media(),
-    action: RuleAction::SensitiveMediaInterstitial(FilteredReason::ContainNsfwMedia),
-    exempt_author: true,
+pub(super) const STALE_TWEET_DROP: &[RuleClause] = &[RuleClause {
+    rule_name: "DropStaleTweetsRule",
+    when: &[
+        Condition::Holds(Predicate::Tweet(TweetPredicate::IsSupersededEdit)),
+        NOT_RETWEET,
+    ],
+    applies_to: Audience::Everyone,
+    action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
 }];
 
-fn nsfw_base_condition(context: &RuleContext<'_>) -> bool {
-    let tweet = context.tweet();
-    !context.viewer().is_author()
-        && tweet.has_media()
-        && (tweet.has_safety_label(SafetyLabelType::NSFW_HIGH_PRECISION)
-            || tweet.has_safety_label(SafetyLabelType::NSFW_HIGH_RECALL)
-            || (tweet.is_nsfw_flagged() && !tweet.is_retweet()))
-}
-
-fn graphic_base_condition(context: &RuleContext<'_>) -> bool {
-    let tweet = context.tweet();
-    !context.viewer().is_author()
-        && tweet.has_media()
-        && tweet.has_safety_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)
-}
-
-fn nsfw_no_media_label_condition(context: &RuleContext<'_>) -> bool {
-    let tweet = context.tweet();
-    !context.viewer().is_author()
-        && (tweet.has_safety_label(SafetyLabelType::NSFW_TEXT)
-            || tweet.has_safety_label(SafetyLabelType::NSFW_CARD_IMAGE))
-}
-
-fn sensitive_base_condition(context: &RuleContext<'_>) -> bool {
-    nsfw_base_condition(context)
-        || graphic_base_condition(context)
-        || nsfw_no_media_label_condition(context)
-}
-
-fn sensitive_viewer_logged_out(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().is_logged_out() && sensitive_base_condition(context) {
-        VfAction::Drop(FilteredReason::ContainNsfwMedia)
-    } else {
-        VfAction::Allow
-    }
-}
-
-fn sensitive_viewer_underage(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().is_underage() && sensitive_base_condition(context) {
-        VfAction::Drop(FilteredReason::ContainNsfwMedia)
-    } else {
-        VfAction::Allow
-    }
-}
-
-fn sensitive_viewer_no_stated_age(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().has_no_stated_age()
-        && context
-            .viewer()
-            .country()
-            .is_some_and(|country| context.nsfw_gating_country(country))
-        && sensitive_base_condition(context)
-    {
-        VfAction::Drop(FilteredReason::ContainNsfwMedia)
-    } else {
-        VfAction::Allow
-    }
-}
-
-pub(super) const NULLCAST_DROP: &[RuleSpec] = &[RuleSpec::Tweet {
-    name: "NullcastedTweetDropRule",
-    when: |tweet| tweet.is_nullcast() && !tweet.is_retweet() && !tweet.is_community_tweet(),
-    action: RuleAction::Drop(FilteredReason::TweetIsNullcast),
-    exempt_author: false,
-}];
-
-fn drop_legal_takendown_post(context: &RuleContext<'_>) -> VfAction {
-    if !context.viewer().is_author() && context.takedown().legal_in_viewer_country() {
-        return VfAction::Drop(FilteredReason::UnspecifiedReason);
-    }
-    VfAction::Allow
-}
-
-fn drop_local_laws_takendown_post(context: &RuleContext<'_>) -> VfAction {
-    if !context.viewer().is_author() && context.takedown().local_laws_in_viewer_country() {
-        return VfAction::Drop(FilteredReason::UnspecifiedReason);
-    }
-    VfAction::Allow
-}
-
-fn drop_geo_restricted_media(context: &RuleContext<'_>) -> VfAction {
-    if context.takedown().media_restricted_in_viewer_country() {
-        VfAction::Drop(FilteredReason::UnspecifiedReason)
-    } else {
-        VfAction::Allow
-    }
-}
-
-pub(super) const TES_HOME_DROPS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "DropStaleTweetsRule",
-        when: |tweet| tweet.is_stale() && !tweet.is_retweet(),
-        action: RuleAction::Drop(FilteredReason::UnspecifiedReason),
-        exempt_author: false,
+pub(super) const TAKEDOWN_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "DropLegalTakendownPostRule",
+        when: &[Condition::Opaque {
+            id: "legal_takedown_in_viewer_country",
+            doc: "a LegalRequest (any code but xy) or UnspecifiedReason takedown names \
+                  the viewer's request country or a worldwide code (xx/xy); Dmca counts as xy",
+            eval: |context| context.takedown().legal_in_viewer_country(),
+        }],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
     },
-    RuleSpec::Custom {
-        name: "DropLegalTakendownPostRule",
-        evaluate: drop_legal_takendown_post,
-    },
-    RuleSpec::Custom {
-        name: "DropLocalLawsTakendownPostRule",
-        evaluate: drop_local_laws_takendown_post,
+    RuleClause {
+        rule_name: "DropLocalLawsTakendownPostRule",
+        when: &[Condition::Opaque {
+            id: "local_laws_takedown_in_viewer_country",
+            doc: "a BystanderReport takedown names the viewer's request country; \
+                  worldwide codes (xx/xy) do not count",
+            eval: |context| context.takedown().local_laws_in_viewer_country(),
+        }],
+        applies_to: Audience::ExceptAuthor,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
     },
 ];
 
-pub(super) const FILTER_ALL: &[RuleSpec] = &[RuleSpec::Tweet {
-    name: "FilterAllRule",
-    when: |_| true,
-    action: RuleAction::Drop(FilteredReason::UnspecifiedReason),
-    exempt_author: false,
+pub(super) const FILTER_ALL: &[RuleClause] = &[RuleClause {
+    rule_name: "FilterAllRule",
+    when: &[],
+    applies_to: Audience::Everyone,
+    action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
 }];
 
-pub(super) const RECS_MEDIA_DROPS: &[RuleSpec] = &[
-    RuleSpec::Tweet {
-        name: "DropTweetsWithDmcaMediaRule",
-        when: |tweet| tweet.has_dmca_media(),
-        action: RuleAction::Drop(FilteredReason::UnspecifiedReason),
-        exempt_author: false,
+pub(super) const RECS_MEDIA_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "DropTweetsWithDmcaMediaRule",
+        when: &[Condition::Holds(Predicate::Tweet(
+            TweetPredicate::HasDmcaMedia,
+        ))],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
     },
-    RuleSpec::Custom {
-        name: "DropTweetsWithGeoRestrictedMediaRule",
-        evaluate: drop_geo_restricted_media,
-    },
-];
-
-pub(super) const SENSITIVE_VIEWER_DROPS: &[RuleSpec] = &[
-    RuleSpec::Custom {
-        name: "SensitiveViewerLoggedOutDropRule",
-        evaluate: sensitive_viewer_logged_out,
-    },
-    RuleSpec::Custom {
-        name: "SensitiveViewerUnderageDropRule",
-        evaluate: sensitive_viewer_underage,
-    },
-    RuleSpec::Custom {
-        name: "SensitiveViewerNoStatedAgeDropRule",
-        evaluate: sensitive_viewer_no_stated_age,
+    RuleClause {
+        rule_name: "DropTweetsWithGeoRestrictedMediaRule",
+        when: &[Condition::Opaque {
+            id: "media_geo_restricted_in_viewer_country",
+            doc: "the media geo allow-list is non-empty and omits the viewer's \
+                  request country (xx when absent), or the deny-list names it",
+            eval: |context| context.takedown().media_restricted_in_viewer_country(),
+        }],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
     },
 ];
 
@@ -334,13 +451,14 @@ pub(super) const SENSITIVE_VIEWER_DROPS: &[RuleSpec] = &[
 mod tests {
     use super::*;
     use crate::models::{
-        AuthorFeatures, ExclusiveContentFeatures, HydratedTweetCandidate, MediaFeature,
-        NsfwFeature, TweetFeatures, VfAction, Viewer, ViewerAge, ViewerFeatures,
+        AuthorFeatures, Decided, ExclusiveContentFeatures, HydratedTweetCandidate, MediaFeature,
+        MediaInterstitial, NsfwFeature, TweetFeatures, Verdict, Viewer, ViewerAge, ViewerFeatures,
     };
     use crate::rules::fixtures::{
-        assert_allows, assert_drops, author_viewer, candidate, logged_out_viewer,
-        nsfw_flag_media_candidates, sensitive_opt_in_viewer, viewer, VIEWER_ID,
+        assert_allows, assert_clauses_allow, assert_clauses_drop, assert_drops, author_viewer,
+        candidate, logged_out_viewer, sensitive_opt_in_viewer, viewer, VIEWER_ID,
     };
+    use crate::rules::registry::Policy;
     use crate::rules::test_context;
     use xai_core_entities::entities::{EditControl, EditControlInitial, TakedownReason};
 
@@ -363,9 +481,6 @@ mod tests {
             "SpamHighRecallDropRule" => SafetyLabelType::SPAM_HIGH_RECALL,
             "NsfwTextTweetLabelDropRule" => SafetyLabelType::NSFW_TEXT,
             "FosnrAbuseInsultsOonDropRule" => SafetyLabelType::FOSNR_ABUSE_INSULTS,
-            "NsfwHighPrecisionInterstitialRule" => SafetyLabelType::NSFW_HIGH_PRECISION,
-            "GoreAndViolenceInterstitialRule" => SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
-            "NsfwCardImageInterstitialRule" => SafetyLabelType::NSFW_CARD_IMAGE,
             _ => panic!("no trigger label for rule {name}"),
         }
     }
@@ -375,14 +490,14 @@ mod tests {
     #[test]
     fn tweet_label_drop_axis() {
         for spec in TWEET_LABEL_DROPS.iter().chain(OON_TWEET_LABEL_DROPS) {
-            let RuleSpec::Tweet {
-                name,
-                action: RuleAction::Drop(reason),
-                exempt_author,
+            let RuleClause {
+                rule_name: name,
+                action: ActionSpec::Drop(reason),
+                applies_to,
                 ..
             } = spec
             else {
-                panic!("{} is not a tweet-label drop row", spec.name());
+                panic!("{} is not a tweet-label drop row", spec.rule_name);
             };
             let firing = candidate().with_label(trigger_label(name)).build();
             for v in [
@@ -401,40 +516,83 @@ mod tests {
             let unrelated = candidate().with_label(UNRELATED_LABEL).build();
             assert_allows(spec, &viewer(VIEWER_ID), &unrelated);
 
-            if *exempt_author {
-                assert_allows(spec, &author_viewer(), &firing);
-            } else {
+            if *applies_to == Audience::Everyone {
                 assert_drops(spec, &author_viewer(), &firing, reason);
+            } else {
+                assert_allows(spec, &author_viewer(), &firing);
             }
         }
     }
 
     #[test]
     fn nsfw_media_interstitial_axis() {
-        for spec in NSFW_MEDIA_INTERSTITIALS {
-            let RuleSpec::Tweet {
-                name,
-                action: RuleAction::SensitiveMediaInterstitial(reason),
-                exempt_author: true,
-                ..
-            } = spec
-            else {
-                panic!(
-                    "{} is not an author-exempt sensitive-media interstitial row",
-                    spec.name()
-                );
-            };
-            let firing = candidate().with_label(trigger_label(name)).build();
-            let action = spec.evaluate(&test_context(&viewer(VIEWER_ID), &firing));
-            assert!(
-                matches!(&action, VfAction::Interstitial(r) if r == reason),
-                "{name} should interstitial, got {action:?}"
+        static POLICY: Policy = Policy::new(&[NSFW_MEDIA_INTERSTITIALS]);
+        const AT_CUTOFF: u64 = (1705536000000 - 1288834974657) << 22;
+        for (label, tweet_id, reason, by) in [
+            (
+                SafetyLabelType::NSFW_HIGH_PRECISION,
+                AT_CUTOFF - 1,
+                InterstitialReason::Sensitive(true),
+                "NsfwHighPrecisionInterstitialRule",
+            ),
+            (
+                SafetyLabelType::NSFW_HIGH_PRECISION,
+                AT_CUTOFF,
+                InterstitialReason::Sensitive(true),
+                "NsfwHighPrecisionInterstitialRule",
+            ),
+            (
+                SafetyLabelType::NSFW_HIGH_PRECISION,
+                AT_CUTOFF + (1 << 22),
+                InterstitialReason::Nudity(true),
+                "NsfwHighPrecisionAdultInterstitialRule",
+            ),
+            (
+                SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+                1,
+                InterstitialReason::Violence(true),
+                "GoreAndViolenceInterstitialRule",
+            ),
+            (
+                SafetyLabelType::NSFW_CARD_IMAGE,
+                1,
+                InterstitialReason::Sensitive(true),
+                "NsfwCardImageInterstitialRule",
+            ),
+        ] {
+            let firing = candidate().tweet_id(tweet_id).with_label(label).build();
+            let verdict = POLICY.evaluate(&test_context(&viewer(VIEWER_ID), &firing));
+            assert_eq!(
+                verdict,
+                Verdict::Shown {
+                    media: Some(Decided {
+                        value: MediaInterstitial {
+                            legacy: FilteredReason::ContainNsfwMedia,
+                            reason
+                        },
+                        by,
+                    }),
+                    engagement: None,
+                }
             );
-            assert_allows(spec, &sensitive_opt_in_viewer(), &firing);
-            assert_allows(spec, &author_viewer(), &firing);
-            let unrelated = candidate().with_label(UNRELATED_LABEL).build();
-            assert_allows(spec, &viewer(VIEWER_ID), &unrelated);
+            for viewer in [sensitive_opt_in_viewer(), author_viewer()] {
+                assert_eq!(
+                    POLICY.evaluate(&test_context(&viewer, &firing)),
+                    Verdict::Shown {
+                        media: None,
+                        engagement: None
+                    }
+                );
+            }
         }
+        let unrelated = candidate().with_label(UNRELATED_LABEL).build();
+        assert_eq!(
+            POLICY.evaluate(&test_context(&viewer(VIEWER_ID), &unrelated)),
+            Verdict::Shown {
+                media: None,
+                engagement: None
+            }
+        );
     }
 
     fn tweet_flag_features(name: &str) -> NsfwFeature {
@@ -454,14 +612,14 @@ mod tests {
     #[test]
     fn tweet_flag_drop_axis() {
         for spec in OON_TWEET_FLAG_DROPS {
-            let RuleSpec::Tweet {
-                name,
-                action: RuleAction::Drop(reason),
-                exempt_author,
+            let RuleClause {
+                rule_name: name,
+                action: ActionSpec::Drop(reason),
+                applies_to,
                 ..
             } = spec
             else {
-                panic!("{} is not a tweet-flag drop row", spec.name());
+                panic!("{} is not a tweet-flag drop row", spec.rule_name);
             };
             let nsfw = tweet_flag_features(name);
             let firing = candidate()
@@ -473,10 +631,10 @@ mod tests {
             assert_drops(spec, &viewer(VIEWER_ID), &firing, reason);
             let unflagged = candidate().build();
             assert_allows(spec, &viewer(VIEWER_ID), &unflagged);
-            if *exempt_author {
-                assert_allows(spec, &author_viewer(), &firing);
-            } else {
+            if *applies_to == Audience::Everyone {
                 assert_drops(spec, &author_viewer(), &firing, reason);
+            } else {
+                assert_allows(spec, &author_viewer(), &firing);
             }
         }
     }
@@ -496,49 +654,89 @@ mod tests {
 
     #[test]
     fn nsfw_author_interstitial_axis() {
-        let spec = &NSFW_AUTHOR_INTERSTITIAL[0];
-        let RuleSpec::Tweet {
-            name: "NsfwAuthorInterstitialRule",
-            action: RuleAction::SensitiveMediaInterstitial(reason),
-            exempt_author: true,
-            ..
-        } = spec
-        else {
-            panic!("{} is not the NSFW-author interstitial row", spec.name());
-        };
-        for firing in nsfw_flag_media_candidates() {
-            let action = spec.evaluate(&test_context(&viewer(VIEWER_ID), &firing));
-            assert!(
-                matches!(&action, VfAction::Interstitial(r) if r == reason),
-                "{} should interstitial, got {action:?}",
-                spec.name()
-            );
-            assert_allows(spec, &sensitive_opt_in_viewer(), &firing);
-            assert_allows(spec, &author_viewer(), &firing);
+        static POLICY: Policy = Policy::new(&[NSFW_AUTHOR_INTERSTITIAL]);
+        for flags in 0..16 {
+            let author_admin = flags & 1 != 0;
+            let tweet_admin = flags & 2 != 0;
+            let author_user = flags & 4 != 0;
+            let tweet_user = flags & 8 != 0;
+            for has_media in [false, true] {
+                let candidate = candidate()
+                    .with_author_features(AuthorFeatures {
+                        is_nsfw_admin: author_admin,
+                        is_nsfw_user: author_user,
+                        ..Default::default()
+                    })
+                    .with_tweet_features(TweetFeatures {
+                        nsfw: NsfwFeature {
+                            admin: tweet_admin,
+                            user: tweet_user,
+                        },
+                        media: MediaFeature {
+                            has_media,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .build();
+                for viewer in [
+                    viewer(VIEWER_ID),
+                    sensitive_opt_in_viewer(),
+                    author_viewer(),
+                ] {
+                    let restriction = if !has_media
+                        || viewer.allows_sensitive_media
+                        || candidate.is_author_viewer(viewer.viewer)
+                    {
+                        None
+                    } else if author_admin || tweet_admin {
+                        Some((
+                            InterstitialReason::Sensitive(true),
+                            "NsfwAdminInterstitialRule",
+                        ))
+                    } else if author_user || tweet_user {
+                        Some((
+                            InterstitialReason::SensitiveUser(true),
+                            "NsfwUserInterstitialRule",
+                        ))
+                    } else {
+                        None
+                    };
+                    let expected = Verdict::Shown {
+                        media: restriction.map(|(reason, by)| Decided {
+                            value: MediaInterstitial {
+                                legacy: FilteredReason::ContainNsfwMedia,
+                                reason,
+                            },
+                            by,
+                        }),
+                        engagement: None,
+                    };
+                    assert_eq!(
+                        POLICY.evaluate(&test_context(&viewer, &candidate)),
+                        expected,
+                        "flags={flags}, media={has_media}, viewer={viewer:?}"
+                    );
+                }
+            }
         }
-        let [mut no_media, ..] = nsfw_flag_media_candidates();
-        no_media.tweet_features.media.has_media = false;
-        assert_allows(spec, &viewer(VIEWER_ID), &no_media);
-        let [_, mut no_flags, ..] = nsfw_flag_media_candidates();
-        no_flags.tweet_features.nsfw = NsfwFeature::default();
-        assert_allows(spec, &viewer(VIEWER_ID), &no_flags);
     }
 
     #[test]
     fn exclusive_content_axis() {
-        let spec = &EXCLUSIVE_TWEET_DROP[0];
-        assert_allows(spec, &viewer(VIEWER_ID), &candidate().build());
+        let clauses = EXCLUSIVE_TWEET_DROP;
+        assert_clauses_allow(clauses, &viewer(VIEWER_ID), &candidate().build());
 
         let exclusive = exclusive_candidate(1, 100, 100);
-        assert_drops(
-            spec,
+        assert_clauses_drop(
+            clauses,
             &logged_out_viewer(),
             &exclusive,
             &FilteredReason::ExclusiveTweet,
         );
-        assert_allows(spec, &author_viewer(), &exclusive);
-        assert_drops(
-            spec,
+        assert_clauses_allow(clauses, &author_viewer(), &exclusive);
+        assert_clauses_drop(
+            clauses,
             &viewer(200),
             &exclusive,
             &FilteredReason::ExclusiveTweet,
@@ -550,15 +748,15 @@ mod tests {
             .as_mut()
             .unwrap()
             .viewer_super_follows_author = true;
-        assert_allows(spec, &viewer(200), &super_follow);
+        assert_clauses_allow(clauses, &viewer(200), &super_follow);
 
         let reply = exclusive_candidate(2, 200, 100);
-        assert_allows(spec, &viewer(200), &reply);
+        assert_clauses_allow(clauses, &viewer(200), &reply);
 
         let mut retweet = exclusive_candidate(2, 200, 100);
         retweet.tweet_features.core.source_tweet_id = Some(99);
-        assert_drops(
-            spec,
+        assert_clauses_drop(
+            clauses,
             &viewer(200),
             &retweet,
             &FilteredReason::ExclusiveTweet,
@@ -603,11 +801,17 @@ mod tests {
         c
     }
 
-    fn sensitive_spec(name: &str) -> &'static RuleSpec {
-        SENSITIVE_VIEWER_DROPS
+    fn sensitive_clauses(name: &str) -> &'static [RuleClause] {
+        let clauses = SENSITIVE_VIEWER_DROPS;
+        let start = clauses
             .iter()
-            .find(|spec| spec.name() == name)
-            .unwrap_or_else(|| panic!("no sensitive-viewer row {name}"))
+            .position(|clause| clause.rule_name == name)
+            .unwrap_or_else(|| panic!("no clause named {name}"));
+        let len = clauses[start..]
+            .iter()
+            .take_while(|clause| clause.rule_name == name)
+            .count();
+        &clauses[start..start + len]
     }
 
     fn sensitive_firing_candidates() -> Vec<HydratedTweetCandidate> {
@@ -639,23 +843,23 @@ mod tests {
 
     #[test]
     fn sensitive_viewer_content_axis() {
-        let underage = sensitive_spec("SensitiveViewerUnderageDropRule");
-        let logged_out = sensitive_spec("SensitiveViewerLoggedOutDropRule");
-        let no_age = sensitive_spec("SensitiveViewerNoStatedAgeDropRule");
+        let underage = sensitive_clauses("SensitiveViewerUnderageDropRule");
+        let logged_out = sensitive_clauses("SensitiveViewerLoggedOutDropRule");
+        let no_age = sensitive_clauses("SensitiveViewerNoStatedAgeDropRule");
         let reason = FilteredReason::ContainNsfwMedia;
         let logged_out_viewer = ViewerFeatures {
             viewer: Viewer::LoggedOut,
             ..gating_viewer(ViewerAge::Unknown)
         };
         for firing in sensitive_firing_candidates() {
-            assert_drops(
+            assert_clauses_drop(
                 underage,
                 &gating_viewer(ViewerAge::Known(15)),
                 &firing,
                 &reason,
             );
-            assert_drops(logged_out, &logged_out_viewer, &firing, &reason);
-            assert_drops(
+            assert_clauses_drop(logged_out, &logged_out_viewer, &firing, &reason);
+            assert_clauses_drop(
                 no_age,
                 &gating_viewer(ViewerAge::NotStated),
                 &firing,
@@ -666,71 +870,72 @@ mod tests {
 
     #[test]
     fn sensitive_viewer_exemption_axis() {
-        let underage = sensitive_spec("SensitiveViewerUnderageDropRule");
-        let logged_out = sensitive_spec("SensitiveViewerLoggedOutDropRule");
-        let no_age = sensitive_spec("SensitiveViewerNoStatedAgeDropRule");
+        let underage = sensitive_clauses("SensitiveViewerUnderageDropRule");
+        let logged_out = sensitive_clauses("SensitiveViewerLoggedOutDropRule");
+        let no_age = sensitive_clauses("SensitiveViewerNoStatedAgeDropRule");
         let hp = media_label(SafetyLabelType::NSFW_HIGH_PRECISION);
         let text = no_media_label(SafetyLabelType::NSFW_TEXT);
         let reason = FilteredReason::ContainNsfwMedia;
 
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(18)), &hp);
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(18)), &text);
-        assert_allows(underage, &gating_viewer(ViewerAge::Unknown), &hp);
-        assert_allows(no_age, &gating_viewer(ViewerAge::Unknown), &hp);
-        assert_allows(underage, &gating_viewer(ViewerAge::Unknown), &text);
-        assert_allows(no_age, &gating_viewer(ViewerAge::Unknown), &text);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(18)), &hp);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(18)), &text);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Unknown), &hp);
+        assert_clauses_allow(no_age, &gating_viewer(ViewerAge::Unknown), &hp);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Unknown), &text);
+        assert_clauses_allow(no_age, &gating_viewer(ViewerAge::Unknown), &text);
 
         let opted_in = ViewerFeatures {
             allows_sensitive_media: true,
             ..gating_viewer(ViewerAge::Known(15))
         };
-        assert_drops(underage, &opted_in, &hp, &reason);
+        assert_clauses_drop(underage, &opted_in, &hp, &reason);
 
         let mut self_hp = hp.clone();
         self_hp.author_id = VIEWER_ID;
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &self_hp);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &self_hp);
         let mut self_text = text.clone();
         self_text.author_id = VIEWER_ID;
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &self_text);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &self_text);
 
         let mut hp_no_media = hp.clone();
         hp_no_media.tweet_features.media.has_media = false;
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &hp_no_media);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &hp_no_media);
         let logged_out_viewer = ViewerFeatures {
             viewer: Viewer::LoggedOut,
             ..gating_viewer(ViewerAge::Unknown)
         };
-        assert_allows(logged_out, &logged_out_viewer, &hp_no_media);
-        assert_allows(logged_out, &gating_viewer(ViewerAge::Known(15)), &hp);
+        assert_clauses_allow(logged_out, &logged_out_viewer, &hp_no_media);
+        assert_clauses_allow(logged_out, &gating_viewer(ViewerAge::Known(15)), &hp);
 
         let mut no_flags = nsfw_tweet_flag_media();
         no_flags.tweet_features.nsfw = NsfwFeature::default();
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &no_flags);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &no_flags);
 
         let mut flag_rt = nsfw_tweet_flag_media();
         flag_rt.tweet_features.core.source_tweet_id = Some(42);
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &flag_rt);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &flag_rt);
         let mut flag_self = nsfw_tweet_flag_media();
         flag_self.author_id = VIEWER_ID;
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &flag_self);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &flag_self);
 
         let mut author_rt = nsfw_author_media();
         author_rt.tweet_features.core.source_tweet_id = Some(42);
-        assert_allows(underage, &gating_viewer(ViewerAge::Known(15)), &author_rt);
+        assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &author_rt);
         let mut author_no_media = nsfw_author_media();
         author_no_media.tweet_features.media.has_media = false;
-        assert_allows(
+        assert_clauses_allow(
             underage,
             &gating_viewer(ViewerAge::Known(15)),
             &author_no_media,
         );
     }
 
-    fn tes_spec(name: &str) -> &'static RuleSpec {
-        TES_HOME_DROPS
+    fn tes_spec(name: &str) -> &'static RuleClause {
+        STALE_TWEET_DROP
             .iter()
+            .chain(TAKEDOWN_DROPS)
             .chain(RECS_MEDIA_DROPS)
-            .find(|spec| spec.name() == name)
+            .find(|spec| spec.rule_name == name)
             .unwrap_or_else(|| panic!("no TES row {name}"))
     }
 
@@ -773,14 +978,14 @@ mod tests {
     #[test]
     fn filter_all_axis() {
         let spec = &FILTER_ALL[0];
-        let RuleSpec::Tweet {
-            name: "FilterAllRule",
-            action: RuleAction::Drop(reason),
-            exempt_author: false,
-            ..
+        let RuleClause {
+            rule_name: "FilterAllRule",
+            when: [],
+            action: ActionSpec::Drop(reason),
+            applies_to: Audience::Everyone,
         } = spec
         else {
-            panic!("{} is not the FilterAll row", spec.name());
+            panic!("{} is not the FilterAll row", spec.rule_name);
         };
         let pristine = candidate().build();
         assert_drops(spec, &viewer(VIEWER_ID), &pristine, reason);
@@ -985,14 +1190,14 @@ mod tests {
     #[test]
     fn nullcast_drop_axis() {
         let spec = &NULLCAST_DROP[0];
-        let RuleSpec::Tweet {
-            name: "NullcastedTweetDropRule",
-            action: RuleAction::Drop(reason),
-            exempt_author: false,
+        let RuleClause {
+            rule_name: "NullcastedTweetDropRule",
+            action: ActionSpec::Drop(reason),
+            applies_to: Audience::Everyone,
             ..
         } = spec
         else {
-            panic!("{} is not the nullcast drop row", spec.name());
+            panic!("{} is not the nullcast drop row", spec.rule_name);
         };
         let firing = candidate()
             .with_tweet_features(TweetFeatures {
@@ -1015,7 +1220,7 @@ mod tests {
 
     #[test]
     fn no_stated_age_jurisdiction_axis() {
-        let no_age = sensitive_spec("SensitiveViewerNoStatedAgeDropRule");
+        let no_age = sensitive_clauses("SensitiveViewerNoStatedAgeDropRule");
         let hp = media_label(SafetyLabelType::NSFW_HIGH_PRECISION);
         let text = no_media_label(SafetyLabelType::NSFW_TEXT);
         let reason = FilteredReason::ContainNsfwMedia;
@@ -1024,38 +1229,38 @@ mod tests {
             country_code: Some("us".into()),
             ..gating_viewer(ViewerAge::NotStated)
         };
-        assert_allows(no_age, &us, &hp);
-        assert_allows(no_age, &us, &text);
+        assert_clauses_allow(no_age, &us, &hp);
+        assert_clauses_allow(no_age, &us, &text);
 
         let missing = ViewerFeatures {
             country_code: None,
             ..gating_viewer(ViewerAge::NotStated)
         };
-        assert_allows(no_age, &missing, &hp);
+        assert_clauses_allow(no_age, &missing, &hp);
 
         let account_overrides = ViewerFeatures {
             country_code: Some("de".into()),
             account_country_code: Some("us".into()),
             ..gating_viewer(ViewerAge::NotStated)
         };
-        assert_allows(no_age, &account_overrides, &hp);
+        assert_clauses_allow(no_age, &account_overrides, &hp);
 
         let gating_account = ViewerFeatures {
             country_code: Some("us".into()),
             account_country_code: Some("kr".into()),
             ..gating_viewer(ViewerAge::NotStated)
         };
-        assert_drops(no_age, &gating_account, &hp, &reason);
+        assert_clauses_drop(no_age, &gating_account, &hp, &reason);
 
         let request_fallback = ViewerFeatures {
             country_code: Some("de".into()),
             account_country_code: None,
             ..gating_viewer(ViewerAge::NotStated)
         };
-        assert_drops(no_age, &request_fallback, &hp, &reason);
+        assert_clauses_drop(no_age, &request_fallback, &hp, &reason);
     }
 
-    fn all_rule_slices() -> [&'static [RuleSpec]; 15] {
+    fn all_rule_slices() -> [&'static [RuleClause]; 16] {
         use crate::rules::author_rules::{
             AUTHOR_STATE_DROPS, OON_NSFW_AUTHOR_DROPS, OON_USER_LABEL_DROPS, SOCIALGRAPH_DROPS,
         };
@@ -1071,7 +1276,8 @@ mod tests {
             EXCLUSIVE_TWEET_DROP,
             NSFW_AUTHOR_INTERSTITIAL,
             NULLCAST_DROP,
-            TES_HOME_DROPS,
+            STALE_TWEET_DROP,
+            TAKEDOWN_DROPS,
             FILTER_ALL,
             RECS_MEDIA_DROPS,
             SENSITIVE_VIEWER_DROPS,
@@ -1079,12 +1285,30 @@ mod tests {
     }
 
     #[test]
-    fn wired_rule_names_are_unique_and_nonempty() {
+    fn wired_rule_names_are_unique_runs_and_nonempty() {
         let mut seen = std::collections::BTreeSet::new();
+        let mut previous = None;
         for spec in all_rule_slices().into_iter().flatten() {
-            let name = spec.name();
+            let name = spec.rule_name;
             assert!(!name.is_empty(), "rule name must be non-empty");
-            assert!(seen.insert(name), "duplicate wired rule name {name}");
+            if previous != Some(name) {
+                assert!(seen.insert(name), "rule name {name} starts a second run");
+            }
+            previous = Some(name);
         }
+        for name in [
+            "NsfwHighPrecisionAdultInterstitialRule",
+            "NsfwHighPrecisionInterstitialRule",
+            "GoreAndViolenceInterstitialRule",
+            "NsfwCardImageInterstitialRule",
+            "NsfwAdminInterstitialRule",
+            "NsfwUserInterstitialRule",
+        ] {
+            assert!(
+                seen.contains(name),
+                "missing media interstitial clause {name}"
+            );
+        }
+        assert_eq!(seen.len(), 57);
     }
 }

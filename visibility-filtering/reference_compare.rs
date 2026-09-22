@@ -1,5 +1,6 @@
-use crate::models::VfAction;
-use crate::rules::{SafetyLevel, Verdict};
+use crate::models::{Decided, MediaInterstitial, Verdict, Withholding};
+use crate::rules::SafetyLevel;
+use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,12 +36,35 @@ pub(crate) fn should_build_harness(
     }
 }
 
-fn service_pair(action: &VfAction) -> (&'static str, Option<&FilteredReason>) {
-    match action {
-        VfAction::Allow => ("allow", None),
-        VfAction::Drop(reason) => ("drop", Some(reason)),
-        VfAction::Interstitial(reason) => ("interstitial", Some(reason)),
-    }
+fn service_triple(
+    verdict: &Verdict,
+) -> (&'static str, Option<&FilteredReason>, Option<&'static str>) {
+    let reason = match verdict {
+        Verdict::Withheld(Decided {
+            value: Withholding::Drop(reason),
+            ..
+        })
+        | Verdict::Shown {
+            media:
+                Some(Decided {
+                    value: MediaInterstitial { legacy: reason, .. },
+                    ..
+                }),
+            engagement: None | Some(_),
+        } => Some(reason),
+        Verdict::Withheld(Decided {
+            value: Withholding::Tombstone(_),
+            ..
+        })
+        | Verdict::Shown {
+            media: None,
+            engagement: None | Some(_),
+        } => None,
+    };
+    let rule = treatment::decided_rows(verdict)
+        .next()
+        .map(|(rule, _)| rule);
+    (treatment::metric_label(verdict), reason, rule)
 }
 
 fn reference_action_label(reason: &Option<FilteredReason>) -> &'static str {
@@ -73,13 +97,13 @@ fn reason_token(reason: &FilteredReason) -> String {
 }
 
 fn service_verdict_str(verdict: &Verdict) -> String {
-    let (action, reason) = service_pair(&verdict.action);
+    let (action, reason, rule) = service_triple(verdict);
     let mut out = action.to_string();
     if let Some(reason) = reason {
         out.push(':');
         out.push_str(&reason_token(reason));
     }
-    if let Some(rule) = verdict.decided_by {
+    if let Some(rule) = rule {
         out.push('@');
         out.push_str(rule);
     }
@@ -97,8 +121,8 @@ fn reference_verdict_str(reference: &Option<FilteredReason>) -> String {
     }
 }
 
-pub(crate) fn is_exact_match(service: &VfAction, reference: &Option<FilteredReason>) -> bool {
-    let (service_action, service_reason) = service_pair(service);
+pub(crate) fn is_exact_match(service: &Verdict, reference: &Option<FilteredReason>) -> bool {
+    let (service_action, service_reason, _) = service_triple(service);
     service_action == reference_action_label(reference) && service_reason == reference.as_ref()
 }
 
@@ -156,7 +180,7 @@ pub(crate) fn compare_batch(
             Some(Ok(reason)) => reason,
         };
         counts.compared += 1;
-        if is_exact_match(&verdict.action, reference) {
+        if is_exact_match(verdict, reference) {
             counts.exact_match += 1;
         } else {
             counts.differed += 1;
@@ -286,7 +310,9 @@ pub(crate) fn comparable_request(
         SafetyLevel::TimelineHomeRecommendations => {
             ReferenceSafetyLevel::TimelineHomeRecommendations
         }
-        SafetyLevel::FilterAll => return Err("level_unmapped"),
+        SafetyLevel::FilterAll | SafetyLevel::TimelineHomeHydration => {
+            return Err("level_unmapped");
+        }
     };
     match viewer_id {
         Some(viewer_id) => Ok((level, viewer_id)),
@@ -439,6 +465,7 @@ mod tests {
     };
     use xai_visibility_filtering::tweet_safety_label::SafetyLabelFailure;
     use xai_visibility_filtering::vf_client::TweetVisibility;
+    use xai_x_thrift::action::InterstitialReason;
 
     fn reference_allow() -> Option<FilteredReason> {
         None
@@ -463,16 +490,35 @@ mod tests {
         ))
     }
 
-    fn service_allow() -> VfAction {
-        VfAction::Allow
+    fn service_allow() -> Verdict {
+        Verdict::Shown {
+            media: None,
+            engagement: None,
+        }
     }
 
-    fn service_drop() -> VfAction {
-        VfAction::Drop(FilteredReason::AuthorIsSuspended)
+    fn service_drop_of(reason: FilteredReason) -> Verdict {
+        Verdict::Withheld(Decided {
+            value: Withholding::Drop(reason),
+            by: "DropSuspendedAuthorRule",
+        })
     }
 
-    fn service_interstitial() -> VfAction {
-        VfAction::Interstitial(FilteredReason::ContainNsfwMedia)
+    fn service_drop() -> Verdict {
+        service_drop_of(FilteredReason::AuthorIsSuspended)
+    }
+
+    fn service_interstitial() -> Verdict {
+        Verdict::Shown {
+            media: Some(Decided {
+                value: MediaInterstitial {
+                    legacy: FilteredReason::ContainNsfwMedia,
+                    reason: InterstitialReason::Sensitive(true),
+                },
+                by: "nsfw_media",
+            }),
+            engagement: None,
+        }
     }
 
     #[test]
@@ -480,7 +526,7 @@ mod tests {
         assert!(is_exact_match(&service_allow(), &reference_allow()));
         assert!(is_exact_match(&service_drop(), &reference_bare_drop()));
         assert!(!is_exact_match(
-            &VfAction::Drop(FilteredReason::AuthorIsUnsafe),
+            &service_drop_of(FilteredReason::AuthorIsUnsafe),
             &reference_bare_drop()
         ));
         assert!(!is_exact_match(&service_interstitial(), &reference_allow()));
@@ -514,6 +560,10 @@ mod tests {
             Err("level_unmapped")
         );
         assert_eq!(
+            comparable_request(SafetyLevel::TimelineHomeHydration, Some(7)),
+            Err("level_unmapped")
+        );
+        assert_eq!(
             comparable_request(SafetyLevel::TimelineHome, None),
             Err("logged_out_viewer")
         );
@@ -529,11 +579,8 @@ mod tests {
         assert!(should_build_harness(true, Some("prod")).is_err());
     }
 
-    fn verdict(tweet_id: u64, action: VfAction, decided_by: Option<&'static str>) -> TweetVerdict {
-        TweetVerdict {
-            tweet_id,
-            verdict: Verdict { action, decided_by },
-        }
+    fn verdict(tweet_id: u64, verdict: Verdict) -> TweetVerdict {
+        TweetVerdict { tweet_id, verdict }
     }
 
     fn context() -> CompareContext<'static> {
@@ -548,11 +595,11 @@ mod tests {
     #[test]
     fn compare_batch_counts_policy_free_and_collects_differing_pairs_only() {
         let verdicts = vec![
-            verdict(1, service_allow(), None),
-            verdict(2, service_drop(), Some("DropSuspendedAuthorRule")),
-            verdict(3, service_allow(), None),
-            verdict(4, service_allow(), None),
-            verdict(5, service_allow(), None),
+            verdict(1, service_allow()),
+            verdict(2, service_drop()),
+            verdict(3, service_allow()),
+            verdict(4, service_allow()),
+            verdict(5, service_allow()),
         ];
         let reference_results: HashMap<u64, anyhow::Result<Option<FilteredReason>>> =
             HashMap::from([
@@ -577,19 +624,18 @@ mod tests {
     #[test]
     fn verdict_grammar_encodes_action_reason_and_rule() {
         let cases = [
-            (verdict(0, service_allow(), None), "allow"),
+            (service_allow(), "allow"),
             (
-                verdict(0, service_drop(), Some("drop_suspended_author")),
-                "drop:AuthorIsSuspended@drop_suspended_author",
+                service_drop(),
+                "drop:AuthorIsSuspended@DropSuspendedAuthorRule",
             ),
-            (verdict(0, service_drop(), None), "drop:AuthorIsSuspended"),
             (
-                verdict(0, service_interstitial(), Some("nsfw_media")),
+                service_interstitial(),
                 "interstitial:ContainNsfwMedia@nsfw_media",
             ),
         ];
         for (v, expected) in &cases {
-            assert_eq!(service_verdict_str(&v.verdict), *expected);
+            assert_eq!(service_verdict_str(v), *expected);
         }
 
         assert_eq!(reference_verdict_str(&reference_allow()), "allow");
@@ -807,8 +853,8 @@ mod tests {
             )
             .expect("comparable request");
         sender.send(vec![
-            verdict(1, service_allow(), None),
-            verdict(2, service_allow(), None),
+            verdict(1, service_allow()),
+            verdict(2, service_allow()),
         ]);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

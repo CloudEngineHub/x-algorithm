@@ -7,6 +7,7 @@ use crate::hydration::tes_composite::ProdTweetForVisibilitySource;
 use crate::hydration::HydrationPipeline;
 use crate::models::{RawCandidate, TweetId};
 use crate::reference_compare::ReferenceCompareHarness;
+use crate::rules::metrics::Rpc;
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
@@ -134,7 +135,6 @@ pub async fn build_prod_server(
                     client_id: S2S_CLIENT_ID.clone(),
                     retry_config: Some(RetryConfig::for_idempotent()),
                     max_batch_size: TESRpcConstants::max_batch_size(),
-                    enable_serve_within: true,
                 },
                 deterministic_aperture,
             )
@@ -163,7 +163,6 @@ pub async fn build_prod_server(
                         client_id,
                         retry_config: None,
                         max_batch_size: GizmoduckRpcConstants::max_batch_size(),
-                        enable_serve_within: false,
                     },
                     deterministic_aperture,
                 )
@@ -390,7 +389,6 @@ struct XdsStratoParams {
     client_id: String,
     retry_config: Option<RetryConfig>,
     max_batch_size: usize,
-    enable_serve_within: bool,
 }
 
 async fn build_xds_strato(
@@ -427,23 +425,13 @@ async fn build_xds_strato(
             )
         })?;
 
-    let mut strato = StratoGrpc::from_load_balanced_channel(
+    Ok(StratoGrpc::from_load_balanced_channel(
         channel,
         None,
         Some(params.client_id),
         params.retry_config,
         params.max_batch_size,
-    );
-    if params.enable_serve_within {
-        strato = strato.with_op_context(xai_strato::strato_proto::OpContext {
-            serve_within: Some(xai_strato::strato_proto::ServeWithin {
-                duration_microseconds: STRATO_REQUEST_TIMEOUT.as_micros() as i64,
-                round_trip_allowance_microseconds: 10_000,
-            }),
-            ..Default::default()
-        });
-    }
-    Ok(strato)
+    ))
 }
 
 async fn warm_cache(twemcache: &CacheClient) {
@@ -491,6 +479,7 @@ fn warm_filter_tweets_request() -> FilterRequest {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
             request_author_id: None,
         }],
+        rpc: Rpc::FilterTweets,
     }
 }
 
@@ -553,8 +542,7 @@ async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
 mod tests {
     use super::*;
     use crate::filter::FilterOutcome;
-    use crate::models::VfAction;
-    use crate::rules::Verdict;
+    use crate::models::{Decided, Verdict, Withholding};
     use std::cell::Cell;
     use xai_visibility_filtering::models::FilteredReason;
 
@@ -654,44 +642,35 @@ mod tests {
         assert_eq!(start.elapsed(), CLIENT_INIT_ATTEMPT_TIMEOUT);
     }
 
-    fn response(verdicts: Vec<Verdict>) -> FilterResponse {
-        let outcomes: Vec<FilterOutcome> = verdicts
-            .into_iter()
-            .map(|verdict| FilterOutcome {
+    fn response(verdict: Verdict, status: EvaluationStatus) -> FilterResponse {
+        FilterResponse {
+            outcomes: vec![FilterOutcome {
                 tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
-                status: if verdict.decided_by == Verdict::unresolved_author().decided_by {
-                    EvaluationStatus::UnresolvedAuthor
-                } else {
-                    EvaluationStatus::Evaluated
-                },
+                status,
                 verdict,
                 safety_labels: None,
-            })
-            .collect();
-        FilterResponse { outcomes }
+            }],
+        }
     }
 
     #[test]
-    fn allow_verdict_is_warm() {
-        let response = response(vec![Verdict {
-            action: VfAction::Allow,
-            decided_by: None,
-        }]);
-        assert!(filter_tweets_response_is_warm(&response));
-    }
-
-    #[test]
-    fn drop_by_real_rule_is_warm() {
-        let response = response(vec![Verdict {
-            action: VfAction::Drop(FilteredReason::AuthorIsSuspended),
-            decided_by: Some("DropSuspendedAuthorRule"),
-        }]);
+    fn evaluated_verdict_is_warm() {
+        let response = response(
+            Verdict::Withheld(Decided {
+                value: Withholding::Drop(FilteredReason::AuthorIsSuspended),
+                by: "DropSuspendedAuthorRule",
+            }),
+            EvaluationStatus::Evaluated,
+        );
         assert!(filter_tweets_response_is_warm(&response));
     }
 
     #[test]
     fn unresolved_author_verdict_is_not_warm() {
-        let response = response(vec![Verdict::unresolved_author()]);
+        let response = response(
+            Verdict::unresolved_author(),
+            EvaluationStatus::UnresolvedAuthor,
+        );
         assert!(!filter_tweets_response_is_warm(&response));
     }
 }

@@ -1,4 +1,6 @@
-use crate::models::{AuthorLabel, HydratedTweetCandidate, SafetyLabelType, ViewerFeatures};
+use crate::models::{
+    tweet_timestamp_ms, AuthorLabel, HydratedTweetCandidate, SafetyLabelType, ViewerFeatures,
+};
 use crate::params::NsfwGatingCountries;
 use xai_core_entities::entities::TakedownReason;
 
@@ -138,6 +140,11 @@ pub struct TweetPredicates<'a> {
 
 impl TweetPredicates<'_> {
     #[inline]
+    pub fn created_after(&self, unix_ms: u64) -> bool {
+        tweet_timestamp_ms(self.ctx.candidate.tweet_id) > unix_ms
+    }
+
+    #[inline]
     pub fn has_safety_label(&self, label: SafetyLabelType) -> bool {
         self.ctx.candidate.has_safety_label(label)
     }
@@ -170,11 +177,6 @@ impl TweetPredicates<'_> {
     #[inline]
     pub fn has_dmca_media(&self) -> bool {
         self.ctx.candidate.has_dmca_media()
-    }
-
-    #[inline]
-    pub fn is_nsfw_flagged(&self) -> bool {
-        self.ctx.candidate.is_nsfw_flagged()
     }
 
     #[inline]

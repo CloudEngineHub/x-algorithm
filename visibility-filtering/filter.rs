@@ -1,7 +1,7 @@
 use crate::hydration::{HydrationOutput, HydrationPipeline, HydrationRequest};
-use crate::models::{RawCandidate, TweetId};
-use crate::rules::metrics as ft_metrics;
-use crate::rules::{RuleEngine, SafetyLevel, Verdict};
+use crate::models::{RawCandidate, TweetId, Verdict};
+use crate::rules::metrics::{self as ft_metrics, Rpc};
+use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::HashMap;
 use std::time::Instant;
 use xai_visibility_filtering_proto as vf_pb;
@@ -11,6 +11,7 @@ pub struct FilterRequest {
     pub country_code: Option<String>,
     pub safety_level: SafetyLevel,
     pub candidates: Vec<RawCandidate>,
+    pub rpc: Rpc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +57,7 @@ impl FilterTweets {
             ))
             .await;
         let hydrated_at = Instant::now();
-        ft_metrics::record_phase("hydration", hydrated_at - started);
+        ft_metrics::record_phase(request.rpc, "hydration", hydrated_at - started);
         let HydrationOutput {
             viewer_features,
             candidates: hydrated_candidates,
@@ -100,10 +101,11 @@ impl FilterTweets {
             .collect();
 
         ft_metrics::record_verdicts(
+            request.rpc,
             request.safety_level,
             outcomes.iter().map(|outcome| &outcome.verdict),
         );
-        ft_metrics::record_phase("post_hydration", hydrated_at.elapsed());
+        ft_metrics::record_phase(request.rpc, "post_hydration", hydrated_at.elapsed());
 
         FilterResponse { outcomes }
     }
@@ -205,7 +207,8 @@ mod tests {
         MockTweetForVisibilitySource, TweetForVisibility, TweetForVisibilitySource,
     };
     use crate::models::{
-        CoreFeature, ExclusiveContentFeatures, TweetFeatures, VfAction, ViewerAuthorRelationship,
+        CoreFeature, Decided, ExclusiveContentFeatures, TweetFeatures, ViewerAuthorRelationship,
+        Withholding,
     };
     use std::sync::{Arc, Mutex};
     use tonic::async_trait;
@@ -260,6 +263,13 @@ mod tests {
             _: &[u64],
         ) -> HashMap<u64, anyhow::Result<Option<TweetForVisibility>>> {
             std::future::pending().await
+        }
+    }
+
+    fn unrestricted() -> Verdict {
+        Verdict::Shown {
+            media: None,
+            engagement: None,
         }
     }
 
@@ -336,6 +346,7 @@ mod tests {
                 country_code: None,
                 safety_level: SafetyLevel::TimelineHome,
                 candidates: vec![candidate(1, None), candidate(1, None)],
+                rpc: Rpc::FilterTweets,
             })
             .await;
         assert_eq!(tes.call_count(), 1);
@@ -346,7 +357,7 @@ mod tests {
         assert!(result
             .outcomes
             .iter()
-            .all(|outcome| matches!(outcome.verdict.action, VfAction::Allow)));
+            .all(|outcome| outcome.verdict == unrestricted()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -381,7 +392,7 @@ mod tests {
         let raw = [candidate(1, None)];
         let started = tokio::time::Instant::now();
         let hydration = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            crate::hydration::HYDRATION_TIMEOUT * 2,
             pipeline.hydrate(HydrationRequest::new(
                 Some(50),
                 None,
@@ -480,6 +491,7 @@ mod tests {
                     candidate(1, None),
                     candidate(2, Some(20)),
                 ],
+                rpc: Rpc::FilterTweets,
             })
             .await;
 
@@ -491,18 +503,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![TweetId(2), TweetId(1), TweetId(2)]
         );
-        assert!(matches!(
-            response.outcomes[0].verdict.action,
-            VfAction::Allow
-        ));
-        assert!(matches!(
-            response.outcomes[1].verdict.action,
-            VfAction::Drop(_)
-        ));
-        assert_eq!(
-            response.outcomes[1].verdict.decided_by,
-            Some("unresolved_author_id")
-        );
+        assert_eq!(response.outcomes[0].verdict, unrestricted());
+        assert_eq!(response.outcomes[1].verdict, Verdict::unresolved_author());
         assert_eq!(
             response
                 .outcomes
@@ -515,10 +517,7 @@ mod tests {
                 EvaluationStatus::Failed
             ]
         );
-        assert!(matches!(
-            response.outcomes[2].verdict.action,
-            VfAction::Allow
-        ));
+        assert_eq!(response.outcomes[2].verdict, unrestricted());
         assert!(response
             .outcomes
             .iter()
@@ -543,6 +542,7 @@ mod tests {
                 country_code: None,
                 safety_level: SafetyLevel::TimelineHome,
                 candidates: vec![candidate(3, Some(30)), candidate(3, Some(30))],
+                rpc: Rpc::FilterTweets,
             })
             .await;
 
@@ -563,19 +563,19 @@ mod tests {
             country_code: None,
             safety_level,
             candidates: vec![candidate(1, Some(10))],
+            rpc: Rpc::FilterTweets,
         };
 
         let home = service.run(request(SafetyLevel::TimelineHome)).await;
         let filter_all = service.run(request(SafetyLevel::FilterAll)).await;
 
-        assert!(matches!(home.outcomes[0].verdict.action, VfAction::Allow));
+        assert_eq!(home.outcomes[0].verdict, unrestricted());
         assert!(matches!(
-            filter_all.outcomes[0].verdict.action,
-            VfAction::Drop(_)
+            filter_all.outcomes[0].verdict,
+            Verdict::Withheld(Decided {
+                value: Withholding::Drop(_),
+                by: "FilterAllRule",
+            })
         ));
-        assert_eq!(
-            filter_all.outcomes[0].verdict.decided_by,
-            Some("FilterAllRule")
-        );
     }
 }

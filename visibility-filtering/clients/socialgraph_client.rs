@@ -141,6 +141,8 @@ async fn select_edge_set(
         service_account: None,
         quota_name: None,
     };
+    let mut request = tonic::Request::new(request);
+    xai_x_rpc::apply_call_deadline(&mut request);
     match client.inner().clone().select(request).await {
         Ok(resp) => Some(
             resp.into_inner()
@@ -186,7 +188,8 @@ impl SocialgraphClient for ProdSocialgraphClient {
         }
 
         let dest_ids: Vec<i64> = author_ids.iter().map(|&id| id as i64).collect();
-        let request = relationship_select_request(viewer_id, &dest_ids);
+        let mut request = tonic::Request::new(relationship_select_request(viewer_id, &dest_ids));
+        xai_x_rpc::apply_call_deadline(&mut request);
 
         let edges = match self.flock_client.inner().clone().select(request).await {
             Ok(resp) => decode_relationship_edges(resp.into_inner().results),

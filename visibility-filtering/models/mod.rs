@@ -3,6 +3,7 @@ pub mod exclusive_content;
 pub mod relationship;
 pub mod safety_labels;
 pub mod tweet;
+pub mod verdict;
 pub mod viewer;
 
 pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
@@ -10,14 +11,23 @@ pub use exclusive_content::ExclusiveContentFeatures;
 pub use relationship::ViewerAuthorRelationship;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
 pub use tweet::{CoreFeature, MediaFeature, NsfwFeature, TweetFeatures};
+pub use verdict::{
+    Decided, LimitedEngagement, LimitedEngagementReason, MediaInterstitial, TombstoneReason,
+    Verdict, Withholding,
+};
 pub use viewer::{Viewer, ViewerAge, ViewerFeatures};
 
 use std::collections::HashMap;
 use xai_core_entities::entities::PureCoreData;
-use xai_visibility_filtering::models::FilteredReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TweetId(pub u64);
+
+pub fn tweet_timestamp_ms(tweet_id: u64) -> u64 {
+    const SNOWFLAKE_EPOCH_MS: u64 = 1288834974657;
+    const SNOWFLAKE_TIMESTAMP_SHIFT: u32 = 22;
+    (tweet_id >> SNOWFLAKE_TIMESTAMP_SHIFT) + SNOWFLAKE_EPOCH_MS
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AuthorId(u64);
@@ -97,13 +107,6 @@ impl HydratedTweetCandidate {
         self.tweet_features.core.source_tweet_id.is_some()
     }
 
-    pub fn is_nsfw_flagged(&self) -> bool {
-        self.author_features.is_nsfw_user
-            || self.author_features.is_nsfw_admin
-            || self.tweet_features.nsfw.user
-            || self.tweet_features.nsfw.admin
-    }
-
     pub fn has_dmca_media(&self) -> bool {
         self.tweet_features.media.has_dmca_media
     }
@@ -156,13 +159,6 @@ pub fn assemble(
         relationship,
         exclusive_content,
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum VfAction {
-    Allow,
-    Drop(FilteredReason),
-    Interstitial(FilteredReason),
 }
 
 #[cfg(test)]

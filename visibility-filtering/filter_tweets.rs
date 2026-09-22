@@ -1,8 +1,9 @@
 use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
-use crate::models::{RawCandidate, TweetId, VfAction};
+use crate::models::{RawCandidate, TweetId};
 use crate::reference_compare::{ReferenceCompareHarness, TweetVerdict};
-use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard};
+use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
+use crate::treatment;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::metadata::MetadataMap;
@@ -29,8 +30,10 @@ impl FilterTweetsEndpoint {
         &self,
         request: Request<vf_pb::VisibilityFilterRequest>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
+        let entered = tokio::time::Instant::now();
         let request_metrics = RequestMetricsGuard::new();
         let grpc_timeout = parse_grpc_timeout(request.metadata());
+        let context = crate::hydration::request_context(entered, grpc_timeout);
         let req = request.into_inner();
         ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());
         let viewer_id = normalize_viewer_id(req.viewer_id);
@@ -61,14 +64,14 @@ impl FilterTweetsEndpoint {
             )
         });
 
-        let response = self
-            .filter_tweets
-            .run(FilterRequest {
+        let response = context
+            .scope(self.filter_tweets.run(FilterRequest {
                 viewer_id,
                 country_code: req.country_code,
                 safety_level,
                 candidates,
-            })
+                rpc: Rpc::FilterTweets,
+            }))
             .await;
 
         if let Some(verdicts) = reference_compare {
@@ -100,7 +103,7 @@ pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
     raw.filter(|&id| id as i64 > 0)
 }
 
-fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
+pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
     let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
     let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
     if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -120,19 +123,10 @@ fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
 }
 
 fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
-    let (kind, filtered_reason) = match outcome.verdict.action {
-        VfAction::Allow => (vf_pb::action::Kind::Allow(true), None),
-        VfAction::Drop(reason) => (
-            vf_pb::action::Kind::Drop(vf_pb::DropReason {}),
-            Some(reason.into()),
-        ),
-        VfAction::Interstitial(reason) => {
-            (vf_pb::action::Kind::Interstitial(true), Some(reason.into()))
-        }
-    };
+    let (action, filtered_reason) = treatment::proto_action(outcome.verdict);
     vf_pb::TweetVisibilityResult {
         tweet_id: outcome.tweet_id.0,
-        action: Some(vf_pb::Action { kind: Some(kind) }),
+        action: Some(action),
         filtered_reason,
         safety_labels: outcome.safety_labels,
     }
@@ -141,20 +135,6 @@ fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::Verdict;
-    use xai_visibility_filtering::models::FilteredReason;
-
-    fn outcome(tweet_id: u64, action: VfAction) -> FilterOutcome {
-        FilterOutcome {
-            tweet_id: TweetId(tweet_id),
-            verdict: Verdict {
-                action,
-                decided_by: Some("test"),
-            },
-            status: crate::filter::EvaluationStatus::Evaluated,
-            safety_labels: None,
-        }
-    }
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let gizmoduck = std::sync::Arc::new(
@@ -214,25 +194,5 @@ mod tests {
         assert_eq!(normalize_viewer_id(Some(u64::MAX)), None);
         assert_eq!(normalize_viewer_id(Some(42)), Some(42));
         assert_eq!(normalize_viewer_id(None), None);
-    }
-
-    #[test]
-    fn actions_map_to_proto_kinds() {
-        let cases = [
-            (VfAction::Allow, vf_pb::action::Kind::Allow(true)),
-            (
-                VfAction::Drop(FilteredReason::ContainNsfwMedia),
-                vf_pb::action::Kind::Drop(vf_pb::DropReason {}),
-            ),
-            (
-                VfAction::Interstitial(FilteredReason::ContainNsfwMedia),
-                vf_pb::action::Kind::Interstitial(true),
-            ),
-        ];
-
-        for (action, expected) in cases {
-            let result = to_visibility_result(outcome(1, action));
-            assert_eq!(result.action.and_then(|action| action.kind), Some(expected));
-        }
     }
 }

@@ -2,10 +2,11 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use xai_stats_receiver::{HistogramBuckets, global_stats_receiver};
+use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
-use crate::models::VfAction;
-use crate::rules::{SafetyLevel, Verdict};
+use crate::models::Verdict;
+use crate::rules::SafetyLevel;
+use crate::treatment;
 
 const REQUESTS: &str = "filter_tweets_requests";
 const LATENCY_MS: &str = "filter_tweets_latency_ms";
@@ -18,6 +19,13 @@ const PHASE_MS: &str = "filter_tweets_phase_ms";
 const DEADLINE: &str = "filter_tweets_deadline";
 const DEADLINE_REMAINING_MS: &str = "filter_tweets_deadline_remaining_ms";
 const DEADLINE_OVERRUN_MS: &str = "filter_tweets_deadline_overrun_ms";
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Rpc {
+    FilterTweets,
+    EvaluateTweets,
+}
 
 pub(crate) fn record_viewer_state(raw: Option<u64>, normalized: Option<u64>) {
     if normalized.is_some() {
@@ -35,47 +43,43 @@ pub(crate) struct AggregatedVerdicts {
     pub by_rule: HashMap<(&'static str, &'static str), u64>,
 }
 
-fn action_label(action: &VfAction) -> &'static str {
-    match action {
-        VfAction::Allow => "allow",
-        VfAction::Drop(_) => "drop",
-        VfAction::Interstitial(_) => "interstitial",
-    }
-}
-
 pub(crate) fn aggregate_verdicts<'a>(
     verdicts: impl IntoIterator<Item = &'a Verdict>,
 ) -> AggregatedVerdicts {
     let mut out = AggregatedVerdicts::default();
     for verdict in verdicts {
-        let action = action_label(&verdict.action);
-        *out.mix.entry(action).or_default() += 1;
-        if !matches!(verdict.action, VfAction::Allow)
-            && let Some(rule) = verdict.decided_by
-        {
-            *out.by_rule.entry((rule, action)).or_default() += 1;
+        *out.mix.entry(treatment::metric_label(verdict)).or_default() += 1;
+        for row in treatment::decided_rows(verdict) {
+            *out.by_rule.entry(row).or_default() += 1;
         }
     }
     out
 }
 
 pub(crate) fn record_verdicts<'a>(
+    rpc: Rpc,
     safety_level: SafetyLevel,
     verdicts: impl IntoIterator<Item = &'a Verdict>,
 ) {
     let aggregated = aggregate_verdicts(verdicts);
     let level = <&str>::from(safety_level);
+    let rpc = rpc.into();
     for (action, count) in &aggregated.mix {
         incr_nonzero(
             VERDICTS,
-            &[("action", action), ("safety_level", level)],
+            &[("action", action), ("safety_level", level), ("rpc", rpc)],
             *count,
         );
     }
     for ((rule, action), count) in &aggregated.by_rule {
         incr_nonzero(
             VERDICTS_BY_RULE,
-            &[("rule", rule), ("action", action), ("safety_level", level)],
+            &[
+                ("rule", rule),
+                ("action", action),
+                ("safety_level", level),
+                ("rpc", rpc),
+            ],
             *count,
         );
     }
@@ -127,8 +131,12 @@ impl RequestMetricsGuard {
     }
 }
 
-pub(crate) fn record_phase(stage: &'static str, elapsed: Duration) {
-    observe_vm(PHASE_MS, &[("stage", stage)], millis(elapsed));
+pub(crate) fn record_phase(rpc: Rpc, stage: &'static str, elapsed: Duration) {
+    observe_vm(
+        PHASE_MS,
+        &[("stage", stage), ("rpc", rpc.into())],
+        millis(elapsed),
+    );
 }
 
 fn millis(d: Duration) -> f64 {
@@ -173,27 +181,46 @@ fn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{
+        Decided, LimitedEngagement, LimitedEngagementReason, MediaInterstitial, Withholding,
+    };
     use xai_visibility_filtering::models::FilteredReason;
+    use xai_x_thrift::action::InterstitialReason;
 
     fn allow() -> Verdict {
-        Verdict {
-            action: VfAction::Allow,
-            decided_by: None,
+        Verdict::Shown {
+            media: None,
+            engagement: None,
         }
     }
 
     fn drop_by(rule: &'static str) -> Verdict {
-        Verdict {
-            action: VfAction::Drop(FilteredReason::UnspecifiedReason),
-            decided_by: Some(rule),
+        Verdict::Withheld(Decided {
+            value: Withholding::Drop(FilteredReason::UnspecifiedReason),
+            by: rule,
+        })
+    }
+
+    fn limit_by(rule: &'static str) -> Decided<LimitedEngagement> {
+        Decided {
+            value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
+            by: rule,
         }
     }
 
-    fn interstitial_by(rule: &'static str) -> Verdict {
-        Verdict {
-            action: VfAction::Interstitial(FilteredReason::ContainNsfwMedia),
-            decided_by: Some(rule),
-        }
+    #[test]
+    fn dashboard_generator_pins_the_rpc_label() {
+        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
+        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
+        let path = if std::path::Path::new(cargo).exists() {
+            cargo
+        } else {
+            ws
+        };
+        let dashboard =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let filter_tweets = <&str>::from(Rpc::FilterTweets);
+        assert!(dashboard.contains(&format!("FT_RPC_FILTER = 'rpc=~\"{filter_tweets}|\"'")));
     }
 
     #[test]
@@ -228,35 +255,38 @@ mod tests {
     }
 
     #[test]
-    fn drop_vs_interstitial_bucket_separately() {
+    fn each_filled_slot_counts_its_own_row() {
         let d = drop_by("nsfw_media");
-        let i1 = interstitial_by("nsfw_media");
-        let i2 = interstitial_by("nsfw_author");
-        let aggregated = aggregate_verdicts([&d, &i1, &i2]);
+        let both = Verdict::Shown {
+            media: Some(Decided {
+                value: MediaInterstitial {
+                    legacy: FilteredReason::ContainNsfwMedia,
+                    reason: InterstitialReason::Sensitive(true),
+                },
+                by: "nsfw_media",
+            }),
+            engagement: Some(limit_by("conversation_control")),
+        };
+        let limit_only = Verdict::Shown {
+            media: None,
+            engagement: Some(limit_by("conversation_control")),
+        };
+        let aggregated = aggregate_verdicts([&d, &both, &limit_only]);
 
         assert_eq!(aggregated.mix.get("drop"), Some(&1));
-        assert_eq!(aggregated.mix.get("interstitial"), Some(&2));
-        assert!(!aggregated.mix.contains_key("allow"));
+        assert_eq!(aggregated.mix.get("tweet_interstitial"), Some(&1));
+        assert_eq!(aggregated.mix.get("limited_engagement"), Some(&1));
+        assert_eq!(aggregated.mix.values().sum::<u64>(), 3);
         assert_eq!(aggregated.by_rule.get(&("nsfw_media", "drop")), Some(&1));
         assert_eq!(
             aggregated.by_rule.get(&("nsfw_media", "interstitial")),
             Some(&1)
         );
         assert_eq!(
-            aggregated.by_rule.get(&("nsfw_author", "interstitial")),
-            Some(&1)
+            aggregated
+                .by_rule
+                .get(&("conversation_control", "limited_engagement")),
+            Some(&2)
         );
-    }
-
-    #[test]
-    fn non_allow_without_decided_by_skips_by_rule() {
-        let v = Verdict {
-            action: VfAction::Drop(FilteredReason::UnspecifiedReason),
-            decided_by: None,
-        };
-        let aggregated = aggregate_verdicts([&v]);
-
-        assert_eq!(aggregated.mix.get("drop"), Some(&1));
-        assert!(aggregated.by_rule.is_empty());
     }
 }
