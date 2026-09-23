@@ -1,4 +1,9 @@
+#![cfg_attr(not(test), deny(clippy::allow_attributes))]
 #![deny(
+    clippy::allow_attributes_without_reason,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
     clippy::dbg_macro,
     clippy::expect_used,
     clippy::indexing_slicing,

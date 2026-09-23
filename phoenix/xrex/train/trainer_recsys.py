@@ -3262,14 +3262,6 @@ class RecsysTrainer(Trainer):
                     self._last_disk_checkpoint_ts = time.time()
                 return None
 
-            if should_persist_disk:
-                if self._shmem_write_future is not None:
-                    self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()
-                    self._shmem_write_future = None
-                host_state.clear()
-                del write_items
-                self.host_state = None
-
         if port and not should_persist_disk:
             return None
 

@@ -1,16 +1,18 @@
 use crate::models::{
-    AuthorFeatures, AuthorLabel, Decided, HydratedTweetCandidate, SafetyLabelMap, SafetyLabelType,
-    TweetFeatures, Verdict, Viewer, ViewerAuthorRelationship, ViewerFeatures, Withholding,
+    AuthorFeatures, AuthorLabel, ConversationControlFeatures, Decided, HydratedTweetCandidate,
+    SafetyLabelMap, SafetyLabelType, TweetFeatures, Verdict, Viewer, ViewerAuthorRelationship,
+    ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::rules::registry::Policy;
 use crate::rules::rule_spec::RuleClause;
 use crate::rules::test_context;
 use std::collections::HashSet;
 use std::slice::from_ref;
+use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
 
 const TWEET_ID: u64 = 1;
-const AUTHOR_ID: u64 = 100;
+pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
 pub(super) fn clauses_verdict(
@@ -80,7 +82,20 @@ pub(super) fn assert_allows(
 
 pub(crate) fn viewer(id: u64) -> ViewerFeatures {
     ViewerFeatures {
-        viewer: Viewer::LoggedIn(id),
+        viewer: Viewer::LoggedIn {
+            id,
+            profile: ViewerProfile::default(),
+        },
+        ..Default::default()
+    }
+}
+
+pub(crate) fn viewer_with_profile(profile: ViewerProfile) -> ViewerFeatures {
+    ViewerFeatures {
+        viewer: Viewer::LoggedIn {
+            id: VIEWER_ID,
+            profile,
+        },
         ..Default::default()
     }
 }
@@ -97,9 +112,26 @@ pub(crate) fn logged_out_viewer() -> ViewerFeatures {
 }
 
 pub(crate) fn sensitive_opt_in_viewer() -> ViewerFeatures {
-    ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
         allows_sensitive_media: true,
-        ..viewer(VIEWER_ID)
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn conversation_control(
+    arm: ConversationControlArm,
+    root_author_id: u64,
+) -> ConversationControlFeatures {
+    ConversationControlFeatures {
+        control: ConversationControl {
+            arm,
+            conversation_tweet_author_id: root_author_id,
+            invited_user_ids: vec![],
+            invite_via_mention: None,
+            allowed_country_codes: vec![],
+        },
+        root_author_follows_viewer: None,
+        viewer_super_follows_root_author: None,
     }
 }
 
@@ -165,8 +197,16 @@ impl CandidateBuilder {
         self
     }
 
+    pub(crate) fn with_conversation_control(
+        mut self,
+        features: ConversationControlFeatures,
+    ) -> Self {
+        self.candidate.conversation_control = Some(features);
+        self
+    }
+
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.tweet_features.core.source_tweet_id = Some(source_tweet_id);
+        self.candidate.tweet_features.source_tweet_id = Some(source_tweet_id);
         self
     }
 

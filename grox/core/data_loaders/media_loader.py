@@ -14,6 +14,7 @@ from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
 from grox.core.clients.nightowl_client import NightOwlClient
 from grox_fetcher_client import GroxFetcherClient
 from video_tools.subtitles import SubtitleAligner
+from video_tools.key_frames import KeyFramesExtractor
 from video_tools.video_frames import VideoFramesExtractor
 from grox.core.data_loaders.data_types import Post, Image, Video, BroadcastMetadata
 from blobstore_http.cdn_downloader import CDNDownloader
@@ -631,6 +632,10 @@ class MediaLoader:
         logger.info(
             f"video config video_tile_size {video_tile_size}, video_max_frames {video_max_frames}"
         )
+        if grox_config.media_hydration.use_key_frames:
+            return await cls._construct_convo_video_from_key_frames(
+                video_bytes, video_tile_size, is_main_post and is_high_fav
+            )
         video_data = await VideoFramesExtractor.extract_frames(
             video_bytes,
             video_max_frames,
@@ -686,4 +691,38 @@ class MediaLoader:
             total_duration=total_duration,
             is_deluxe_target=is_main_post and is_high_fav,
             motion_reveal_frames=video_data.motion_reveal_frames,
+        )
+
+    @classmethod
+    async def _construct_convo_video_from_key_frames(
+        cls, video_bytes: bytes, tile_size: int, is_deluxe_target: bool
+    ) -> ConvoVideo:
+        cfg = grox_config.media_hydration
+        data = await KeyFramesExtractor.extract_key_frames(
+            video_bytes,
+            window_sec=cfg.key_frames_window_seconds,
+            max_fps=cfg.key_frames_max_fps,
+            max_key_frames=cfg.key_frames_max,
+            tile_size=tile_size,
+        )
+        Metrics.counter("media_loader.key_frames.count").add(
+            1,
+            attributes={
+                **cls._metrics_attributes(),
+                "shots": str(min(data.shots, 5)),
+                "frames": str(len(data.key_frames)),
+            },
+        )
+        logger.info(
+            f"key frames: scanned {data.scanned_frames} frames, {data.shots} shots, picked {[k.time_sec for k in data.key_frames]}"
+        )
+        if not data.key_frames:
+            raise ValueError(
+                f"no key frames in the opening {cfg.key_frames_window_seconds}s ({data.scanned_frames} frames scanned)"
+            )
+        return ConvoVideo(
+            frames=[k.frame for k in data.key_frames],
+            duration=data.window_sec / max(len(data.key_frames), 1),
+            total_duration=data.window_sec,
+            is_deluxe_target=is_deluxe_target,
         )

@@ -1,23 +1,27 @@
 use crate::models::{
-    AuthorFeatures, AuthorLabel, Decided, ExclusiveContentFeatures, HydratedTweetCandidate,
-    MediaInterstitial, SafetyLabelType, TweetFeatures, Verdict, ViewerAge,
-    ViewerAuthorRelationship, ViewerFeatures, Withholding,
+    AuthorFeatures, AuthorLabel, ConversationControlFeatures, Decided, ExclusiveContentFeatures,
+    HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    SafetyLabelType, TweetFeatures, Verdict, ViewerAge, ViewerAuthorRelationship, ViewerFeatures,
+    ViewerProfile, Withholding,
 };
 use crate::rules::fixtures::{
-    author_viewer, candidate, logged_out_viewer, sensitive_opt_in_viewer, viewer, VIEWER_ID,
+    author_viewer, candidate, conversation_control, logged_out_viewer, sensitive_opt_in_viewer,
+    viewer, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
 };
 use crate::rules::{RuleEngine, SafetyLevel};
 use crate::treatment::proto_action;
 use prost::Message;
 use std::collections::BTreeSet;
-use std::hint::black_box;
-use std::time::Instant;
-use xai_core_entities::entities::{EditControl, EditControlInitial, TakedownReason};
+use xai_core_entities::entities::{
+    ConversationControl, ConversationControlArm, EditControl, EditControlInitial, TakedownReason,
+};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
 use xai_x_thrift::action::InterstitialReason;
 use SafetyLevel::{FilterAll, TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations};
+
+const REPLY_ROOT_AUTHOR_ID: u64 = 4242;
 
 struct Case {
     name: &'static str,
@@ -54,6 +58,16 @@ fn blurred(reason: InterstitialReason, by: &'static str) -> Verdict {
     }
 }
 
+fn limited(by: &'static str) -> Verdict {
+    Verdict::Shown {
+        media: None,
+        engagement: Some(Decided {
+            value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
+            by,
+        }),
+    }
+}
+
 fn deciders(verdict: &Verdict) -> Vec<&'static str> {
     match verdict {
         Verdict::Withheld(decided) => vec![decided.by],
@@ -68,8 +82,11 @@ fn deciders(verdict: &Verdict) -> Vec<&'static str> {
 #[test]
 fn golden_corpus_pins_policy_verdicts() {
     let rule_engine = RuleEngine::for_tests();
+    let cases = cases();
+    let names: BTreeSet<&'static str> = cases.iter().map(|c| c.name).collect();
+    assert_eq!(names.len(), cases.len(), "duplicate corpus case name");
     let mut failures = Vec::new();
-    for case in cases() {
+    for case in cases {
         let verdict = rule_engine.evaluate(case.level, &case.viewer, &case.candidate);
         if matches!(&case.expected, Verdict::Shown { media: Some(_), .. }) {
             let (action, reason) = proto_action(verdict.clone());
@@ -117,34 +134,6 @@ fn every_wired_rule_decides_a_corpus_case() {
     );
 }
 
-#[test]
-#[ignore = "timing loop; run explicitly in release mode"]
-fn evaluate_throughput() {
-    const PASSES: u32 = 1_000_000;
-    let rule_engine = RuleEngine::for_tests();
-    let cases = cases();
-    let started = Instant::now();
-    for _ in 0..PASSES {
-        for case in &cases {
-            let verdict = rule_engine.evaluate(case.level, &case.viewer, &case.candidate);
-            black_box(verdict);
-        }
-    }
-    let elapsed = started.elapsed();
-    let evaluations = u64::from(PASSES) * cases.len() as u64;
-    eprintln!(
-        "{evaluations} evaluations in {elapsed:?}: {:.1} ns/evaluate",
-        elapsed.as_nanos() as f64 / evaluations as f64
-    );
-}
-
-#[test]
-fn corpus_case_names_are_unique() {
-    let cases = cases();
-    let names: BTreeSet<&'static str> = cases.iter().map(|c| c.name).collect();
-    assert_eq!(names.len(), cases.len());
-}
-
 fn cases() -> Vec<Case> {
     let mut cases = filter_all_cases();
     cases.extend(baseline_cases());
@@ -154,6 +143,7 @@ fn cases() -> Vec<Case> {
     cases.extend(tweet_shape_cases());
     cases.extend(age_gating_cases());
     cases.extend(exclusive_content_cases());
+    cases.extend(conversation_control_cases());
     cases.extend(interstitial_cases());
     cases.extend(oon_media_cases());
     cases.extend(oon_tweet_label_cases());
@@ -223,6 +213,14 @@ fn exclusive_candidate(viewer_super_follows_author: bool) -> HydratedTweetCandid
     c
 }
 
+fn controlled_root(arm: ConversationControlArm) -> ConversationControlFeatures {
+    conversation_control(arm, AUTHOR_ID)
+}
+
+fn controlled_candidate(features: ConversationControlFeatures) -> HydratedTweetCandidate {
+    candidate().with_conversation_control(features).build()
+}
+
 fn viewer_in_country(code: &str) -> ViewerFeatures {
     ViewerFeatures {
         country_code: Some(code.to_string()),
@@ -231,17 +229,18 @@ fn viewer_in_country(code: &str) -> ViewerFeatures {
 }
 
 fn viewer_with_age(age: ViewerAge) -> ViewerFeatures {
-    ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
         viewer_age: age,
-        ..viewer(VIEWER_ID)
-    }
+        ..ViewerProfile::default()
+    })
 }
 
 fn no_stated_age_viewer(account_country_code: &str) -> ViewerFeatures {
-    ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
+        viewer_age: ViewerAge::NotStated,
         account_country_code: Some(account_country_code.to_string()),
-        ..viewer_with_age(ViewerAge::NotStated)
-    }
+        ..ViewerProfile::default()
+    })
 }
 
 fn nsfw_high_precision_reason() -> FilteredReason {
@@ -578,11 +577,51 @@ fn tweet_shape_cases() -> Vec<Case> {
             expected: allow(),
         },
         Case {
+            name: "nullcast_community_tweet_allows",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: tweet_candidate(|t| {
+                t.is_nullcast = true;
+                t.is_community_tweet = true;
+            }),
+            expected: allow(),
+        },
+        Case {
+            name: "nullcast_tweet_drops_even_self_view",
+            level: TimelineHome,
+            viewer: author_viewer(),
+            candidate: tweet_candidate(|t| t.is_nullcast = true),
+            expected: dropped(FilteredReason::TweetIsNullcast, "NullcastedTweetDropRule"),
+        },
+        Case {
             name: "stale_edit_tweet_drops",
             level: TimelineHome,
             viewer: viewer(VIEWER_ID),
             candidate: stale_candidate(),
             expected: dropped(FilteredReason::UnspecifiedReason, "DropStaleTweetsRule"),
+        },
+        Case {
+            name: "stale_edit_retweet_allows",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: {
+                let mut retweet = stale_candidate();
+                retweet.tweet_features.source_tweet_id = Some(2);
+                retweet
+            },
+            expected: allow(),
+        },
+        Case {
+            name: "current_edit_tweet_allows",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: tweet_candidate(|t| {
+                t.edit_control = Some(EditControl::Initial(EditControlInitial {
+                    edit_tweet_ids: vec![1],
+                    ..Default::default()
+                }))
+            }),
+            expected: allow(),
         },
         Case {
             name: "legal_takedown_drops_in_withheld_country",
@@ -784,6 +823,117 @@ fn exclusive_content_cases() -> Vec<Case> {
     ]
 }
 
+fn conversation_control_cases() -> Vec<Case> {
+    use ConversationControlArm::{ByInvitation, Community, Subscribers, Verified};
+    vec![
+        Case {
+            name: "home_hydration_by_invitation_conversation_limits_replies",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(controlled_root(ByInvitation)),
+            expected: limited("LimitRepliesByInvitationConversationRule"),
+        },
+        Case {
+            name: "home_hydration_community_conversation_limits_replies",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(controlled_root(Community)),
+            expected: limited("LimitRepliesCommunityConversationRule"),
+        },
+        Case {
+            name: "home_hydration_subscribers_conversation_limits_replies",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(controlled_root(Subscribers)),
+            expected: limited("LimitRepliesSubscribersConversationRule"),
+        },
+        Case {
+            name: "home_hydration_verified_conversation_limits_replies",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(controlled_root(Verified)),
+            expected: limited("LimitRepliesVerifiedConversationRule"),
+        },
+        Case {
+            name: "home_hydration_reply_carrying_root_arm_limits_its_author",
+            level: TimelineHomeHydration,
+            viewer: author_viewer(),
+            candidate: controlled_candidate(conversation_control(
+                ByInvitation,
+                REPLY_ROOT_AUTHOR_ID,
+            )),
+            expected: limited("LimitRepliesByInvitationConversationRule"),
+        },
+        Case {
+            name: "home_hydration_conversation_control_exempts_root_author",
+            level: TimelineHomeHydration,
+            viewer: author_viewer(),
+            candidate: controlled_candidate(controlled_root(ByInvitation)),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_conversation_control_exempts_invited_viewer",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(ConversationControlFeatures {
+                control: ConversationControl {
+                    invited_user_ids: vec![VIEWER_ID],
+                    ..controlled_root(ByInvitation).control
+                },
+                ..controlled_root(ByInvitation)
+            }),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_conversation_control_allows_logged_out",
+            level: TimelineHomeHydration,
+            viewer: logged_out_viewer(),
+            candidate: controlled_candidate(controlled_root(ByInvitation)),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_conversation_control_allows_retweet",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: candidate()
+                .retweet_of(2)
+                .with_conversation_control(controlled_root(ByInvitation))
+                .build(),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_community_conversation_exempts_followed_viewer",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(ConversationControlFeatures {
+                root_author_follows_viewer: Some(true),
+                ..controlled_root(Community)
+            }),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_subscribers_conversation_exempts_super_follower",
+            level: TimelineHomeHydration,
+            viewer: viewer(VIEWER_ID),
+            candidate: controlled_candidate(ConversationControlFeatures {
+                viewer_super_follows_root_author: Some(true),
+                ..controlled_root(Subscribers)
+            }),
+            expected: allow(),
+        },
+        Case {
+            name: "home_hydration_verified_conversation_exempts_verified_viewer",
+            level: TimelineHomeHydration,
+            viewer: viewer_with_profile(ViewerProfile {
+                has_verified_badge: true,
+                ..ViewerProfile::default()
+            }),
+            candidate: controlled_candidate(controlled_root(Verified)),
+            expected: allow(),
+        },
+    ]
+}
+
 fn interstitial_cases() -> Vec<Case> {
     const AT_CUTOFF: u64 = (1705536000000 - 1288834974657) << 22;
     vec![
@@ -866,6 +1016,62 @@ fn interstitial_cases() -> Vec<Case> {
             expected: blurred(
                 InterstitialReason::SensitiveUser(true),
                 "NsfwUserInterstitialRule",
+            ),
+        },
+        Case {
+            name: "tweet_nsfw_admin_flag_with_media_interstitials_in_network",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: tweet_candidate(|t| {
+                t.nsfw.admin = true;
+                t.media.has_media = true;
+            }),
+            expected: blurred(
+                InterstitialReason::Sensitive(true),
+                "NsfwAdminInterstitialRule",
+            ),
+        },
+        Case {
+            name: "tweet_nsfw_user_flag_with_media_interstitials_in_network",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: tweet_candidate(|t| {
+                t.nsfw.user = true;
+                t.media.has_media = true;
+            }),
+            expected: blurred(
+                InterstitialReason::SensitiveUser(true),
+                "NsfwUserInterstitialRule",
+            ),
+        },
+        Case {
+            name: "nsfw_admin_interstitial_beats_nsfw_user_when_author_has_both_flags",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: candidate()
+                .with_author_features(AuthorFeatures {
+                    is_nsfw_user: true,
+                    is_nsfw_admin: true,
+                    ..Default::default()
+                })
+                .with_media()
+                .build(),
+            expected: blurred(
+                InterstitialReason::Sensitive(true),
+                "NsfwAdminInterstitialRule",
+            ),
+        },
+        Case {
+            name: "two_interstitial_labels_keep_the_first_media_blur",
+            level: TimelineHome,
+            viewer: viewer(VIEWER_ID),
+            candidate: candidate()
+                .with_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)
+                .with_label(SafetyLabelType::NSFW_CARD_IMAGE)
+                .build(),
+            expected: blurred(
+                InterstitialReason::Violence(true),
+                "GoreAndViolenceInterstitialRule",
             ),
         },
         Case {
@@ -963,6 +1169,13 @@ fn oon_media_cases() -> Vec<Case> {
             name: "tweet_nsfw_admin_flag_drops_oon",
             level: TimelineHomeRecommendations,
             viewer: viewer(VIEWER_ID),
+            candidate: tweet_candidate(|t| t.nsfw.admin = true),
+            expected: dropped(FilteredReason::ContainNsfwMedia, "TweetNsfwAdminDropRule"),
+        },
+        Case {
+            name: "tweet_nsfw_admin_flag_drops_even_self_view_oon",
+            level: TimelineHomeRecommendations,
+            viewer: author_viewer(),
             candidate: tweet_candidate(|t| t.nsfw.admin = true),
             expected: dropped(FilteredReason::ContainNsfwMedia, "TweetNsfwAdminDropRule"),
         },

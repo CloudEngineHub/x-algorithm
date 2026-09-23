@@ -36,12 +36,6 @@ impl NsfwGatingCountries {
         self.countries.load().iter().any(|c| c == country_code)
     }
 
-    #[cfg(test)]
-    pub fn refresh_from(&self, feature_switches: &FeatureSwitches) {
-        let (_, resolved) = resolve_with_origin(feature_switches);
-        self.countries.store(Arc::new(resolved));
-    }
-
     pub fn refresh_and_check_drift(&self, feature_switches: &FeatureSwitches, fs_path: &str) {
         let (origin, resolved) = resolve_with_origin(feature_switches);
         self.countries.store(Arc::new(resolved.clone()));
@@ -138,6 +132,8 @@ fn set_eq(a: &[String], b: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    const ABSENT_FS_FILE: &str = "/nonexistent/rust_vf.yml";
+
     fn engine(yaml: &str) -> FeatureSwitches {
         FeatureSwitches::load_string(yaml).unwrap()
     }
@@ -148,8 +144,9 @@ mod tests {
         assert!(cache.contains("de"));
         assert!(!cache.contains("xx"));
 
-        cache.refresh_from(&engine(
-            r#"
+        cache.refresh_and_check_drift(
+            &engine(
+                r#"
 rust_vf:
   parameters:
     rust_vf_nsfw_gating_countries:
@@ -157,11 +154,13 @@ rust_vf:
       default:
       - "XX"
 "#,
-        ));
+            ),
+            ABSENT_FS_FILE,
+        );
         assert!(cache.contains("xx"));
         assert!(!cache.contains("de"));
 
-        cache.refresh_from(&engine("other:\n  parameters: {}\n"));
+        cache.refresh_and_check_drift(&engine("other:\n  parameters: {}\n"), ABSENT_FS_FILE);
         assert!(cache.contains("de"));
         assert!(!cache.contains("xx"));
     }
@@ -169,8 +168,9 @@ rust_vf:
     #[test]
     fn malformed_value_falls_back_whole_not_partial() {
         let cache = NsfwGatingCountries::starting_at_default();
-        cache.refresh_from(&engine(
-            r#"
+        cache.refresh_and_check_drift(
+            &engine(
+                r#"
 rust_vf:
   parameters:
     rust_vf_nsfw_gating_countries:
@@ -179,7 +179,9 @@ rust_vf:
       - "xx"
       - 7
 "#,
-        ));
+            ),
+            ABSENT_FS_FILE,
+        );
         assert!(!cache.contains("xx"));
         assert!(cache.contains("de"));
     }

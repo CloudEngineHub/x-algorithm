@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-21T16:23:47Z
+// mirrored from config feature-switch defaults; last sync 2026-09-22T17:39:32Z
 use xai_feature_switches::param;
 
 param!(
@@ -183,19 +183,19 @@ param!(
     PhoenixRetrievalMOEInferenceClusterId,
     String,
     "rust_home_mixer_phoenix_retrieval_moe_inference_cluster_id",
-    "Experiment3Memy04"
+    "Experiment2Memy04"
 );
 param!(
     PhoenixMOEMaxResults,
     u32,
     "rust_home_mixer_phoenix_moe_max_results",
-    200
+    0
 );
 param!(
     PhoenixMoeColdStartMaxResults,
     u32,
     "rust_home_mixer_phoenix_moe_cold_start_max_results",
-    0
+    200
 );
 param!(
     AuthorPhoenixMoeEnabled,
@@ -569,6 +569,18 @@ param!(
     VMRankerComputeValueModel,
     bool,
     "rust_home_mixer_vm_ranker_compute_value_model",
+    false
+);
+param!(
+    VMRankerSendDebiasInputs,
+    bool,
+    "rust_home_mixer_vm_ranker_send_debias_inputs",
+    false
+);
+param!(
+    CachedPostsReuseWeightedScore,
+    bool,
+    "rust_home_mixer_cached_posts_reuse_weighted_score",
     false
 );
 param!(

@@ -14,6 +14,7 @@ pub mod purchase_value;
 pub mod starter_packs;
 
 pub const SAFETY_BIT_AUTHOR_NSFW: u64 = 1 << 2;
+pub const SAFETY_BIT_TWEET_NSFW: u64 = 1 << 3;
 
 pub fn timezone_string_to_enum(tz: &str) -> Timezone {
     match tz {

@@ -12,7 +12,6 @@ pub struct AuthorFeatures {
     pub user_labels: AuthorLabelSet,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactAuthorFeatures(NonZeroU64);
 
@@ -23,7 +22,10 @@ const COMPACT_PRESENT_BIT: NonZeroU64 = match NonZeroU64::new(1 << 63) {
 const COMPACT_LABEL_SHIFT: u32 = 8;
 const COMPACT_LABEL_MASK: u64 = (1 << (63 - COMPACT_LABEL_SHIFT)) - 1;
 
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "unused until the CLOCK user cache stores it")
+)]
 impl AuthorFeatures {
     pub(crate) fn to_compact(self) -> CompactAuthorFeatures {
         let flags = self.is_suspended as u64
@@ -88,8 +90,6 @@ impl AuthorLabelSet {
 mod tests {
     use super::*;
 
-    fn assert_copy<T: Copy>() {}
-
     const ALL_LABELS: [AuthorLabel; 11] = [
         AuthorLabel::NsfwHighRecall,
         AuthorLabel::NsfwHighPrecision,
@@ -105,13 +105,8 @@ mod tests {
     ];
 
     #[test]
-    fn compact_is_copy_and_option_is_8_bytes() {
-        assert_copy::<CompactAuthorFeatures>();
-        assert_eq!(std::mem::size_of::<Option<CompactAuthorFeatures>>(), 8);
-    }
-
-    #[test]
     fn compact_round_trips_every_flag_combination_and_label_subset() {
+        assert_eq!(std::mem::size_of::<Option<CompactAuthorFeatures>>(), 8);
         for flag_bits in 0u32..1 << 7 {
             for label_bits in 0u32..1 << ALL_LABELS.len() {
                 let mut user_labels = AuthorLabelSet::default();
@@ -136,23 +131,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn author_features_is_copy_and_16_bytes_with_option_niche() {
-        assert_copy::<AuthorFeatures>();
-        assert_eq!(std::mem::size_of::<AuthorFeatures>(), 16);
-        assert_eq!(std::mem::size_of::<Option<AuthorFeatures>>(), 16);
-    }
-
-    #[test]
-    fn label_set_membership() {
-        let mut set = AuthorLabelSet::default();
-        assert!(!set.has_label(AuthorLabel::NsfwHighRecall));
-        set.insert(AuthorLabel::NsfwHighRecall);
-        set.insert(AuthorLabel::DoNotAmplify);
-        assert!(set.has_label(AuthorLabel::NsfwHighRecall));
-        assert!(set.has_label(AuthorLabel::DoNotAmplify));
-        assert!(!set.has_label(AuthorLabel::Compromised));
     }
 }

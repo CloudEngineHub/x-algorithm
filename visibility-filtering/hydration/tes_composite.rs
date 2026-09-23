@@ -169,7 +169,7 @@ impl TSerializable for Tweet {
                 Some(2) => tweet.core_data = Some(read_core_data(proto)?),
                 Some(7) => {
                     let list = proto.read_list_begin()?;
-                    let mut media = Vec::with_capacity(list.size as usize);
+                    let mut media = Vec::with_capacity(usize::try_from(list.size).unwrap_or(0));
                     for _ in 0..list.size {
                         media.push(MediaEntity::read_from_in_protocol(proto)?);
                     }
@@ -212,7 +212,7 @@ fn read_core_data(proto: &mut dyn TInputProtocol) -> thrift::Result<CoreData> {
             break;
         }
         match field.id {
-            Some(1) => core_data.user_id = proto.read_i64()? as u64,
+            Some(1) => core_data.user_id = proto.read_i64()?.cast_unsigned(),
             Some(7) => core_data.share = Some(Share::from_thrift(proto)),
             Some(8) => core_data.has_takedown = proto.read_bool()?,
             Some(9) => core_data.nsfw_user = proto.read_bool()?,
@@ -258,13 +258,11 @@ mod tests {
     use super::*;
     use crate::hydration::batch::TweetHydrationBatch;
     use crate::hydration::tes_hydrator::TesHydrator;
-    use crate::models::{
-        resolve_candidate, CoreFeature, NsfwFeature, RawCandidate, TweetFeatures, TweetId,
-    };
+    use crate::models::{AuthorId, NsfwFeature, TweetCandidateInput, TweetFeatures, TweetId};
     use thrift::protocol::{
         TBinaryOutputProtocol, TFieldIdentifier, TListIdentifier, TStructIdentifier,
     };
-    use xai_core_entities::entities::{EditControlInitial, PureCoreData};
+    use xai_core_entities::entities::EditControlInitial;
     use xai_core_entities::tweet_entity_service_client::MockTESClient;
     use xai_x_thrift::media_common::MediaKey;
     use xai_x_thrift::media_information::{AdditionalMetadata, GeoRestrictions, Restrictions};
@@ -275,9 +273,7 @@ mod tests {
     const TWEET_ID: i64 = 10;
     const AUTHOR_ID: i64 = 7001;
     const SOURCE_TWEET_ID: i64 = 9;
-    const PURE_CORE_SOURCE_TWEET_ID: u64 = 8;
     const CONVERSATION_AUTHOR_ID: i64 = 7003;
-    const PURE_CORE_TEXT: &str = "pure core text";
 
     fn field(proto: &mut Proto<'_>, id: i16, ty: TType, value: impl FnOnce(&mut Proto<'_>)) {
         proto
@@ -391,24 +387,10 @@ mod tests {
     }
 
     fn assemble_fixture(bytes: &[u8]) -> TweetFeatures {
-        let core = HashMap::from([(
-            TweetId(TWEET_ID as u64),
-            PureCoreData {
-                author_id: 100,
-                text: PURE_CORE_TEXT.to_string(),
-                source_tweet_id: Some(PURE_CORE_SOURCE_TWEET_ID),
-                ..Default::default()
-            },
-        )]);
-        let candidate = resolve_candidate(
-            &RawCandidate {
-                tweet_id: TweetId(TWEET_ID as u64),
-                request_author_id: None,
-            },
-            &core,
-            &HashMap::new(),
-        )
-        .unwrap();
+        let candidate = TweetCandidateInput {
+            tweet_id: TweetId(TWEET_ID as u64),
+            author_id: AuthorId(100),
+        };
         let composite = TweetHydrationBatch::from_results(
             [TweetId(TWEET_ID as u64)],
             HashMap::from([(
@@ -421,19 +403,9 @@ mod tests {
             Arc::new(MockTweetForVisibilitySource::default()),
             None,
         )
-        .assemble_tweet_features(&[candidate], &core, &composite)
+        .assemble_tweet_features(&[candidate], &composite)
         .remove(&TweetId(TWEET_ID as u64))
         .unwrap()
-    }
-
-    fn pure_core_features() -> TweetFeatures {
-        TweetFeatures {
-            core: CoreFeature {
-                text: PURE_CORE_TEXT.to_string(),
-                source_tweet_id: None,
-            },
-            ..Default::default()
-        }
     }
 
     #[test]
@@ -499,10 +471,7 @@ mod tests {
         assert_eq!(
             assemble_fixture(&bytes),
             TweetFeatures {
-                core: CoreFeature {
-                    text: PURE_CORE_TEXT.to_string(),
-                    source_tweet_id: Some(SOURCE_TWEET_ID as u64),
-                },
+                source_tweet_id: Some(SOURCE_TWEET_ID as u64),
                 media,
                 takedown_reasons: vec![TakedownReason::Dmca],
                 nsfw: NsfwFeature {
@@ -517,10 +486,10 @@ mod tests {
     }
 
     #[test]
-    fn plain_tweet_takes_text_from_pure_core_but_not_its_retweet_source() {
+    fn plain_tweet_assembles_default_features() {
         let bytes = encode_tweet(&mut |_| {}, &mut |_| {});
 
-        assert_eq!(assemble_fixture(&bytes), pure_core_features());
+        assert_eq!(assemble_fixture(&bytes), TweetFeatures::default());
     }
 
     #[test]
@@ -595,13 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_tweet_keeps_pure_core_text_and_defaults_the_rest() {
+    fn missing_tweet_defaults_every_feature() {
         for bytes in [
             encode_option(&mut |p| field(p, 9048, TType::Void, |_| {})),
             encode_option(&mut |p| structure(p, 26900, |p| i64_field(p, 1, TWEET_ID))),
         ] {
             assert!(decode_tweet_for_visibility(&bytes).unwrap().is_none());
-            assert_eq!(assemble_fixture(&bytes), pure_core_features());
+            assert_eq!(assemble_fixture(&bytes), TweetFeatures::default());
         }
     }
 }

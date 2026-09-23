@@ -13,6 +13,7 @@ pub struct SafetyLabelHydrator {
     pub source: Arc<SafetyLabelSource>,
 }
 
+#[derive(Default)]
 pub struct SafetyLabelHydration {
     pub label_types: HashMap<TweetId, SafetyLabelMap>,
     pub label_response: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
@@ -163,7 +164,6 @@ mod tests {
             .await;
 
         assert!(result.label_types[&TweetId(1)].has_label(SafetyLabelType::NSFW_HIGH_PRECISION));
-        assert!(!result.label_types[&TweetId(2)].has_label(SafetyLabelType::SPAM));
         assert!(result.label_response.contains_key(&TweetId(1)));
         assert!(result.label_response.contains_key(&TweetId(2)));
     }
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_fails_open_on_missing_results() {
+    async fn hydrate_treats_not_found_as_an_empty_label_map() {
         let tweet_ids = vec![TweetId(1)];
         let hydrator = hydrator(HashMap::new(), HashMap::new(), None);
 

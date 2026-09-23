@@ -2,7 +2,7 @@ use crate::clients::socialgraph_client::SocialgraphClient;
 use crate::hydration::batch::{HydrationBatch, TweetHydrationBatch};
 use crate::hydration::metrics::{record_batch_size, timed_values};
 use crate::hydration::{keyed_by_author, tweets_per_author};
-use crate::models::{TweetCandidateInput, Viewer, ViewerAuthorRelationship};
+use crate::models::{TweetCandidateInput, ViewerAuthorRelationship};
 use crate::rules::SafetyLevel;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,10 +18,10 @@ impl SocialgraphHydrator {
     pub(crate) async fn hydrate(
         &self,
         candidates: &[TweetCandidateInput],
-        viewer: Viewer,
+        viewer_id: Option<u64>,
         safety_level: SafetyLevel,
     ) -> TweetHydrationBatch<ViewerAuthorRelationship> {
-        let Some(vid) = viewer.user_id() else {
+        let Some(vid) = viewer_id else {
             return HydrationBatch::from_values(
                 candidates.iter().map(|c| c.tweet_id),
                 candidates
@@ -60,20 +60,14 @@ mod tests {
     use super::*;
     use crate::clients::socialgraph_client::FakeSocialgraphClient;
     use crate::hydration::batch::Hydrated;
-    use crate::models::{resolve_candidate, RawCandidate, TweetId};
+    use crate::models::{AuthorId, TweetId};
     use std::collections::HashMap;
-    use xai_core_entities::entities::PureCoreData;
 
     fn candidate(tweet_id: u64, author_id: u64) -> TweetCandidateInput {
-        resolve_candidate(
-            &RawCandidate {
-                tweet_id: TweetId(tweet_id),
-                request_author_id: Some(author_id),
-            },
-            &HashMap::<TweetId, PureCoreData>::new(),
-            &HashMap::new(),
-        )
-        .unwrap()
+        TweetCandidateInput {
+            tweet_id: TweetId(tweet_id),
+            author_id: AuthorId(author_id),
+        }
     }
 
     struct EmptyResponseSocialgraphClient;
@@ -95,6 +89,14 @@ mod tests {
         ) -> Option<HashMap<u64, bool>> {
             Some(HashMap::new())
         }
+
+        async fn batch_check_followed_by(
+            &self,
+            _viewer_id: u64,
+            _user_ids: &[u64],
+        ) -> Option<HashMap<u64, bool>> {
+            Some(HashMap::new())
+        }
     }
 
     #[tokio::test]
@@ -105,7 +107,7 @@ mod tests {
         let candidates = vec![candidate(1, 10), candidate(2, 20)];
 
         let relationships = hydrator
-            .hydrate(&candidates, Viewer::LoggedIn(99), SafetyLevel::TimelineHome)
+            .hydrate(&candidates, Some(99), SafetyLevel::TimelineHome)
             .await;
 
         for tweet_id in [TweetId(1), TweetId(2)] {
@@ -124,7 +126,7 @@ mod tests {
         let candidates = vec![candidate(1, 10), candidate(1, 10), candidate(2, 20)];
 
         let relationships = hydrator
-            .hydrate(&candidates, Viewer::LoggedOut, SafetyLevel::TimelineHome)
+            .hydrate(&candidates, None, SafetyLevel::TimelineHome)
             .await;
 
         for tweet_id in [TweetId(1), TweetId(2)] {

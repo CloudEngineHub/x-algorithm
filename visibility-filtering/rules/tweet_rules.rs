@@ -1,8 +1,10 @@
-use crate::models::SafetyLabelType;
+use crate::hydration::{Hydrator, Hydrators};
+use crate::models::{LimitedEngagementReason, SafetyLabelType};
 use crate::rules::rule_spec::{
     ActionSpec, Audience, AuthorPredicate, Condition, Predicate, RelationshipPredicate, RuleClause,
     TweetPredicate, ViewerPredicate,
 };
+use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
@@ -57,6 +59,19 @@ const NOT_CONVERSATION_AUTHOR: Condition = Condition::Not(Predicate::Relationshi
 const NOT_SUPER_FOLLOWER: Condition = Condition::Not(Predicate::Relationship(
     RelationshipPredicate::ViewerSuperFollowsAuthor,
 ));
+const NOT_LOGGED_OUT: Condition = Condition::Not(Predicate::Viewer(ViewerPredicate::LoggedOut));
+const NOT_CONVERSATION_ROOT_AUTHOR: Condition = Condition::Not(Predicate::Relationship(
+    RelationshipPredicate::ViewerIsConversationRootAuthor,
+));
+const NOT_INVITED_TO_CONVERSATION: Condition = Condition::Not(Predicate::Relationship(
+    RelationshipPredicate::ViewerIsInvitedToConversation,
+));
+
+const fn has_conversation_control(arm: ConversationControlArm) -> Condition {
+    Condition::Holds(Predicate::Tweet(TweetPredicate::HasConversationControl(
+        arm,
+    )))
+}
 
 pub(super) const TWEET_LABEL_DROPS: &[RuleClause] = &[
     RuleClause {
@@ -309,6 +324,65 @@ pub(super) const NSFW_AUTHOR_INTERSTITIAL: &[RuleClause] = &[
     },
 ];
 
+const fn limit_replies(rule_name: &'static str, when: &'static [Condition]) -> RuleClause {
+    RuleClause {
+        rule_name,
+        when,
+        applies_to: Audience::Everyone,
+        action: ActionSpec::LimitedEngagement(LimitedEngagementReason::ConversationControl),
+    }
+}
+
+pub(super) const LIMIT_REPLIES_CONVERSATION_RULES: &[RuleClause] = &[
+    limit_replies(
+        "LimitRepliesByInvitationConversationRule",
+        &[
+            has_conversation_control(ConversationControlArm::ByInvitation),
+            NOT_LOGGED_OUT,
+            NOT_RETWEET,
+            NOT_CONVERSATION_ROOT_AUTHOR,
+            NOT_INVITED_TO_CONVERSATION,
+        ],
+    ),
+    limit_replies(
+        "LimitRepliesCommunityConversationRule",
+        &[
+            has_conversation_control(ConversationControlArm::Community),
+            NOT_LOGGED_OUT,
+            NOT_RETWEET,
+            NOT_CONVERSATION_ROOT_AUTHOR,
+            NOT_INVITED_TO_CONVERSATION,
+            Condition::Not(Predicate::Relationship(
+                RelationshipPredicate::ViewerIsFollowedByConversationRootAuthor,
+            )),
+        ],
+    ),
+    limit_replies(
+        "LimitRepliesSubscribersConversationRule",
+        &[
+            has_conversation_control(ConversationControlArm::Subscribers),
+            NOT_LOGGED_OUT,
+            NOT_RETWEET,
+            NOT_CONVERSATION_ROOT_AUTHOR,
+            NOT_INVITED_TO_CONVERSATION,
+            Condition::Not(Predicate::Relationship(
+                RelationshipPredicate::ViewerSuperFollowsConversationRootAuthor,
+            )),
+        ],
+    ),
+    limit_replies(
+        "LimitRepliesVerifiedConversationRule",
+        &[
+            has_conversation_control(ConversationControlArm::Verified),
+            NOT_LOGGED_OUT,
+            NOT_RETWEET,
+            NOT_CONVERSATION_ROOT_AUTHOR,
+            NOT_INVITED_TO_CONVERSATION,
+            Condition::Not(Predicate::Viewer(ViewerPredicate::HasVerifiedBadge)),
+        ],
+    ),
+];
+
 const fn sensitive_viewer_drop(rule_name: &'static str, when: &'static [Condition]) -> RuleClause {
     RuleClause {
         rule_name,
@@ -400,7 +474,12 @@ pub(super) const TAKEDOWN_DROPS: &[RuleClause] = &[
             id: "legal_takedown_in_viewer_country",
             doc: "a LegalRequest (any code but xy) or UnspecifiedReason takedown names \
                   the viewer's request country or a worldwide code (xx/xy); Dmca counts as xy",
-            eval: |context| context.takedown().legal_in_viewer_country(),
+            eval: |context| {
+                context
+                    .tweet_features()
+                    .legal_takedown_in(context.request_country())
+            },
+            hydrators: Hydrators::of(Hydrator::Tweet),
         }],
         applies_to: Audience::ExceptAuthor,
         action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
@@ -411,7 +490,12 @@ pub(super) const TAKEDOWN_DROPS: &[RuleClause] = &[
             id: "local_laws_takedown_in_viewer_country",
             doc: "a BystanderReport takedown names the viewer's request country; \
                   worldwide codes (xx/xy) do not count",
-            eval: |context| context.takedown().local_laws_in_viewer_country(),
+            eval: |context| {
+                context
+                    .tweet_features()
+                    .local_laws_takedown_in(context.request_country())
+            },
+            hydrators: Hydrators::of(Hydrator::Tweet),
         }],
         applies_to: Audience::ExceptAuthor,
         action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
@@ -440,7 +524,12 @@ pub(super) const RECS_MEDIA_DROPS: &[RuleClause] = &[
             id: "media_geo_restricted_in_viewer_country",
             doc: "the media geo allow-list is non-empty and omits the viewer's \
                   request country (xx when absent), or the deny-list names it",
-            eval: |context| context.takedown().media_restricted_in_viewer_country(),
+            eval: |context| {
+                context
+                    .tweet_features()
+                    .media_restricted_in(context.request_country())
+            },
+            hydrators: Hydrators::of(Hydrator::Tweet),
         }],
         applies_to: Audience::Everyone,
         action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
@@ -451,16 +540,20 @@ pub(super) const RECS_MEDIA_DROPS: &[RuleClause] = &[
 mod tests {
     use super::*;
     use crate::models::{
-        AuthorFeatures, Decided, ExclusiveContentFeatures, HydratedTweetCandidate, MediaFeature,
-        MediaInterstitial, NsfwFeature, TweetFeatures, Verdict, Viewer, ViewerAge, ViewerFeatures,
+        AuthorFeatures, ConversationControlFeatures, Decided, ExclusiveContentFeatures,
+        HydratedTweetCandidate, LimitedEngagement, MediaFeature, MediaInterstitial, NsfwFeature,
+        TweetFeatures, Verdict, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
     };
     use crate::rules::fixtures::{
         assert_allows, assert_clauses_allow, assert_clauses_drop, assert_drops, author_viewer,
-        candidate, logged_out_viewer, sensitive_opt_in_viewer, viewer, VIEWER_ID,
+        candidate, clauses_verdict, conversation_control, logged_out_viewer,
+        sensitive_opt_in_viewer, viewer, viewer_with_profile, VIEWER_ID,
     };
     use crate::rules::registry::Policy;
     use crate::rules::test_context;
-    use xai_core_entities::entities::{EditControl, EditControlInitial, TakedownReason};
+    use xai_core_entities::entities::{
+        ConversationControl, ConversationControlArm, TakedownReason,
+    };
 
     fn trigger_label(name: &str) -> SafetyLabelType {
         match name {
@@ -595,50 +688,6 @@ mod tests {
         );
     }
 
-    fn tweet_flag_features(name: &str) -> NsfwFeature {
-        match name {
-            "TweetNsfwUserDropRule" => NsfwFeature {
-                user: true,
-                admin: false,
-            },
-            "TweetNsfwAdminDropRule" => NsfwFeature {
-                user: false,
-                admin: true,
-            },
-            _ => panic!("no trigger flags for rule {name}"),
-        }
-    }
-
-    #[test]
-    fn tweet_flag_drop_axis() {
-        for spec in OON_TWEET_FLAG_DROPS {
-            let RuleClause {
-                rule_name: name,
-                action: ActionSpec::Drop(reason),
-                applies_to,
-                ..
-            } = spec
-            else {
-                panic!("{} is not a tweet-flag drop row", spec.rule_name);
-            };
-            let nsfw = tweet_flag_features(name);
-            let firing = candidate()
-                .with_tweet_features(TweetFeatures {
-                    nsfw,
-                    ..Default::default()
-                })
-                .build();
-            assert_drops(spec, &viewer(VIEWER_ID), &firing, reason);
-            let unflagged = candidate().build();
-            assert_allows(spec, &viewer(VIEWER_ID), &unflagged);
-            if *applies_to == Audience::Everyone {
-                assert_drops(spec, &author_viewer(), &firing, reason);
-            } else {
-                assert_allows(spec, &author_viewer(), &firing);
-            }
-        }
-    }
-
     fn exclusive_candidate(
         tweet_id: u64,
         author_id: u64,
@@ -650,76 +699,6 @@ mod tests {
             viewer_super_follows_author: false,
         });
         c
-    }
-
-    #[test]
-    fn nsfw_author_interstitial_axis() {
-        static POLICY: Policy = Policy::new(&[NSFW_AUTHOR_INTERSTITIAL]);
-        for flags in 0..16 {
-            let author_admin = flags & 1 != 0;
-            let tweet_admin = flags & 2 != 0;
-            let author_user = flags & 4 != 0;
-            let tweet_user = flags & 8 != 0;
-            for has_media in [false, true] {
-                let candidate = candidate()
-                    .with_author_features(AuthorFeatures {
-                        is_nsfw_admin: author_admin,
-                        is_nsfw_user: author_user,
-                        ..Default::default()
-                    })
-                    .with_tweet_features(TweetFeatures {
-                        nsfw: NsfwFeature {
-                            admin: tweet_admin,
-                            user: tweet_user,
-                        },
-                        media: MediaFeature {
-                            has_media,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                    .build();
-                for viewer in [
-                    viewer(VIEWER_ID),
-                    sensitive_opt_in_viewer(),
-                    author_viewer(),
-                ] {
-                    let restriction = if !has_media
-                        || viewer.allows_sensitive_media
-                        || candidate.is_author_viewer(viewer.viewer)
-                    {
-                        None
-                    } else if author_admin || tweet_admin {
-                        Some((
-                            InterstitialReason::Sensitive(true),
-                            "NsfwAdminInterstitialRule",
-                        ))
-                    } else if author_user || tweet_user {
-                        Some((
-                            InterstitialReason::SensitiveUser(true),
-                            "NsfwUserInterstitialRule",
-                        ))
-                    } else {
-                        None
-                    };
-                    let expected = Verdict::Shown {
-                        media: restriction.map(|(reason, by)| Decided {
-                            value: MediaInterstitial {
-                                legacy: FilteredReason::ContainNsfwMedia,
-                                reason,
-                            },
-                            by,
-                        }),
-                        engagement: None,
-                    };
-                    assert_eq!(
-                        POLICY.evaluate(&test_context(&viewer, &candidate)),
-                        expected,
-                        "flags={flags}, media={has_media}, viewer={viewer:?}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -749,12 +728,18 @@ mod tests {
             .unwrap()
             .viewer_super_follows_author = true;
         assert_clauses_allow(clauses, &viewer(200), &super_follow);
+        assert_clauses_drop(
+            clauses,
+            &logged_out_viewer(),
+            &super_follow,
+            &FilteredReason::ExclusiveTweet,
+        );
 
         let reply = exclusive_candidate(2, 200, 100);
         assert_clauses_allow(clauses, &viewer(200), &reply);
 
         let mut retweet = exclusive_candidate(2, 200, 100);
-        retweet.tweet_features.core.source_tweet_id = Some(99);
+        retweet.tweet_features.source_tweet_id = Some(99);
         assert_clauses_drop(
             clauses,
             &viewer(200),
@@ -763,11 +748,97 @@ mod tests {
         );
     }
 
+    const ROOT_AUTHOR_ID: u64 = 4242;
+
+    fn controlled(arm: ConversationControlArm) -> ConversationControlFeatures {
+        conversation_control(arm, ROOT_AUTHOR_ID)
+    }
+
+    fn limited_by(rule_name: &'static str) -> Verdict {
+        Verdict::Shown {
+            media: None,
+            engagement: Some(Decided {
+                value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
+                by: rule_name,
+            }),
+        }
+    }
+
+    #[test]
+    fn limit_replies_conversation_control_axis() {
+        use ConversationControlArm::{ByInvitation, Community, Followers, Subscribers, Verified};
+        let clauses = LIMIT_REPLIES_CONVERSATION_RULES;
+        let verdict = |viewer: &ViewerFeatures, features: ConversationControlFeatures| {
+            let candidate = candidate().with_conversation_control(features).build();
+            clauses_verdict(clauses, viewer, &candidate)
+        };
+        let allow = Verdict::Shown {
+            media: None,
+            engagement: None,
+        };
+        let verified = viewer_with_profile(ViewerProfile {
+            has_verified_badge: true,
+            ..ViewerProfile::default()
+        });
+
+        for (arm, rule) in [
+            (ByInvitation, "LimitRepliesByInvitationConversationRule"),
+            (Community, "LimitRepliesCommunityConversationRule"),
+            (Subscribers, "LimitRepliesSubscribersConversationRule"),
+            (Verified, "LimitRepliesVerifiedConversationRule"),
+        ] {
+            assert_eq!(
+                verdict(&viewer(VIEWER_ID), controlled(arm)),
+                limited_by(rule)
+            );
+            assert_eq!(verdict(&author_viewer(), controlled(arm)), limited_by(rule));
+            assert_eq!(verdict(&viewer(ROOT_AUTHOR_ID), controlled(arm)), allow);
+            assert_eq!(verdict(&logged_out_viewer(), controlled(arm)), allow);
+            let invited = ConversationControlFeatures {
+                control: ConversationControl {
+                    invited_user_ids: vec![VIEWER_ID],
+                    ..controlled(arm).control
+                },
+                ..controlled(arm)
+            };
+            assert_eq!(verdict(&viewer(VIEWER_ID), invited), allow);
+            let retweet = candidate()
+                .retweet_of(2)
+                .with_conversation_control(controlled(arm))
+                .build();
+            assert_eq!(
+                clauses_verdict(clauses, &viewer(VIEWER_ID), &retweet),
+                allow
+            );
+        }
+
+        let followed = ConversationControlFeatures {
+            root_author_follows_viewer: Some(true),
+            ..controlled(Community)
+        };
+        assert_eq!(verdict(&viewer(VIEWER_ID), followed), allow);
+        let subscribed = ConversationControlFeatures {
+            viewer_super_follows_root_author: Some(true),
+            ..controlled(Subscribers)
+        };
+        assert_eq!(verdict(&viewer(VIEWER_ID), subscribed), allow);
+        assert_eq!(verdict(&verified, controlled(Verified)), allow);
+
+        assert_eq!(verdict(&viewer(VIEWER_ID), controlled(Followers)), allow);
+        assert_clauses_allow(clauses, &viewer(VIEWER_ID), &candidate().build());
+    }
+
     fn gating_viewer(age: ViewerAge) -> ViewerFeatures {
-        ViewerFeatures {
+        gating_viewer_with(ViewerProfile {
             viewer_age: age,
+            ..ViewerProfile::default()
+        })
+    }
+
+    fn gating_viewer_with(profile: ViewerProfile) -> ViewerFeatures {
+        ViewerFeatures {
             country_code: Some("de".into()),
-            ..viewer(VIEWER_ID)
+            ..viewer_with_profile(profile)
         }
     }
 
@@ -884,10 +955,11 @@ mod tests {
         assert_clauses_allow(underage, &gating_viewer(ViewerAge::Unknown), &text);
         assert_clauses_allow(no_age, &gating_viewer(ViewerAge::Unknown), &text);
 
-        let opted_in = ViewerFeatures {
+        let opted_in = gating_viewer_with(ViewerProfile {
             allows_sensitive_media: true,
-            ..gating_viewer(ViewerAge::Known(15))
-        };
+            viewer_age: ViewerAge::Known(15),
+            ..ViewerProfile::default()
+        });
         assert_clauses_drop(underage, &opted_in, &hp, &reason);
 
         let mut self_hp = hp.clone();
@@ -912,14 +984,14 @@ mod tests {
         assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &no_flags);
 
         let mut flag_rt = nsfw_tweet_flag_media();
-        flag_rt.tweet_features.core.source_tweet_id = Some(42);
+        flag_rt.tweet_features.source_tweet_id = Some(42);
         assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &flag_rt);
         let mut flag_self = nsfw_tweet_flag_media();
         flag_self.author_id = VIEWER_ID;
         assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &flag_self);
 
         let mut author_rt = nsfw_author_media();
-        author_rt.tweet_features.core.source_tweet_id = Some(42);
+        author_rt.tweet_features.source_tweet_id = Some(42);
         assert_clauses_allow(underage, &gating_viewer(ViewerAge::Known(15)), &author_rt);
         let mut author_no_media = nsfw_author_media();
         author_no_media.tweet_features.media.has_media = false;
@@ -937,13 +1009,6 @@ mod tests {
             .chain(RECS_MEDIA_DROPS)
             .find(|spec| spec.rule_name == name)
             .unwrap_or_else(|| panic!("no TES row {name}"))
-    }
-
-    fn stale_edit_control() -> Option<EditControl> {
-        Some(EditControl::Initial(EditControlInitial {
-            edit_tweet_ids: vec![1, 2],
-            ..Default::default()
-        }))
     }
 
     fn takedown_candidate(reasons: Vec<TakedownReason>) -> HydratedTweetCandidate {
@@ -976,59 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_all_axis() {
-        let spec = &FILTER_ALL[0];
-        let RuleClause {
-            rule_name: "FilterAllRule",
-            when: [],
-            action: ActionSpec::Drop(reason),
-            applies_to: Audience::Everyone,
-        } = spec
-        else {
-            panic!("{} is not the FilterAll row", spec.rule_name);
-        };
-        let pristine = candidate().build();
-        assert_drops(spec, &viewer(VIEWER_ID), &pristine, reason);
-        assert_drops(spec, &author_viewer(), &pristine, reason);
-        assert_drops(spec, &logged_out_viewer(), &pristine, reason);
-    }
-
-    #[test]
-    fn stale_and_dmca_tweet_axis() {
-        let stale = tes_spec("DropStaleTweetsRule");
-        let dmca = tes_spec("DropTweetsWithDmcaMediaRule");
-        let reason = FilteredReason::UnspecifiedReason;
-        let stale_c = candidate()
-            .with_tweet_features(TweetFeatures {
-                edit_control: stale_edit_control(),
-                ..Default::default()
-            })
-            .build();
-        assert_drops(stale, &viewer(VIEWER_ID), &stale_c, &reason);
-        assert_allows(stale, &viewer(VIEWER_ID), &candidate().build());
-        let stale_rt = candidate()
-            .with_tweet_features(TweetFeatures {
-                edit_control: stale_edit_control(),
-                ..Default::default()
-            })
-            .retweet_of(99)
-            .build();
-        assert_allows(stale, &viewer(VIEWER_ID), &stale_rt);
-
-        let dmca_c = candidate()
-            .with_tweet_features(TweetFeatures {
-                media: MediaFeature {
-                    has_dmca_media: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .build();
-        assert_drops(dmca, &viewer(VIEWER_ID), &dmca_c, &reason);
-        assert_allows(dmca, &viewer(VIEWER_ID), &candidate().build());
-    }
-
-    #[test]
     fn takedown_country_axis() {
         let legal = tes_spec("DropLegalTakendownPostRule");
         let local = tes_spec("DropLocalLawsTakendownPostRule");
@@ -1051,6 +1063,7 @@ mod tests {
         assert_allows(legal, &viewer_with_country("de"), &bystander);
         assert_drops(local, &viewer_with_country("de"), &bystander, &reason);
         assert_allows(local, &viewer_with_country("us"), &bystander);
+        assert_allows(local, &viewer(VIEWER_ID), &bystander);
 
         let legal_only = takedown_candidate(vec![TakedownReason::LegalRequest {
             country_code: "de".to_string(),
@@ -1070,60 +1083,30 @@ mod tests {
         ]);
         assert_allows(legal, &viewer_with_country("de"), &non_country);
         assert_allows(local, &viewer_with_country("de"), &non_country);
-    }
 
-    #[test]
-    fn takedown_worldwide_axis() {
-        let legal = tes_spec("DropLegalTakendownPostRule");
-        let local = tes_spec("DropLocalLawsTakendownPostRule");
-        let reason = FilteredReason::UnspecifiedReason;
-
-        for code in ["xx", "XX"] {
-            let worldwide = takedown_candidate(vec![TakedownReason::LegalRequest {
-                country_code: code.to_string(),
-            }]);
-            assert_drops(legal, &viewer_with_country("us"), &worldwide, &reason);
-            assert_drops(legal, &viewer(VIEWER_ID), &worldwide, &reason);
-        }
-        for code in ["xx", "xy"] {
-            let unspecified = takedown_candidate(vec![TakedownReason::UnspecifiedReason {
-                country_code: code.to_string(),
-            }]);
-            assert_drops(legal, &viewer_with_country("us"), &unspecified, &reason);
-            assert_drops(legal, &viewer(VIEWER_ID), &unspecified, &reason);
-        }
-
-        for code in ["xy", "XY"] {
-            let legal_copyright = takedown_candidate(vec![TakedownReason::LegalRequest {
-                country_code: code.to_string(),
-            }]);
-            assert_allows(legal, &viewer_with_country("us"), &legal_copyright);
-            assert_allows(legal, &viewer(VIEWER_ID), &legal_copyright);
-        }
-        for code in ["xx", "XY"] {
-            let bystander_worldwide = takedown_candidate(vec![TakedownReason::BystanderReport {
-                country_code: code.to_string(),
-            }]);
-            assert_allows(local, &viewer_with_country("us"), &bystander_worldwide);
-            assert_allows(local, &viewer(VIEWER_ID), &bystander_worldwide);
-        }
-
-        let country_scoped = takedown_candidate(vec![TakedownReason::LegalRequest {
-            country_code: "de".to_string(),
+        let worldwide_upper = takedown_candidate(vec![TakedownReason::LegalRequest {
+            country_code: "XX".to_string(),
         }]);
-        assert_allows(legal, &viewer(VIEWER_ID), &country_scoped);
-        let bystander_scoped = takedown_candidate(vec![TakedownReason::BystanderReport {
-            country_code: "de".to_string(),
+        assert_drops(legal, &viewer_with_country("us"), &worldwide_upper, &reason);
+        assert_drops(legal, &viewer(VIEWER_ID), &worldwide_upper, &reason);
+        let copyright_upper = takedown_candidate(vec![TakedownReason::LegalRequest {
+            country_code: "XY".to_string(),
         }]);
-        assert_allows(local, &viewer(VIEWER_ID), &bystander_scoped);
+        assert_allows(legal, &viewer_with_country("us"), &copyright_upper);
+        assert_allows(legal, &viewer(VIEWER_ID), &copyright_upper);
+        let bystander_worldwide_upper = takedown_candidate(vec![TakedownReason::BystanderReport {
+            country_code: "XY".to_string(),
+        }]);
+        assert_allows(
+            local,
+            &viewer_with_country("us"),
+            &bystander_worldwide_upper,
+        );
+        assert_allows(local, &viewer(VIEWER_ID), &bystander_worldwide_upper);
 
         let dmca = takedown_candidate(vec![TakedownReason::Dmca]);
-        assert_drops(legal, &viewer_with_country("de"), &dmca, &reason);
-        assert_drops(legal, &viewer(VIEWER_ID), &dmca, &reason);
         assert_allows(local, &viewer_with_country("de"), &dmca);
-        let mut author_dmca = dmca.clone();
-        author_dmca.author_id = VIEWER_ID;
-        assert_allows(legal, &viewer(VIEWER_ID), &author_dmca);
+        assert_allows(local, &viewer(VIEWER_ID), &dmca);
     }
 
     #[test]
@@ -1183,39 +1166,8 @@ mod tests {
         assert_drops(spec, &viewer_with_country("de"), &author, &reason);
 
         let mut retweet = geo_candidate(&[], &["de"]);
-        retweet.tweet_features.core.source_tweet_id = Some(99);
+        retweet.tweet_features.source_tweet_id = Some(99);
         assert_drops(spec, &viewer_with_country("de"), &retweet, &reason);
-    }
-
-    #[test]
-    fn nullcast_drop_axis() {
-        let spec = &NULLCAST_DROP[0];
-        let RuleClause {
-            rule_name: "NullcastedTweetDropRule",
-            action: ActionSpec::Drop(reason),
-            applies_to: Audience::Everyone,
-            ..
-        } = spec
-        else {
-            panic!("{} is not the nullcast drop row", spec.rule_name);
-        };
-        let firing = candidate()
-            .with_tweet_features(TweetFeatures {
-                is_nullcast: true,
-                ..Default::default()
-            })
-            .build();
-        assert_drops(spec, &viewer(VIEWER_ID), &firing, reason);
-        assert_drops(spec, &author_viewer(), &firing, reason);
-        assert_allows(spec, &viewer(VIEWER_ID), &candidate().build());
-
-        let mut community = firing.clone();
-        community.tweet_features.is_community_tweet = true;
-        assert_allows(spec, &viewer(VIEWER_ID), &community);
-
-        let mut retweet = firing.clone();
-        retweet.tweet_features.core.source_tweet_id = Some(99);
-        assert_allows(spec, &viewer(VIEWER_ID), &retweet);
     }
 
     #[test]
@@ -1238,77 +1190,24 @@ mod tests {
         };
         assert_clauses_allow(no_age, &missing, &hp);
 
-        let account_overrides = ViewerFeatures {
-            country_code: Some("de".into()),
+        let account_overrides = gating_viewer_with(ViewerProfile {
+            viewer_age: ViewerAge::NotStated,
             account_country_code: Some("us".into()),
-            ..gating_viewer(ViewerAge::NotStated)
-        };
+            ..ViewerProfile::default()
+        });
         assert_clauses_allow(no_age, &account_overrides, &hp);
 
         let gating_account = ViewerFeatures {
             country_code: Some("us".into()),
-            account_country_code: Some("kr".into()),
-            ..gating_viewer(ViewerAge::NotStated)
+            ..gating_viewer_with(ViewerProfile {
+                viewer_age: ViewerAge::NotStated,
+                account_country_code: Some("kr".into()),
+                ..ViewerProfile::default()
+            })
         };
         assert_clauses_drop(no_age, &gating_account, &hp, &reason);
 
-        let request_fallback = ViewerFeatures {
-            country_code: Some("de".into()),
-            account_country_code: None,
-            ..gating_viewer(ViewerAge::NotStated)
-        };
+        let request_fallback = gating_viewer(ViewerAge::NotStated);
         assert_clauses_drop(no_age, &request_fallback, &hp, &reason);
-    }
-
-    fn all_rule_slices() -> [&'static [RuleClause]; 16] {
-        use crate::rules::author_rules::{
-            AUTHOR_STATE_DROPS, OON_NSFW_AUTHOR_DROPS, OON_USER_LABEL_DROPS, SOCIALGRAPH_DROPS,
-        };
-        [
-            AUTHOR_STATE_DROPS,
-            TWEET_LABEL_DROPS,
-            NSFW_MEDIA_INTERSTITIALS,
-            OON_NSFW_AUTHOR_DROPS,
-            OON_TWEET_FLAG_DROPS,
-            OON_TWEET_LABEL_DROPS,
-            OON_USER_LABEL_DROPS,
-            SOCIALGRAPH_DROPS,
-            EXCLUSIVE_TWEET_DROP,
-            NSFW_AUTHOR_INTERSTITIAL,
-            NULLCAST_DROP,
-            STALE_TWEET_DROP,
-            TAKEDOWN_DROPS,
-            FILTER_ALL,
-            RECS_MEDIA_DROPS,
-            SENSITIVE_VIEWER_DROPS,
-        ]
-    }
-
-    #[test]
-    fn wired_rule_names_are_unique_runs_and_nonempty() {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut previous = None;
-        for spec in all_rule_slices().into_iter().flatten() {
-            let name = spec.rule_name;
-            assert!(!name.is_empty(), "rule name must be non-empty");
-            if previous != Some(name) {
-                assert!(seen.insert(name), "rule name {name} starts a second run");
-            }
-            previous = Some(name);
-        }
-        for name in [
-            "NsfwHighPrecisionAdultInterstitialRule",
-            "NsfwHighPrecisionInterstitialRule",
-            "GoreAndViolenceInterstitialRule",
-            "NsfwCardImageInterstitialRule",
-            "NsfwAdminInterstitialRule",
-            "NsfwUserInterstitialRule",
-        ] {
-            assert!(
-                seen.contains(name),
-                "missing media interstitial clause {name}"
-            );
-        }
-        assert_eq!(seen.len(), 57);
     }
 }

@@ -154,7 +154,8 @@ where
 
 #[expect(
     clippy::indexing_slicing,
-    reason = "index is modulo the non-empty shard list"
+    clippy::cast_possible_truncation,
+    reason = "index is modulo the non-empty shard list; truncating the hash only drops entropy"
 )]
 fn cache_shard<'a, K, V>(shards: &'a [Mutex<Cache<K, V>>], key: &K) -> &'a Mutex<Cache<K, V>>
 where

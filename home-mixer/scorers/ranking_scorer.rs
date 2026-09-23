@@ -482,6 +482,20 @@ impl RankingScorer {
         }
     }
 
+    pub(crate) fn unoffset_score(weighted_score: f64, w: &ScoringWeights) -> f64 {
+        if w.total_sum == 0.0 {
+            weighted_score
+        } else if weighted_score < NEGATIVE_SCORES_OFFSET {
+            weighted_score / NEGATIVE_SCORES_OFFSET * w.total_sum - w.negative_sum
+        } else {
+            weighted_score - NEGATIVE_SCORES_OFFSET
+        }
+    }
+
+    pub(crate) fn reuses_cached_weighted_score(query: &ScoredPostsQuery) -> bool {
+        query.has_cached_posts && query.params.get(CachedPostsReuseWeightedScore)
+    }
+
     fn diversity_multiplier(decay_factor: f64, floor: f64, exponent: f64) -> f64 {
         (1.0 - floor) * decay_factor.powf(exponent) + floor
     }
@@ -573,13 +587,13 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
         let weights = ScoringWeights::from_params(&query.params).perturbed(query);
         let enable_author_diversity = query.params.get(EnableAuthorDiversity);
 
-        let weighted_parts: Vec<(f64, f64)> = candidates
+        let reuse_cached = Self::reuses_cached_weighted_score(query);
+        let weighted_scores: Vec<f64> = candidates
             .iter()
-            .map(|c| Self::compute_weighted_parts(&weights, query, c))
-            .collect();
-        let weighted_scores: Vec<f64> = weighted_parts
-            .iter()
-            .map(|&(pos, neg)| Self::offset_score(pos - neg, &weights))
+            .map(|c| match c.weighted_score.filter(|_| reuse_cached) {
+                Some(weighted) => weighted,
+                None => Self::compute_weighted_score(&weights, query, c),
+            })
             .collect();
 
         let effective_oon = Self::effective_oon_weight(query);
@@ -610,15 +624,15 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
             } else {
                 vec![1.0; candidates.len()]
             };
-            let scores: Vec<f64> = weighted_parts
+            let scores: Vec<f64> = weighted_scores
                 .iter()
                 .enumerate()
-                .map(|(i, &(pos, neg))| {
+                .map(|(i, &weighted)| {
                     let mut m = diversity_multipliers[i];
                     if oon_applies(&candidates[i]) {
                         m *= effective_oon;
                     }
-                    let net = pos - neg;
+                    let net = Self::unoffset_score(weighted, &weights);
                     let scaled = if net >= 0.0 { m * net } else { net };
                     Self::offset_score(scaled, &weights)
                 })

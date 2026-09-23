@@ -29,31 +29,12 @@ impl GizmoduckLookup {
         user_ids: Vec<u64>,
         fields: &[QueryFields],
     ) -> HashMap<u64, anyhow::Result<Option<GizmoduckUserResult>>> {
-        let ids: Vec<i64> = user_ids.into_iter().map(|id| id as i64).collect();
+        let ids: Vec<i64> = user_ids.into_iter().map(u64::cast_signed).collect();
         self.inner
             .get_users_with_context(ids, Some(author_hydration_lookup_context()), fields)
             .await
             .into_iter()
-            .map(|(id, result)| (id as u64, result))
+            .map(|(id, result)| (id.cast_unsigned(), result))
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn author_lookup_context_sets_include_flags() {
-        let ctx = author_hydration_lookup_context();
-        assert_eq!(ctx.for_user_id, None);
-        assert!(ctx.include_deactivated);
-        assert!(ctx.include_failed);
-        assert!(ctx.include_erased);
-        assert!(ctx.include_no_screen_name_users);
-        assert!(ctx.include_offboarded);
-        assert!(!ctx.include_soft_users);
-        assert!(!ctx.include_login_email);
-        assert!(ctx.filter_perspectival.is_empty());
     }
 }

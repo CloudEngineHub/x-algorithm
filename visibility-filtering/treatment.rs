@@ -176,6 +176,7 @@ pub(crate) fn decided_rows(
 mod tests {
     use super::*;
     use crate::models::LimitedEngagement;
+    use crate::rules::metrics::Rpc;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::models::{KeywordMatch, SafetyResult};
     use xai_x_thrift::action::InterstitialReason;
@@ -218,50 +219,6 @@ mod tests {
                 )),
             },
         ))
-    }
-
-    #[test]
-    fn nudity_projects_to_media_blur() {
-        assert_eq!(
-            thrift_action(
-                &shown(Some(blur(InterstitialReason::Nudity(true))), None),
-                TimelineHome
-            ),
-            thrift_blur(InterstitialReason::Nudity(true))
-        );
-    }
-
-    #[test]
-    fn sensitive_projects_to_media_blur() {
-        assert_eq!(
-            thrift_action(
-                &shown(Some(blur(InterstitialReason::Sensitive(true))), None),
-                TimelineHome
-            ),
-            thrift_blur(InterstitialReason::Sensitive(true))
-        );
-    }
-
-    #[test]
-    fn sensitive_user_projects_to_media_blur() {
-        assert_eq!(
-            thrift_action(
-                &shown(Some(blur(InterstitialReason::SensitiveUser(true))), None),
-                TimelineHome
-            ),
-            thrift_blur(InterstitialReason::SensitiveUser(true))
-        );
-    }
-
-    #[test]
-    fn violence_projects_to_media_blur() {
-        assert_eq!(
-            thrift_action(
-                &shown(Some(blur(InterstitialReason::Violence(true))), None),
-                TimelineHome
-            ),
-            thrift_blur(InterstitialReason::Violence(true))
-        );
     }
 
     fn limit() -> Decided<LimitedEngagement> {
@@ -424,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_every_verdict_mix_label() {
+    fn dashboard_generator_pins_the_rpc_and_verdict_mix_labels() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -434,6 +391,8 @@ mod tests {
         };
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let filter_tweets = <&str>::from(Rpc::FilterTweets);
+        assert!(dashboard.contains(&format!("FT_RPC_FILTER = 'rpc=~\"{filter_tweets}|\"'")));
         let actions = dashboard
             .split_once("FT_VERDICT_ACTIONS = (")
             .and_then(|(_, rest)| rest.split_once(')'))

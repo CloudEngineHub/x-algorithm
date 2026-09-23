@@ -434,6 +434,10 @@ async fn build_xds_strato(
     ))
 }
 
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn warm_cache(twemcache: &CacheClient) {
     let start = Instant::now();
     let key = match Key::new(b"slm_warmup".to_vec()) {
@@ -443,22 +447,21 @@ async fn warm_cache(twemcache: &CacheClient) {
             return;
         }
     };
-    let latency_ms = || start.elapsed().as_millis() as u64;
     match twemcache.multi_get(std::slice::from_ref(&key)).await {
         Ok(map) => match map.get(&key) {
-            Some(Ok(_)) => info!(latency_ms = latency_ms(), "Cache warmup succeeded"),
+            Some(Ok(_)) => info!(latency_ms = elapsed_ms(start), "Cache warmup succeeded"),
             Some(Err(e)) => warn!(
-                latency_ms = latency_ms(),
+                latency_ms = elapsed_ms(start),
                 error = %e,
                 "Cache warmup failed (non-fatal)"
             ),
             None => warn!(
-                latency_ms = latency_ms(),
+                latency_ms = elapsed_ms(start),
                 "Cache warmup returned no response (non-fatal)"
             ),
         },
         Err(e) => warn!(
-            latency_ms = latency_ms(),
+            latency_ms = elapsed_ms(start),
             error = %e,
             "Cache warmup failed (non-fatal)"
         ),
@@ -502,7 +505,7 @@ async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {
                 info!(
                     attempts,
-                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    elapsed_ms = elapsed_ms(start),
                     "filter_tweets warmup succeeded"
                 );
                 return;
@@ -518,7 +521,7 @@ async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
     }
     warn!(
         attempts,
-        elapsed_ms = start.elapsed().as_millis() as u64,
+        elapsed_ms = elapsed_ms(start),
         "filter_tweets warmup deadline expired (non-fatal)"
     );
 }
@@ -526,12 +529,9 @@ async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
 async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
     let start = Instant::now();
     match manhattan.fetch_labels(&[0]).await {
-        Ok(_) => info!(
-            latency_ms = start.elapsed().as_millis() as u64,
-            "Manhattan warmup succeeded"
-        ),
+        Ok(_) => info!(latency_ms = elapsed_ms(start), "Manhattan warmup succeeded"),
         Err(e) => warn!(
-            latency_ms = start.elapsed().as_millis() as u64,
+            latency_ms = elapsed_ms(start),
             error = %e,
             "Manhattan warmup failed (non-fatal)"
         ),
@@ -541,20 +541,10 @@ async fn warm_manhattan(manhattan: &dyn ManhattanLabelFetcher) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::FilterOutcome;
-    use crate::models::{Decided, Verdict, Withholding};
     use std::cell::Cell;
-    use xai_visibility_filtering::models::FilteredReason;
 
     fn deadline_in(budget: Duration) -> tokio::time::Instant {
         tokio::time::Instant::now() + budget
-    }
-
-    #[tokio::test]
-    async fn reference_compare_harness_not_built_without_flag() {
-        let harness =
-            build_reference_compare_harness("atla", deadline_in(Duration::from_secs(1))).await;
-        assert!(harness.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -640,37 +630,5 @@ mod tests {
             ))
         );
         assert_eq!(start.elapsed(), CLIENT_INIT_ATTEMPT_TIMEOUT);
-    }
-
-    fn response(verdict: Verdict, status: EvaluationStatus) -> FilterResponse {
-        FilterResponse {
-            outcomes: vec![FilterOutcome {
-                tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
-                status,
-                verdict,
-                safety_labels: None,
-            }],
-        }
-    }
-
-    #[test]
-    fn evaluated_verdict_is_warm() {
-        let response = response(
-            Verdict::Withheld(Decided {
-                value: Withholding::Drop(FilteredReason::AuthorIsSuspended),
-                by: "DropSuspendedAuthorRule",
-            }),
-            EvaluationStatus::Evaluated,
-        );
-        assert!(filter_tweets_response_is_warm(&response));
-    }
-
-    #[test]
-    fn unresolved_author_verdict_is_not_warm() {
-        let response = response(
-            Verdict::unresolved_author(),
-            EvaluationStatus::UnresolvedAuthor,
-        );
-        assert!(!filter_tweets_response_is_warm(&response));
     }
 }

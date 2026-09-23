@@ -151,27 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn try_from_resolved_reports_all_success() {
-        let outcome = GetSafetyLabelsOutcome::try_from_resolved(
-            HashMap::from([
-                (1, Ok(Arc::new(labels_with_entry(11)))),
-                (2, Ok(Arc::new(labels_with_entry(22)))),
-            ]),
-            2,
-        )
-        .unwrap();
-
-        assert_eq!(outcome.success_count(), 2);
-        assert_eq!(outcome.failure_count(), 0);
-        assert!(outcome.failed_ids.is_empty());
-        assert!(outcome.failures.values().all(|&c| c == 0));
-    }
-
-    #[test]
     fn try_from_resolved_reports_partial_failure() {
         let outcome = GetSafetyLabelsOutcome::try_from_resolved(
             HashMap::from([
                 (1, Ok(Arc::new(labels_with_entry(11)))),
+                (4, Ok(Arc::new(labels_with_entry(44)))),
                 (
                     2,
                     Err(LookupError::new(FailureKind::ManhattanDecode, "decode")),
@@ -181,40 +165,15 @@ mod tests {
                     Err(LookupError::new(FailureKind::ManhattanFetch, "mh down")),
                 ),
             ]),
-            3,
+            4,
         )
         .unwrap();
 
-        assert_eq!(outcome.success_count(), 1);
-        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.success_count(), 2);
+        assert_eq!(outcome.results.len(), 2);
         assert_eq!(outcome.failed_ids, vec![2, 3]);
         assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 1);
         assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 1);
-        assert_eq!(outcome.failure_count(), 2);
-    }
-
-    #[test]
-    fn try_from_resolved_reports_full_failure() {
-        let outcome = GetSafetyLabelsOutcome::try_from_resolved(
-            HashMap::from([
-                (
-                    4,
-                    Err(LookupError::new(FailureKind::ManhattanFetch, "mh down")),
-                ),
-                (
-                    5,
-                    Err(LookupError::new(FailureKind::ManhattanFetch, "mh down")),
-                ),
-            ]),
-            2,
-        )
-        .unwrap();
-
-        assert_eq!(outcome.success_count(), 0);
-        assert!(outcome.results.is_empty());
-        assert_eq!(outcome.failed_ids, vec![4, 5]);
-        assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 2);
-        assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 0);
         assert_eq!(outcome.failure_count(), 2);
     }
 

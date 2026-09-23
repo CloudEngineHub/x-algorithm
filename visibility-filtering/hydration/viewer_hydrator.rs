@@ -1,88 +1,77 @@
 use crate::hydration::batch::Completeness;
 use crate::hydration::metrics::{record_hydrator_request, HydratorOutcome};
-use crate::models::{Viewer, ViewerAge, ViewerFeatures};
+use crate::models::{ViewerAge, ViewerProfile};
 use crate::rules::SafetyLevel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
-use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
+use xai_core_entities::entities::VerifiedType;
+use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields, ViewerData};
 use xai_x_rpc::WithBudget;
 
 const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 
-const VIEWER_QUERY_FIELDS: [QueryFields; 2] = [QueryFields::ACCOUNT, QueryFields::EXTENDED_PROFILE];
+const VIEWER_QUERY_FIELDS: [QueryFields; 3] = [
+    QueryFields::ACCOUNT,
+    QueryFields::EXTENDED_PROFILE,
+    QueryFields::SAFETY,
+];
+
+fn has_verified_badge(data: &ViewerData) -> bool {
+    matches!(
+        data.verified_type,
+        Some(VerifiedType::Business | VerifiedType::Government)
+    ) || data.is_blue_verified
+}
 
 pub struct ViewerHydrator {
     pub gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
 }
 
 impl ViewerHydrator {
-    pub async fn hydrate(
-        &self,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        safety_level: SafetyLevel,
-    ) -> Completeness<ViewerFeatures> {
-        let viewer = match viewer_id {
-            Some(id) => Viewer::LoggedIn(id),
-            None => Viewer::LoggedOut,
+    pub async fn hydrate(&self, id: u64, safety_level: SafetyLevel) -> Completeness<ViewerProfile> {
+        let start = Instant::now();
+        let result = self
+            .gizmoduck_client
+            .get_viewer_data_with_fields(id, &VIEWER_QUERY_FIELDS)
+            .with_budget(CLIENT_TIMEOUT)
+            .await;
+        let outcome = match &result {
+            Ok(Ok(_)) => HydratorOutcome::Success,
+            Ok(Err(_)) => HydratorOutcome::Error,
+            Err(_) => HydratorOutcome::Timeout,
         };
-        let lookup = match viewer_id {
-            Some(vid) => {
-                let start = Instant::now();
-                let result = self
-                    .gizmoduck_client
-                    .get_viewer_data_with_fields(vid, &VIEWER_QUERY_FIELDS)
-                    .with_budget(CLIENT_TIMEOUT)
-                    .await;
-                let outcome = match &result {
-                    Ok(Ok(_)) => HydratorOutcome::Success,
-                    Ok(Err(_)) => HydratorOutcome::Error,
-                    Err(_) => HydratorOutcome::Timeout,
+        record_hydrator_request(
+            "gizmoduck",
+            "get_viewer_data",
+            safety_level,
+            outcome,
+            1,
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+        match result {
+            Ok(Ok(data)) => {
+                let viewer_age = match data.age_in_years {
+                    Some(age) => ViewerAge::Known(age),
+                    None if data.user_exists => ViewerAge::NotStated,
+                    None => ViewerAge::Unknown,
                 };
-                record_hydrator_request(
-                    "gizmoduck",
-                    "get_viewer_data",
-                    safety_level,
-                    outcome,
-                    1,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-                match result {
-                    Ok(Ok(data)) => {
-                        let age = match data.age_in_years {
-                            Some(age) => ViewerAge::Known(age),
-                            None if data.user_exists => ViewerAge::NotStated,
-                            None => ViewerAge::Unknown,
-                        };
-                        Completeness::Complete((
-                            data.nsfw_view.unwrap_or(false),
-                            age,
-                            data.account_country_code,
-                        ))
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "Gizmoduck viewer lookup failed; failing open");
-                        Completeness::Incomplete((false, ViewerAge::Unknown, None))
-                    }
-                    Err(_) => {
-                        warn!("Gizmoduck viewer lookup timed out; failing open");
-                        Completeness::Incomplete((false, ViewerAge::Unknown, None))
-                    }
-                }
+                Completeness::Complete(ViewerProfile {
+                    allows_sensitive_media: data.nsfw_view.unwrap_or(false),
+                    viewer_age,
+                    has_verified_badge: has_verified_badge(&data),
+                    account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),
+                })
             }
-            None => Completeness::Complete((false, ViewerAge::Unknown, None)),
-        };
-
-        lookup.map(
-            |(allows_sensitive_media, viewer_age, account_country_code)| ViewerFeatures {
-                viewer,
-                allows_sensitive_media,
-                country_code: country_code.map(|c| c.to_ascii_lowercase()),
-                account_country_code: account_country_code.map(|c| c.to_ascii_lowercase()),
-                viewer_age,
-            },
-        )
+            Ok(Err(e)) => {
+                warn!(error = %e, "Gizmoduck viewer lookup failed; failing open");
+                Completeness::Incomplete(ViewerProfile::default())
+            }
+            Err(_) => {
+                warn!("Gizmoduck viewer lookup timed out; failing open");
+                Completeness::Incomplete(ViewerProfile::default())
+            }
+        }
     }
 }
 
@@ -92,7 +81,7 @@ mod tests {
     use anyhow::Result;
     use std::collections::HashMap;
     use xai_core_entities::entities::{GizmoduckUserResult, PCFLabel};
-    use xai_core_entities::gizmoduck_client::{MockGizmoduckClient, UserFields, ViewerData};
+    use xai_core_entities::gizmoduck_client::{MockGizmoduckClient, UserFields};
 
     fn hydrator_with_viewer_data(user_id: u64, data: ViewerData) -> ViewerHydrator {
         let mut client = MockGizmoduckClient::default();
@@ -168,111 +157,115 @@ mod tests {
         }
     }
 
-    async fn hydrate_with_broken_client(lookup: ViewerLookup) -> ViewerFeatures {
+    async fn hydrate_with_broken_client(lookup: ViewerLookup) -> ViewerProfile {
         let hydrator = ViewerHydrator {
             gizmoduck_client: Arc::new(BrokenViewerClient(lookup)),
         };
-        let Completeness::Incomplete(viewer) = hydrator
-            .hydrate(Some(123), Some("US".to_string()), SafetyLevel::FilterAll)
-            .await
+        let Completeness::Incomplete(profile) = hydrator.hydrate(123, SafetyLevel::FilterAll).await
         else {
             panic!("broken viewer lookups are incomplete")
         };
-        viewer
+        profile
     }
 
     #[tokio::test]
-    async fn rpc_error_fails_open_to_logged_in_defaults() {
-        let viewer = hydrate_with_broken_client(ViewerLookup::Fails).await;
+    async fn rpc_error_fails_open_to_the_default_profile() {
+        let profile = hydrate_with_broken_client(ViewerLookup::Fails).await;
 
-        assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
-        assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
-        assert_eq!(viewer.account_country_code, None);
-        assert_eq!(viewer.country_code.as_deref(), Some("us"));
+        assert!(!profile.allows_sensitive_media);
+        assert_eq!(profile.viewer_age, ViewerAge::Unknown);
+        assert_eq!(profile.account_country_code, None);
+        assert!(!profile.has_verified_badge);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_timeout_fails_open_to_the_default_profile() {
+        let profile = hydrate_with_broken_client(ViewerLookup::Hangs).await;
+
+        assert!(!profile.allows_sensitive_media);
+        assert_eq!(profile.viewer_age, ViewerAge::Unknown);
+        assert_eq!(profile.account_country_code, None);
+        assert!(!profile.has_verified_badge);
     }
 
     #[tokio::test]
-    async fn rpc_timeout_fails_open_to_logged_in_defaults() {
-        let viewer = hydrate_with_broken_client(ViewerLookup::Hangs).await;
+    async fn viewer_existence_and_preference_determine_age_and_sensitive_media() {
+        for (data, expected_age, expected_sensitive_media) in [
+            (
+                ViewerData {
+                    user_exists: true,
+                    nsfw_view: Some(false),
+                    age_in_years: None,
+                    ..Default::default()
+                },
+                ViewerAge::NotStated,
+                false,
+            ),
+            (
+                ViewerData {
+                    user_exists: true,
+                    nsfw_view: Some(true),
+                    age_in_years: None,
+                    ..Default::default()
+                },
+                ViewerAge::NotStated,
+                true,
+            ),
+            (ViewerData::default(), ViewerAge::Unknown, false),
+        ] {
+            let viewer = hydrator_with_viewer_data(123, data)
+                .hydrate(123, SafetyLevel::FilterAll)
+                .await
+                .into_value();
+            assert_eq!(viewer.viewer_age, expected_age);
+            assert_eq!(viewer.allows_sensitive_media, expected_sensitive_media);
+        }
+    }
 
-        assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
-        assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
-        assert_eq!(viewer.account_country_code, None);
-        assert_eq!(viewer.country_code.as_deref(), Some("us"));
+    #[test]
+    fn viewer_lookup_requests_safety() {
+        assert!(VIEWER_QUERY_FIELDS.contains(&QueryFields::SAFETY));
+    }
+
+    #[test]
+    fn verified_badge_requires_org_type_or_blue_check() {
+        let cases = [
+            (Some(VerifiedType::Business), false, true),
+            (Some(VerifiedType::Government), false, true),
+            (None, true, true),
+            (Some(VerifiedType::User), false, false),
+            (Some(VerifiedType::Notable), false, false),
+            (None, false, false),
+        ];
+        for (verified_type, is_blue_verified, expected) in cases {
+            let data = ViewerData {
+                verified_type,
+                is_blue_verified,
+                ..Default::default()
+            };
+            assert_eq!(
+                has_verified_badge(&data),
+                expected,
+                "{verified_type:?} blue={is_blue_verified}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn logged_out_viewer_defaults_sensitive_media_to_false() {
-        let hydrator = ViewerHydrator {
-            gizmoduck_client: Arc::new(MockGizmoduckClient::default()),
-        };
-
-        let viewer = hydrator
-            .hydrate(None, Some("US".to_string()), SafetyLevel::FilterAll)
-            .await
-            .into_value();
-
-        assert_eq!(viewer.viewer, Viewer::LoggedOut);
-        assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.country_code.as_deref(), Some("us"));
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
-    }
-
-    #[tokio::test]
-    async fn account_country_code_is_hydrated_lowercased() {
+    async fn verified_badge_is_hydrated() {
         let hydrator = hydrator_with_viewer_data(
             123,
             ViewerData {
-                account_country_code: Some("KR".to_string()),
+                is_blue_verified: true,
                 ..Default::default()
             },
         );
 
         let viewer = hydrator
-            .hydrate(Some(123), Some("US".to_string()), SafetyLevel::FilterAll)
+            .hydrate(123, SafetyLevel::FilterAll)
             .await
             .into_value();
 
-        assert_eq!(viewer.account_country_code.as_deref(), Some("kr"));
-        assert_eq!(viewer.country_code.as_deref(), Some("us"));
-    }
-
-    #[tokio::test]
-    async fn existing_viewer_without_age_is_not_stated() {
-        let hydrator = hydrator_with_viewer_data(
-            123,
-            ViewerData {
-                user_exists: true,
-                nsfw_view: Some(false),
-                age_in_years: None,
-                ..Default::default()
-            },
-        );
-
-        let viewer = hydrator
-            .hydrate(Some(123), None, SafetyLevel::FilterAll)
-            .await
-            .into_value();
-
-        assert_eq!(viewer.viewer_age, ViewerAge::NotStated);
-    }
-
-    #[tokio::test]
-    async fn nonexistent_viewer_is_unknown() {
-        let hydrator = ViewerHydrator {
-            gizmoduck_client: Arc::new(MockGizmoduckClient::default()),
-        };
-
-        let viewer = hydrator
-            .hydrate(Some(123), Some("FR".to_string()), SafetyLevel::FilterAll)
-            .await
-            .into_value();
-
-        assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
-        assert!(!viewer.allows_sensitive_media);
-        assert_eq!(viewer.country_code.as_deref(), Some("fr"));
-        assert_eq!(viewer.viewer_age, ViewerAge::Unknown);
+        assert!(viewer.has_verified_badge);
     }
 }

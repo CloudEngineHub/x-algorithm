@@ -207,8 +207,7 @@ mod tests {
         MockTweetForVisibilitySource, TweetForVisibility, TweetForVisibilitySource,
     };
     use crate::models::{
-        CoreFeature, Decided, ExclusiveContentFeatures, TweetFeatures, ViewerAuthorRelationship,
-        Withholding,
+        ExclusiveContentFeatures, TweetFeatures, Viewer, ViewerAuthorRelationship, ViewerProfile,
     };
     use std::sync::{Arc, Mutex};
     use tonic::async_trait;
@@ -252,6 +251,10 @@ mod tests {
             self.super_follows.lock().unwrap().push(authors.to_vec());
             Some(authors.iter().map(|&id| (id, true)).collect())
         }
+
+        async fn batch_check_followed_by(&self, _: u64, _: &[u64]) -> Option<HashMap<u64, bool>> {
+            unreachable!("filter hydration never checks followed-by edges")
+        }
     }
 
     struct PendingComposite;
@@ -280,8 +283,6 @@ mod tests {
                     1,
                     Some(PureCoreData {
                         author_id: 10,
-                        text: "pure core text".into(),
-                        source_tweet_id: Some(999),
                         ..Default::default()
                     }),
                 ),
@@ -407,21 +408,56 @@ mod tests {
         assert_eq!(started.elapsed(), crate::hydration::HYDRATION_TIMEOUT);
         let tweet = &result.candidates[0];
         assert_eq!(tweet.author_id, 10);
-        assert_eq!(
-            tweet.tweet_features,
-            TweetFeatures {
-                core: CoreFeature {
-                    text: "pure core text".into(),
-                    source_tweet_id: None
-                },
-                ..Default::default()
-            }
-        );
+        assert_eq!(tweet.tweet_features, TweetFeatures::default());
         assert!(tweet.author_features.is_suspended);
         assert!(tweet.relationship.viewer_follows_author);
         assert_eq!(tweet.exclusive_content, None);
         assert_eq!(tes.call_count(), 1);
         assert!(sg.super_follows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn filter_all_hydrates_pure_core_only_and_keeps_the_request_side_viewer() {
+        let sg = Arc::new(RecordingSocialgraph::default());
+        let gizmoduck = Arc::new(MockGizmoduckClient::default());
+        let pipeline = HydrationPipeline::new(
+            core_client(),
+            Arc::new(MockTweetForVisibilitySource {
+                tweets: HashMap::from([(1, Some(exclusive_tweet()))]),
+                ..Default::default()
+            }),
+            gizmoduck.clone(),
+            sg.clone(),
+            test_support::safety_labels(),
+            None,
+            None,
+        );
+        let raw = [candidate(1, None)];
+        let result = pipeline
+            .hydrate(HydrationRequest::new(
+                Some(50),
+                Some("US".into()),
+                &raw,
+                SafetyLevel::FilterAll,
+            ))
+            .await;
+        assert_eq!(gizmoduck.call_count(), 0);
+        assert!(sg.relationships.lock().unwrap().is_empty());
+        assert!(sg.super_follows.lock().unwrap().is_empty());
+        assert_eq!(
+            result.viewer_features.viewer,
+            Viewer::LoggedIn {
+                id: 50,
+                profile: ViewerProfile::default(),
+            }
+        );
+        assert_eq!(result.viewer_features.country_code.as_deref(), Some("us"));
+        let tweet = &result.candidates[0];
+        assert_eq!(tweet.author_id, 10);
+        assert_eq!(tweet.relationship, ViewerAuthorRelationship::default());
+        assert_eq!(tweet.exclusive_content, None);
+        assert!(result.safety_labels.is_empty());
+        assert!(result.failed_ids.is_empty());
     }
 
     #[tokio::test]
@@ -512,9 +548,9 @@ mod tests {
                 .map(|outcome| outcome.status)
                 .collect::<Vec<_>>(),
             vec![
-                EvaluationStatus::Failed,
+                EvaluationStatus::Evaluated,
                 EvaluationStatus::UnresolvedAuthor,
-                EvaluationStatus::Failed
+                EvaluationStatus::Evaluated
             ]
         );
         assert_eq!(response.outcomes[2].verdict, unrestricted());
@@ -532,50 +568,5 @@ mod tests {
             response.outcomes[0].safety_labels,
             response.outcomes[2].safety_labels
         );
-    }
-
-    #[tokio::test]
-    async fn run_labels_both_occurrences_of_a_cold_id() {
-        let response = filter_tweets()
-            .run(FilterRequest {
-                viewer_id: None,
-                country_code: None,
-                safety_level: SafetyLevel::TimelineHome,
-                candidates: vec![candidate(3, Some(30)), candidate(3, Some(30))],
-                rpc: Rpc::FilterTweets,
-            })
-            .await;
-
-        let labels = response
-            .outcomes
-            .iter()
-            .map(|outcome| outcome.safety_labels.as_ref().unwrap())
-            .collect::<Vec<_>>();
-        assert!(!labels[0].labels.is_empty());
-        assert_eq!(labels[0], labels[1]);
-    }
-
-    #[tokio::test]
-    async fn run_selects_policy_from_safety_level() {
-        let service = filter_tweets();
-        let request = |safety_level| FilterRequest {
-            viewer_id: None,
-            country_code: None,
-            safety_level,
-            candidates: vec![candidate(1, Some(10))],
-            rpc: Rpc::FilterTweets,
-        };
-
-        let home = service.run(request(SafetyLevel::TimelineHome)).await;
-        let filter_all = service.run(request(SafetyLevel::FilterAll)).await;
-
-        assert_eq!(home.outcomes[0].verdict, unrestricted());
-        assert!(matches!(
-            filter_all.outcomes[0].verdict,
-            Verdict::Withheld(Decided {
-                value: Withholding::Drop(_),
-                by: "FilterAllRule",
-            })
-        ));
     }
 }

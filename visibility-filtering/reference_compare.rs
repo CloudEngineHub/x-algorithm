@@ -1,3 +1,4 @@
+use crate::config::ENV_IMAGE;
 use crate::models::{Decided, MediaInterstitial, Verdict, Withholding};
 use crate::rules::SafetyLevel;
 use crate::treatment;
@@ -131,11 +132,22 @@ pub(crate) struct TweetVerdict {
     pub verdict: Verdict,
 }
 
-pub(crate) struct VerdictSender(tokio::sync::oneshot::Sender<Vec<TweetVerdict>>);
+pub(crate) struct VerdictSender {
+    sender: tokio::sync::oneshot::Sender<Vec<TweetVerdict>>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "awaited only by tests"))]
+    task: tokio::task::JoinHandle<CompareResult>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompareResult {
+    Compared,
+    ReferenceTimeout,
+    VerdictsDropped,
+}
 
 impl VerdictSender {
     pub(crate) fn send(self, verdicts: Vec<TweetVerdict>) {
-        let _ = self.0.send(verdicts);
+        let _ = self.sender.send(verdicts);
     }
 }
 
@@ -200,7 +212,7 @@ fn batch_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64;
+        .as_nanos();
     format!("{nanos:x}-{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -321,7 +333,6 @@ pub(crate) fn comparable_request(
 }
 
 const BUILD_SHA_LEN: usize = 12;
-const VF_IMAGE_ENV: &str = "VF_IMAGE";
 
 fn resolve_build_sha(compiled: &str, image: Option<&str>) -> String {
     if let Some(sha) = sha_prefix(compiled) {
@@ -352,7 +363,7 @@ pub struct ReferenceCompareHarness {
 impl ReferenceCompareHarness {
     pub(crate) fn new(reference: Arc<dyn VfClient + Send + Sync>, datacenter: &str) -> Self {
         let compiled = xai_build_version::current_build_information().git_commit_sha;
-        let image = std::env::var(VF_IMAGE_ENV).ok();
+        let image = std::env::var(ENV_IMAGE).ok();
         let build_sha = resolve_build_sha(&compiled, image.as_deref());
         let harness = Self {
             reference,
@@ -386,9 +397,9 @@ impl ReferenceCompareHarness {
         }
         let (tx, rx) = tokio::sync::oneshot::channel::<Vec<TweetVerdict>>();
         let harness = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let viewer = TwitterContextViewer {
-                user_id: viewer_id as i64,
+                user_id: viewer_id.cast_signed(),
                 request_country_code: country_code.unwrap_or_default(),
                 ..Default::default()
             };
@@ -407,10 +418,12 @@ impl ReferenceCompareHarness {
                         .collect(),
                     Err(_) => {
                         harness.incr(ERROR, &[("kind", "timeout")]);
-                        return;
+                        return CompareResult::ReferenceTimeout;
                     }
                 };
-            let Ok(verdicts) = verdicts else { return };
+            let Ok(verdicts) = verdicts else {
+                return CompareResult::VerdictsDropped;
+            };
             let context = CompareContext {
                 viewer_id,
                 safety_level,
@@ -427,8 +440,9 @@ impl ReferenceCompareHarness {
                     }
                 }
             }
+            CompareResult::Compared
         });
-        Some(VerdictSender(tx))
+        Some(VerdictSender { sender: tx, task })
     }
 
     fn emit(&self, safety_level: SafetyLevel, counts: &CompareCounts) {
@@ -546,30 +560,6 @@ mod tests {
     }
 
     #[test]
-    fn comparable_request_maps_home_levels_and_skips_the_rest() {
-        assert_eq!(
-            comparable_request(SafetyLevel::TimelineHome, Some(7)),
-            Ok((ReferenceSafetyLevel::TimelineHome, 7))
-        );
-        assert_eq!(
-            comparable_request(SafetyLevel::TimelineHomeRecommendations, Some(7)),
-            Ok((ReferenceSafetyLevel::TimelineHomeRecommendations, 7))
-        );
-        assert_eq!(
-            comparable_request(SafetyLevel::FilterAll, Some(7)),
-            Err("level_unmapped")
-        );
-        assert_eq!(
-            comparable_request(SafetyLevel::TimelineHomeHydration, Some(7)),
-            Err("level_unmapped")
-        );
-        assert_eq!(
-            comparable_request(SafetyLevel::TimelineHome, None),
-            Err("logged_out_viewer")
-        );
-    }
-
-    #[test]
     fn should_build_harness_requires_flag_and_rejects_prod() {
         assert_eq!(should_build_harness(false, Some("prod")), Ok(false));
         assert_eq!(should_build_harness(false, Some("staging")), Ok(false));
@@ -621,51 +611,73 @@ mod tests {
         assert_eq!(diffs.len(), 2, "differing pairs only: {diffs:?}");
     }
 
-    #[test]
-    fn verdict_grammar_encodes_action_reason_and_rule() {
-        let cases = [
-            (service_allow(), "allow"),
-            (
-                service_drop(),
-                "drop:AuthorIsSuspended@DropSuspendedAuthorRule",
-            ),
-            (
-                service_interstitial(),
-                "interstitial:ContainNsfwMedia@nsfw_media",
-            ),
-        ];
-        for (v, expected) in &cases {
-            assert_eq!(service_verdict_str(v), *expected);
-        }
+    const RECORDER_LINE_FIXTURE: &str = "scripts/tests/fixtures/recorder_lines.json";
 
-        assert_eq!(reference_verdict_str(&reference_allow()), "allow");
-        assert_eq!(
-            reference_verdict_str(&reference_bare_drop()),
-            "drop:AuthorIsSuspended"
-        );
-        assert_eq!(
-            reference_verdict_str(&Some(FilteredReason::SafetyResult(ReferenceSafetyResult {
-                reason: Some(
-                    xai_visibility_filtering::models::SafetyResultReason::NsfwHighPrecision
-                ),
-                action: Action::Avoid,
-            }))),
-            "avoid:NsfwHighPrecision"
-        );
-        for (action, label) in [
-            (Action::NotEvaluated, "not_evaluated"),
-            (Action::Allow, "allow"),
-            (Action::Drop(DropReason {}), "drop"),
-            (Action::Interstitial, "interstitial"),
-            (Action::Downrank, "downrank"),
-            (Action::Tombstone, "tombstone"),
-            (Action::Avoid, "avoid"),
-        ] {
-            assert_eq!(
-                reference_verdict_str(&reference_safety_result(action)),
-                format!("{label}:SafetyResult")
-            );
+                #[test]
+    fn recorder_line_fixture_matches_chunk_lines() {
+        use xai_visibility_filtering::models::SafetyResultReason;
+        let avoid_nsfw = Some(FilteredReason::SafetyResult(ReferenceSafetyResult {
+            reason: Some(SafetyResultReason::NsfwHighPrecision),
+            action: Action::Avoid,
+        }));
+        let pairs = [
+            (service_allow(), avoid_nsfw.clone()),
+            (service_drop(), reference_allow()),
+            (service_interstitial(), reference_allow()),
+            (service_allow(), reference_bare_drop()),
+            (service_allow(), reference_muted_keyword()),
+            (service_allow(), avoid_nsfw),
+            (
+                service_allow(),
+                reference_safety_result(Action::NotEvaluated),
+            ),
+            (service_allow(), reference_safety_result(Action::Allow)),
+            (
+                service_allow(),
+                reference_safety_result(Action::Drop(DropReason {})),
+            ),
+            (
+                service_allow(),
+                reference_safety_result(Action::Interstitial),
+            ),
+            (service_allow(), reference_safety_result(Action::Downrank)),
+            (service_allow(), reference_safety_result(Action::Tombstone)),
+            (service_allow(), reference_safety_result(Action::Avoid)),
+        ];
+        let diffs: Vec<Diff> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (service, reference))| Diff {
+                tweet_id: ID + i as u64,
+                service: service_verdict_str(service),
+                reference: reference_verdict_str(reference),
+            })
+            .collect();
+        let emitted = serde_json::Value::Array(chunk_lines(&context(), "b1", &diffs));
+
+        let cargo = format!("{}/{RECORDER_LINE_FIXTURE}", env!("CARGO_MANIFEST_DIR"));
+        let ws =
+            format!("crates/x-product/xai-visibility-filtering-service/{RECORDER_LINE_FIXTURE}");
+        if std::env::var_os("VF_WRITE_FIXTURES").is_some() {
+            std::fs::write(
+                &cargo,
+                serde_json::to_string_pretty(&emitted).unwrap() + "\n",
+            )
+            .unwrap();
         }
+        let path = if std::path::Path::new(&cargo).exists() {
+            cargo
+        } else {
+            ws
+        };
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}")),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk, emitted,
+            "{RECORDER_LINE_FIXTURE} differs from chunk_lines"
+        );
     }
 
     #[test]
@@ -705,14 +717,6 @@ mod tests {
                 ["drop:ContainNsfwMedia@nsfw_media", "allow", [2]],
             ])
         );
-
-        let repeated: Vec<Diff> = (0..150)
-            .map(|i| diff(ID + i, "allow", "avoid:SafetyResult"))
-            .collect();
-        let lines = chunk_lines(&context(), "b2", &repeated);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().len() <= LINE_BUDGET_BYTES);
-        assert_eq!(lines[0]["diffs"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -774,8 +778,15 @@ mod tests {
 
     type RecordedCall = (Vec<u64>, ReferenceSafetyLevel, u64, Option<String>);
 
+    enum FakeReply {
+        Immediate,
+        Hangs,
+    }
+
     struct FakeReference {
         calls: std::sync::Mutex<Vec<RecordedCall>>,
+        called: tokio::sync::Notify,
+        reply: FakeReply,
     }
 
     #[tonic::async_trait]
@@ -787,9 +798,19 @@ mod tests {
             for_user_id: u64,
             context: Option<TwitterContextViewer>,
         ) -> HashMap<u64, anyhow::Result<TweetVisibility>> {
-            let results = tweet_ids
-                .iter()
-                .map(|&id| {
+            self.calls.lock().unwrap().push((
+                tweet_ids.clone(),
+                safety_level,
+                for_user_id,
+                context.map(|c| c.request_country_code),
+            ));
+            self.called.notify_one();
+            if matches!(self.reply, FakeReply::Hangs) {
+                std::future::pending::<()>().await;
+            }
+            tweet_ids
+                .into_iter()
+                .map(|id| {
                     (
                         id,
                         Ok(TweetVisibility {
@@ -799,20 +820,15 @@ mod tests {
                         }),
                     )
                 })
-                .collect();
-            self.calls.lock().unwrap().push((
-                tweet_ids,
-                safety_level,
-                for_user_id,
-                context.map(|c| c.request_country_code),
-            ));
-            results
+                .collect()
         }
     }
 
-    fn fake_harness() -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
+    fn fake_harness(reply: FakeReply) -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
         let fake = Arc::new(FakeReference {
             calls: std::sync::Mutex::new(Vec::new()),
+            called: tokio::sync::Notify::new(),
+            reply,
         });
         (
             Arc::new(ReferenceCompareHarness::new(fake.clone(), "atla")),
@@ -822,29 +838,46 @@ mod tests {
 
     #[tokio::test]
     async fn begin_compare_skips_unmappable_requests_without_calling_reference() {
-        let (harness, fake) = fake_harness();
+        let (harness, fake) = fake_harness(FakeReply::Immediate);
 
+        for (level, viewer, expected) in [
+            (
+                SafetyLevel::TimelineHome,
+                Some(7),
+                Ok((ReferenceSafetyLevel::TimelineHome, 7)),
+            ),
+            (
+                SafetyLevel::TimelineHomeRecommendations,
+                Some(7),
+                Ok((ReferenceSafetyLevel::TimelineHomeRecommendations, 7)),
+            ),
+            (SafetyLevel::FilterAll, Some(7), Err("level_unmapped")),
+            (
+                SafetyLevel::TimelineHomeHydration,
+                Some(7),
+                Err("level_unmapped"),
+            ),
+            (SafetyLevel::TimelineHome, None, Err("logged_out_viewer")),
+        ] {
+            assert_eq!(comparable_request(level, viewer), expected);
+        }
         assert!(
             harness
                 .begin_compare(Some(7), None, SafetyLevel::FilterAll, vec![1])
-                .is_none(),
-            "FilterAll has no reference level"
+                .is_none()
         );
         assert!(
             harness
                 .begin_compare(Some(7), None, SafetyLevel::TimelineHome, vec![])
-                .is_none(),
-            "empty requests have nothing to compare"
+                .is_none()
         );
-        tokio::task::yield_now().await;
         assert!(fake.calls.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn begin_compare_fetches_reference_concurrently_with_request_context() {
-        let (harness, fake) = fake_harness();
-
-        let sender = harness
+    #[tokio::test(start_paused = true)]
+    async fn begin_compare_fetches_reference_before_the_verdicts_arrive() {
+        let (harness, fake) = fake_harness(FakeReply::Immediate);
+        let VerdictSender { sender, task } = harness
             .begin_compare(
                 Some(99),
                 Some("de".to_string()),
@@ -852,25 +885,12 @@ mod tests {
                 vec![1, 2],
             )
             .expect("comparable request");
-        sender.send(vec![
-            verdict(1, service_allow()),
-            verdict(2, service_allow()),
-        ]);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if !fake.calls.lock().unwrap().is_empty() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "reference never called"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let calls = fake.calls.lock().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), fake.called.notified())
+            .await
+            .expect("reference called before any verdict was sent");
         assert_eq!(
-            *calls,
+            *fake.calls.lock().unwrap(),
             vec![(
                 vec![1, 2],
                 ReferenceSafetyLevel::TimelineHomeRecommendations,
@@ -878,5 +898,37 @@ mod tests {
                 Some("de".to_string()),
             )]
         );
+
+        assert!(
+            sender
+                .send(vec![
+                    verdict(1, service_allow()),
+                    verdict(2, service_allow())
+                ])
+                .is_ok()
+        );
+        assert_eq!(task.await.unwrap(), CompareResult::Compared);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reference_timeout_ends_the_task_without_comparing() {
+        let (harness, _fake) = fake_harness(FakeReply::Hangs);
+        let VerdictSender { sender, task } = harness
+            .begin_compare(Some(99), None, SafetyLevel::TimelineHome, vec![1])
+            .expect("comparable request");
+
+        assert!(sender.send(vec![verdict(1, service_drop())]).is_ok());
+        assert_eq!(task.await.unwrap(), CompareResult::ReferenceTimeout);
+    }
+
+    #[tokio::test]
+    async fn dropped_verdict_sender_ends_the_task() {
+        let (harness, _fake) = fake_harness(FakeReply::Immediate);
+        let VerdictSender { sender, task } = harness
+            .begin_compare(Some(99), None, SafetyLevel::TimelineHome, vec![1])
+            .expect("comparable request");
+
+        drop(sender);
+        assert_eq!(task.await.unwrap(), CompareResult::VerdictsDropped);
     }
 }

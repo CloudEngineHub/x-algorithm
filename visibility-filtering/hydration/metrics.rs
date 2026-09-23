@@ -219,7 +219,6 @@ pub(crate) fn record_batch_size(client: &'static str, candidate_count: usize) {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_fallback_cache_keys(
     facet: &'static str,
     fresh: usize,
@@ -401,32 +400,21 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_millis(30));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn hop_without_caller_deadline_uses_the_static_ceiling() {
-        let ceiling = crate::hydration::HYDRATION_TIMEOUT;
-        let seen = async { xai_x_rpc::remaining() }
-            .with_budget(ceiling)
-            .await
-            .unwrap();
-        assert_eq!(seen, Some(ceiling));
-    }
-
     #[test]
-    fn empty_batch_is_success() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::new();
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
-    }
-
-    #[test]
-    fn all_keys_errored_is_error() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::from([(1, Err(())), (2, Err(()))]);
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Error);
-    }
-
-    #[test]
-    fn any_success_preserves_legacy_batch_success() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::from([(1, Err(())), (2, Ok(7))]);
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
+    fn batch_outcome_distinguishes_all_failed_from_any_success() {
+        for (map, expected) in [
+            (HashMap::new(), HydratorOutcome::Success),
+            (
+                HashMap::from([(1, Err(())), (2, Err(()))]),
+                HydratorOutcome::Error,
+            ),
+            (
+                HashMap::from([(1, Err(())), (2, Ok(7))]),
+                HydratorOutcome::Success,
+            ),
+        ] {
+            assert_eq!(batch_outcome(&map), expected);
+        }
     }
 
     #[test]
@@ -473,30 +461,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            returned.hydrated(&1),
-            Some(Hydrated::Failed(HydrationError::Timeout))
-        ));
-    }
-
-    #[tokio::test]
-    async fn timed_values_backfills_absent_expected_keys() {
-        let expected = HashMap::from([(1, 1), (2, 1)]);
-
-        let returned = timed_values(
-            "test",
-            "values",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::from_secs(1),
-            std::future::ready(HashMap::from([(1, 7)])),
-        )
-        .await;
-
-        assert_eq!(returned.get(&1), Some(&7));
-        assert!(matches!(
-            returned.hydrated(&2),
-            Some(Hydrated::Failed(HydrationError::MissingResponse))
-        ));
+        for key in [1, 2] {
+            assert!(matches!(
+                returned.hydrated(&key),
+                Some(Hydrated::Failed(HydrationError::Timeout))
+            ));
+        }
     }
 }

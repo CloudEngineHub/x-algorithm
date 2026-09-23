@@ -60,6 +60,8 @@ message UserContext {
   int32 user_following_count = 15;
   int32 user_blockers_count = 16;
   int32 user_muters_count = 17;
+  bool is_nsfw_user = 18;
+  bool is_nsfw_mode = 19;
 }
 
 message EngagementCountRow {

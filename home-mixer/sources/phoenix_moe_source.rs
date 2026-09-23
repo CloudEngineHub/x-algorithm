@@ -60,6 +60,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 query.params.get(EnablePhoenixRetrievalFallback),
+                vec![],
             )
             .await
             .map_err(|e| format!("PhoenixMOESource: {e}"))?;

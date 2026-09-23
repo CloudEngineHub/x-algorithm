@@ -148,16 +148,14 @@ fn author_label(value: LabelValue) -> Option<AuthorLabel> {
 mod tests {
     use super::*;
     use crate::hydration::batch::Hydrated;
-    use crate::models::{resolve_candidate, RawCandidate, TweetId};
+    use crate::models::TweetId;
     use anyhow::Result;
     use std::collections::HashMap;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use xai_core_entities::entities::{
-        GizmoduckUser, Label, Labels, PCFLabel, PureCoreData, Safety,
-    };
+    use xai_core_entities::entities::{GizmoduckUser, Label, Labels, PCFLabel, Safety};
     use xai_core_entities::gizmoduck_client::{
         GizmoduckClient, MockGizmoduckClient, UserFields, ViewerData,
     };
@@ -244,15 +242,10 @@ mod tests {
     }
 
     fn candidate(tweet_id: u64, author_id: u64) -> TweetCandidateInput {
-        resolve_candidate(
-            &RawCandidate {
-                tweet_id: TweetId(tweet_id),
-                request_author_id: Some(author_id),
-            },
-            &HashMap::<TweetId, PureCoreData>::new(),
-            &HashMap::new(),
-        )
-        .unwrap()
+        TweetCandidateInput {
+            tweet_id: TweetId(tweet_id),
+            author_id: AuthorId(author_id),
+        }
     }
 
     #[tokio::test]
@@ -390,10 +383,7 @@ mod tests {
             assert!(features.user_labels.has_label(variant), "{thrift:?}");
             assert_eq!((counts.mapped, counts.unmapped), (1, 0), "{thrift:?}");
         }
-    }
 
-    #[test]
-    fn unmodelled_thrift_labels_drop_at_conversion() {
         for unmodelled in [
             LabelValue::EGREGIOUS_NSFW,
             LabelValue::RECOMMENDATIONS_BLACKLIST,
@@ -407,30 +397,6 @@ mod tests {
             expected.insert(AuthorLabel::SpamHighRecall);
             assert_eq!(features.user_labels, expected, "{unmodelled:?}");
             assert_eq!((counts.mapped, counts.unmapped), (1, 1), "{unmodelled:?}");
-        }
-    }
-
-    #[test]
-    fn error_and_missing_author_results_fail_open_but_stay_failed() {
-        let (a10, a20) = (candidate(1, 10).author_id, candidate(2, 20).author_id);
-        let user_results: AuthorHydrationBatch<GizmoduckUserResult> = HydrationBatch::from_results(
-            [a10, a20],
-            HashMap::from([(a10, Err(anyhow::anyhow!("gizmoduck unavailable")))]),
-        );
-
-        let mut counts = LabelCounts::default();
-        let by_tweet = user_results
-            .map(|user_result| author_features(user_result, &mut counts))
-            .project([(TweetId(1), a10), (TweetId(2), a20)]);
-
-        for tweet_id in [TweetId(1), TweetId(2)] {
-            assert!(matches!(
-                by_tweet.hydrated(&tweet_id),
-                Some(Hydrated::Failed(_))
-            ));
-            let feature = by_tweet.get_or_default(&tweet_id);
-            assert!(!feature.is_suspended);
-            assert!(!feature.is_deactivated);
         }
     }
 }

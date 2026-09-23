@@ -13,6 +13,7 @@ lazy_static = { workspace = true }
 log = { workspace = true }
 prometheus = { workspace = true }
 xai-recsys-proto = { workspace = true }
+xai-recsys-uas-arrow = { workspace = true }
 
 [lints]
 workspace = true

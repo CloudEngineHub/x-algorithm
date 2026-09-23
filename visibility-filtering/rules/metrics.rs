@@ -209,53 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_rpc_label() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
-        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
-        let path = if std::path::Path::new(cargo).exists() {
-            cargo
-        } else {
-            ws
-        };
-        let dashboard =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let filter_tweets = <&str>::from(Rpc::FilterTweets);
-        assert!(dashboard.contains(&format!("FT_RPC_FILTER = 'rpc=~\"{filter_tweets}|\"'")));
-    }
-
-    #[test]
-    fn allows_only_on_mix_metric() {
+    fn each_filled_slot_counts_its_own_row() {
         let a = allow();
         let b = allow();
-        let d = drop_by("suspended_author");
-        let aggregated = aggregate_verdicts([&a, &b, &d]);
-
-        assert_eq!(aggregated.mix.get("allow"), Some(&2));
-        assert_eq!(aggregated.mix.get("drop"), Some(&1));
-        assert!(!aggregated.mix.contains_key("interstitial"));
-        assert_eq!(aggregated.by_rule.len(), 1);
-        assert_eq!(
-            aggregated.by_rule.get(&("suspended_author", "drop")),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn unresolved_author_verdict_counts_on_by_rule() {
-        let d = Verdict::unresolved_author();
-        let a = allow();
-        let aggregated = aggregate_verdicts([&d, &a]);
-
-        assert_eq!(aggregated.mix.get("drop"), Some(&1));
-        assert_eq!(aggregated.mix.get("allow"), Some(&1));
-        assert_eq!(
-            aggregated.by_rule.get(&("unresolved_author_id", "drop")),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn each_filled_slot_counts_its_own_row() {
         let d = drop_by("nsfw_media");
         let both = Verdict::Shown {
             media: Some(Decided {
@@ -271,12 +227,14 @@ mod tests {
             media: None,
             engagement: Some(limit_by("conversation_control")),
         };
-        let aggregated = aggregate_verdicts([&d, &both, &limit_only]);
+        let aggregated = aggregate_verdicts([&a, &b, &d, &both, &limit_only]);
 
+        assert_eq!(aggregated.mix.get("allow"), Some(&2));
         assert_eq!(aggregated.mix.get("drop"), Some(&1));
         assert_eq!(aggregated.mix.get("tweet_interstitial"), Some(&1));
         assert_eq!(aggregated.mix.get("limited_engagement"), Some(&1));
-        assert_eq!(aggregated.mix.values().sum::<u64>(), 3);
+        assert_eq!(aggregated.mix.values().sum::<u64>(), 5);
+        assert_eq!(aggregated.by_rule.values().sum::<u64>(), 4);
         assert_eq!(aggregated.by_rule.get(&("nsfw_media", "drop")), Some(&1));
         assert_eq!(
             aggregated.by_rule.get(&("nsfw_media", "interstitial")),

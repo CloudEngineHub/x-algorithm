@@ -118,6 +118,10 @@ class MediaHydrationConfig(BaseModel):
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
     deluxe_image_tile_size: int = 600
+    use_key_frames: bool = False
+    key_frames_window_seconds: float = 3.0
+    key_frames_max_fps: float = 15.0
+    key_frames_max: int = 3
 
 
 class GroxKafkaLoaderConfig(BaseModel):

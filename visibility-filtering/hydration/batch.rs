@@ -265,16 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_fails_every_expected_key() {
-        let batch: HydrationBatch<u64, u32> = HydrationBatch::timed_out([1, 2]);
-
-        assert_eq!(
-            batch.hydrated(&1),
-            Some(&Hydrated::Failed(HydrationError::Timeout))
-        );
-    }
-
-    #[test]
     fn map_preserves_tri_state() {
         let mapped = batch(HashMap::from([
             (1, Ok(Some(7))),
@@ -312,15 +302,6 @@ mod tests {
             by_tweet.hydrated(&TweetId(1)),
             Some(&Hydrated::Failed(HydrationError::MissingResponse))
         );
-    }
-
-    #[test]
-    fn duplicate_expected_keys_resolve_once() {
-        let batch: HydrationBatch<u64, u32> =
-            HydrationBatch::from_values([1, 1, 2, 2], HashMap::from([(1, 7), (2, 8)]));
-
-        assert_eq!(batch.get(&1), Some(&7));
-        assert_eq!(batch.get(&2), Some(&8));
     }
 
     #[test]

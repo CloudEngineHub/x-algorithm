@@ -1,7 +1,7 @@
 use crate::clients::socialgraph_client::SocialgraphClient;
 use crate::hydration::batch::Completeness;
 use crate::hydration::metrics::{record_batch_size, timed_rpc, HydratorOutcome};
-use crate::models::{ExclusiveContentFeatures, TweetId, Viewer};
+use crate::models::{ExclusiveContentFeatures, TweetId};
 use crate::rules::SafetyLevel;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ impl ExclusiveContentHydrator {
         &self,
         conversation_authors: HashMap<TweetId, u64>,
         candidate_count: usize,
-        viewer: Viewer,
+        viewer_id: Option<u64>,
         safety_level: SafetyLevel,
     ) -> HashMap<TweetId, Completeness<ExclusiveContentFeatures>> {
         record_batch_size(CLIENT, candidate_count);
@@ -29,7 +29,7 @@ impl ExclusiveContentHydrator {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let super_follows = match viewer.user_id() {
+        let super_follows = match viewer_id {
             Some(vid) if !root_author_ids.is_empty() => {
                 timed_rpc(
                     CLIENT,
@@ -72,16 +72,17 @@ impl ExclusiveContentHydrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::FakeSocialgraphClient;
     use crate::models::ViewerAuthorRelationship;
     use tonic::async_trait;
 
-    struct MissingSuperFollows {
-        pending: bool,
+    enum SuperFollowLookup {
+        Fails,
+        Hangs,
+        Succeeds,
     }
 
     #[async_trait]
-    impl SocialgraphClient for MissingSuperFollows {
+    impl SocialgraphClient for SuperFollowLookup {
         async fn batch_check_relationships(
             &self,
             _: u64,
@@ -91,11 +92,15 @@ mod tests {
         }
 
         async fn batch_check_super_follows(&self, _: u64, _: &[u64]) -> Option<HashMap<u64, bool>> {
-            if self.pending {
-                std::future::pending().await
-            } else {
-                None
+            match self {
+                Self::Fails => None,
+                Self::Hangs => std::future::pending().await,
+                Self::Succeeds => Some(HashMap::from([(10, true)])),
             }
+        }
+
+        async fn batch_check_followed_by(&self, _: u64, _: &[u64]) -> Option<HashMap<u64, bool>> {
+            unreachable!("exclusive hydration only checks super follows")
         }
     }
 
@@ -107,7 +112,7 @@ mod tests {
             ExclusiveContentHydrator { sg_client }.hydrate(
                 HashMap::from([(TweetId(1), 10)]),
                 2,
-                Viewer::LoggedIn(50),
+                Some(50),
                 SafetyLevel::TimelineHome,
             ),
         )
@@ -116,28 +121,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_super_follow_lookup_keeps_the_control_but_is_incomplete() {
-        for pending in [false, true] {
-            let out = hydrate_with(Arc::new(MissingSuperFollows { pending })).await;
-
+    async fn super_follow_lookup_completeness_tracks_success() {
+        for (lookup, complete, super_follows) in [
+            (SuperFollowLookup::Fails, false, false),
+            (SuperFollowLookup::Hangs, false, false),
+            (SuperFollowLookup::Succeeds, true, true),
+        ] {
+            let out = hydrate_with(Arc::new(lookup)).await;
+            assert_eq!(out[&TweetId(1)].is_complete(), complete);
             assert_eq!(
-                out,
-                HashMap::from([(
-                    TweetId(1),
-                    Completeness::Incomplete(ExclusiveContentFeatures {
-                        conversation_author_id: 10,
-                        viewer_super_follows_author: false,
-                    })
-                )]),
-                "pending={pending}"
+                out[&TweetId(1)].value(),
+                &ExclusiveContentFeatures {
+                    conversation_author_id: 10,
+                    viewer_super_follows_author: super_follows,
+                }
             );
         }
-    }
-
-    #[tokio::test]
-    async fn successful_super_follow_lookup_completes_every_tweet() {
-        let out = hydrate_with(Arc::new(FakeSocialgraphClient)).await;
-
-        assert!(out.values().all(Completeness::is_complete));
     }
 }

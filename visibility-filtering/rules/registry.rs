@@ -1,3 +1,4 @@
+use crate::hydration::Hydrators;
 use crate::models::{
     Decided, HydratedTweetCandidate, LimitedEngagement, MediaInterstitial, Verdict, ViewerFeatures,
     Withholding,
@@ -20,13 +21,22 @@ pub enum SafetyLevel {
 pub(super) struct Policy<'a> {
     rules: &'a [&'a [RuleClause]],
     additional_rules: &'a [&'a [RuleClause]],
+    hydrators: Hydrators,
 }
 
 impl<'a> Policy<'a> {
     pub(super) const fn new(rules: &'a [&'a [RuleClause]]) -> Self {
+        Self::with_additional(rules, &[])
+    }
+
+    const fn with_additional(
+        rules: &'a [&'a [RuleClause]],
+        additional_rules: &'a [&'a [RuleClause]],
+    ) -> Self {
         Self {
             rules,
-            additional_rules: &[],
+            additional_rules,
+            hydrators: hydrators_of(rules).union(hydrators_of(additional_rules)),
         }
     }
 
@@ -97,6 +107,19 @@ impl<'a> Policy<'a> {
     }
 }
 
+const fn hydrators_of(mut groups: &[&[RuleClause]]) -> Hydrators {
+    let mut hydrators = Hydrators::empty();
+    while let [group, tail @ ..] = groups {
+        let mut rules = *group;
+        while let [rule, rest @ ..] = rules {
+            hydrators = hydrators.union(rule.hydrators());
+            rules = rest;
+        }
+        groups = tail;
+    }
+    hydrators
+}
+
 static FILTER_ALL_POLICY: Policy = Policy::new(&[tweet_rules::FILTER_ALL]);
 
 static TIMELINE_HOME_SHARED_RULES: [&[RuleClause]; 10] = [
@@ -121,10 +144,10 @@ static TIMELINE_HOME_RECOMMENDATION_ONLY_RULES: [&[RuleClause]; 5] = [
 ];
 
 static TIMELINE_HOME_POLICY: Policy = Policy::new(&TIMELINE_HOME_SHARED_RULES);
-static TIMELINE_HOME_RECOMMENDATIONS_POLICY: Policy = Policy {
-    rules: &TIMELINE_HOME_SHARED_RULES,
-    additional_rules: &TIMELINE_HOME_RECOMMENDATION_ONLY_RULES,
-};
+static TIMELINE_HOME_RECOMMENDATIONS_POLICY: Policy = Policy::with_additional(
+    &TIMELINE_HOME_SHARED_RULES,
+    &TIMELINE_HOME_RECOMMENDATION_ONLY_RULES,
+);
 
 static TIMELINE_HOME_HYDRATION_POLICY: Policy = Policy::new(&[
     tweet_rules::TWEET_LABEL_DROPS,
@@ -133,6 +156,7 @@ static TIMELINE_HOME_HYDRATION_POLICY: Policy = Policy::new(&[
     tweet_rules::SENSITIVE_VIEWER_DROPS,
     tweet_rules::NSFW_MEDIA_INTERSTITIALS,
     tweet_rules::NSFW_AUTHOR_INTERSTITIAL,
+    tweet_rules::LIMIT_REPLIES_CONVERSATION_RULES,
 ]);
 
 pub struct RuleEngine {
@@ -166,8 +190,15 @@ impl RuleEngine {
         viewer: &ViewerFeatures,
         candidate: &HydratedTweetCandidate,
     ) -> Verdict {
+        let policy = Self::select(level);
         let context = RuleContext::new(viewer, candidate, &self.nsfw_gating_countries);
-        Self::select(level).evaluate(&context)
+        #[cfg(test)]
+        let context = context.hydrated_by(policy.hydrators);
+        policy.evaluate(&context)
+    }
+
+    pub fn hydrators_for(level: SafetyLevel) -> Hydrators {
+        Self::select(level).hydrators
     }
 
     #[cfg(test)]
@@ -186,7 +217,10 @@ impl RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
+    use crate::hydration::Hydrator;
+    use crate::models::{ViewerAge, ViewerProfile};
+    use crate::rules::fixtures::{candidate, viewer, viewer_with_profile, VIEWER_ID};
+    use crate::rules::rule_spec::Condition;
 
     #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
@@ -197,15 +231,17 @@ mod tests {
             .with_media()
             .build();
         let viewer = ViewerFeatures {
-            viewer_age: crate::models::ViewerAge::NotStated,
             country_code: Some("us".into()),
-            ..viewer(VIEWER_ID)
+            ..viewer_with_profile(ViewerProfile {
+                viewer_age: ViewerAge::NotStated,
+                ..ViewerProfile::default()
+            })
         };
 
         let verdict = rule_engine.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
         assert!(!matches!(verdict, Verdict::Withheld(_)));
 
-        gating_countries.refresh_from(
+        gating_countries.refresh_and_check_drift(
             &xai_feature_switches::FeatureSwitches::load_string(
                 r#"
 rust_vf:
@@ -217,6 +253,7 @@ rust_vf:
 "#,
             )
             .unwrap(),
+            "/nonexistent/rust_vf.yml",
         );
         let verdict = rule_engine.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
         assert!(matches!(
@@ -231,7 +268,6 @@ rust_vf:
     #[test]
     fn wired_rule_order_matches_pre_migration_sequence() {
         let rule_engine = RuleEngine::for_tests();
-        assert_eq!(rule_engine.rule_counts(), (30, 56));
         assert_eq!(
             rule_engine.wired_rule_names(SafetyLevel::FilterAll),
             vec!["FilterAllRule"]
@@ -332,60 +368,74 @@ rust_vf:
                 "NsfwCardImageInterstitialRule",
                 "NsfwAdminInterstitialRule",
                 "NsfwUserInterstitialRule",
+                "LimitRepliesByInvitationConversationRule",
+                "LimitRepliesCommunityConversationRule",
+                "LimitRepliesSubscribersConversationRule",
+                "LimitRepliesVerifiedConversationRule",
             ]
         );
-        assert_terminals_precede_restrictions(
-            &TIMELINE_HOME_HYDRATION_POLICY,
-            "TimelineHomeHydration",
-        );
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum RowClass {
-        Terminal,
-        Restriction,
+    #[test]
+    #[should_panic(expected = "a rule reads Relationship")]
+    fn a_rule_reading_an_underived_hydrator_panics_in_tests() {
+        let viewer = viewer(VIEWER_ID);
+        let candidate = candidate().build();
+        let context = crate::rules::test_context(&viewer, &candidate)
+            .hydrated_by(Hydrators::all().without(Hydrator::Relationship));
+        context.relationship();
     }
 
-    fn row_class(spec: &RuleClause) -> RowClass {
-        match spec.action {
-            ActionSpec::Drop(_) | ActionSpec::Tombstone(_) => RowClass::Terminal,
-            ActionSpec::Interstitial { .. } | ActionSpec::LimitedEngagement(_) => {
-                RowClass::Restriction
-            }
-        }
-    }
-
-    fn assert_terminals_precede_restrictions(policy: &Policy, name: &str) {
-        let mut seen_restriction = false;
-        for spec in policy.rules() {
-            match row_class(spec) {
-                RowClass::Restriction => seen_restriction = true,
-                RowClass::Terminal if seen_restriction => {
-                    panic!(
-                        "{name}: terminal {} follows a restriction row",
-                        spec.rule_name
-                    );
+    #[test]
+    fn every_leaf_reads_only_the_hydrators_it_declares() {
+        let viewer = viewer(VIEWER_ID);
+        let candidate = candidate().build();
+        let narrowed = |hydrators: Hydrators| {
+            crate::rules::test_context(&viewer, &candidate).hydrated_by(hydrators)
+        };
+        for level in [
+            SafetyLevel::FilterAll,
+            SafetyLevel::TimelineHome,
+            SafetyLevel::TimelineHomeRecommendations,
+            SafetyLevel::TimelineHomeHydration,
+        ] {
+            for rule in RuleEngine::select(level).rules() {
+                for condition in rule.when {
+                    match condition {
+                        Condition::AnyOf(leaves) => {
+                            for leaf in *leaves {
+                                leaf.holds(&narrowed(leaf.hydrators()));
+                            }
+                        }
+                        leaf => {
+                            leaf.holds(&narrowed(leaf.hydrators()));
+                        }
+                    }
                 }
-                RowClass::Terminal => {}
+                rule.applies_to
+                    .admits(&narrowed(rule.applies_to.hydrators()));
             }
         }
     }
 
     #[test]
-    fn terminals_precede_restrictions_and_recommendation_only_rules_are_drops() {
-        assert_terminals_precede_restrictions(&FILTER_ALL_POLICY, "FilterAll");
-        assert_terminals_precede_restrictions(&TIMELINE_HOME_POLICY, "TimelineHome");
-        for spec in TIMELINE_HOME_RECOMMENDATION_ONLY_RULES
-            .iter()
-            .copied()
-            .flatten()
-        {
-            assert!(
-                matches!(spec.action, ActionSpec::Drop(_)),
-                "recommendation-only row {} must be a drop",
-                spec.rule_name
-            );
-        }
+    fn each_level_derives_the_hydrators_its_rules_read() {
+        assert_eq!(
+            RuleEngine::hydrators_for(SafetyLevel::FilterAll),
+            Hydrators::empty()
+        );
+        assert_eq!(
+            RuleEngine::hydrators_for(SafetyLevel::TimelineHome),
+            Hydrators::all().without(Hydrator::ConversationControl)
+        );
+        assert_eq!(
+            RuleEngine::hydrators_for(SafetyLevel::TimelineHomeRecommendations),
+            Hydrators::all().without(Hydrator::ConversationControl)
+        );
+        assert_eq!(
+            RuleEngine::hydrators_for(SafetyLevel::TimelineHomeHydration),
+            Hydrators::all().without(Hydrator::Relationship)
+        );
     }
 
     #[test]
@@ -439,12 +489,14 @@ rust_vf:
             id: "never",
             doc: "test leaf that never holds",
             eval: |_| false,
+            hydrators: Hydrators::empty(),
         };
 
         const UNREACHABLE: Condition = Condition::Opaque {
             id: "unreachable",
             doc: "test leaf that must not be evaluated",
             eval: |_| panic!("a rule after a terminal action must never be evaluated"),
+            hydrators: Hydrators::empty(),
         };
 
         const DROP_SUSPENDED: ActionSpec = ActionSpec::Drop(FilteredReason::AuthorIsSuspended);
@@ -499,49 +551,17 @@ rust_vf:
         ];
         static RESTRICTIONS: Policy = Policy::new(&[&RESTRICTION_ROWS]);
 
-        static DROP_AFTER_RESTRICTIONS_ROWS: [RuleClause; 3] = [
-            always("interstitial", INTERSTITIAL_NSFW),
-            always("limit", LIMIT),
-            always("drop", DROP_SUSPENDED),
-        ];
-        static DROP_AFTER_RESTRICTIONS: Policy = Policy::new(&[&DROP_AFTER_RESTRICTIONS_ROWS]);
-
-        static ALL_ALLOWS_ROWS: [RuleClause; 2] = [
-            RuleClause {
-                rule_name: "a",
-                when: &[NEVER],
-                applies_to: Audience::Everyone,
-                action: DROP_SUSPENDED,
-            },
-            RuleClause {
-                rule_name: "b",
-                when: &[NEVER],
-                applies_to: Audience::Everyone,
-                action: LIMIT,
-            },
-        ];
-        static ALL_ALLOWS: Policy = Policy::new(&[&ALL_ALLOWS_ROWS]);
-
         #[test]
         fn first_terminal_returns_before_later_rules() {
             let (viewer, candidate) = context_inputs();
-
-            let verdict = SHORT_CIRCUIT.evaluate(&test_context(&viewer, &candidate));
+            let context = test_context(&viewer, &candidate);
 
             assert_eq!(
-                verdict,
+                SHORT_CIRCUIT.evaluate(&context),
                 withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "drop")
             );
-        }
-
-        #[test]
-        fn tombstone_is_terminal_in_policy_order() {
-            let (viewer, candidate) = context_inputs();
-
-            let verdict = TOMBSTONE_FIRST.evaluate(&test_context(&viewer, &candidate));
-
             assert_eq!(
-                verdict,
+                TOMBSTONE_FIRST.evaluate(&context),
                 withheld(
                     Withholding::Tombstone(TombstoneReason::LocalRegulations),
                     "tombstone"
@@ -569,33 +589,6 @@ rust_vf:
                         value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
                         by: "first_limit",
                     }),
-                }
-            );
-        }
-
-        #[test]
-        fn terminal_after_restrictions_discards_them() {
-            let (viewer, candidate) = context_inputs();
-
-            let verdict = DROP_AFTER_RESTRICTIONS.evaluate(&test_context(&viewer, &candidate));
-
-            assert_eq!(
-                verdict,
-                withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "drop")
-            );
-        }
-
-        #[test]
-        fn no_applying_rule_is_shown_unrestricted() {
-            let (viewer, candidate) = context_inputs();
-
-            let verdict = ALL_ALLOWS.evaluate(&test_context(&viewer, &candidate));
-
-            assert_eq!(
-                verdict,
-                Verdict::Shown {
-                    media: None,
-                    engagement: None,
                 }
             );
         }

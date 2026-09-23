@@ -2,7 +2,7 @@ use crate::clients::vm_ranker_client::{VMRankerClient, VMRankerCluster};
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
-use crate::scorers::vm_ranker_request::{write_candidate_inputs, write_value_model_inputs};
+use crate::scorers::vm_ranker_request::OptionalInputs;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -62,23 +62,10 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
         let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let send_value_model_inputs = query.params.get(VMRankerSendValueModelInputs);
-        let compute_value_model =
-            send_value_model_inputs && query.params.get(VMRankerComputeValueModel);
-        record_request_mode(if compute_value_model {
-            "compute_value_model"
-        } else if send_value_model_inputs {
-            "send_inputs"
-        } else {
-            "dpp_only"
-        });
+        let inputs = OptionalInputs::from_query(query);
+        record_request_mode(inputs.mode());
 
-        let request = build_request(
-            query,
-            candidates,
-            send_value_model_inputs,
-            compute_value_model,
-        );
+        let request = build_request(query, candidates, &inputs);
 
         let response = match self.rank(query, cluster, request).await {
             Ok(resp) => resp,
@@ -88,25 +75,26 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             }
         };
 
-        let score_map: FxHashMap<u64, f64> = response
+        let score_map: FxHashMap<u64, (f64, Option<f64>)> = response
             .candidates
             .iter()
-            .map(|sc| (sc.tweet_id, sc.score))
+            .map(|sc| (sc.tweet_id, (sc.score, sc.weighted_score)))
             .collect();
 
         let mut missing = 0;
         let scored = candidates
             .iter()
             .map(|c| {
-                let score = match score_map.get(&c.tweet_id) {
-                    Some(&score) => Some(score),
+                let (score, weighted_score) = match score_map.get(&c.tweet_id) {
+                    Some(&(score, weighted)) => (Some(score), weighted.or(c.weighted_score)),
                     None => {
                         missing += 1;
-                        c.score
+                        (c.score, c.weighted_score)
                     }
                 };
                 Ok(PostCandidate {
                     score,
+                    weighted_score,
                     ..Default::default()
                 })
             })
@@ -119,6 +107,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
 
     fn update(&self, candidate: &mut PostCandidate, scored: PostCandidate) {
         candidate.score = scored.score;
+        candidate.weighted_score = scored.weighted_score;
     }
 }
 
@@ -141,8 +130,7 @@ fn record_fallback(reason: &str, candidate_count: usize) {
 fn build_request(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
-    send_value_model_inputs: bool,
-    compute_value_model: bool,
+    inputs: &OptionalInputs,
 ) -> RankRequest {
     let proto_candidates: Vec<RankCandidate> = candidates
         .iter()
@@ -153,9 +141,7 @@ fn build_request(
                 score: c.score,
                 ..Default::default()
             };
-            if send_value_model_inputs {
-                write_candidate_inputs(c, &mut rank_candidate);
-            }
+            inputs.write_candidate(c, &mut rank_candidate);
             rank_candidate
         })
         .collect();
@@ -180,9 +166,7 @@ fn build_request(
         ..Default::default()
     };
 
-    if send_value_model_inputs {
-        write_value_model_inputs(query, compute_value_model, &mut request);
-    }
+    inputs.write_request(query, candidates, &mut request);
 
     request
 }

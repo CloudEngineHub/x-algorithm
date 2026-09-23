@@ -41,13 +41,6 @@ pub enum TombstoneReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "constructed once a policy has a LimitedEngagement clause"
-    )
-)]
 pub enum LimitedEngagementReason {
     ConversationControl,
 }

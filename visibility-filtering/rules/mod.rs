@@ -1,5 +1,5 @@
 mod author_rules;
-pub mod context;
+mod context;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
@@ -9,7 +9,7 @@ pub mod registry;
 mod rule_spec;
 mod tweet_rules;
 
-pub use context::RuleContext;
+use context::RuleContext;
 pub use registry::{RuleEngine, SafetyLevel};
 
 #[cfg(test)]

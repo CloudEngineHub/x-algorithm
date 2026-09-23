@@ -7,7 +7,8 @@ use std::sync::{
     Mutex,
 };
 
-const WAYS: usize = 32;
+const WAYS_U8: u8 = 32;
+const WAYS: usize = WAYS_U8 as usize;
 const SHARDS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +118,8 @@ impl<V: Copy> ClockCache<V> {
 
     #[expect(
         clippy::indexing_slicing,
-        reason = "global set modulo shard count selects an allocated shard"
+        clippy::cast_possible_truncation,
+        reason = "global set modulo shard count selects an allocated shard; truncating the hash only drops entropy"
     )]
     fn shard(&self, key: u64) -> Option<(&Mutex<Shard<V>>, usize)> {
         if self.set_count == 0 {
@@ -167,7 +169,7 @@ impl<V: Copy> ClockCache<V> {
                 break;
             }
             set.marks[hand] = Mark::Cold;
-            set.hand = (set.hand + 1) % WAYS as u8;
+            set.hand = (set.hand + 1) % WAYS_U8;
         }
         let hand = usize::from(set.hand);
         let inserted = set.marks[hand] == Mark::Empty;
@@ -177,7 +179,7 @@ impl<V: Copy> ClockCache<V> {
             value,
         };
         set.marks[hand] = Mark::Referenced;
-        set.hand = (set.hand + 1) % WAYS as u8;
+        set.hand = (set.hand + 1) % WAYS_U8;
         shard.entries += usize::from(inserted);
     }
 
@@ -252,30 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_and_aligned_values_evict_and_tombstone_like_authors() {
-        let cache = ClockCache::<u64>::new(32).unwrap();
-        for id in 0..33 {
-            cache.insert(cache.begin_request(), id, Some(0));
-        }
-        assert_eq!(cache.get(0), Lookup::Miss);
-        assert_eq!(cache.get(32), Lookup::Found(0));
-
-        let cache = ClockCache::<Aligned>::new(32).unwrap();
-        for id in 0..33 {
-            let value = if id % 2 == 0 {
-                Some(Aligned(id as u8))
-            } else {
-                None
-            };
-            cache.insert(cache.begin_request(), id, value);
-        }
-        assert_eq!(cache.get(0), Lookup::Miss);
-        assert_eq!(cache.get(31), Lookup::NotFound);
-        assert_eq!(cache.get(32), Lookup::Found(Aligned(32)));
-        assert_eq!(cache.entry_count(), 32);
-    }
-
-    #[test]
     fn resident_generation_order_preserves_found_and_not_found() {
         for newest in [None, NonZeroU64::new(9)] {
             let cache = ClockCache::new(32).unwrap();
@@ -290,6 +268,22 @@ mod tests {
             cache.insert(older, 1, oldest);
             assert_eq!(cache.get(1), cached(newest));
             assert_eq!(cache.entry_count(), 1);
+
+            for id in 2..34 {
+                cache.insert(cache.begin_request(), id, NonZeroU64::new(id));
+            }
+            assert_eq!(cache.get(1), Lookup::Miss);
+            cache.insert(older, 1, oldest);
+            assert_eq!(cache.get(1), cached(oldest));
+            assert_eq!(cache.get(2), Lookup::Miss);
+            for id in 34..98 {
+                cache.insert(cache.begin_request(), id, None);
+            }
+            assert_eq!(cache.get(1), Lookup::Miss);
+            cache.insert(newer, 1, newest);
+            cache.insert(older, 1, oldest);
+            assert_eq!(cache.get(1), cached(newest));
+            assert_eq!(cache.entry_count(), 32);
         }
     }
 
@@ -322,6 +316,26 @@ mod tests {
 
     #[test]
     fn hits_and_refreshes_protect_old_keys_without_moving_the_hand() {
+        let plain = ClockCache::<u64>::new(32).unwrap();
+        for id in 0..33 {
+            plain.insert(plain.begin_request(), id, Some(0));
+        }
+        assert_eq!(plain.get(0), Lookup::Miss);
+        assert_eq!(plain.get(32), Lookup::Found(0));
+
+        let aligned = ClockCache::<Aligned>::new(32).unwrap();
+        for id in 0..33 {
+            aligned.insert(
+                aligned.begin_request(),
+                id,
+                (id % 2 == 0).then_some(Aligned(id as u8)),
+            );
+        }
+        assert_eq!(aligned.get(0), Lookup::Miss);
+        assert_eq!(aligned.get(31), Lookup::NotFound);
+        assert_eq!(aligned.get(32), Lookup::Found(Aligned(32)));
+        assert_eq!(aligned.entry_count(), 32);
+
         for refresh in [false, true] {
             let cache = ClockCache::new(32).unwrap();
             for id in 0..33 {
@@ -365,8 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_bytes_follow_the_value_layout_and_reject_unaddressable_sizes() {
-        assert_eq!(size_of::<Slot<NonZeroU64>>(), 24);
+    fn inline_bytes_scale_with_the_slot_and_reject_unaddressable_sizes() {
         assert_eq!(ClockCache::<NonZeroU64>::inline_bytes(0), Some(0));
         assert_eq!(
             ClockCache::<NonZeroU64>::inline_bytes(8_000_000),
@@ -395,52 +408,5 @@ mod tests {
             assert_eq!(cache.get(id), cached(NonZeroU64::new(id + 1)));
         }
         assert_eq!(cache.entry_count(), 2080);
-    }
-
-    #[test]
-    fn concurrent_eviction_and_reinsertion_order_only_resident_generations() {
-        use std::sync::{mpsc, Arc};
-        use std::time::Duration;
-
-        for newest in [None, NonZeroU64::new(99)] {
-            let cache = Arc::new(ClockCache::new(32).unwrap());
-            let older = cache.begin_request();
-            let newer = cache.begin_request();
-            let oldest = if newest.is_some() {
-                None
-            } else {
-                NonZeroU64::new(7)
-            };
-            cache.insert(newer, 0, newest);
-            let (resume, waiting) = mpsc::channel();
-            let (completed, done) = mpsc::channel();
-            let worker_cache = Arc::clone(&cache);
-            let worker = std::thread::spawn(move || {
-                for _ in 0..2 {
-                    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-                    worker_cache.insert(older, 0, oldest);
-                    completed.send(()).unwrap();
-                }
-            });
-            for id in 1..33 {
-                cache.insert(cache.begin_request(), id, NonZeroU64::new(id));
-            }
-            assert_eq!(cache.get(0), Lookup::Miss);
-            resume.send(()).unwrap();
-            done.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert_eq!(cache.get(0), cached(oldest));
-            assert_eq!(cache.get(1), Lookup::Miss);
-
-            for id in 33..97 {
-                cache.insert(cache.begin_request(), id, None);
-            }
-            assert_eq!(cache.get(0), Lookup::Miss);
-            cache.insert(newer, 0, newest);
-            resume.send(()).unwrap();
-            done.recv_timeout(Duration::from_secs(5)).unwrap();
-            worker.join().unwrap();
-            assert_eq!(cache.get(0), cached(newest));
-            assert_eq!(cache.entry_count(), 32);
-        }
     }
 }

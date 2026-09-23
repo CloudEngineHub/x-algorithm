@@ -100,7 +100,7 @@ impl FilterTweetsEndpoint {
 }
 
 pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
-    raw.filter(|&id| id as i64 > 0)
+    raw.filter(|&id| id.cast_signed() > 0)
 }
 
 pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
@@ -166,6 +166,7 @@ mod tests {
     async fn endpoint_treats_zero_viewer_id_as_logged_out() {
         let logged_out = gizmoduck_calls(None).await;
         assert_eq!(gizmoduck_calls(Some(0)).await, logged_out);
+        assert_eq!(gizmoduck_calls(Some(u64::MAX)).await, logged_out);
         assert_eq!(gizmoduck_calls(Some(42)).await, logged_out + 1);
     }
 
@@ -180,19 +181,13 @@ mod tests {
         assert_eq!(parsed("1S"), Some(Duration::from_secs(1)));
         assert_eq!(parsed("2M"), Some(Duration::from_secs(120)));
         assert_eq!(parsed("500u"), Some(Duration::from_micros(500)));
+        assert_eq!(parsed("3H"), Some(Duration::from_secs(10_800)));
+        assert_eq!(parsed("9n"), Some(Duration::from_nanos(9)));
         assert_eq!(parsed("400"), None);
         assert_eq!(parsed("m"), None);
         assert_eq!(parsed("400x"), None);
         assert_eq!(parsed("+400m"), None);
         assert_eq!(parsed("123456789m"), None);
         assert_eq!(parse_grpc_timeout(&MetadataMap::new()), None);
-    }
-
-    #[test]
-    fn normalize_viewer_id_cases() {
-        assert_eq!(normalize_viewer_id(Some(0)), None);
-        assert_eq!(normalize_viewer_id(Some(u64::MAX)), None);
-        assert_eq!(normalize_viewer_id(Some(42)), Some(42));
-        assert_eq!(normalize_viewer_id(None), None);
     }
 }

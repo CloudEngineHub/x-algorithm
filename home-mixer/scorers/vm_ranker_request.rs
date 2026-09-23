@@ -1,9 +1,71 @@
 use crate::models::candidate::{PhoenixScores, PostCandidate};
 use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::query::ScoredPostsQuery;
+use crate::params::*;
+use crate::scorers::ranking_scorer::RankingScorer;
+use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
 use xai_vm_ranker_proto as pb;
 
-pub(crate) fn write_value_model_inputs(
+pub(crate) struct OptionalInputs {
+    value_model: bool,
+    compute_value_model: bool,
+    cached_weighted_score: bool,
+    debias: bool,
+}
+
+impl OptionalInputs {
+    pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
+        let value_model = query.params.get(VMRankerSendValueModelInputs);
+        let cached_weighted_score =
+            value_model && RankingScorer::reuses_cached_weighted_score(query);
+        Self {
+            value_model,
+            compute_value_model: value_model && query.params.get(VMRankerComputeValueModel),
+            cached_weighted_score,
+            debias: value_model
+                && !cached_weighted_score
+                && query.params.get(VMRankerSendDebiasInputs),
+        }
+    }
+
+    pub(crate) fn mode(&self) -> &'static str {
+        if self.compute_value_model {
+            "compute_value_model"
+        } else if self.value_model {
+            "send_inputs"
+        } else {
+            "dpp_only"
+        }
+    }
+
+    pub(crate) fn write_request(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        request: &mut pb::RankRequest,
+    ) {
+        if self.value_model {
+            write_value_model_inputs(query, self.compute_value_model, request);
+        }
+        if self.debias {
+            request.experiment_payload = request_payload(query, candidates).into();
+        }
+    }
+
+    pub(crate) fn write_candidate(&self, candidate: &PostCandidate, out: &mut pb::RankCandidate) {
+        if self.value_model {
+            write_candidate_inputs(candidate, out);
+        }
+        if self.cached_weighted_score {
+            out.weighted_score = candidate.weighted_score;
+        }
+        if self.debias {
+            out.experiment_payload = candidate_payload(candidate).into();
+        }
+    }
+}
+
+fn write_value_model_inputs(
     query: &ScoredPostsQuery,
     compute_value_model: bool,
     request: &mut pb::RankRequest,
@@ -13,7 +75,7 @@ pub(crate) fn write_value_model_inputs(
     request.topic_request = query.is_topic_request();
 }
 
-pub(crate) fn write_candidate_inputs(candidate: &PostCandidate, out: &mut pb::RankCandidate) {
+fn write_candidate_inputs(candidate: &PostCandidate, out: &mut pb::RankCandidate) {
     out.author_id = candidate.author_id;
     out.in_network = candidate.in_network.unwrap_or(false);
     out.is_retweet = candidate.retweeted_tweet_id.is_some();
