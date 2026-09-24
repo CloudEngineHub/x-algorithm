@@ -125,12 +125,16 @@ impl Source<ScoredPostsQuery, PostCandidate> for SimclustersSource {
         interleaved.truncate(MAX_RESULTS);
         let mut candidates: Vec<PostCandidate> = interleaved
             .into_iter()
-            .map(|c| PostCandidate {
+            .enumerate()
+            .map(|(index, c)| PostCandidate {
                 tweet_id: c.tweet_id as u64,
                 served_type: Some(pb::ServedType::ForYouSimclusters),
-                retrieval_sources: vec![RetrievalSource::from_served_type(
-                    pb::ServedType::ForYouSimclusters,
-                )],
+                retrieval_sources: vec![RetrievalSource {
+                    served_type: pb::ServedType::ForYouSimclusters,
+                    cluster: None,
+                    score: Some(*c.score as f32),
+                    position: Some(index as u32 + 1),
+                }],
                 ..Default::default()
             })
             .collect();

@@ -1,21 +1,28 @@
 use crate::clients::vm_ranker_client::{VMRankerClient, VMRankerCluster};
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{PostCandidate, SlateContext};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
-use crate::scorers::vm_ranker_request::OptionalInputs;
+use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
+use crate::scorers::value_model;
+use crate::scorers::vm_ranker_request::RequestShape;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::scorer::Scorer;
 use xai_stats_receiver::global_stats_receiver;
-use xai_vm_ranker_proto::{DppParams, RankCandidate, RankRequest, RankResponse};
+use xai_vm_ranker_proto::{RankRequest, RankResponse};
 
-const DPP_VALUE_MODEL_ID: &str = "dpp";
 const METRIC_PREFIX: &str = "VMRanker";
 
 pub struct VMRanker {
     pub client: Arc<dyn VMRankerClient>,
     pub xds_client: Option<Arc<dyn VMRankerClient>>,
+    pub author_cold_start: AuthorColdStart,
+}
+
+struct LocalScores {
+    weighted: Vec<f64>,
+    cold_start: ColdStartOutcome,
 }
 
 impl VMRanker {
@@ -48,12 +55,30 @@ impl VMRanker {
             .await
             .map_err(|e| format!("VMRanker gRPC call failed: {e}"))
     }
+
+    fn local_scores(&self, query: &ScoredPostsQuery, candidates: &[PostCandidate]) -> LocalScores {
+        let weights = value_model::weights_for(query);
+        let weighted: Vec<f64> = candidates
+            .iter()
+            .map(|c| match c.weighted_score {
+                Some(cached) => cached,
+                None => value_model::weighted_score(query, &weights, c),
+            })
+            .collect();
+        let cold_start = self
+            .author_cold_start
+            .apply_with_decisions(query, candidates, &weighted);
+        LocalScores {
+            weighted,
+            cold_start,
+        }
+    }
 }
 
 #[async_trait]
 impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.params.get(EnableVMRanker)
+        query.params.get(EnableRanking)
     }
 
     async fn score(
@@ -61,59 +86,86 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
-        let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
-        let inputs = OptionalInputs::from_query(query);
-        record_request_mode(inputs.mode());
+        let shape = RequestShape::from_query(query);
+        let local = self.local_scores(query, candidates);
+        let slate_contexts = slate_contexts(query, candidates);
 
-        let request = build_request(query, candidates, &inputs);
+        let mut scored: Vec<PostCandidate> = (0..candidates.len())
+            .map(|i| PostCandidate {
+                weighted_score: Some(local.weighted[i]),
+                score: Some(local.cold_start.scores[i]),
+                author_policy_zeroed: local.cold_start.author_policy_zeroed[i],
+                cold_start_lift_to_rank: local.cold_start.lift_to_rank(i),
+                slate_context: slate_contexts.as_ref().map(|contexts| contexts[i]),
+                ..Default::default()
+            })
+            .collect();
+
+        let cluster = VMRankerCluster::parse(&query.params.get(VMRankerClusterId));
+        let request = shape.build(query, candidates, &scored);
+        record_request(&cluster);
 
         let response = match self.rank(query, cluster, request).await {
             Ok(resp) => resp,
             Err(msg) => {
+                tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
                 record_fallback("rpc_error", candidates.len());
-                return vec![Err(msg); candidates.len()];
+                return scored.into_iter().map(Ok).collect();
             }
         };
 
-        let score_map: FxHashMap<u64, (f64, Option<f64>)> = response
+        let returned: FxHashMap<u64, (f64, Option<f64>)> = response
             .candidates
             .iter()
             .map(|sc| (sc.tweet_id, (sc.score, sc.weighted_score)))
             .collect();
 
         let mut missing = 0;
-        let scored = candidates
-            .iter()
-            .map(|c| {
-                let (score, weighted_score) = match score_map.get(&c.tweet_id) {
-                    Some(&(score, weighted)) => (Some(score), weighted.or(c.weighted_score)),
-                    None => {
-                        missing += 1;
-                        (c.score, c.weighted_score)
-                    }
-                };
-                Ok(PostCandidate {
-                    score,
-                    weighted_score,
-                    ..Default::default()
-                })
-            })
-            .collect();
+        for (c, out) in candidates.iter().zip(scored.iter_mut()) {
+            match returned.get(&c.tweet_id) {
+                Some(&(score, weighted)) => {
+                    out.score = Some(score);
+                    out.weighted_score = weighted.or(out.weighted_score);
+                }
+                None => missing += 1,
+            }
+        }
         if missing > 0 {
             record_fallback("missing_candidate", missing);
         }
-        scored
+        scored.into_iter().map(Ok).collect()
     }
 
     fn update(&self, candidate: &mut PostCandidate, scored: PostCandidate) {
-        candidate.score = scored.score;
         candidate.weighted_score = scored.weighted_score;
+        candidate.score = scored.score;
+        candidate.author_policy_zeroed = scored.author_policy_zeroed;
+        candidate.cold_start_lift_to_rank = scored.cold_start_lift_to_rank;
+        candidate.slate_context = scored.slate_context;
     }
 }
 
-fn record_request_mode(mode: &str) {
+fn slate_contexts(
+    query: &ScoredPostsQuery,
+    candidates: &[PostCandidate],
+) -> Option<Vec<SlateContext>> {
+    let served: Option<Vec<SlateContext>> =
+        candidates.iter().map(|c| c.served_slate_context).collect();
+    served.or_else(|| {
+        query
+            .has_cached_posts
+            .then(|| candidates.iter().map(|c| c.slate_context).collect())
+            .flatten()
+    })
+}
+
+fn record_request(cluster: &VMRankerCluster) {
     if let Some(receiver) = global_stats_receiver() {
-        receiver.incr(&format!("{METRIC_PREFIX}.request"), &[("mode", mode)], 1);
+        receiver.incr(
+            &format!("{METRIC_PREFIX}.request"),
+            &[("vm_cluster", &format!("{cluster:?}"))],
+            1,
+        );
     }
 }
 
@@ -125,48 +177,4 @@ fn record_fallback(reason: &str, candidate_count: usize) {
             candidate_count as u64,
         );
     }
-}
-
-fn build_request(
-    query: &ScoredPostsQuery,
-    candidates: &[PostCandidate],
-    inputs: &OptionalInputs,
-) -> RankRequest {
-    let proto_candidates: Vec<RankCandidate> = candidates
-        .iter()
-        .map(|c| {
-            let mut rank_candidate = RankCandidate {
-                tweet_id: c.tweet_id,
-                retweeted_tweet_id: c.retweeted_tweet_id.unwrap_or(0),
-                score: c.score,
-                ..Default::default()
-            };
-            inputs.write_candidate(c, &mut rank_candidate);
-            rank_candidate
-        })
-        .collect();
-
-    let dpp_theta = query.params.get(VMRankerDppTheta);
-    let dpp_max_selected_rank = query.params.get(VMRankerDppMaxSelectedRank);
-
-    let dpp_params = if dpp_theta > 0.0 || dpp_max_selected_rank > 0 {
-        Some(DppParams {
-            theta: dpp_theta,
-            max_selected_rank: dpp_max_selected_rank,
-        })
-    } else {
-        None
-    };
-
-    let mut request = RankRequest {
-        viewer_id: query.user_id,
-        candidates: proto_candidates,
-        value_model_id: DPP_VALUE_MODEL_ID.to_string(),
-        dpp_params,
-        ..Default::default()
-    };
-
-    inputs.write_request(query, candidates, &mut request);
-
-    request
 }

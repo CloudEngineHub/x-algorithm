@@ -3,7 +3,7 @@ use crate::hydration::fallback_cache::FallbackCache;
 use crate::hydration::metrics::{record_batch_size, timed_results};
 use crate::hydration::tes_composite::{TweetForVisibility, TweetForVisibilitySource};
 use crate::models::{
-    AuthorId, MediaFeature, NsfwFeature, TweetCandidateInput, TweetFeatures, TweetId,
+    AuthorId, MediaFeature, NsfwFeature, PureCore, TweetCandidateInput, TweetFeatures, TweetId,
 };
 use crate::rules::SafetyLevel;
 use std::collections::HashMap;
@@ -15,41 +15,41 @@ use xai_core_entities::tweet_entity_service_client::TESClient;
 const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 const CLIENT: &str = "tes";
 
-pub(crate) type AuthorIdFallbackCache = FallbackCache<TweetId, AuthorId>;
+pub(crate) type PureCoreFallbackCache = FallbackCache<TweetId, PureCore>;
 
 pub struct TesHydrator {
     tes_client: Arc<dyn TESClient + Send + Sync>,
     tweet_source: Arc<dyn TweetForVisibilitySource>,
-    author_id_cache: Option<AuthorIdFallbackCache>,
+    pure_core_cache: Option<PureCoreFallbackCache>,
 }
 
 impl TesHydrator {
     pub(crate) fn new(
         tes_client: Arc<dyn TESClient + Send + Sync>,
         tweet_source: Arc<dyn TweetForVisibilitySource>,
-        author_id_cache: Option<AuthorIdFallbackCache>,
+        pure_core_cache: Option<PureCoreFallbackCache>,
     ) -> Self {
         Self {
             tes_client,
             tweet_source,
-            author_id_cache,
+            pure_core_cache,
         }
     }
 
-    pub(crate) fn author_id_fallback_cache(capacity: usize) -> AuthorIdFallbackCache {
+    pub(crate) fn pure_core_fallback_cache(capacity: usize) -> PureCoreFallbackCache {
         FallbackCache::new("author_id", capacity)
     }
 
-    pub(crate) async fn fetch_author_ids(
+    pub(crate) async fn fetch_pure_core(
         &self,
         tweet_ids: &[TweetId],
         safety_level: SafetyLevel,
-    ) -> TweetHydrationBatch<AuthorId> {
+    ) -> TweetHydrationBatch<PureCore> {
         if tweet_ids.is_empty() {
             return TweetHydrationBatch::empty();
         }
         let cache_request = self
-            .author_id_cache
+            .pure_core_cache
             .as_ref()
             .map(|cache| (cache, cache.begin_request()));
         let candidate_count_by_key = candidates_per_tweet(tweet_ids);
@@ -65,7 +65,10 @@ impl TesHydrator {
         )
         .await
         .map_keys(TweetId)
-        .map(|core| AuthorId(core.author_id));
+        .map(|core| PureCore {
+            author_id: AuthorId(core.author_id),
+            source_tweet_id: core.source_tweet_id.map(TweetId),
+        });
         match cache_request {
             Some((cache, generation)) => cache.resolve_hydration_batch(generation, fetched),
             None => fetched,

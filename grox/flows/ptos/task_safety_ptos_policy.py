@@ -174,6 +174,7 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
             SafetyPolicyCategory.ViolentSpeech: "violent_speech",
             SafetyPolicyCategory.SuicideOrSelfHarm: "suicide_or_self_harm",
             SafetyPolicyCategory.ChildSafety: "child_safety",
+            SafetyPolicyCategory.AgeGatingHarmfulText: "age_gating_harmful_text",
         }.get(violation.category)
         if category_key:
             Metrics.counter(

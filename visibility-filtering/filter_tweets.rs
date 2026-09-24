@@ -57,7 +57,7 @@ impl FilterTweetsEndpoint {
 
         let reference_compare = self.reference_compare.as_ref().and_then(|harness| {
             harness.begin_compare(
-                req.viewer_id,
+                viewer_id,
                 req.country_code.clone(),
                 safety_level,
                 req.tweets.iter().map(|t| t.tweet_id).collect(),
@@ -73,6 +73,11 @@ impl FilterTweetsEndpoint {
                 rpc: Rpc::FilterTweets,
             }))
             .await;
+        ft_metrics::record_verdicts(
+            Rpc::FilterTweets,
+            safety_level,
+            response.outcomes.iter().map(|outcome| &outcome.verdict),
+        );
 
         if let Some(verdicts) = reference_compare {
             verdicts.send(
@@ -135,6 +140,7 @@ fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference_compare::tests::{fake_harness, FakeReply};
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let gizmoduck = std::sync::Arc::new(
@@ -170,6 +176,40 @@ mod tests {
         assert_eq!(gizmoduck_calls(Some(42)).await, logged_out + 1);
     }
 
+    #[tokio::test]
+    async fn reference_compare_sees_the_normalized_viewer_id() {
+        let (harness, reference) = fake_harness(FakeReply::Immediate);
+        let endpoint = FilterTweetsEndpoint::new(
+            Arc::new(crate::filter::test_support::filter_tweets()),
+            Some(harness),
+        );
+        for viewer_id in [Some(0), Some(42)] {
+            endpoint
+                .handle(Request::new(vf_pb::VisibilityFilterRequest {
+                    safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
+                    tweets: vec![vf_pb::TweetInput {
+                        tweet_id: 2,
+                        author_id: Some(20),
+                    }],
+                    viewer_id,
+                    country_code: None,
+                }))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), reference.called.notified())
+            .await
+            .unwrap();
+        let compared_viewer_ids: Vec<u64> = reference
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, viewer_id, _)| *viewer_id)
+            .collect();
+        assert_eq!(compared_viewer_ids, vec![42]);
+    }
+
     #[test]
     fn parse_grpc_timeout_units_and_garbage() {
         let parsed = |value: &str| {
@@ -187,6 +227,7 @@ mod tests {
         assert_eq!(parsed("m"), None);
         assert_eq!(parsed("400x"), None);
         assert_eq!(parsed("+400m"), None);
+        assert_eq!(parsed("12345678m"), Some(Duration::from_millis(12_345_678)));
         assert_eq!(parsed("123456789m"), None);
         assert_eq!(parse_grpc_timeout(&MetadataMap::new()), None);
     }

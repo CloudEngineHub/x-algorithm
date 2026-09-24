@@ -47,6 +47,12 @@ impl RankingConfig {
         }
         results.into()
     }
+
+    pub fn resolve_anonymous(&self) -> Params {
+        self.feature_switches
+            .match_recipient(&SimpleRecipient::default())
+            .into()
+    }
 }
 
 pub fn recipient(viewer: &ViewerContext) -> SimpleRecipient {

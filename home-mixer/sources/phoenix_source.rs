@@ -14,6 +14,7 @@ use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
+use xai_recsys_proto::RetrievalDatasetType;
 
 pub struct PhoenixSource {
     pub dispatch: RetrievalDispatch,
@@ -109,10 +110,8 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
     }
 }
 
-const HOME_COLD_DATASET_TYPE: u32 = 13;
-
 fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
-    if dataset_type == HOME_COLD_DATASET_TYPE {
+    if dataset_type == RetrievalDatasetType::HomeCold as u32 {
         pb::ServedType::ForYouPhoenixRetrievalCold
     } else {
         pb::ServedType::ForYouPhoenixRetrieval
@@ -170,7 +169,10 @@ mod tests {
         let response = RetrieveTopKCandidatesResponse {
             top_k_candidates: vec![ScoredCandidates {
                 user_id: 1,
-                candidates: vec![tweet(10, 1, 1), tweet(11, 2, HOME_COLD_DATASET_TYPE)],
+                candidates: vec![
+                    tweet(10, 1, RetrievalDatasetType::Home as u32),
+                    tweet(11, 2, RetrievalDatasetType::HomeCold as u32),
+                ],
             }],
         };
         let got: Vec<(u64, pb::ServedType)> = candidates_from_retrieval_response(

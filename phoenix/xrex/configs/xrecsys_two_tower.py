@@ -293,6 +293,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "head_names": ["home", "immersive"],
         "head_dataset_mapping": {
             "HOME": 0,
+            "HOME_COLD": 0,
+            "HOME_HOT": 0,
             "IMMERSIVE4Day": 1,
             "IMMERSIVE2Day": 1,
             "IMMERSIVENSFW": 1,
@@ -580,6 +582,7 @@ for config in configs:
         precision_level=2,
         reuse_run_id=False,
         evals=evals,
+        split_home_checkpoint=mparams.get("split_home_checkpoint", False),
         eval_every_n=mparams.get("eval_every_n", 1000),
         model_config=RecsysTwoTowerModelConfig(
             num_global_negatives_per_example=mparams["num_global_negatives_per_example"],
@@ -594,6 +597,11 @@ for config in configs:
             ),
             user_features=user_features_config,
             checkpoint_dataset_names=checkpoint_dataset_names,
+            split_home_checkpoint=mparams.get("split_home_checkpoint", False),
+            cold_start_max_age_seconds=mparams.get(
+                "cold_start_max_age_seconds",
+                RecsysTwoTowerModelConfig.cold_start_max_age_seconds,
+            ),
             immersive_positive_actions=mparams.get(
                 "immersive_positive_actions",
                 RecsysTwoTowerModelConfig.__dataclass_fields__[

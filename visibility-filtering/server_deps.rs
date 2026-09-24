@@ -116,8 +116,8 @@ pub async fn build_prod_server(
         .then(crate::hydration::gizmoduck_hydrator::GizmoduckAuthorHydrator::fallback_cache);
     let author_id_fallback_enabled = crate::config::author_id_fallback_enabled();
     let author_id_fallback_capacity = crate::config::author_id_fallback_capacity();
-    let author_id_fallback_cache = author_id_fallback_enabled.then(|| {
-        crate::hydration::tes_hydrator::TesHydrator::author_id_fallback_cache(
+    let pure_core_fallback_cache = author_id_fallback_enabled.then(|| {
+        crate::hydration::tes_hydrator::TesHydrator::pure_core_fallback_cache(
             author_id_fallback_capacity,
         )
     });
@@ -263,7 +263,7 @@ pub async fn build_prod_server(
         sg_client,
         safety_label_source.clone(),
         fallback_cache,
-        author_id_fallback_cache,
+        pure_core_fallback_cache,
     );
     let gating_countries = Arc::new(crate::params::NsfwGatingCountries::starting_at_default());
     let fs_path = crate::config::fs_path();

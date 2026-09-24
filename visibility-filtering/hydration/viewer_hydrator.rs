@@ -76,7 +76,7 @@ impl ViewerHydrator {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::Result;
     use std::collections::HashMap;
@@ -91,12 +91,12 @@ mod tests {
         }
     }
 
-    enum ViewerLookup {
+    pub(crate) enum ViewerLookup {
         Fails,
         Hangs,
     }
 
-    struct BrokenViewerClient(ViewerLookup);
+    pub(crate) struct BrokenViewerClient(pub(crate) ViewerLookup);
 
     #[tonic::async_trait]
     impl GizmoduckClient for BrokenViewerClient {

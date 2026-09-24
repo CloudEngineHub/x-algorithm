@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-22T17:39:32Z
+// mirrored from config feature-switch defaults; last sync 2026-09-23T16:28:43Z
 use xai_feature_switches::param;
 
 param!(
@@ -256,67 +256,12 @@ param!(
 
 param!(EnableRanking, bool, "rust_home_mixer_enable_ranking", true);
 param!(
-    EnableAuthorDiversity,
-    bool,
-    "rust_home_mixer_enable_author_diversity",
-    true
-);
-param!(
-    AuthorDiversityDecay,
-    f64,
-    "rust_home_mixer_author_diversity_decay",
-    0.5
-);
-param!(
-    AuthorDiversityFloor,
-    f64,
-    "rust_home_mixer_author_diversity_floor",
-    0.25
-);
-param!(
     LogSlateContext,
     bool,
     "rust_home_mixer_log_slate_context",
     false
 );
 param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
-param!(
-    OonWeightFactor,
-    f64,
-    "rust_home_mixer_oon_weight_factor",
-    0.75
-);
-param!(
-    MultiplierPreOffset,
-    bool,
-    "rust_home_mixer_multiplier_pre_offset",
-    false
-);
-
-param!(
-    EnableOonRescoreForInNetworkRepliesRetweets,
-    bool,
-    "rust_home_mixer_enable_oon_rescore_for_in_network_replies_retweets",
-    true
-);
-param!(
-    TopicOonWeightFactor,
-    f64,
-    "rust_home_mixer_topic_oon_weight_factor",
-    0.5
-);
-param!(
-    NewUserAgeThresholdSecs,
-    u64,
-    "rust_home_mixer_new_user_age_threshold_secs",
-    0
-);
-param!(
-    NewUserOonWeightFactor,
-    f64,
-    "rust_home_mixer_new_user_oon_weight_factor",
-    0.00001
-);
 
 // These weights reflect a combination of how much an action is
 // valued in ranking and typical propensities of these actions
@@ -423,24 +368,6 @@ param!(
     0.02
 );
 param!(
-    EnableMultiplicativePostUnexplored,
-    bool,
-    "rust_home_mixer_enable_multiplicative_post_unexplored",
-    false
-);
-param!(
-    MultiplicativePostUnexploredAlpha,
-    f64,
-    "rust_home_mixer_multiplicative_post_unexplored_alpha",
-    0.0
-);
-param!(
-    PostUnexploredWeightInNetworkOnly,
-    bool,
-    "rust_home_mixer_post_unexplored_weight_in_network_only",
-    true
-);
-param!(
     ContDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_dwell_time_weight",
@@ -450,18 +377,6 @@ param!(
     ContClickDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_click_dwell_time_weight",
-    0.0
-);
-param!(
-    EnableCdwellOnImpr,
-    bool,
-    "rust_home_mixer_enable_cdwell_on_impr",
-    false
-);
-param!(
-    ContActiveSecs5mResidualNormWeight,
-    f64,
-    "rust_home_mixer_cont_active_secs_5m_residual_norm_weight",
     0.0
 );
 
@@ -492,19 +407,6 @@ param!(
 );
 
 param!(
-    WeightPerturbationSigma,
-    f64,
-    "rust_home_mixer_weight_perturbation_sigma",
-    0.0
-);
-param!(
-    WeightPerturbationSalt,
-    String,
-    "rust_home_mixer_weight_perturbation_salt",
-    ""
-);
-
-param!(
     EnableFollowingRepliedUsersFacepile,
     bool,
     "rust_home_mixer_enable_following_replied_users_facepile",
@@ -524,12 +426,6 @@ param!(
 );
 
 param!(
-    EnableVMRanker,
-    bool,
-    "rust_home_mixer_enable_vm_ranker",
-    true
-);
-param!(
     VMRankerEnableFallback,
     bool,
     "rust_home_mixer_vm_ranker_enable_fallback",
@@ -539,7 +435,7 @@ param!(
     VMRankerClusterId,
     String,
     "rust_home_mixer_vm_ranker_cluster_id",
-    "Experiment3"
+    "Experiment6"
 );
 param!(
     PhoenixExperimentOverrides,
@@ -548,39 +444,9 @@ param!(
     ""
 );
 param!(
-    VMRankerDppTheta,
-    f64,
-    "rust_home_mixer_vm_ranker_dpp_theta",
-    0.65
-);
-param!(
-    VMRankerDppMaxSelectedRank,
-    u32,
-    "rust_home_mixer_vm_ranker_dpp_max_selected_rank",
-    150
-);
-param!(
-    VMRankerSendValueModelInputs,
-    bool,
-    "rust_home_mixer_vm_ranker_send_value_model_inputs",
-    false
-);
-param!(
-    VMRankerComputeValueModel,
-    bool,
-    "rust_home_mixer_vm_ranker_compute_value_model",
-    false
-);
-param!(
     VMRankerSendDebiasInputs,
     bool,
     "rust_home_mixer_vm_ranker_send_debias_inputs",
-    false
-);
-param!(
-    CachedPostsReuseWeightedScore,
-    bool,
-    "rust_home_mixer_cached_posts_reuse_weighted_score",
     false
 );
 param!(

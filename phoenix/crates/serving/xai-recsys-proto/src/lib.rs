@@ -148,4 +148,12 @@ mod tests {
             CountryCode::CountryUnknown
         );
     }
+
+    #[test]
+    fn retrieval_dataset_type_ids() {
+        assert_eq!(RetrievalDatasetType::Home as i32, 1);
+        assert_eq!(RetrievalDatasetType::HomeCold as i32, 13);
+        assert_eq!(RetrievalDatasetType::HomeHot as i32, 14);
+        assert_eq!(RetrievalDatasetType::Trending as i32, 12);
+    }
 }

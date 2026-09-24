@@ -1,9 +1,10 @@
 use crate::filter::{EvaluationStatus, FilterOutcome, FilterRequest, FilterTweets};
-use crate::models::{RawCandidate, TweetId};
+use crate::filter_tweets::normalize_viewer_id;
+use crate::models::{RawCandidate, TweetId, Verdict};
 use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
 use crate::treatment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use vf_pb::tweet_evaluation::Outcome;
@@ -13,6 +14,7 @@ use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
 const REQUESTS: &str = "evaluate_tweets_requests";
 const LATENCY_MS: &str = "evaluate_tweets_latency_ms";
 const BATCH_SIZE: &str = "evaluate_tweets_batch_size";
+const RETWEET_SOURCES: &str = "evaluate_tweets_retweet_sources";
 
 pub struct EvaluateTweetsEndpoint {
     filter_tweets: Arc<FilterTweets>,
@@ -70,18 +72,93 @@ impl EvaluateTweetsEndpoint {
                 request_author_id: None,
             })
             .collect();
-        let response = self
+        let viewer_id = normalize_viewer_id(req.viewer_id);
+        let outcomes = self
             .filter_tweets
             .run(FilterRequest {
-                viewer_id: crate::filter_tweets::normalize_viewer_id(req.viewer_id),
-                country_code: req.country_code,
+                viewer_id,
+                country_code: req.country_code.clone(),
                 safety_level,
                 candidates,
                 rpc: Rpc::EvaluateTweets,
             })
-            .await;
-        let outcomes: HashMap<TweetId, FilterOutcome> = response
-            .outcomes
+            .await
+            .outcomes;
+        let is_evaluated_retweet = |outcome: &FilterOutcome| {
+            outcome.status == EvaluationStatus::Evaluated && outcome.source_tweet_id.is_some()
+        };
+        let outcomes = if !outcomes.iter().any(is_evaluated_retweet) {
+            outcomes
+        } else {
+            let requested: HashSet<TweetId> =
+                outcomes.iter().map(|outcome| outcome.tweet_id).collect();
+            let (in_batch, fetched): (HashSet<TweetId>, HashSet<TweetId>) = outcomes
+                .iter()
+                .filter(|outcome| outcome.status == EvaluationStatus::Evaluated)
+                .filter_map(|outcome| outcome.source_tweet_id)
+                .partition(|source_id| requested.contains(source_id));
+            ft_metrics::incr_nonzero(
+                RETWEET_SOURCES,
+                &[("outcome", "in_batch")],
+                in_batch.len() as u64,
+            );
+            ft_metrics::incr_nonzero(
+                RETWEET_SOURCES,
+                &[("outcome", "fetched")],
+                fetched.len() as u64,
+            );
+            let fetched_outcomes = if fetched.is_empty() {
+                Vec::new()
+            } else {
+                self.filter_tweets
+                    .run(FilterRequest {
+                        viewer_id,
+                        country_code: req.country_code,
+                        safety_level,
+                        candidates: fetched
+                            .into_iter()
+                            .map(|tweet_id| RawCandidate {
+                                tweet_id,
+                                request_author_id: None,
+                            })
+                            .collect(),
+                        rpc: Rpc::EvaluateTweets,
+                    })
+                    .await
+                    .outcomes
+            };
+            let sources: HashMap<TweetId, (EvaluationStatus, Verdict)> = outcomes
+                .iter()
+                .filter(|outcome| in_batch.contains(&outcome.tweet_id))
+                .map(|outcome| (outcome.tweet_id, (outcome.status, outcome.verdict.clone())))
+                .chain(
+                    fetched_outcomes
+                        .into_iter()
+                        .map(|outcome| (outcome.tweet_id, (outcome.status, outcome.verdict))),
+                )
+                .collect();
+            outcomes
+                .into_iter()
+                .map(|mut outcome| {
+                    if is_evaluated_retweet(&outcome) {
+                        match outcome.source_tweet_id.and_then(|id| sources.get(&id)) {
+                            Some((EvaluationStatus::Evaluated, source)) => {
+                                outcome.verdict =
+                                    Verdict::merge_retweet_verdict(outcome.verdict, source);
+                            }
+                            _ => outcome.status = EvaluationStatus::Failed,
+                        }
+                    }
+                    outcome
+                })
+                .collect()
+        };
+        ft_metrics::record_verdicts(
+            Rpc::EvaluateTweets,
+            safety_level,
+            outcomes.iter().map(|outcome| &outcome.verdict),
+        );
+        let outcomes: HashMap<TweetId, FilterOutcome> = outcomes
             .into_iter()
             .map(|outcome| (outcome.tweet_id, outcome))
             .collect();
@@ -120,19 +197,45 @@ impl EvaluateTweetsEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xai_core_entities::entities::PureCoreData;
+    use xai_core_entities::entities::{
+        GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
+    };
     use xai_core_entities::gizmoduck_client::MockGizmoduckClient;
     use xai_core_entities::tweet_entity_service_client::MockTESClient;
     use xai_x_thrift::action::{self, Action, DropReason};
 
     #[tokio::test]
-    async fn evaluate_tweets_gates_levels_and_maps_outcomes_in_order() {
-        let tes = MockTESClient {
-            core_data: [(
-                3,
-                Some(PureCoreData {
-                    author_id: 30,
-                    ..Default::default()
+    async fn evaluate_tweets_gates_levels_maps_outcomes_and_merges_retweet_sources() {
+        let core = |author_id, source_tweet_id| {
+            Some(PureCoreData {
+                author_id,
+                source_tweet_id,
+                ..Default::default()
+            })
+        };
+        let tes = Arc::new(MockTESClient {
+            core_data: [
+                (3, core(30, None)),
+                (4, core(40, Some(6))),
+                (5, core(50, Some(6))),
+                (6, core(60, None)),
+                (7, core(70, Some(8))),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let gizmoduck = MockGizmoduckClient {
+            users: [(
+                60,
+                Some(GizmoduckUserResult {
+                    user: Some(GizmoduckUser {
+                        safety: Safety {
+                            suspended: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    response_state: Some(UserResponseState::Found),
                 }),
             )]
             .into(),
@@ -140,8 +243,8 @@ mod tests {
         };
         let endpoint = EvaluateTweetsEndpoint::new(Arc::new(
             crate::filter::test_support::filter_tweets_with_clients(
-                Arc::new(tes),
-                Arc::new(MockGizmoduckClient::default()),
+                tes.clone(),
+                Arc::new(gizmoduck),
             ),
         ));
         for (level, code) in [
@@ -208,6 +311,42 @@ mod tests {
                     Outcome::ActionThriftCompact(bytes.clone().into()),
                     Outcome::ActionThriftCompact(bytes.into()),
                 ]
+            );
+        }
+        let suspended = Outcome::ActionThriftCompact(
+            xai_x_thrift::serialize_compact(&Action::Drop(action::Drop::new(
+                Some(DropReason::SuspendedAuthor(true)),
+                None,
+            )))
+            .unwrap()
+            .into(),
+        );
+        for (tweet_ids, core_data_calls, outcomes) in [
+            (vec![4, 6], 1, vec![suspended.clone(), suspended.clone()]),
+            (
+                vec![5, 7],
+                2,
+                vec![suspended, Outcome::Failed(vf_pb::Failed {})],
+            ),
+        ] {
+            let calls_before = tes.call_count();
+            let response = endpoint
+                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+                    safety_level: 8,
+                    tweets: tweet_ids.into_iter().map(|id| tweet(id, None)).collect(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(tes.call_count() - calls_before, core_data_calls);
+            assert_eq!(
+                response
+                    .results
+                    .into_iter()
+                    .map(|r| r.outcome.unwrap())
+                    .collect::<Vec<_>>(),
+                outcomes
             );
         }
     }

@@ -413,6 +413,8 @@ class RecsysTrainer(Trainer):
 
     empty_history_user_dropout_rate: float = 0.0
 
+    split_home_checkpoint: bool = False
+
     checkpoint_storage_urls: str = ""
 
     export_stablehlo_bundle: bool = False
@@ -3393,6 +3395,11 @@ class RecsysTrainer(Trainer):
 
         raise ValueError("Ranking model eval_every_n is not supported yet.")
 
+    def _split_home_checkpoint(self) -> bool:
+        return bool(self.split_home_checkpoint) or bool(
+            getattr(self.model_config, "split_home_checkpoint", False)
+        )
+
     def maybe_build_retrieval_post_embeddings(self):
         if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
             return
@@ -3411,6 +3418,8 @@ class RecsysTrainer(Trainer):
             target_datasets = [
                 RetrievalDataset[name] for name in self.model_config.checkpoint_dataset_names
             ]
+            if self._split_home_checkpoint():
+                target_datasets = RetrievalDataset.expand_home_to_cold_hot(target_datasets)
             rank_logger.info(
                 f"Loading configured retrieval datasets: {[ds.name for ds in target_datasets]}"
             )
@@ -3422,6 +3431,8 @@ class RecsysTrainer(Trainer):
             target_datasets = (
                 list(eval_target_types) if eval_target_types else [RetrievalDataset.HOME]
             )
+            if self._split_home_checkpoint():
+                target_datasets = RetrievalDataset.expand_home_to_cold_hot(target_datasets)
             rank_logger.info(
                 f"Loading configured retrieval datasets: {[ds.name for ds in target_datasets]}"
             )
@@ -3436,6 +3447,9 @@ class RecsysTrainer(Trainer):
                 max_posts=max_posts,
                 read_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
+                cold_start_max_age_seconds=float(
+                    getattr(self.model_config, "cold_start_max_age_seconds", 0.0) or 0.0
+                ),
             )
         else:
             post_ids = np.zeros(max_posts, dtype=np.int64)

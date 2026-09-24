@@ -23,6 +23,7 @@ pub enum EvaluationStatus {
 
 pub struct FilterOutcome {
     pub tweet_id: TweetId,
+    pub source_tweet_id: Option<TweetId>,
     pub verdict: Verdict,
     pub status: EvaluationStatus,
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
@@ -63,6 +64,7 @@ impl FilterTweets {
             candidates: hydrated_candidates,
             safety_labels,
             failed_ids,
+            pure_cores,
         } = hydration;
         let evaluated: HashMap<TweetId, Verdict> = hydrated_candidates
             .iter()
@@ -91,6 +93,9 @@ impl FilterTweets {
                 };
                 FilterOutcome {
                     tweet_id: candidate.tweet_id,
+                    source_tweet_id: pure_cores
+                        .get(&candidate.tweet_id)
+                        .and_then(|core| core.source_tweet_id),
                     verdict,
                     status,
                     safety_labels: safety_labels
@@ -100,11 +105,6 @@ impl FilterTweets {
             })
             .collect();
 
-        ft_metrics::record_verdicts(
-            request.rpc,
-            request.safety_level,
-            outcomes.iter().map(|outcome| &outcome.verdict),
-        );
         ft_metrics::record_phase(request.rpc, "post_hydration", hydrated_at.elapsed());
 
         FilterResponse { outcomes }
@@ -115,14 +115,21 @@ impl FilterTweets {
 pub(crate) mod test_support {
     use super::*;
     use crate::clients::socialgraph_client::FakeSocialgraphClient;
-    use crate::hydration::tes_composite::MockTweetForVisibilitySource;
+    use crate::hydration::tes_composite::{MockTweetForVisibilitySource, TweetForVisibility};
     use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
     use crate::safety_label_source::SafetyLabelSource;
     use std::sync::Arc;
     use tonic::async_trait;
+    use xai_core_entities::entities::{
+        ApiCounts, CashtagAttachments, ConversationControl, EditControl,
+        EscherbirdEntityAnnotation, ExclusiveTweetControl, MediaEntities, PureCoreData,
+        QuotedTweet, ReactionContext, TakedownReason, TrustedFriendsControl, UrlEntities,
+    };
     use xai_core_entities::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient};
     use xai_core_entities::tweet_entity_service_client::{MockTESClient, TESClient};
+    use xai_x_thrift::entities::ApiMediaEntity;
+    use xai_x_thrift::tweets::ApiPerspective;
 
     fn full_label_map() -> vf_pb::SafetyLabelMap {
         vf_pb::SafetyLabelMap {
@@ -172,10 +179,32 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn safety_labels() -> Arc<SafetyLabelSource> {
+        safety_labels_with_manhattan(Arc::new(FakeManhattan))
+    }
+
+    pub(crate) fn safety_labels_with_manhattan<M: ManhattanLookup + 'static>(
+        manhattan: Arc<M>,
+    ) -> Arc<SafetyLabelSource> {
         Arc::new(SafetyLabelSource::new(Arc::new(RemoteSource::new(
             Arc::new(FakeTwemcache),
-            Arc::new(FakeManhattan),
+            manhattan,
         ))))
+    }
+
+    pub(crate) fn exclusive_tweet() -> TweetForVisibility {
+        TweetForVisibility {
+            author_id: 900,
+            source_tweet_id: None,
+            is_nullcast: false,
+            nsfw_user: false,
+            nsfw_admin: false,
+            has_takedown: false,
+            takedown_reasons: vec![],
+            media: Default::default(),
+            is_community_tweet: false,
+            edit_control: None,
+            exclusive_conversation_author_id: Some(30),
+        }
     }
 
     pub(crate) fn filter_tweets_with_clients(
@@ -196,13 +225,86 @@ pub(crate) mod test_support {
             RuleEngine::for_tests(),
         )
     }
+
+    pub(crate) struct PendingTes;
+
+    macro_rules! pending_tes {
+        ($($method:ident -> $value:ty),* $(,)?) => {
+            #[async_trait]
+            impl TESClient for PendingTes {
+                $(
+                    async fn $method(
+                        &self,
+                        _: Vec<u64>,
+                    ) -> HashMap<u64, anyhow::Result<Option<$value>>> {
+                        std::future::pending().await
+                    }
+                )*
+
+                async fn get_core_data_and_api_counts(
+                    &self,
+                    _: u64,
+                ) -> (
+                    anyhow::Result<Option<PureCoreData>>,
+                    anyhow::Result<Option<ApiCounts>>,
+                ) {
+                    std::future::pending().await
+                }
+
+                async fn get_status_perspectives(
+                    &self,
+                    _: Vec<u64>,
+                    _: Option<&tonic::metadata::MetadataMap>,
+                ) -> HashMap<u64, anyhow::Result<Option<ApiPerspective>>> {
+                    std::future::pending().await
+                }
+
+                async fn get_api_media_entities(
+                    &self,
+                    _: Vec<u64>,
+                    _: Option<&tonic::metadata::MetadataMap>,
+                ) -> HashMap<u64, anyhow::Result<Option<Vec<ApiMediaEntity>>>> {
+                    std::future::pending().await
+                }
+            }
+        };
+    }
+
+    pending_tes! {
+        get_tweet_core_datas -> PureCoreData,
+        get_tweet_media_entities -> MediaEntities,
+        get_subscription_author_ids -> u64,
+        get_conversation_controls -> ConversationControl,
+        get_quoted_tweets -> QuotedTweet,
+        get_reaction_context -> ReactionContext,
+        get_min_video_durations -> i64,
+        get_media_count -> i64,
+        get_nullcast -> bool,
+        get_community -> i64,
+        get_nsfw_user -> bool,
+        get_nsfw_admin -> bool,
+        get_has_takedown -> bool,
+        get_takedown_country_codes -> Vec<String>,
+        get_takedown_reasons -> Vec<TakedownReason>,
+        get_language_code -> String,
+        get_api_counts -> ApiCounts,
+        get_cashtag_attachments -> CashtagAttachments,
+        get_is_article -> bool,
+        get_is_premium -> bool,
+        get_urls -> UrlEntities,
+        get_exclusive_controls -> ExclusiveTweetControl,
+        get_trusted_friends_controls -> TrustedFriendsControl,
+        get_grok_post_ids -> String,
+        get_edit_control -> EditControl,
+        get_escherbird_entity_annotations -> Vec<EscherbirdEntityAnnotation>,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::SocialgraphClient;
-    use crate::filter::test_support::filter_tweets;
+    use crate::filter::test_support::{exclusive_tweet, filter_tweets, PendingTes};
     use crate::hydration::tes_composite::{
         MockTweetForVisibilitySource, TweetForVisibility, TweetForVisibilitySource,
     };
@@ -296,22 +398,6 @@ mod tests {
             ]),
             ..Default::default()
         })
-    }
-
-    fn exclusive_tweet() -> TweetForVisibility {
-        TweetForVisibility {
-            author_id: 900,
-            source_tweet_id: None,
-            is_nullcast: false,
-            nsfw_user: false,
-            nsfw_admin: false,
-            has_takedown: false,
-            takedown_reasons: vec![],
-            media: Default::default(),
-            is_community_tweet: false,
-            edit_control: None,
-            exclusive_conversation_author_id: Some(30),
-        }
     }
 
     fn candidate(tweet_id: u64, author_id: Option<u64>) -> RawCandidate {
@@ -414,6 +500,42 @@ mod tests {
         assert_eq!(tweet.exclusive_content, None);
         assert_eq!(tes.call_count(), 1);
         assert!(sg.super_follows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pure_core_timeout_fails_every_candidate_at_hydration_timeout() {
+        let service = test_support::filter_tweets_with_clients(
+            Arc::new(PendingTes),
+            Arc::new(MockGizmoduckClient::default()),
+        );
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            crate::hydration::HYDRATION_TIMEOUT * 2,
+            service.run(FilterRequest {
+                viewer_id: Some(50),
+                country_code: None,
+                safety_level: SafetyLevel::TimelineHome,
+                candidates: vec![candidate(1, None), candidate(2, Some(20))],
+                rpc: Rpc::FilterTweets,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), crate::hydration::HYDRATION_TIMEOUT);
+        assert_eq!(
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.verdict.clone(), outcome.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Verdict::unresolved_author(),
+                    EvaluationStatus::UnresolvedAuthor
+                ),
+                (unrestricted(), EvaluationStatus::Failed),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -170,6 +170,20 @@ mod tests {
         }
     }
 
+    struct FailingLabelFetcher;
+
+    #[async_trait]
+    impl ManhattanLabelFetcher for FailingLabelFetcher {
+        async fn fetch_labels(
+            &self,
+            _: &[i64],
+        ) -> Result<Vec<FetchResult>, xai_manhattan::ManhattanError> {
+            Err(xai_manhattan::ManhattanError::NativeProtocol(
+                "manhattan unavailable".into(),
+            ))
+        }
+    }
+
     fn make_source_with_clock(
         cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
@@ -190,14 +204,24 @@ mod tests {
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
         clock: Clock,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
+        make_counting_source_with_fetcher(
+            cache_results,
+            Arc::new(FakeLabelFetcher { items: mh_items }),
+            clock,
+        )
+    }
+
+    fn make_counting_source_with_fetcher(
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
+        fetcher: Arc<dyn ManhattanLabelFetcher>,
+        clock: Clock,
+    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
         let remote_keys = Arc::new(AtomicUsize::new(0));
         let twemcache = Arc::new(TwemcacheSource::with_cache(Arc::new(FakeTwemcache {
             results: cache_results,
             fetched_keys: remote_keys.clone(),
         })));
-        let manhattan = Arc::new(ManhattanSource::new(Arc::new(FakeLabelFetcher {
-            items: mh_items,
-        })));
+        let manhattan = Arc::new(ManhattanSource::new(fetcher));
         let remote = Arc::new(RemoteSource::new(twemcache, manhattan));
         (SafetyLabelSource::with_clock(remote, clock), remote_keys)
     }
@@ -238,6 +262,23 @@ mod tests {
             &first
         ));
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_never_backfills_a_remote_error_into_l1() {
+        let (source, remote_keys) = make_counting_source_with_fetcher(
+            HashMap::new(),
+            Arc::new(FailingLabelFetcher),
+            Clock::new(),
+        );
+
+        let results1 = source.get(&[42]).await;
+        assert!(results1.get(&42).unwrap().is_err());
+        assert!(source.cache.expiry_of(&42).is_none());
+
+        let results2 = source.get(&[42]).await;
+        assert!(results2.get(&42).unwrap().is_err());
+        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -297,6 +338,11 @@ mod tests {
                 YOUNG_TWEET_AGE - Duration::from_secs(10),
                 Some(Duration::from_secs(10)),
             ),
+            (
+                YOUNG_TWEET_AGE - Duration::from_millis(1),
+                Some(Duration::from_millis(1)),
+            ),
+            (YOUNG_TWEET_AGE, Some(LONG_TTL)),
         ] {
             let tweet_id = tweet_id_created_at(now - age);
             assert_eq!(ttl_for_tweet(tweet_id, now), expected);

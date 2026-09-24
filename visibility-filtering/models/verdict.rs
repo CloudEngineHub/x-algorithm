@@ -46,10 +46,70 @@ pub enum LimitedEngagementReason {
 }
 
 impl Verdict {
+    pub fn merge_retweet_verdict(retweet: Verdict, source: &Verdict) -> Verdict {
+        match (&retweet, source) {
+            (_, Verdict::Withheld(_)) => source.clone(),
+            (Verdict::Withheld(_), _) => retweet,
+            (
+                Verdict::Shown {
+                    media: None,
+                    engagement: None,
+                },
+                _,
+            ) => source.clone(),
+            _ => retweet,
+        }
+    }
+
     pub fn unresolved_author() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(FilteredReason::UnspecifiedReason),
             by: "unresolved_author_id",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_retweet_verdict_prefers_withheld_source_then_restricted_retweet() {
+        let dropped = Verdict::Withheld(Decided {
+            value: Withholding::Drop(FilteredReason::AuthorIsSuspended),
+            by: "SuspendedAuthorRule",
+        });
+        let blurred = Verdict::Shown {
+            media: Some(Decided {
+                value: MediaInterstitial {
+                    legacy: FilteredReason::ContainNsfwMedia,
+                    reason: InterstitialReason::Sensitive(true),
+                },
+                by: "NsfwUserInterstitialRule",
+            }),
+            engagement: None,
+        };
+        let limited = Verdict::Shown {
+            media: None,
+            engagement: Some(Decided {
+                value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
+                by: "LimitRepliesByInvitationConversationRule",
+            }),
+        };
+        let unrestricted = Verdict::Shown {
+            media: None,
+            engagement: None,
+        };
+        for (retweet, source, merged) in [
+            (&Verdict::unresolved_author(), &dropped, &dropped),
+            (&dropped, &limited, &dropped),
+            (&unrestricted, &limited, &limited),
+            (&blurred, &limited, &blurred),
+        ] {
+            assert_eq!(
+                Verdict::merge_retweet_verdict(retweet.clone(), source),
+                *merged
+            );
+        }
     }
 }

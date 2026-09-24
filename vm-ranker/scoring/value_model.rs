@@ -143,7 +143,7 @@ fn compute_or_fallback(
     req: &RankRequest,
     params: Option<&Params>,
 ) -> Result<ValueModelOutput, Fallback> {
-    let params = params.ok_or_else(|| Fallback::new("missing_viewer_context", ""))?;
+    let params = params.ok_or_else(|| Fallback::new("no_config", ""))?;
     let weights = weights_from_params(params, req.viewer_id);
     let ctx = scoring_context(req, params);
     let inputs = candidate_inputs(req, &weights);

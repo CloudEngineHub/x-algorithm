@@ -14,7 +14,7 @@ use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::SocialgraphClient;
 use crate::models::{
     assemble, resolve_candidates, AuthorFeatures, AuthorId, ConversationControlFeatures,
-    ExclusiveContentFeatures, HydratedTweetCandidate, RawCandidate, SafetyLabelMap,
+    ExclusiveContentFeatures, HydratedTweetCandidate, PureCore, RawCandidate, SafetyLabelMap,
     TweetCandidateInput, TweetFeatures, TweetId, Viewer, ViewerAuthorRelationship, ViewerFeatures,
     ViewerProfile,
 };
@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tes_composite::TweetForVisibilitySource;
-use tes_hydrator::{AuthorIdFallbackCache, TesHydrator};
+use tes_hydrator::{PureCoreFallbackCache, TesHydrator};
 use viewer_hydrator::ViewerHydrator;
 use xai_core_entities::gizmoduck_client::GizmoduckClient;
 use xai_core_entities::tweet_entity_service_client::TESClient;
@@ -209,6 +209,7 @@ pub(crate) struct HydrationOutput {
     pub(crate) candidates: Vec<HydratedTweetCandidate>,
     pub(crate) safety_labels: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
     pub(crate) failed_ids: HashSet<TweetId>,
+    pub(crate) pure_cores: TweetHydrationBatch<PureCore>,
 }
 
 impl HydrationPipeline {
@@ -219,7 +220,7 @@ impl HydrationPipeline {
         socialgraph_client: Arc<dyn SocialgraphClient + Send + Sync>,
         safety_label_source: Arc<SafetyLabelSource>,
         fallback_cache: Option<FallbackCache<AuthorId, Completeness<AuthorFeatures>>>,
-        author_id_fallback_cache: Option<AuthorIdFallbackCache>,
+        pure_core_fallback_cache: Option<PureCoreFallbackCache>,
     ) -> Self {
         Self {
             viewer_hydrator: ViewerHydrator {
@@ -228,7 +229,7 @@ impl HydrationPipeline {
             tes_hydrator: TesHydrator::new(
                 tes_client.clone(),
                 tweet_source,
-                author_id_fallback_cache,
+                pure_core_fallback_cache,
             ),
             gizmoduck_author_hydrator: GizmoduckAuthorHydrator::new(
                 GizmoduckLookup::new(gizmoduck_client),
@@ -342,12 +343,12 @@ impl HydrationPipeline {
             };
 
             let author_hop = async {
-                let authors = self
+                let pure_cores = self
                     .tes_hydrator
-                    .fetch_author_ids(&tweet_ids, safety_level)
+                    .fetch_pure_core(&tweet_ids, safety_level)
                     .await;
                 let tes_elapsed = tes_started.elapsed();
-                let candidates = resolve_candidates(raw_candidates, &authors);
+                let candidates = resolve_candidates(raw_candidates, &pure_cores);
                 let (author_features, relationships) = tokio::join!(
                     async {
                         if hydrators.contains(Hydrator::Author) {
@@ -369,7 +370,7 @@ impl HydrationPipeline {
                     },
                 );
                 (
-                    authors,
+                    pure_cores,
                     candidates,
                     author_features,
                     relationships,
@@ -384,7 +385,7 @@ impl HydrationPipeline {
                     exclusive_content,
                     conversation_control,
                 ),
-                (authors, candidates, author_features, relationships, core_elapsed),
+                (pure_cores, candidates, author_features, relationships, core_elapsed),
             ) = tokio::join!(independent_group, author_hop);
             metrics::record_tes_join_latency(
                 safety_level,
@@ -404,7 +405,7 @@ impl HydrationPipeline {
                 .iter()
                 .map(|candidate| candidate.tweet_id)
                 .filter(|id| {
-                    authors.is_failed(id)
+                    pure_cores.is_failed(id)
                         || (hydrators.contains(Hydrator::Author)
                             && !matches!(
                                 author_features.hydrated(id),
@@ -439,10 +440,10 @@ impl HydrationPipeline {
             };
             let hydrated_candidates = features.assemble(&candidates);
 
-            (hydrated_candidates, label_response, failed_ids)
+            (hydrated_candidates, label_response, failed_ids, pure_cores)
         };
 
-        let (viewer, (candidates, safety_labels, mut failed_ids)) =
+        let (viewer, (candidates, safety_labels, mut failed_ids, pure_cores)) =
             tokio::join!(viewer_hydration, candidate_hydration);
         if !viewer.is_complete() {
             failed_ids.extend(candidates.iter().map(|c| TweetId(c.tweet_id)));
@@ -453,6 +454,7 @@ impl HydrationPipeline {
             candidates,
             safety_labels,
             failed_ids,
+            pure_cores,
         }
     }
 }
@@ -461,11 +463,19 @@ impl HydrationPipeline {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::FakeSocialgraphClient;
-    use crate::filter::test_support::safety_labels;
+    use crate::filter::test_support::{
+        exclusive_tweet, safety_labels, safety_labels_with_manhattan, PendingTes,
+    };
     use crate::hydration::tes_composite::MockTweetForVisibilitySource;
-    use xai_core_entities::entities::PureCoreData;
-    use xai_core_entities::gizmoduck_client::{MockGizmoduckClient, ViewerData};
-    use xai_core_entities::tweet_entity_service_client::MockTESClient;
+    use crate::hydration::viewer_hydrator::tests::{BrokenViewerClient, ViewerLookup};
+    use crate::safety_label_source::lookup::{LookupError, ManhattanLookup};
+    use crate::safety_label_source::types::{FailureKind, ManhattanOutcome};
+    use xai_core_entities::entities::{
+        ConversationControl, ConversationControlArm, GizmoduckUserResult, PureCoreData,
+        UserResponseState,
+    };
+    use xai_core_entities::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient, ViewerData};
+    use xai_core_entities::tweet_entity_service_client::{MockTESClient, TESClient};
 
     #[test]
     fn request_context_budget_is_header_or_hang_guard_minus_allowance() {
@@ -611,10 +621,226 @@ mod tests {
         assert_ne!(profile, ViewerProfile::default());
     }
 
+    struct DegradedSocialgraph;
+
+    #[tonic::async_trait]
+    impl SocialgraphClient for DegradedSocialgraph {
+        async fn batch_check_relationships(
+            &self,
+            _: u64,
+            authors: &[u64],
+        ) -> HashMap<u64, ViewerAuthorRelationship> {
+            authors
+                .iter()
+                .filter(|&&author| author != 10)
+                .map(|&author| (author, ViewerAuthorRelationship::default()))
+                .collect()
+        }
+
+        async fn batch_check_super_follows(&self, _: u64, _: &[u64]) -> Option<HashMap<u64, bool>> {
+            None
+        }
+
+        async fn batch_check_followed_by(&self, _: u64, _: &[u64]) -> Option<HashMap<u64, bool>> {
+            None
+        }
+    }
+
+    struct FailingManhattan;
+
+    #[tonic::async_trait]
+    impl ManhattanLookup for FailingManhattan {
+        async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
+            ids.iter()
+                .map(|&id| {
+                    (
+                        id,
+                        ManhattanOutcome::Failure(LookupError::new(
+                            FailureKind::ManhattanFetch,
+                            "manhattan unavailable",
+                        )),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn tes(
+        core: &[(u64, u64)],
+        conversation_controls: HashMap<u64, Option<ConversationControl>>,
+    ) -> Arc<MockTESClient> {
+        Arc::new(MockTESClient {
+            core_data: core
+                .iter()
+                .map(|&(tweet_id, author_id)| {
+                    (
+                        tweet_id,
+                        Some(PureCoreData {
+                            author_id,
+                            ..Default::default()
+                        }),
+                    )
+                })
+                .collect(),
+            conversation_controls,
+            ..Default::default()
+        })
+    }
+
+    struct Deps {
+        tes: Arc<dyn TESClient + Send + Sync>,
+        composite: MockTweetForVisibilitySource,
+        gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
+        socialgraph: Arc<dyn SocialgraphClient + Send + Sync>,
+        labels: Arc<SafetyLabelSource>,
+    }
+
+    impl Default for Deps {
+        fn default() -> Self {
+            Self {
+                tes: tes(&[(1, 10), (2, 20)], HashMap::new()),
+                composite: MockTweetForVisibilitySource::default(),
+                gizmoduck: Arc::new(MockGizmoduckClient::default()),
+                socialgraph: Arc::new(FakeSocialgraphClient),
+                labels: safety_labels(),
+            }
+        }
+    }
+
+    impl Deps {
+        fn pipeline(self) -> HydrationPipeline {
+            HydrationPipeline::new(
+                self.tes,
+                Arc::new(self.composite),
+                self.gizmoduck,
+                self.socialgraph,
+                self.labels,
+                None,
+                None,
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_ids_reports_exactly_the_candidates_each_clause_flags() {
+        let community = ConversationControl {
+            arm: ConversationControlArm::Community,
+            conversation_tweet_author_id: 30,
+            invited_user_ids: vec![],
+            invite_via_mention: None,
+            allowed_country_codes: vec![],
+        };
+        let rows = [
+            ("healthy", Hydrators::all(), Deps::default(), vec![]),
+            (
+                "failed pure core",
+                Hydrators::empty(),
+                Deps {
+                    tes: Arc::new(PendingTes),
+                    ..Default::default()
+                },
+                vec![1, 2],
+            ),
+            (
+                "incomplete author",
+                Hydrators::of(Hydrator::Author),
+                Deps {
+                    gizmoduck: Arc::new(MockGizmoduckClient {
+                        users: HashMap::from([(
+                            10,
+                            Some(GizmoduckUserResult {
+                                user: None,
+                                response_state: Some(UserResponseState::Failed),
+                            }),
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "failed relationships",
+                Hydrators::of(Hydrator::Relationship),
+                Deps {
+                    socialgraph: Arc::new(DegradedSocialgraph),
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "failed tweet-keyed TES",
+                Hydrators::of(Hydrator::Tweet),
+                Deps {
+                    composite: MockTweetForVisibilitySource {
+                        errors: HashMap::from([(1, "tes unavailable".into())]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "missing label response",
+                Hydrators::of(Hydrator::TweetSafetyLabels),
+                Deps {
+                    labels: safety_labels_with_manhattan(Arc::new(FailingManhattan)),
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "incomplete exclusive content",
+                Hydrators::of(Hydrator::Tweet).with(Hydrator::ExclusiveContent),
+                Deps {
+                    composite: MockTweetForVisibilitySource {
+                        tweets: HashMap::from([(1, Some(exclusive_tweet()))]),
+                        ..Default::default()
+                    },
+                    socialgraph: Arc::new(DegradedSocialgraph),
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "incomplete conversation control",
+                Hydrators::of(Hydrator::ConversationControl),
+                Deps {
+                    tes: tes(&[(1, 10), (2, 20)], HashMap::from([(1, Some(community))])),
+                    socialgraph: Arc::new(DegradedSocialgraph),
+                    ..Default::default()
+                },
+                vec![1],
+            ),
+            (
+                "incomplete viewer",
+                Hydrators::of(Hydrator::ViewerProfile),
+                Deps {
+                    gizmoduck: Arc::new(BrokenViewerClient(ViewerLookup::Fails)),
+                    ..Default::default()
+                },
+                vec![1, 2],
+            ),
+        ];
+        let raw = [raw(1, Some(10)), raw(2, Some(20))];
+        for (name, hydrators, deps, expected) in rows {
+            let hydrated = deps
+                .pipeline()
+                .hydrate_with(
+                    hydrators,
+                    HydrationRequest::new(Some(50), None, &raw, SafetyLevel::TimelineHome),
+                )
+                .await;
+            assert_eq!(
+                hydrated.failed_ids,
+                expected.into_iter().map(TweetId).collect::<HashSet<_>>(),
+                "{name}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn conversation_control_arm_populates_the_candidate_and_fails_it_on_a_lost_edge() {
-        use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
-
         struct LostEdge;
 
         #[tonic::async_trait]

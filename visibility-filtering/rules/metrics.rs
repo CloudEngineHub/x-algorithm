@@ -154,7 +154,7 @@ pub(crate) fn record_batch_size(metric: &str, size: usize) {
     observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);
 }
 
-fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {
+pub(crate) fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {
     if count > 0 {
         incr(metric, labels, count);
     }

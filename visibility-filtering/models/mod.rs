@@ -40,6 +40,12 @@ impl AuthorId {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct PureCore {
+    pub author_id: AuthorId,
+    pub source_tweet_id: Option<TweetId>,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct RawCandidate {
     pub tweet_id: TweetId,
     pub request_author_id: Option<u64>,
@@ -53,13 +59,13 @@ pub struct TweetCandidateInput {
 
 pub(crate) fn resolve_candidates(
     raw: &[RawCandidate],
-    authors: &TweetHydrationBatch<AuthorId>,
+    pure_cores: &TweetHydrationBatch<PureCore>,
 ) -> Vec<TweetCandidateInput> {
     raw.iter()
         .filter_map(|c| {
             let author_id = match c.request_author_id {
                 Some(author_id) => AuthorId(author_id),
-                None => *authors.get(&c.tweet_id)?,
+                None => pure_cores.get(&c.tweet_id)?.author_id,
             };
             Some(TweetCandidateInput {
                 tweet_id: c.tweet_id,
@@ -109,9 +115,13 @@ mod tests {
 
     #[test]
     fn resolve_candidates_prefers_the_request_author_and_drops_unresolved_tweets() {
-        let authors = TweetHydrationBatch::from_values(
+        let core = |author| PureCore {
+            author_id: AuthorId(author),
+            source_tweet_id: None,
+        };
+        let pure_cores = TweetHydrationBatch::from_values(
             [TweetId(2), TweetId(3), TweetId(4)],
-            HashMap::from([(TweetId(2), AuthorId(20)), (TweetId(4), AuthorId(40))]),
+            HashMap::from([(TweetId(2), core(20)), (TweetId(4), core(40))]),
         );
         let raw = vec![
             RawCandidate {
@@ -131,7 +141,7 @@ mod tests {
                 request_author_id: Some(41),
             },
         ];
-        let resolved: Vec<(TweetId, u64)> = resolve_candidates(&raw, &authors)
+        let resolved: Vec<(TweetId, u64)> = resolve_candidates(&raw, &pure_cores)
             .into_iter()
             .map(|c| (c.tweet_id, c.author_id.get()))
             .collect();

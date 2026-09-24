@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
 from xrex.cuda.top_k_by_key import top_k_by_key
+from xrex.data.cold_pool_filter import DEFAULT_COLD_START_MAX_AGE_SECONDS
 from xrex.data.recsys.constants import action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType
 from xrex.data.recsys.safety_filter import (
@@ -1335,10 +1336,11 @@ class RecsysTwoTowerModel(hk.Module):
         topic_bitmaps: jax.Array | None = None,
         topic_user_bitmasks: jax.Array | None = None,
         eval_bs_per_device: int = 0,
-        dataset_ranges: tuple[tuple[int, int], ...] | None = None,
+        dataset_ranges: tuple[tuple[int, int], ...] | jax.Array | None = None,
         use_async_topk: bool = False,
         use_radix_select_topk: bool = False,
         post_scales: jax.Array | None = None,
+        dataset_capacities: tuple[int, ...] | None = None,
     ) -> tuple[tuple[jax.Array, jax.Array], ...]:
         saxis = "expert"
 
@@ -1464,12 +1466,43 @@ class RecsysTwoTowerModel(hk.Module):
         else:
             all_scores = compute_top_k(post_embeddings, user_representation)
 
-        use_slice_path = (
-            dataset_ranges is not None
-            and eligible_mask is None
-            and not use_topic_filter
-            and not skip_dataset_mask
+        no_per_post_filter = (
+            eligible_mask is None and not use_topic_filter and not skip_dataset_mask
         )
+        if dataset_capacities is not None:
+            assert isinstance(dataset_ranges, jax.Array) and no_per_post_filter, (
+                "dataset_capacities need dataset_ranges as an array input and no per-post filter"
+            )
+            assert len(dataset_capacities) == len(target_dataset_types), (
+                f"dataset_capacities ({len(dataset_capacities)}) must align with "
+                f"target_dataset_types ({len(target_dataset_types)})"
+            )
+            results = []
+            for d, capacity in enumerate(dataset_capacities):
+
+                @shard_map(mesh=mesh, in_specs=(P(), P()), out_specs=(P(), P()), check_vma=False)
+                def window_and_top_k(all_scores, ranges, _d=d, _w=capacity):
+                    start, end = ranges[_d, 0], ranges[_d, 1]
+                    start_c = jnp.minimum(start, all_scores.shape[1] - _w)
+                    window = jax.lax.dynamic_slice_in_dim(all_scores, start_c, _w, axis=1)
+                    col = start_c + jnp.arange(_w, dtype=jnp.int32)
+                    masked = jnp.where(
+                        ((col >= start) & (col < end))[None, :],
+                        window,
+                        jnp.finfo(all_scores.dtype).min,
+                    )
+                    sorted_scores, sorted_indices = local_top_k(masked, top_k)
+                    sorted_indices = sorted_indices + start_c
+                    return (
+                        jax.lax.all_gather(sorted_scores, axis_name=saxis, axis=0, tiled=True),
+                        jax.lax.all_gather(sorted_indices, axis_name=saxis, axis=0, tiled=True),
+                    )
+
+                top_k_scores, top_k_indices = window_and_top_k(all_scores, dataset_ranges)
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+            return tuple(results)
+
+        use_slice_path = dataset_ranges is not None and no_per_post_filter
         if use_slice_path:
             assert len(dataset_ranges) == len(target_dataset_types), (
                 f"dataset_ranges ({len(dataset_ranges)}) must align with "
@@ -1505,7 +1538,9 @@ class RecsysTwoTowerModel(hk.Module):
         results = []
         for ds_type in target_dataset_types:
             if dataset_types is not None and not skip_dataset_mask:
-                type_mask = dataset_types.squeeze() == ds_type
+                stored = dataset_types.squeeze()
+                match = jnp.asarray(RetrievalDataset.mask_values(ds_type), dtype=stored.dtype)
+                type_mask = jnp.isin(stored, match)
             else:
                 type_mask = jnp.ones(post_embeddings.shape[0], dtype=jnp.bool_)
 
@@ -1683,6 +1718,9 @@ class RecsysTwoTowerModelConfig(Config):
     )
 
     checkpoint_dataset_names: list[str] | None = None
+
+    split_home_checkpoint: bool = False
+    cold_start_max_age_seconds: float = DEFAULT_COLD_START_MAX_AGE_SECONDS
 
     immersive_positive_actions: list[int] = field(
         default_factory=lambda: [

@@ -472,7 +472,7 @@ impl ReferenceCompareHarness {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use xai_visibility_filtering::models::{
         Action, DropReason, KeywordMatch, SafetyResult as ReferenceSafetyResult,
@@ -776,16 +776,74 @@ mod tests {
         }
     }
 
-    type RecordedCall = (Vec<u64>, ReferenceSafetyLevel, u64, Option<String>);
+    #[test]
+    fn group_slices_splits_at_the_budget_and_keeps_id_order() {
+        for (id_count, budget, sizes) in [
+            (0, 100, &[0][..]),
+            (5, 112, &[5][..]),
+            (5, 111, &[4, 1][..]),
+            (5, 110, &[4, 1][..]),
+            (5, 96, &[3, 2][..]),
+        ] {
+            let group = Group {
+                service: "a",
+                reference: "b",
+                tweet_ids: (0..id_count).map(|i| ID + i).collect(),
+            };
 
-    enum FakeReply {
+            let slices = group_slices(&group, budget);
+
+            let slice_sizes: Vec<usize> = slices
+                .iter()
+                .map(|slice| slice[2].as_array().unwrap().len())
+                .collect();
+            assert_eq!(slice_sizes, sizes, "{id_count} ids, budget {budget}");
+            let sliced_ids: Vec<u64> = slices
+                .iter()
+                .flat_map(|slice| slice[2].as_array().unwrap().iter())
+                .map(|id| id.as_u64().unwrap())
+                .collect();
+            assert_eq!(
+                sliced_ids, group.tweet_ids,
+                "{id_count} ids, budget {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_lines_fills_a_page_to_the_exact_byte_budget() {
+        let header_len = line_json(&context(), "b5", [1, 1], Vec::new())
+            .to_string()
+            .len();
+        let budget = LINE_BUDGET_BYTES - header_len;
+        let slice_cost = |service: &str, id: u64| {
+            serde_json::json!([service, "avoid:SafetyResult", [id]])
+                .to_string()
+                .len()
+                + 1
+        };
+        let pad = budget - slice_cost("allow", ID) - slice_cost("", ID + 1);
+
+        for (extra, lines) in [(0, 1), (1, 2)] {
+            let diffs = vec![
+                diff(ID, "allow", "avoid:SafetyResult"),
+                diff(ID + 1, &"x".repeat(pad + extra), "avoid:SafetyResult"),
+            ];
+
+            assert_eq!(chunk_lines(&context(), "b5", &diffs).len(), lines);
+        }
+    }
+
+    pub(crate) type RecordedCall = (Vec<u64>, ReferenceSafetyLevel, u64, Option<String>);
+
+    pub(crate) enum FakeReply {
         Immediate,
         Hangs,
     }
 
-    struct FakeReference {
-        calls: std::sync::Mutex<Vec<RecordedCall>>,
-        called: tokio::sync::Notify,
+    pub(crate) struct FakeReference {
+        pub(crate) calls: std::sync::Mutex<Vec<RecordedCall>>,
+        pub(crate) called: tokio::sync::Notify,
         reply: FakeReply,
     }
 
@@ -824,7 +882,9 @@ mod tests {
         }
     }
 
-    fn fake_harness(reply: FakeReply) -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
+    pub(crate) fn fake_harness(
+        reply: FakeReply,
+    ) -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
         let fake = Arc::new(FakeReference {
             calls: std::sync::Mutex::new(Vec::new()),
             called: tokio::sync::Notify::new(),

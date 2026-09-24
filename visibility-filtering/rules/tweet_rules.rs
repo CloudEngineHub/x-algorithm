@@ -246,12 +246,6 @@ pub(super) const OON_TWEET_LABEL_DROPS: &[RuleClause] = &[
         action: ActionSpec::Drop(FilteredReason::PossiblyUndesirable),
     },
     RuleClause {
-        rule_name: "NsfwTextTweetLabelDropRule",
-        when: &[label(SafetyLabelType::NSFW_TEXT)],
-        applies_to: Audience::ExceptAuthor,
-        action: ActionSpec::Drop(NSFW_HIGH_PRECISION_REASON),
-    },
-    RuleClause {
         rule_name: "FosnrAbuseInsultsOonDropRule",
         when: &[label(SafetyLabelType::FOSNR_ABUSE_INSULTS)],
         applies_to: Audience::ExceptAuthor,
@@ -572,7 +566,6 @@ mod tests {
             "DoNotAmplifyOonDropRule" => SafetyLabelType::DO_NOT_AMPLIFY,
             "MaliciousUrlOonDropRule" => SafetyLabelType::MALICIOUS_URL,
             "SpamHighRecallDropRule" => SafetyLabelType::SPAM_HIGH_RECALL,
-            "NsfwTextTweetLabelDropRule" => SafetyLabelType::NSFW_TEXT,
             "FosnrAbuseInsultsOonDropRule" => SafetyLabelType::FOSNR_ABUSE_INSULTS,
             _ => panic!("no trigger label for rule {name}"),
         }

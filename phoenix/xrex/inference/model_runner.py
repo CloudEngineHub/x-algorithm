@@ -44,7 +44,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
+from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import pack_batch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
 from xrex.inference import debug_logger, service_registry
@@ -4361,6 +4361,7 @@ class RetrievalModelRunner(
     enable_topic_filter: bool = False
     enable_dataset_slice_topk: bool = False
     enable_async_topk: bool = False
+    cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
     enable_int8_post_table: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
@@ -4417,11 +4418,97 @@ class RetrievalModelRunner(
             ranges[val] = (int(s), int(e))
         return ranges
 
+    def _trim_ranges_by_post_age(
+        self,
+        ranges: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        max_age_s = float(self.cold_start_max_age_seconds or 0.0)
+        if max_age_s <= 0 or not ranges or post_ids is None:
+            return ranges
+
+        cutoff_ms = int(time.time() * 1000.0 - max_age_s * 1000.0) - TWITTER_EPOCH_MS
+        if cutoff_ms <= 0:
+            return ranges
+        cutoff_id = cutoff_ms << 22
+
+        ids = np.asarray(post_ids).reshape(-1)
+        out: dict[int, tuple[int, int]] = {}
+        for ds_value, (start, end) in ranges.items():
+            out[ds_value] = (start, end)
+            if ds_value != RetrievalDataset.HOME_COLD.value or end - start <= 0:
+                continue
+            window = ids[start:end]
+            if window.size > 1 and not bool(np.all(window[:-1] <= window[1:])):
+                logger.error(
+                    "cold_start_max_age_seconds: HOME_COLD rows [%d:%d) are not "
+                    "sorted by post_id; skipping age trim",
+                    start,
+                    end,
+                )
+                continue
+            offset = int(np.searchsorted(window, cutoff_id, side="left"))
+            new_start = start + offset
+            floor_start = max(start, end - int(self.large_k))
+            clamped = min(new_start, floor_start)
+            if clamped != new_start:
+                logger.warning(
+                    "cold_start_max_age_seconds=%.0fs would leave %d HOME_COLD rows "
+                    "(< large_k=%d); keeping the %d newest instead",
+                    max_age_s,
+                    end - new_start,
+                    self.large_k,
+                    end - clamped,
+                )
+            out[ds_value] = (clamped, end)
+            logger.info(
+                "Age trim (dataset %d, max_age=%.0fs): [%d:%d) -> [%d:%d) (%d of %d rows kept)",
+                ds_value,
+                max_age_s,
+                start,
+                end,
+                clamped,
+                end,
+                end - clamped,
+                end - start,
+            )
+        return out
+
+    def _finalize_serving_ranges(
+        self,
+        raw: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        if not raw:
+            return raw
+        union = RetrievalDataset.home_union_range(raw)
+        trimmed = self._trim_ranges_by_post_age(raw, post_ids)
+        if trimmed is None:
+            return None
+        if union is not None:
+            trimmed = dict(trimmed)
+            trimmed[RetrievalDataset.HOME.value] = union
+        return trimmed
+
+    def _serving_target_dataset_types(
+        self, ranges: dict[int, tuple[int, int]] | None = None
+    ) -> tuple[int, ...]:
+        launch = tuple(ds.value for ds in self.retrieval_dataset_types)
+        table = ranges if ranges is not None else self._dataset_ranges_by_type
+        if not table:
+            return launch
+        home = RetrievalDataset.HOME.value
+        cold = RetrievalDataset.HOME_COLD.value
+        if home in launch and cold in table and cold not in launch:
+            return launch + (cold,)
+        return launch
+
     def _compute_dataset_ranges(self) -> None:
         if self.all_dataset_types is None:
             self._dataset_ranges_by_type = None
             return
         ranges = self._dataset_ranges_from_types(np.asarray(self.all_dataset_types))
+        ranges = self._finalize_serving_ranges(ranges, self.all_post_ids)
         self._dataset_ranges_by_type = ranges
         if ranges is None:
             return
@@ -4553,6 +4640,7 @@ class RetrievalModelRunner(
         author_ids64 = self.two_int32_to_int64(staged_meta["post_embeddings.author_ids"])
         dataset_types = np.asarray(staged_meta["post_embeddings.dataset_types"], dtype=np.int32)
         ranges = self._dataset_ranges_from_types(dataset_types)
+        ranges = self._finalize_serving_ranges(ranges, post_ids64)
         self._precompile_live_two_tower_variants(ranges)
         self._staged_live_retrieval_meta = (post_ids64, author_ids64, dataset_types, ranges)
 
@@ -4591,7 +4679,7 @@ class RetrievalModelRunner(
         self, staged_ranges: dict[int, tuple[int, int]] | None
     ) -> None:
         self._staged_live_forward_compiled = None
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types(staged_ranges or None)
         ranges_tuple = self._get_dataset_ranges(
             target_dataset_types, ranges_override=staged_ranges or {}
         )
@@ -4856,7 +4944,7 @@ class RetrievalModelRunner(
                 self.metrics_publisher.model_latency.labels("embedding_lookup").observe(
                     emb_lookup_time
                 )
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types()
 
         dataset_ranges = self._get_dataset_ranges(target_dataset_types)
 

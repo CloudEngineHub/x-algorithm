@@ -29,7 +29,11 @@ lazy_static! {
     .unwrap();
 }
 
-pub use xai_recsys_uas_arrow::{WEB_CONV_FAKE_TWEET_ID, is_web_conv_row};
+pub const WEB_CONV_FAKE_TWEET_ID: i64 = 4;
+
+pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
+    tweet_id == WEB_CONV_FAKE_TWEET_ID || has_conv_bit
+}
 
 pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
     ids.filter(|ids| {

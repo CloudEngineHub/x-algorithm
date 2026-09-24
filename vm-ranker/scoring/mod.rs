@@ -80,16 +80,16 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
 
 fn resolve_params(req: &RankRequest, config: Option<&RankingConfig>) -> Option<Params> {
     let outcome = match (req.viewer.as_ref(), config) {
-        (Some(viewer), Some(config)) => {
-            let params = config.resolve(viewer);
-            PARAMS_RESOLVED.with_label_values(&["resolved"]).inc();
-            return Some(params);
-        }
+        (Some(_), Some(_)) => "resolved",
         (None, _) => "no_viewer_context",
         (_, None) => "no_config",
     };
     PARAMS_RESOLVED.with_label_values(&[outcome]).inc();
-    None
+    let config = config?;
+    Some(match req.viewer.as_ref() {
+        Some(viewer) => config.resolve(viewer),
+        None => config.resolve_anonymous(),
+    })
 }
 
 fn served_pre_dpp_scores(

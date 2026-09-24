@@ -216,6 +216,8 @@ message RetrieveTopKCandidatesRequest {
   repeated float search_query_embedding = 11;
 
   UserContext user_context = 12;
+
+  uint32 num_cold_start_to_retrieve = 13;
 }
 
 message RetrieveTopKCandidatesResponse {
@@ -256,6 +258,24 @@ message ScoredCandidates {
   uint64 userId = 1;
 
   repeated ScoredCandidate candidates = 2;
+}
+
+enum RetrievalDatasetType {
+  RETRIEVAL_DATASET_TYPE_PAD = 0;
+  RETRIEVAL_DATASET_TYPE_HOME = 1;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_2_DAY = 2;
+  RETRIEVAL_DATASET_TYPE_RELEVANT_ADS = 3;
+  RETRIEVAL_DATASET_TYPE_CAROUSEL_ADS = 4;
+  RETRIEVAL_DATASET_TYPE_EVERGREEN = 5;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_NSFW = 6;
+  RETRIEVAL_DATASET_TYPE_ACTIVE_ADS = 7;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_4_DAY = 8;
+  RETRIEVAL_DATASET_TYPE_IMAGINE = 9;
+  RETRIEVAL_DATASET_TYPE_TAIL = 10;
+  RETRIEVAL_DATASET_TYPE_DPA_PRODUCTS = 11;
+  RETRIEVAL_DATASET_TYPE_TRENDING = 12;
+  RETRIEVAL_DATASET_TYPE_HOME_COLD = 13;
+  RETRIEVAL_DATASET_TYPE_HOME_HOT = 14;
 }
 
 message ScoredCandidate {

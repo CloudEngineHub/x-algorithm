@@ -323,7 +323,6 @@ rust_vf:
             "DoNotAmplifyOonDropRule",
             "MaliciousUrlOonDropRule",
             "SpamHighRecallDropRule",
-            "NsfwTextTweetLabelDropRule",
             "FosnrAbuseInsultsOonDropRule",
             "NsfwHighRecallUserLabelRule",
             "NsfwHighPrecisionUserLabelRule",

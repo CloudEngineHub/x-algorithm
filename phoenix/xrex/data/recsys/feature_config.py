@@ -17,6 +17,7 @@ class CategoricalFeature(enum.IntEnum):
     quoteCountBucketSeq = 12
     viewCountBucketSeq = 13
     authorIsNsfwSeq = 14
+    webConvTrackingIntegrationSeq = 15
 
 
 COMPUTED_CATEGORICAL_FEATURE_NAMES: frozenset[str] = frozenset(
@@ -36,6 +37,8 @@ COMPUTED_CATEGORICAL_FEATURE_NAMES: frozenset[str] = frozenset(
 COMPUTED_BOOL_FEATURE_NAMES: frozenset[str] = frozenset({"isStalePost14d"})
 
 AUTHOR_NSFW_BIT = 2
+
+WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
 
 
 class BoolFeature(enum.IntEnum):
@@ -59,6 +62,8 @@ class Int64Feature(enum.IntEnum):
     ipAddressSeq = 10
     firstDpaProductKey = 11
     firstDpaProductKeyHash2 = 12
+    webConvTimeOnSiteInferredMsSeq = 13
+    webConvTimeOnSiteMeasuredMsSeq = 14
 
 
 COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset({"firstDpaProductKeyHash2"})
@@ -147,6 +152,9 @@ OPTIONAL_COLUMNS: list[str] = [
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
     "conversionKeepMask",
+    "webConvTimeOnSiteInferredMsSeq",
+    "webConvTimeOnSiteMeasuredMsSeq",
+    "webConvTrackingIntegrationSeq",
 ]
 
 

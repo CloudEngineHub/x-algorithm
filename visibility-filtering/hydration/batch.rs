@@ -305,6 +305,12 @@ mod tests {
     }
 
     #[test]
+    fn defaulted_completeness_is_incomplete_and_absent_keys_are_failed() {
+        assert_eq!(Completeness::<u32>::default(), Completeness::Incomplete(0));
+        assert!(HydrationBatch::<u64, u32>::empty().is_failed(&1));
+    }
+
+    #[test]
     fn from_values_marks_present_found_and_absent_missing() {
         let batch: HydrationBatch<u64, u32> =
             HydrationBatch::from_values([1, 2], HashMap::from([(1, 7)]));

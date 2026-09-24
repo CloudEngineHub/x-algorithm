@@ -765,6 +765,16 @@ fn age_gating_cases() -> Vec<Case> {
             ),
         },
         Case {
+            name: "underage_viewer_drops_sensitive_text",
+            level: TimelineHomeRecommendations,
+            viewer: viewer_with_age(ViewerAge::Known(17)),
+            candidate: labeled(SafetyLabelType::NSFW_TEXT),
+            expected: dropped(
+                FilteredReason::ContainNsfwMedia,
+                "SensitiveViewerUnderageDropRule",
+            ),
+        },
+        Case {
             name: "no_stated_age_in_gating_country_drops_sensitive_media",
             level: TimelineHome,
             viewer: no_stated_age_viewer("gb"),
@@ -1280,11 +1290,11 @@ fn oon_tweet_label_cases() -> Vec<Case> {
             expected: allow(),
         },
         Case {
-            name: "nsfw_text_label_drops_oon",
+            name: "nsfw_text_label_allows_adult_oon",
             level: TimelineHomeRecommendations,
-            viewer: viewer(VIEWER_ID),
+            viewer: viewer_with_age(ViewerAge::Known(30)),
             candidate: labeled(SafetyLabelType::NSFW_TEXT),
-            expected: dropped(nsfw_high_precision_reason(), "NsfwTextTweetLabelDropRule"),
+            expected: allow(),
         },
         Case {
             name: "fosnr_abuse_insults_label_drops_oon",
