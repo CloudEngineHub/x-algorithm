@@ -314,7 +314,7 @@ These produce the scores and labels that Visibility Filtering reads.
 | [`abuse-enforcement-service/`](abuse-enforcement-service/)     | Acts on model scores about an account rather than on events: labels it or its posts, challenges it, or suspends it.                                                                                           |
 | [`safety-label-user-agg/`](safety-label-user-agg/)             | Labels an account for what its posts collected.                                                                                                                                                               |
 | [`visibility-filtering-client/`](visibility-filtering-client/) | The client callers use to reach visibility filtering, and the post safety-label types it answers with.                                                                                                        |
-| [`under-the-hood/`](under-the-hood/)                           | Builds the per-account [Under the Hood](#under-the-hood-label-transparency-tool) report: daily jobs collect the labels applied to an account and its posts, which the serving layer aggregates over a period. |
+| [`under-the-hood/`](under-the-hood/)                           | Builds the per-account [Under the Hood](#under-the-hood-label-transparency-tool) report: daily jobs collect the labels applied to an account and its posts, which the serving layer aggregates over a period, and displays as a [page](under-the-hood/jetfuel/) or JSON file. |
 | [`takedowns/`](takedowns/)                                     | Produces the takedown-reason list that [`rules/context.rs`](visibility-filtering/rules/context.rs) applies: the tweet entity service merges a post's own reasons with its author's account-level ones. |
 
 
@@ -445,7 +445,7 @@ The focus of the repository is transparency into the code that affects post visi
 
 We're piloting a new transparency tool that lets people see aggregate statistics about the visibility-impacting labels on their account and posts. Paired with the code in this repository, we believe this gives people valuable insight into the visibility of their posts.
 
-The tool is [available here](https://x.com/i/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/).
+The tool is [available here](https://x.com/i/jf/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/). The page that renders it is in [`under-the-hood/jetfuel/`](under-the-hood/jetfuel/).
 
 ---
 

@@ -38,6 +38,7 @@ pub enum SafetyLevel {
     SearchTopQig = 165,
     SearchTopSafeSearchEnabled = 227,
     ExploreNsfwRecommendations = 236,
+    ImmersiveExpandedRecommendations = 247,
 }
 
 impl SafetyLevel {
@@ -53,6 +54,7 @@ impl SafetyLevel {
             165 => Some(Self::SearchTopQig),
             227 => Some(Self::SearchTopSafeSearchEnabled),
             236 => Some(Self::ExploreNsfwRecommendations),
+            247 => Some(Self::ImmersiveExpandedRecommendations),
             _ => None,
         }
     }
@@ -400,14 +402,16 @@ fn to_proto_safety_level(level: SafetyLevel) -> vf_pb::SafetyLevel {
     match level {
         SafetyLevel::TimelineHome => vf_pb::SafetyLevel::TimelineHome,
         SafetyLevel::TimelineHomeRecommendations => vf_pb::SafetyLevel::TimelineHomeRecommendations,
+        SafetyLevel::ExploreNsfwRecommendations | SafetyLevel::ImmersiveExpandedRecommendations => {
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
+        }
         SafetyLevel::FilterNone
         | SafetyLevel::SearchTop
         | SafetyLevel::SearchLatest
         | SafetyLevel::SearchPhoto
         | SafetyLevel::SearchVideo
         | SafetyLevel::SearchTopQig
-        | SafetyLevel::SearchTopSafeSearchEnabled
-        | SafetyLevel::ExploreNsfwRecommendations => vf_pb::SafetyLevel::FilterAll,
+        | SafetyLevel::SearchTopSafeSearchEnabled => vf_pb::SafetyLevel::FilterAll,
     }
 }
 
@@ -1001,6 +1005,14 @@ mod rust_vf_tests {
         assert_eq!(
             to_proto_safety_level(SafetyLevel::TimelineHomeRecommendations),
             vf_pb::SafetyLevel::TimelineHomeRecommendations
+        );
+        assert_eq!(
+            to_proto_safety_level(SafetyLevel::ExploreNsfwRecommendations),
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
+        );
+        assert_eq!(
+            to_proto_safety_level(SafetyLevel::ImmersiveExpandedRecommendations),
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
         );
         assert_eq!(
             to_proto_safety_level(SafetyLevel::FilterNone),

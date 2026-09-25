@@ -256,14 +256,12 @@ fn read_communities_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::batch::TweetHydrationBatch;
-    use crate::hydration::tes_hydrator::TesHydrator;
-    use crate::models::{AuthorId, NsfwFeature, TweetCandidateInput, TweetFeatures, TweetId};
+    use crate::hydration::tes_hydrator::build_tweet_features;
+    use crate::models::{NsfwFeature, TweetFeatures};
     use thrift::protocol::{
         TBinaryOutputProtocol, TFieldIdentifier, TListIdentifier, TStructIdentifier,
     };
     use xai_core_entities::entities::EditControlInitial;
-    use xai_core_entities::tweet_entity_service_client::MockTESClient;
     use xai_x_thrift::media_common::MediaKey;
     use xai_x_thrift::media_information::{AdditionalMetadata, GeoRestrictions, Restrictions};
 
@@ -387,25 +385,7 @@ mod tests {
     }
 
     fn assemble_fixture(bytes: &[u8]) -> TweetFeatures {
-        let candidate = TweetCandidateInput {
-            tweet_id: TweetId(TWEET_ID as u64),
-            author_id: AuthorId(100),
-        };
-        let composite = TweetHydrationBatch::from_results(
-            [TweetId(TWEET_ID as u64)],
-            HashMap::from([(
-                TweetId(TWEET_ID as u64),
-                Ok::<_, anyhow::Error>(decode_tweet_for_visibility(bytes).unwrap()),
-            )]),
-        );
-        TesHydrator::new(
-            Arc::new(MockTESClient::default()),
-            Arc::new(MockTweetForVisibilitySource::default()),
-            None,
-        )
-        .assemble_tweet_features(&[candidate], &composite)
-        .remove(&TweetId(TWEET_ID as u64))
-        .unwrap()
+        build_tweet_features(decode_tweet_for_visibility(bytes).unwrap().as_ref())
     }
 
     #[test]
@@ -481,6 +461,7 @@ mod tests {
                 is_nullcast: true,
                 is_community_tweet: true,
                 edit_control,
+                exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
             }
         );
     }

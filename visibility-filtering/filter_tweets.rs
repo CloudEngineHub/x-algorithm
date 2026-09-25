@@ -45,6 +45,9 @@ impl FilterTweetsEndpoint {
             vf_pb::SafetyLevel::TimelineHomeRecommendations => {
                 SafetyLevel::TimelineHomeRecommendations
             }
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations => {
+                SafetyLevel::ImmersiveExpandedRecommendations
+            }
         };
         let candidates: Vec<RawCandidate> = req
             .tweets

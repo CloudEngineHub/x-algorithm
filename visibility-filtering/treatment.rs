@@ -1,12 +1,13 @@
 use crate::models::{
-    Decided, LimitedEngagementReason, MediaInterstitial, TombstoneReason, Verdict, Withholding,
+    Decided, LimitedEngagement, LimitedEngagementReason, MediaInterstitial, TombstoneReason,
+    Verdict, Withholding,
 };
 use crate::rules::SafetyLevel;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::action::{
     self, Action, BlurredImageInterstitial, ComposedMediaVisibilityActions, DropReason,
-    LimitedEngagements, MediaInterstitial as ThriftMediaInterstitial, Tombstone,
+    LimitedEngagements, MediaInterstitial as ThriftMediaInterstitial, Tombstone, TweetInterstitial,
 };
 
 pub(crate) fn thrift_action(verdict: &Verdict, level: SafetyLevel) -> Option<Action> {
@@ -30,30 +31,36 @@ pub(crate) fn thrift_action(verdict: &Verdict, level: SafetyLevel) -> Option<Act
         Verdict::Shown {
             media: None,
             engagement: Some(Decided { value, .. }),
-        } => Some(Action::LimitedEngagements(LimitedEngagements::new(
-            Some(limited_engagement_reason(value.0)),
-            None,
-            None,
-        ))),
+        } => Some(Action::LimitedEngagements(limited_engagements(value))),
         Verdict::Shown {
             media: Some(Decided { value, .. }),
             engagement: None,
-        } => Some(Action::ComposedMediaVisibilityResults(
-            ComposedMediaVisibilityActions {
-                media_interstitial: Some(Box::new(
-                    ThriftMediaInterstitial::BlurredImageInterstitial(BlurredImageInterstitial {
-                        reason: Some(value.reason.clone()),
-                        opacity: Some(0.8.into()),
-                        interstitial_action: None,
-                        available_verification_options: None,
-                    }),
-                )),
-            },
-        )),
+        } => Some(Action::ComposedMediaVisibilityResults(blurred_media(value))),
         Verdict::Shown {
-            media: Some(_),
-            engagement: Some(_),
-        } => None,
+            media: Some(blur),
+            engagement: Some(limit),
+        } => Some(Action::TweetInterstitial(TweetInterstitial {
+            limited_engagements: Some(limited_engagements(&limit.value)),
+            all_media_visibility_results: Some(blurred_media(&blur.value)),
+            ..TweetInterstitial::default()
+        })),
+    }
+}
+
+fn limited_engagements(limit: &LimitedEngagement) -> LimitedEngagements {
+    LimitedEngagements::new(Some(limited_engagement_reason(limit.0)), None, None)
+}
+
+fn blurred_media(blur: &MediaInterstitial) -> ComposedMediaVisibilityActions {
+    ComposedMediaVisibilityActions {
+        media_interstitial: Some(Box::new(ThriftMediaInterstitial::BlurredImageInterstitial(
+            BlurredImageInterstitial {
+                reason: Some(blur.reason.clone()),
+                opacity: Some(0.8.into()),
+                interstitial_action: None,
+                available_verification_options: None,
+            },
+        ))),
     }
 }
 
@@ -92,6 +99,17 @@ fn limited_engagement_reason(reason: LimitedEngagementReason) -> action::Limited
     match reason {
         LimitedEngagementReason::ConversationControl => {
             action::LimitedEngagementReason::ConversationControl(action::ConversationControl::new())
+        }
+        LimitedEngagementReason::ReadonlyViewer => {
+            action::LimitedEngagementReason::ReadonlyViewer(action::ReadonlyViewer::new())
+        }
+        LimitedEngagementReason::BlockedViewer => {
+            action::LimitedEngagementReason::BlockedViewer(action::BlockedViewer::new())
+        }
+        LimitedEngagementReason::RootAuthorBlockedViewer => {
+            action::LimitedEngagementReason::RootAuthorBlockedViewer(
+                action::RootAuthorBlockedViewer::new(),
+            )
         }
     }
 }
@@ -175,11 +193,12 @@ pub(crate) fn decided_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::LimitedEngagement;
     use crate::rules::metrics::Rpc;
     use vf_pb::action::Kind;
+    use xai_visibility_filtering::graphql_results::resolve_blurred_image_interstitial;
     use xai_visibility_filtering::models::{KeywordMatch, SafetyResult};
     use xai_x_thrift::action::InterstitialReason;
+    use xai_x_thrift::safety_result::SafetyResult as ThriftSafetyResult;
     use SafetyLevel::{FilterAll, TimelineHome};
 
     fn dropped(reason: FilteredReason) -> Verdict {
@@ -206,19 +225,31 @@ mod tests {
         }
     }
 
+    fn thrift_media(reason: InterstitialReason) -> ComposedMediaVisibilityActions {
+        ComposedMediaVisibilityActions {
+            media_interstitial: Some(Box::new(ThriftMediaInterstitial::BlurredImageInterstitial(
+                BlurredImageInterstitial {
+                    reason: Some(reason),
+                    opacity: Some(0.8.into()),
+                    interstitial_action: None,
+                    available_verification_options: None,
+                },
+            ))),
+        }
+    }
+
     fn thrift_blur(reason: InterstitialReason) -> Option<Action> {
-        Some(Action::ComposedMediaVisibilityResults(
-            ComposedMediaVisibilityActions {
-                media_interstitial: Some(Box::new(
-                    ThriftMediaInterstitial::BlurredImageInterstitial(BlurredImageInterstitial {
-                        reason: Some(reason),
-                        opacity: Some(0.8.into()),
-                        interstitial_action: None,
-                        available_verification_options: None,
-                    }),
-                )),
-            },
-        ))
+        Some(Action::ComposedMediaVisibilityResults(thrift_media(reason)))
+    }
+
+    fn thrift_limit() -> LimitedEngagements {
+        LimitedEngagements::new(
+            Some(action::LimitedEngagementReason::ConversationControl(
+                action::ConversationControl::new(),
+            )),
+            None,
+            None,
+        )
     }
 
     fn limit() -> Decided<LimitedEngagement> {
@@ -296,13 +327,7 @@ mod tests {
             (
                 shown(None, Some(limit())),
                 Projected {
-                    thrift: Some(Action::LimitedEngagements(LimitedEngagements::new(
-                        Some(action::LimitedEngagementReason::ConversationControl(
-                            action::ConversationControl::new(),
-                        )),
-                        None,
-                        None,
-                    ))),
+                    thrift: Some(Action::LimitedEngagements(thrift_limit())),
                     proto: Kind::Allow(true),
                     reason: None,
                     label: "limited_engagement",
@@ -315,7 +340,13 @@ mod tests {
                     Some(limit()),
                 ),
                 Projected {
-                    thrift: None,
+                    thrift: Some(Action::TweetInterstitial(TweetInterstitial {
+                        limited_engagements: Some(thrift_limit()),
+                        all_media_visibility_results: Some(thrift_media(
+                            InterstitialReason::Sensitive(true),
+                        )),
+                        ..TweetInterstitial::default()
+                    })),
                     proto: Kind::Interstitial(true),
                     reason: Some(FilteredReason::ContainNsfwMedia),
                     label: "tweet_interstitial",
@@ -347,6 +378,16 @@ mod tests {
             assert_eq!(proto.kind, Some(expected.proto), "{name}");
             assert_eq!(reason, expected.reason.map(Into::into), "{name}");
         }
+    }
+
+    #[test]
+    fn entity_mixer_resolves_the_blur_of_the_composed_arm() {
+        let reason = InterstitialReason::Nudity(true);
+        let verdict = shown(Some(blur(reason.clone())), Some(limit()));
+        let rendered = thrift_action(&verdict, TimelineHome).and_then(|action| {
+            resolve_blurred_image_interstitial(&ThriftSafetyResult::new(None, action))
+        });
+        assert_eq!(rendered.and_then(|blur| blur.reason), Some(reason));
     }
 
     #[test]

@@ -322,6 +322,9 @@ pub(crate) fn comparable_request(
         SafetyLevel::TimelineHomeRecommendations => {
             ReferenceSafetyLevel::TimelineHomeRecommendations
         }
+        SafetyLevel::ImmersiveExpandedRecommendations => {
+            ReferenceSafetyLevel::ImmersiveExpandedRecommendations
+        }
         SafetyLevel::FilterAll | SafetyLevel::TimelineHomeHydration => {
             return Err("level_unmapped");
         }
@@ -910,6 +913,11 @@ pub(crate) mod tests {
                 SafetyLevel::TimelineHomeRecommendations,
                 Some(7),
                 Ok((ReferenceSafetyLevel::TimelineHomeRecommendations, 7)),
+            ),
+            (
+                SafetyLevel::ImmersiveExpandedRecommendations,
+                Some(7),
+                Ok((ReferenceSafetyLevel::ImmersiveExpandedRecommendations, 7)),
             ),
             (SafetyLevel::FilterAll, Some(7), Err("level_unmapped")),
             (

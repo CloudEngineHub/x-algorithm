@@ -1,5 +1,4 @@
-use crate::models::ViewerAuthorRelationship;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tonic::async_trait;
 use tracing::warn;
 use xai_flock_client::FlockClient;
@@ -7,79 +6,69 @@ use xai_flock_proto::{
     EdgeState, LongList, Page, QueryTerm, Results, SelectOperation, SelectOperationType,
     SelectQuery, SelectRequest,
 };
-use EdgeDirection::{Forward, Reverse};
 
-const FOLLOWS_GRAPH_ID: i32 = 1;
-const BLOCKS_GRAPH_ID: i32 = 3;
-const MUTE_GRAPH_ID: i32 = 23;
-const MUTE_RETWEETS_GRAPH_ID: i32 = 10;
-const SUPER_FOLLOWS_GRAPH_ID: i32 = 55;
 const REVERSE_EDGE_CHUNK_SIZE: usize = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Graph {
+    Follows = 1,
+    Blocks = 3,
+    MuteRetweets = 10,
+    Mutes = 23,
+    SuperFollows = 55,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeDirection {
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeQuery {
+    pub graph: Graph,
+    pub direction: EdgeDirection,
+    pub destination_ids: Vec<u64>,
+}
+
+#[cfg(test)]
+impl EdgeQuery {
+    pub fn forward(graph: Graph, destination_ids: Vec<u64>) -> Self {
+        Self {
+            graph,
+            direction: EdgeDirection::Forward,
+            destination_ids,
+        }
+    }
+
+    pub fn reverse(graph: Graph, destination_ids: Vec<u64>) -> Self {
+        Self {
+            graph,
+            direction: EdgeDirection::Reverse,
+            destination_ids,
+        }
+    }
+}
 
 #[async_trait]
 pub trait SocialgraphClient: Send + Sync {
-    async fn batch_check_relationships(
+    async fn select_edges(
         &self,
         viewer_id: u64,
-        author_ids: &[u64],
-    ) -> HashMap<u64, ViewerAuthorRelationship>;
-
-    async fn batch_check_super_follows(
-        &self,
-        viewer_id: u64,
-        author_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>>;
-
-    async fn batch_check_followed_by(
-        &self,
-        viewer_id: u64,
-        user_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>>;
+        queries: &[EdgeQuery],
+    ) -> Option<Vec<HashSet<u64>>>;
 }
 
 #[cfg(test)]
-pub struct FakeSocialgraphClient;
+pub(crate) struct NoEdges;
 
 #[cfg(test)]
 #[async_trait]
-impl SocialgraphClient for FakeSocialgraphClient {
-    async fn batch_check_relationships(
-        &self,
-        _viewer_id: u64,
-        author_ids: &[u64],
-    ) -> HashMap<u64, ViewerAuthorRelationship> {
-        author_ids
-            .iter()
-            .map(|&author_id| (author_id, ViewerAuthorRelationship::default()))
-            .collect()
+impl SocialgraphClient for NoEdges {
+    async fn select_edges(&self, _: u64, queries: &[EdgeQuery]) -> Option<Vec<HashSet<u64>>> {
+        Some(vec![HashSet::new(); queries.len()])
     }
-
-    async fn batch_check_super_follows(
-        &self,
-        _viewer_id: u64,
-        author_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>> {
-        Some(
-            author_ids
-                .iter()
-                .map(|&author_id| (author_id, false))
-                .collect(),
-        )
-    }
-
-    async fn batch_check_followed_by(
-        &self,
-        _viewer_id: u64,
-        user_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>> {
-        Some(user_ids.iter().map(|&user_id| (user_id, false)).collect())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum EdgeDirection {
-    Forward,
-    Reverse,
 }
 
 fn decode_packed_ids(packed: &[u8]) -> HashSet<u64> {
@@ -92,19 +81,19 @@ fn decode_packed_ids(packed: &[u8]) -> HashSet<u64> {
 
 fn edge_membership_query(
     source_id: u64,
-    graph_id: i32,
+    graph: Graph,
     direction: EdgeDirection,
-    destination_ids: &[i64],
+    destination_ids: &[u64],
 ) -> SelectQuery {
     SelectQuery {
         operations: vec![SelectOperation {
             operation_type: SelectOperationType::SimpleQuery as i32,
             term: Some(QueryTerm {
                 source_id: source_id.cast_signed(),
-                graph_id,
-                is_forward: matches!(direction, Forward),
+                graph_id: graph as i32,
+                is_forward: direction == EdgeDirection::Forward,
                 destination_ids: Some(LongList {
-                    ids: destination_ids.to_vec(),
+                    ids: destination_ids.iter().map(|&id| id.cast_signed()).collect(),
                 }),
                 state_ids: vec![EdgeState::Positive as i32],
                 size_hint: None,
@@ -118,83 +107,43 @@ fn edge_membership_query(
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RelationshipEdges {
-    follows: HashSet<u64>,
-    blocks: HashSet<u64>,
-    mutes: HashSet<u64>,
-    mute_retweets: HashSet<u64>,
-}
-
-fn relationship_select_request(viewer_id: u64, destination_ids: &[i64]) -> SelectRequest {
-    SelectRequest {
-        queries: vec![
-            edge_membership_query(viewer_id, FOLLOWS_GRAPH_ID, Forward, destination_ids),
-            edge_membership_query(viewer_id, BLOCKS_GRAPH_ID, Forward, destination_ids),
-            edge_membership_query(viewer_id, MUTE_GRAPH_ID, Forward, destination_ids),
-            edge_membership_query(viewer_id, MUTE_RETWEETS_GRAPH_ID, Forward, destination_ids),
-        ],
-        ancestor_client_id: None,
-        service_account: None,
-        quota_name: None,
+fn select_request(viewer_id: u64, queries: &[EdgeQuery]) -> (SelectRequest, Vec<usize>) {
+    let mut flock_queries = Vec::new();
+    let mut counts = Vec::with_capacity(queries.len());
+    for query in queries {
+        let ids = &query.destination_ids;
+        let chunk_size = match query.direction {
+            EdgeDirection::Forward => ids.len().max(1),
+            EdgeDirection::Reverse => REVERSE_EDGE_CHUNK_SIZE,
+        };
+        let before = flock_queries.len();
+        flock_queries
+            .extend(ids.chunks(chunk_size).map(|chunk| {
+                edge_membership_query(viewer_id, query.graph, query.direction, chunk)
+            }));
+        counts.push(flock_queries.len() - before);
     }
-}
-
-fn next_edge_set(results: &mut impl Iterator<Item = Results>) -> HashSet<u64> {
-    results
-        .next()
-        .map(|r| decode_packed_ids(&r.ids))
-        .unwrap_or_default()
-}
-
-fn decode_relationship_edges(results: impl IntoIterator<Item = Results>) -> RelationshipEdges {
-    let mut results = results.into_iter();
-    RelationshipEdges {
-        follows: next_edge_set(&mut results),
-        blocks: next_edge_set(&mut results),
-        mutes: next_edge_set(&mut results),
-        mute_retweets: next_edge_set(&mut results),
-    }
-}
-
-fn followed_by_queries(viewer_id: u64, user_ids: &[i64]) -> Vec<SelectQuery> {
-    user_ids
-        .chunks(REVERSE_EDGE_CHUNK_SIZE)
-        .map(|chunk| edge_membership_query(viewer_id, FOLLOWS_GRAPH_ID, Reverse, chunk))
-        .collect()
-}
-
-fn merge_edge_sets(results: impl IntoIterator<Item = Results>) -> HashSet<u64> {
-    results
-        .into_iter()
-        .flat_map(|r| decode_packed_ids(&r.ids))
-        .collect()
-}
-
-fn membership_map(ids: &[u64], edge_set: &HashSet<u64>) -> HashMap<u64, bool> {
-    ids.iter().map(|&id| (id, edge_set.contains(&id))).collect()
-}
-
-async fn select_edge_set(
-    client: &FlockClient,
-    queries: Vec<SelectQuery>,
-    label: &'static str,
-) -> Option<HashSet<u64>> {
     let request = SelectRequest {
-        queries,
+        queries: flock_queries,
         ancestor_client_id: None,
         service_account: None,
         quota_name: None,
     };
-    let mut request = tonic::Request::new(request);
-    xai_x_rpc::apply_call_deadline(&mut request);
-    match client.inner().clone().select(request).await {
-        Ok(resp) => Some(merge_edge_sets(resp.into_inner().results)),
-        Err(e) => {
-            warn!(error = %e, label, "FlockDB select failed, defaulting to empty set");
-            None
-        }
-    }
+    (request, counts)
+}
+
+fn decode_edge_sets(counts: &[usize], results: Vec<Results>) -> Vec<HashSet<u64>> {
+    let mut results = results.into_iter();
+    counts
+        .iter()
+        .map(|&count| {
+            results
+                .by_ref()
+                .take(count)
+                .flat_map(|r| decode_packed_ids(&r.ids))
+                .collect()
+        })
+        .collect()
 }
 
 pub struct ProdSocialgraphClient {
@@ -217,98 +166,36 @@ impl ProdSocialgraphClient {
 
 #[async_trait]
 impl SocialgraphClient for ProdSocialgraphClient {
-    async fn batch_check_relationships(
+    async fn select_edges(
         &self,
         viewer_id: u64,
-        author_ids: &[u64],
-    ) -> HashMap<u64, ViewerAuthorRelationship> {
-        if author_ids.is_empty() {
-            return HashMap::new();
-        }
-
-        let dest_ids: Vec<i64> = author_ids.iter().map(|&id| id.cast_signed()).collect();
-        let mut request = tonic::Request::new(relationship_select_request(viewer_id, &dest_ids));
+        queries: &[EdgeQuery],
+    ) -> Option<Vec<HashSet<u64>>> {
+        let (request, counts) = select_request(viewer_id, queries);
+        let mut request = tonic::Request::new(request);
         xai_x_rpc::apply_call_deadline(&mut request);
-
-        let edges = match self.flock_client.inner().clone().select(request).await {
-            Ok(resp) => decode_relationship_edges(resp.into_inner().results),
+        match self.flock_client.inner().clone().select(request).await {
+            Ok(resp) => Some(decode_edge_sets(&counts, resp.into_inner().results)),
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "FlockDB multi-query select failed, returning no relationships"
-                );
-                return HashMap::new();
+                let graphs: Vec<Graph> = queries.iter().map(|query| query.graph).collect();
+                warn!(error = %e, ?graphs, "FlockDB select failed");
+                None
             }
-        };
-
-        author_ids
-            .iter()
-            .map(|&author_id| {
-                (
-                    author_id,
-                    ViewerAuthorRelationship {
-                        viewer_follows_author: edges.follows.contains(&author_id),
-                        viewer_blocks_author: edges.blocks.contains(&author_id),
-                        viewer_mutes_author: edges.mutes.contains(&author_id),
-                        viewer_mutes_retweets_from_author: edges.mute_retweets.contains(&author_id),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    async fn batch_check_super_follows(
-        &self,
-        viewer_id: u64,
-        author_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>> {
-        let dest_ids: Vec<i64> = author_ids.iter().map(|&id| id.cast_signed()).collect();
-
-        let super_set = select_edge_set(
-            &self.flock_client,
-            vec![edge_membership_query(
-                viewer_id,
-                SUPER_FOLLOWS_GRAPH_ID,
-                Forward,
-                &dest_ids,
-            )],
-            "super_follows",
-        )
-        .await?;
-
-        Some(membership_map(author_ids, &super_set))
-    }
-
-    async fn batch_check_followed_by(
-        &self,
-        viewer_id: u64,
-        user_ids: &[u64],
-    ) -> Option<HashMap<u64, bool>> {
-        if user_ids.is_empty() {
-            return Some(HashMap::new());
         }
-
-        let mut seen = HashSet::new();
-        let dest_ids: Vec<i64> = user_ids
-            .iter()
-            .filter(|&&id| seen.insert(id))
-            .map(|&id| id.cast_signed())
-            .collect();
-
-        let follower_set = select_edge_set(
-            &self.flock_client,
-            followed_by_queries(viewer_id, &dest_ids),
-            "followed_by",
-        )
-        .await?;
-
-        Some(membership_map(user_ids, &follower_set))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack(ids: &[i64]) -> Results {
+        Results {
+            ids: ids.iter().flat_map(|id| id.to_le_bytes()).collect(),
+            next_cursor: 0,
+            prev_cursor: 0,
+        }
+    }
 
     #[test]
     fn decode_packed_ids_decodes_little_endian_chunks_and_ignores_trailing_bytes() {
@@ -324,77 +211,50 @@ mod tests {
     }
 
     #[test]
-    fn relationship_select_request_packs_four_graphs_in_order() {
-        let dest = vec![10i64, 20];
-        let request = relationship_select_request(999, &dest);
-        assert_eq!(request.queries.len(), 4);
-        let expected_graphs = [
-            FOLLOWS_GRAPH_ID,
-            BLOCKS_GRAPH_ID,
-            MUTE_GRAPH_ID,
-            MUTE_RETWEETS_GRAPH_ID,
-        ];
-        for (query, &graph_id) in request.queries.iter().zip(expected_graphs.iter()) {
-            let term = query.operations[0].term.as_ref().unwrap();
-            assert_eq!(term.source_id, 999);
-            assert_eq!(term.graph_id, graph_id);
-            assert_eq!(term.destination_ids.as_ref().unwrap().ids, dest);
-        }
-    }
-
-    #[test]
-    fn followed_by_queries_reverse_follows_graph_in_chunks() {
-        let user_ids: Vec<i64> = (1..=REVERSE_EDGE_CHUNK_SIZE as i64 + 1).collect();
-        let queries = followed_by_queries(999, &user_ids);
-        assert_eq!(queries.len(), 2);
-        for (query, chunk) in queries.iter().zip(user_ids.chunks(REVERSE_EDGE_CHUNK_SIZE)) {
-            let term = query.operations[0].term.as_ref().unwrap();
-            assert_eq!(term.graph_id, FOLLOWS_GRAPH_ID);
-            assert!(!term.is_forward);
-            assert_eq!(term.destination_ids.as_ref().unwrap().ids, chunk);
-        }
-    }
-
-    #[test]
-    fn merged_edge_set_membership_marks_only_response_ids() {
-        let pack = |ids: &[i64]| -> Results {
-            Results {
-                ids: ids.iter().flat_map(|id| id.to_le_bytes()).collect(),
-                next_cursor: 0,
-                prev_cursor: 0,
-            }
-        };
-        let edge_set = merge_edge_sets([pack(&[2]), pack(&[4])]);
+    fn select_request_sends_forward_queries_whole_and_reverse_queries_in_chunks() {
+        let reverse_ids: Vec<u64> = (1..=REVERSE_EDGE_CHUNK_SIZE as u64 + 1).collect();
+        let (request, counts) = select_request(
+            999,
+            &[
+                EdgeQuery::forward(Graph::Follows, reverse_ids.clone()),
+                EdgeQuery::forward(Graph::Mutes, vec![]),
+                EdgeQuery::reverse(Graph::Blocks, reverse_ids.clone()),
+                EdgeQuery::reverse(Graph::Follows, vec![]),
+            ],
+        );
+        assert_eq!(counts, vec![1, 0, 2, 0]);
+        let terms: Vec<(i32, bool, Vec<i64>)> = request
+            .queries
+            .iter()
+            .map(|query| {
+                let term = query.operations[0].term.as_ref().unwrap();
+                assert_eq!(term.source_id, 999);
+                let ids = term.destination_ids.as_ref().unwrap().ids.clone();
+                assert_eq!(query.page.unwrap().count, ids.len() as i32);
+                (term.graph_id, term.is_forward, ids)
+            })
+            .collect();
+        let ids: Vec<i64> = reverse_ids.iter().map(|&id| id.cast_signed()).collect();
+        let (first, second) = ids.split_at(REVERSE_EDGE_CHUNK_SIZE);
         assert_eq!(
-            membership_map(&[1, 2, 3, 4], &edge_set),
-            HashMap::from([(1, false), (2, true), (3, false), (4, true)])
+            terms,
+            vec![
+                (1, true, ids.clone()),
+                (3, false, first.to_vec()),
+                (3, false, second.to_vec()),
+            ]
         );
     }
 
     #[test]
-    fn decode_relationship_edges_maps_named_fields_and_missing_slots_fail_open() {
-        let pack = |ids: &[i64]| -> Results {
-            Results {
-                ids: ids.iter().flat_map(|id| id.to_le_bytes()).collect(),
-                next_cursor: 0,
-                prev_cursor: 0,
-            }
-        };
+    fn decode_edge_sets_unions_each_querys_chunks_and_missing_slots_fail_open() {
         assert_eq!(
-            decode_relationship_edges([pack(&[1, 2]), pack(&[3]), pack(&[]), pack(&[4, 5, 6])]),
-            RelationshipEdges {
-                follows: HashSet::from([1, 2]),
-                blocks: HashSet::from([3]),
-                mutes: HashSet::new(),
-                mute_retweets: HashSet::from([4, 5, 6]),
-            }
+            decode_edge_sets(&[2, 0, 1], vec![pack(&[1]), pack(&[2]), pack(&[3])]),
+            vec![HashSet::from([1, 2]), HashSet::new(), HashSet::from([3])]
         );
         assert_eq!(
-            decode_relationship_edges([pack(&[1])]),
-            RelationshipEdges {
-                follows: HashSet::from([1]),
-                ..RelationshipEdges::default()
-            }
+            decode_edge_sets(&[1, 1], vec![pack(&[4])]),
+            vec![HashSet::from([4]), HashSet::new()]
         );
     }
 }

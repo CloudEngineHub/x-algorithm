@@ -23,6 +23,7 @@ pub struct TweetFeatures {
     pub is_nullcast: bool,
     pub is_community_tweet: bool,
     pub edit_control: Option<EditControl>,
+    pub exclusive_conversation_author_id: Option<u64>,
 }
 
 impl TweetFeatures {

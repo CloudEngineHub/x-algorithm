@@ -32,6 +32,7 @@ pub struct ViewerProfile {
     pub allows_sensitive_media: bool,
     pub viewer_age: ViewerAge,
     pub has_verified_badge: bool,
+    pub is_read_only: bool,
     pub account_country_code: Option<String>,
 }
 

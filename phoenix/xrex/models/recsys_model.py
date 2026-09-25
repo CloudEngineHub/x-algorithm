@@ -541,6 +541,7 @@ class RecsysAggregatedModelConfig(Config):
     emb_table_width: int
 
     continuous_metrics_mae_mean: bool = False
+    per_layer_l2_weight: float = 0.0
     act_l2_weight: float = 0.0
 
     num_continuous_actions: int = 8
@@ -3631,7 +3632,10 @@ class RecsysAggregatedModel(hk.Module):
                 )
 
         regularization_loss = (
-            loss + self.config.act_l2_weight * stats["act-l2-loss"] + continuous_action_loss_total
+            loss
+            + self.config.act_l2_weight * stats["act-l2-loss"]
+            + self.config.per_layer_l2_weight * (stats["ffn-loss"] + stats["attn-loss"])
+            + continuous_action_loss_total
         )
         return (
             regularization_loss,

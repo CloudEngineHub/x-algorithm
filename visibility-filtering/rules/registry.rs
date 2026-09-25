@@ -1,4 +1,4 @@
-use crate::hydration::Hydrators;
+use crate::hydration::{HydrationPlan, Hydrators};
 use crate::models::{
     Decided, HydratedTweetCandidate, LimitedEngagement, MediaInterstitial, Verdict, ViewerFeatures,
     Withholding,
@@ -8,14 +8,16 @@ use crate::rules::rule_spec::{ActionSpec, RuleClause};
 use crate::rules::RuleContext;
 use crate::rules::{author_rules, tweet_rules};
 use std::sync::Arc;
+use strum::VariantArray;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
 pub enum SafetyLevel {
     FilterAll,
     TimelineHome,
     TimelineHomeRecommendations,
     TimelineHomeHydration,
+    ImmersiveExpandedRecommendations,
 }
 
 pub(super) struct Policy<'a> {
@@ -135,11 +137,15 @@ static TIMELINE_HOME_SHARED_RULES: [&[RuleClause]; 10] = [
     tweet_rules::NSFW_AUTHOR_INTERSTITIAL,
 ];
 
-static TIMELINE_HOME_RECOMMENDATION_ONLY_RULES: [&[RuleClause]; 5] = [
+static TIMELINE_HOME_RECOMMENDATION_ONLY_RULES: [&[RuleClause]; 9] = [
     tweet_rules::RECS_MEDIA_DROPS,
     author_rules::OON_NSFW_AUTHOR_DROPS,
     tweet_rules::OON_TWEET_FLAG_DROPS,
-    tweet_rules::OON_TWEET_LABEL_DROPS,
+    tweet_rules::OON_GORE_DROP,
+    tweet_rules::OON_NSFW_MEDIA_LABEL_DROPS,
+    tweet_rules::OON_LOW_QUALITY_TWEET_LABEL_DROPS,
+    tweet_rules::OON_TEXT_LABEL_DROPS,
+    author_rules::OON_NSFW_USER_LABEL_DROPS,
     author_rules::OON_USER_LABEL_DROPS,
 ];
 
@@ -156,11 +162,29 @@ static TIMELINE_HOME_HYDRATION_POLICY: Policy = Policy::new(&[
     tweet_rules::SENSITIVE_VIEWER_DROPS,
     tweet_rules::NSFW_MEDIA_INTERSTITIALS,
     tweet_rules::NSFW_AUTHOR_INTERSTITIAL,
+    tweet_rules::BLOCKED_VIEWER_LIMITED_ACTIONS,
     tweet_rules::LIMIT_REPLIES_CONVERSATION_RULES,
+    tweet_rules::READ_ONLY_VIEWER_LIMITED_ACTIONS,
+]);
+
+static IMMERSIVE_EXPANDED_RECOMMENDATIONS_POLICY: Policy = Policy::new(&[
+    author_rules::AUTHOR_STATE_DROPS,
+    author_rules::SOCIALGRAPH_DROPS,
+    tweet_rules::TWEET_LABEL_DROPS,
+    tweet_rules::STALE_TWEET_DROP,
+    tweet_rules::TAKEDOWN_DROPS,
+    tweet_rules::SENSITIVE_VIEWER_DROPS,
+    tweet_rules::EXCLUSIVE_TWEET_DROP,
+    tweet_rules::RECS_MEDIA_DROPS,
+    tweet_rules::OON_GORE_DROP,
+    tweet_rules::OON_LOW_QUALITY_TWEET_LABEL_DROPS,
+    author_rules::OON_USER_LABEL_DROPS,
+    tweet_rules::SENSITIVE_MEDIA_OPT_OUT_DROPS,
 ]);
 
 pub struct RuleEngine {
     nsfw_gating_countries: Arc<NsfwGatingCountries>,
+    plans: Vec<HydrationPlan>,
 }
 
 impl RuleEngine {
@@ -172,6 +196,10 @@ impl RuleEngine {
     pub fn with_nsfw_gating_countries(gating_countries: Arc<NsfwGatingCountries>) -> Self {
         Self {
             nsfw_gating_countries: gating_countries,
+            plans: SafetyLevel::VARIANTS
+                .iter()
+                .map(|&level| HydrationPlan::new(level, Self::select(level).hydrators))
+                .collect(),
         }
     }
 
@@ -181,6 +209,9 @@ impl RuleEngine {
             SafetyLevel::TimelineHome => &TIMELINE_HOME_POLICY,
             SafetyLevel::TimelineHomeRecommendations => &TIMELINE_HOME_RECOMMENDATIONS_POLICY,
             SafetyLevel::TimelineHomeHydration => &TIMELINE_HOME_HYDRATION_POLICY,
+            SafetyLevel::ImmersiveExpandedRecommendations => {
+                &IMMERSIVE_EXPANDED_RECOMMENDATIONS_POLICY
+            }
         }
     }
 
@@ -197,8 +228,14 @@ impl RuleEngine {
         policy.evaluate(&context)
     }
 
-    pub fn hydrators_for(level: SafetyLevel) -> Hydrators {
-        Self::select(level).hydrators
+    pub(crate) fn plan(&self, level: SafetyLevel) -> &HydrationPlan {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`plans` maps `SafetyLevel::VARIANTS`, which is in declaration order"
+        )]
+        let plan = &self.plans[level as usize];
+        debug_assert_eq!(plan.level(), level);
+        plan
     }
 
     #[cfg(test)]
@@ -220,7 +257,12 @@ mod tests {
     use crate::hydration::Hydrator;
     use crate::models::{ViewerAge, ViewerProfile};
     use crate::rules::fixtures::{candidate, viewer, viewer_with_profile, VIEWER_ID};
-    use crate::rules::rule_spec::Condition;
+    use crate::rules::golden_corpus;
+    use crate::rules::rule_spec::{
+        Audience, Condition, Predicate, RelationshipPredicate, ViewerPredicate,
+    };
+    use std::collections::BTreeSet;
+    use xai_core_entities::entities::ConversationControlArm;
 
     #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
@@ -266,7 +308,7 @@ rust_vf:
     }
 
     #[test]
-    fn wired_rule_order_matches_pre_migration_sequence() {
+    fn wired_rule_order_is_pinned() {
         let rule_engine = RuleEngine::for_tests();
         assert_eq!(
             rule_engine.wired_rule_names(SafetyLevel::FilterAll),
@@ -316,9 +358,9 @@ rust_vf:
             "DropNsfwAdminAuthorRule",
             "TweetNsfwUserDropRule",
             "TweetNsfwAdminDropRule",
+            "GoreAndViolenceOonDropRule",
             "NsfwHighRecallDropRule",
             "NsfwHighPrecisionOonDropRule",
-            "GoreAndViolenceOonDropRule",
             "NsfwCardImageOonDropRule",
             "DoNotAmplifyOonDropRule",
             "MaliciousUrlOonDropRule",
@@ -326,14 +368,14 @@ rust_vf:
             "FosnrAbuseInsultsOonDropRule",
             "NsfwHighRecallUserLabelRule",
             "NsfwHighPrecisionUserLabelRule",
+            "NsfwAvatarImageRule",
+            "NsfwBannerImageRule",
+            "NsfwNearPerfectAuthorRule",
             "SpamHighRecallUserLabelRule",
             "CompromisedUserLabelRule",
             "ReadOnlyUserLabelRule",
             "ImpersonationHighPrecisionUserLabelRule",
-            "NsfwAvatarImageRule",
-            "NsfwBannerImageRule",
             "AbusiveHighRecallRule",
-            "NsfwNearPerfectAuthorRule",
             "DoNotAmplifyNonFollowerRule",
         ]);
         assert_eq!(
@@ -367,74 +409,200 @@ rust_vf:
                 "NsfwCardImageInterstitialRule",
                 "NsfwAdminInterstitialRule",
                 "NsfwUserInterstitialRule",
+                "BlockedViewerLimitedActionsRule",
+                "RootAuthorBlocksViewerLimitedActionsRule",
                 "LimitRepliesByInvitationConversationRule",
                 "LimitRepliesCommunityConversationRule",
                 "LimitRepliesSubscribersConversationRule",
                 "LimitRepliesVerifiedConversationRule",
+                "LimitRepliesMyNetworkConversationRule",
+                "LimitRepliesCoConversationRule",
+                "ReadOnlyViewerLimitedActionsRule",
             ]
         );
     }
 
     #[test]
-    #[should_panic(expected = "a rule reads Relationship")]
+    fn immersive_expanded_recommendations_wires_only_its_ordered_rules() {
+        assert_eq!(
+            RuleEngine::for_tests().wired_rule_names(SafetyLevel::ImmersiveExpandedRecommendations),
+            vec![
+                "SuspendedAuthorRule",
+                "DeactivatedAuthorRule",
+                "ErasedAuthorRule",
+                "OffboardedAuthorRule",
+                "ProtectedAuthorDropRule",
+                "ViewerBlocksAuthorRule",
+                "ViewerMutesAuthorRule",
+                "MutedRetweetsRule",
+                "PdnaTweetLabelRule",
+                "BounceTweetLabelRule",
+                "SpamTweetLabelRule",
+                "ForEmergencyUseOnlyDropRule",
+                "FosnrHatefulConductDropRule",
+                "FosnrViolentSpeechDropRule",
+                "FosnrAbuseDropRule",
+                "FosnrCivicIntegrityDropRule",
+                "DropStaleTweetsRule",
+                "DropLegalTakendownPostRule",
+                "DropLocalLawsTakendownPostRule",
+                "SensitiveViewerLoggedOutDropRule",
+                "SensitiveViewerUnderageDropRule",
+                "SensitiveViewerNoStatedAgeDropRule",
+                "DropExclusiveTweetContentRule",
+                "DropTweetsWithDmcaMediaRule",
+                "DropTweetsWithGeoRestrictedMediaRule",
+                "GoreAndViolenceOonDropRule",
+                "DoNotAmplifyOonDropRule",
+                "MaliciousUrlOonDropRule",
+                "SpamHighRecallDropRule",
+                "SpamHighRecallUserLabelRule",
+                "CompromisedUserLabelRule",
+                "ReadOnlyUserLabelRule",
+                "ImpersonationHighPrecisionUserLabelRule",
+                "AbusiveHighRecallRule",
+                "DoNotAmplifyNonFollowerRule",
+                "NsfwSensitiveViewerDropTweetRule",
+                "NsfwSensitiveViewerDropUserRule",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a rule reads Follows")]
     fn a_rule_reading_an_underived_hydrator_panics_in_tests() {
         let viewer = viewer(VIEWER_ID);
         let candidate = candidate().build();
         let context = crate::rules::test_context(&viewer, &candidate)
-            .hydrated_by(Hydrators::all().without(Hydrator::Relationship));
-        context.relationship();
+            .hydrated_by(Hydrators::all().without(Hydrator::Follows));
+        context.viewer_follows_author();
     }
+
+    fn predicates(rule: &RuleClause) -> impl Iterator<Item = Predicate> + '_ {
+        rule.when
+            .iter()
+            .flat_map(|condition| match condition {
+                Condition::Holds(leaf) | Condition::Not(leaf) => std::slice::from_ref(leaf),
+                Condition::AnyOf(leaves) => leaves,
+                Condition::Opaque { .. } => &[],
+            })
+            .copied()
+    }
+
+    struct Branch {
+        leaf: &'static str,
+        wired_by: fn(&RuleClause) -> bool,
+        taken: fn(&ViewerFeatures, &HydratedTweetCandidate) -> bool,
+    }
+
+    fn has_arm(candidate: &HydratedTweetCandidate, arms: &[ConversationControlArm]) -> bool {
+        candidate
+            .conversation_control
+            .as_ref()
+            .is_some_and(|features| arms.contains(&features.control.arm))
+    }
+
+    const BRANCHES: [Branch; 7] = {
+        use ConversationControlArm::{Co, Community, MyNetwork, Subscribers};
+        use Predicate::{Relationship, Viewer};
+        use RelationshipPredicate::*;
+        [
+            Branch {
+                leaf: "ViewerSuperFollowsAuthor on an exclusive tweet",
+                wired_by: |rule| {
+                    predicates(rule).any(|p| matches!(p, Relationship(ViewerSuperFollowsAuthor)))
+                },
+                taken: |_, c| c.tweet_features.exclusive_conversation_author_id.is_some(),
+            },
+            Branch {
+                leaf: "ViewerIsFollowedByConversationRootAuthor under Community or MyNetwork",
+                wired_by: |rule| {
+                    predicates(rule).any(|p| {
+                        matches!(p, Relationship(ViewerIsFollowedByConversationRootAuthor))
+                    })
+                },
+                taken: |_, c| has_arm(c, &[Community, MyNetwork]),
+            },
+            Branch {
+                leaf: "ViewerSuperFollowsConversationRootAuthor under Subscribers",
+                wired_by: |rule| {
+                    predicates(rule).any(|p| {
+                        matches!(p, Relationship(ViewerSuperFollowsConversationRootAuthor))
+                    })
+                },
+                taken: |_, c| has_arm(c, &[Subscribers]),
+            },
+            Branch {
+                leaf: "ViewerIsInAllowedCountry under Co with an allowed list",
+                wired_by: |rule| {
+                    predicates(rule).any(|p| matches!(p, Relationship(ViewerIsInAllowedCountry)))
+                },
+                taken: |_, c| {
+                    c.conversation_control.as_ref().is_some_and(|features| {
+                        features.control.arm == Co
+                            && !features.control.allowed_country_codes.is_empty()
+                    })
+                },
+            },
+            Branch {
+                leaf: "ViewerIsBlockedByConversationRootAuthor with a blocking reply root",
+                wired_by: |rule| {
+                    predicates(rule)
+                        .any(|p| matches!(p, Relationship(ViewerIsBlockedByConversationRootAuthor)))
+                },
+                taken: |_, c| c.blocked_by.root_author,
+            },
+            Branch {
+                leaf: "InNsfwGatingCountry for a logged-in viewer",
+                wired_by: |rule| {
+                    predicates(rule)
+                        .any(|p| matches!(p, Viewer(ViewerPredicate::InNsfwGatingCountry)))
+                },
+                taken: |v, _| v.viewer.user_id().is_some(),
+            },
+            Branch {
+                leaf: "ExceptAuthorAndFollowers for a logged-in non-author",
+                wired_by: |rule| rule.applies_to == Audience::ExceptAuthorAndFollowers,
+                taken: |v, c| v.viewer.user_id().is_some_and(|id| id != c.author_id),
+            },
+        ]
+    };
 
     #[test]
     fn every_leaf_reads_only_the_hydrators_it_declares() {
-        let viewer = viewer(VIEWER_ID);
-        let candidate = candidate().build();
-        let narrowed = |hydrators: Hydrators| {
-            crate::rules::test_context(&viewer, &candidate).hydrated_by(hydrators)
-        };
-        for level in [
-            SafetyLevel::FilterAll,
-            SafetyLevel::TimelineHome,
-            SafetyLevel::TimelineHomeRecommendations,
-            SafetyLevel::TimelineHomeHydration,
-        ] {
-            for rule in RuleEngine::select(level).rules() {
-                for condition in rule.when {
-                    match condition {
-                        Condition::AnyOf(leaves) => {
-                            for leaf in *leaves {
-                                leaf.holds(&narrowed(leaf.hydrators()));
-                            }
-                        }
-                        leaf => {
-                            leaf.holds(&narrowed(leaf.hydrators()));
+        let mut paths: Vec<BTreeSet<bool>> = vec![BTreeSet::new(); BRANCHES.len()];
+        for case in golden_corpus::corpus() {
+            let narrowed = |hydrators: Hydrators| {
+                crate::rules::test_context(&case.viewer, &case.candidate).hydrated_by(hydrators)
+            };
+            for &level in SafetyLevel::VARIANTS {
+                for rule in RuleEngine::select(level).rules() {
+                    for condition in rule.when {
+                        if let Condition::Opaque { .. } = condition {
+                            condition.holds(&narrowed(condition.hydrators()));
                         }
                     }
+                    for leaf in predicates(rule) {
+                        leaf.holds(&narrowed(leaf.hydrators()));
+                    }
+                    rule.applies_to
+                        .admits(&narrowed(rule.applies_to.hydrators()));
                 }
-                rule.applies_to
-                    .admits(&narrowed(rule.applies_to.hydrators()));
+            }
+            for (branch, seen) in BRANCHES.iter().zip(&mut paths) {
+                if RuleEngine::select(case.level).rules().any(branch.wired_by) {
+                    seen.insert((branch.taken)(&case.viewer, &case.candidate));
+                }
             }
         }
-    }
-
-    #[test]
-    fn each_level_derives_the_hydrators_its_rules_read() {
-        assert_eq!(
-            RuleEngine::hydrators_for(SafetyLevel::FilterAll),
-            Hydrators::empty()
-        );
-        assert_eq!(
-            RuleEngine::hydrators_for(SafetyLevel::TimelineHome),
-            Hydrators::all().without(Hydrator::ConversationControl)
-        );
-        assert_eq!(
-            RuleEngine::hydrators_for(SafetyLevel::TimelineHomeRecommendations),
-            Hydrators::all().without(Hydrator::ConversationControl)
-        );
-        assert_eq!(
-            RuleEngine::hydrators_for(SafetyLevel::TimelineHomeHydration),
-            Hydrators::all().without(Hydrator::Relationship)
-        );
+        for (branch, seen) in BRANCHES.iter().zip(paths) {
+            assert_eq!(
+                seen.len(),
+                2,
+                "the corpus takes one path of {}",
+                branch.leaf
+            );
+        }
     }
 
     #[test]

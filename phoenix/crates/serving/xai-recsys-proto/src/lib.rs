@@ -75,6 +75,30 @@ pub fn country_code_string_to_enum(country: &str) -> CountryCode {
     }
 }
 
+pub fn is_video_card_type(card_type: i32) -> bool {
+    match UnifiedCardType::try_from(card_type) {
+        Ok(
+            UnifiedCardType::VideoWebsite
+            | UnifiedCardType::VideoApp
+            | UnifiedCardType::VideoAndUrls
+            | UnifiedCardType::VideoCarouselWebsite
+            | UnifiedCardType::VideoCarouselApp
+            | UnifiedCardType::VideoPlayableApp
+            | UnifiedCardType::Video
+            | UnifiedCardType::VideoAndButtonWebsite
+            | UnifiedCardType::VideoMultiDestCarouselApp
+            | UnifiedCardType::VideoMultiDestCarouselWebsite
+            | UnifiedCardType::MixedMediaSingleDestCarouselApp
+            | UnifiedCardType::MixedMediaSingleDestCarouselWebsite
+            | UnifiedCardType::MixedMediaMultiDestCarouselApp
+            | UnifiedCardType::MixedMediaMultiDestCarouselWebsite
+            | UnifiedCardType::VideoPlayableWebsite,
+        ) => true,
+        Ok(_) => false,
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +179,39 @@ mod tests {
         assert_eq!(RetrievalDatasetType::HomeCold as i32, 13);
         assert_eq!(RetrievalDatasetType::HomeHot as i32, 14);
         assert_eq!(RetrievalDatasetType::Trending as i32, 12);
+    }
+
+    #[test]
+    fn test_is_video_card_type() {
+        assert!(is_video_card_type(UnifiedCardType::VideoWebsite as i32));
+        assert!(is_video_card_type(UnifiedCardType::VideoApp as i32));
+        assert!(is_video_card_type(
+            UnifiedCardType::VideoCarouselWebsite as i32
+        ));
+        assert!(is_video_card_type(
+            UnifiedCardType::VideoPlayableWebsite as i32
+        ));
+        assert!(is_video_card_type(
+            UnifiedCardType::VideoMultiDestCarouselWebsite as i32
+        ));
+        assert!(is_video_card_type(
+            UnifiedCardType::MixedMediaSingleDestCarouselApp as i32
+        ));
+        assert!(is_video_card_type(
+            UnifiedCardType::MixedMediaMultiDestCarouselWebsite as i32
+        ));
+        assert!(!is_video_card_type(UnifiedCardType::Unspecified as i32));
+        assert!(!is_video_card_type(UnifiedCardType::ImageWebsite as i32));
+        assert!(!is_video_card_type(UnifiedCardType::ImageApp as i32));
+        assert!(!is_video_card_type(
+            UnifiedCardType::ImageCarouselWebsite as i32
+        ));
+        assert!(!is_video_card_type(
+            UnifiedCardType::ImageMultiDestCarouselWebsite as i32
+        ));
+        assert!(!is_video_card_type(
+            UnifiedCardType::ImageCollectionWebsite as i32
+        ));
+        assert!(is_video_card_type(9999));
     }
 }

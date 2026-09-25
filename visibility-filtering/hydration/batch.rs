@@ -108,18 +108,6 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         })
     }
 
-    pub(crate) fn from_values(
-        expected: impl IntoIterator<Item = K>,
-        mut values: HashMap<K, V>,
-    ) -> Self {
-        Self::from_expected(expected, |key| {
-            values
-                .remove(key)
-                .map(Hydrated::Found)
-                .unwrap_or(Hydrated::Failed(HydrationError::MissingResponse))
-        })
-    }
-
     pub(crate) fn from_hydrated(results: HashMap<K, Hydrated<V>>) -> Self {
         Self { results }
     }
@@ -163,13 +151,6 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         self.results.get(key).and_then(Hydrated::value)
     }
 
-    pub(crate) fn get_or_default(&self, key: &K) -> V
-    where
-        V: Clone + Default,
-    {
-        self.get(key).cloned().unwrap_or_default()
-    }
-
     pub(crate) fn map_keys<K2: Eq + Hash>(self, f: impl Fn(K) -> K2) -> HydrationBatch<K2, V> {
         HydrationBatch {
             results: self
@@ -192,27 +173,6 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
                         Hydrated::Failed(e) => Hydrated::Failed(e),
                     };
                     (key, hydrated)
-                })
-                .collect(),
-        }
-    }
-
-    pub(crate) fn project<K2: Eq + Hash>(
-        &self,
-        pairs: impl IntoIterator<Item = (K2, K)>,
-    ) -> HydrationBatch<K2, V>
-    where
-        V: Clone,
-    {
-        HydrationBatch {
-            results: pairs
-                .into_iter()
-                .map(|(new_key, key)| {
-                    let hydrated = match self.results.get(&key) {
-                        Some(hydrated) => hydrated.clone(),
-                        None => Hydrated::Failed(HydrationError::MissingResponse),
-                    };
-                    (new_key, hydrated)
                 })
                 .collect(),
         }
@@ -249,8 +209,6 @@ mod tests {
                 "backend unavailable".into()
             )))
         );
-        assert_eq!(batch.get_or_default(&2), 0);
-        assert_eq!(batch.get_or_default(&3), 0);
     }
 
     #[test]
@@ -279,46 +237,8 @@ mod tests {
     }
 
     #[test]
-    fn project_fans_source_results_out_to_new_keys() {
-        let by_author = batch(HashMap::from([(10, Ok(Some(7))), (20, Err("boom"))]));
-
-        let by_tweet = by_author.project([(TweetId(1), 10), (TweetId(2), 10), (TweetId(3), 20)]);
-
-        assert_eq!(by_tweet.get(&TweetId(1)), Some(&7));
-        assert_eq!(by_tweet.get(&TweetId(2)), Some(&7));
-        assert!(matches!(
-            by_tweet.hydrated(&TweetId(3)),
-            Some(&Hydrated::Failed(_))
-        ));
-    }
-
-    #[test]
-    fn project_unknown_source_key_is_missing() {
-        let by_author: HydrationBatch<u64, u32> = HydrationBatch::empty();
-
-        let by_tweet = by_author.project([(TweetId(1), 10)]);
-
-        assert_eq!(
-            by_tweet.hydrated(&TweetId(1)),
-            Some(&Hydrated::Failed(HydrationError::MissingResponse))
-        );
-    }
-
-    #[test]
     fn defaulted_completeness_is_incomplete_and_absent_keys_are_failed() {
         assert_eq!(Completeness::<u32>::default(), Completeness::Incomplete(0));
         assert!(HydrationBatch::<u64, u32>::empty().is_failed(&1));
-    }
-
-    #[test]
-    fn from_values_marks_present_found_and_absent_missing() {
-        let batch: HydrationBatch<u64, u32> =
-            HydrationBatch::from_values([1, 2], HashMap::from([(1, 7)]));
-
-        assert_eq!(batch.get(&1), Some(&7));
-        assert_eq!(
-            batch.hydrated(&2),
-            Some(&Hydrated::Failed(HydrationError::MissingResponse))
-        );
     }
 }

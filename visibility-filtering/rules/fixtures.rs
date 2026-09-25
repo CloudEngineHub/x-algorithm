@@ -1,83 +1,62 @@
 use crate::models::{
     AuthorFeatures, AuthorLabel, ConversationControlFeatures, Decided, HydratedTweetCandidate,
-    SafetyLabelMap, SafetyLabelType, TweetFeatures, Verdict, Viewer, ViewerAuthorRelationship,
-    ViewerFeatures, ViewerProfile, Withholding,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, SafetyLabelMap, SafetyLabelType,
+    TweetFeatures, Verdict, Viewer, ViewerAuthorRelationship, ViewerBlockedBy, ViewerFeatures,
+    ViewerProfile, Withholding,
 };
-use crate::rules::registry::Policy;
-use crate::rules::rule_spec::RuleClause;
-use crate::rules::test_context;
 use std::collections::HashSet;
-use std::slice::from_ref;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
+use xai_x_thrift::action::InterstitialReason;
 
 const TWEET_ID: u64 = 1;
 pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
-pub(super) fn clauses_verdict(
-    clauses: &[RuleClause],
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-) -> Verdict {
-    Policy::new(&[clauses]).evaluate(&test_context(viewer, candidate))
+pub(crate) fn allow() -> Verdict {
+    Verdict::Shown {
+        media: None,
+        engagement: None,
+    }
 }
 
-pub(super) fn assert_clauses_drop(
-    clauses: &[RuleClause],
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-    expected: &FilteredReason,
-) {
-    let verdict = clauses_verdict(clauses, viewer, candidate);
-    assert!(
-        matches!(
-            &verdict,
-            Verdict::Withheld(Decided { value: Withholding::Drop(reason), .. }) if reason == expected
-        ),
-        "{} should drop with {expected:?}, got {verdict:?}",
-        clauses
-            .first()
-            .map_or("<no clauses>", |clause| clause.rule_name)
-    );
+pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
+    Verdict::Withheld(Decided {
+        value: Withholding::Drop(reason),
+        by,
+    })
 }
 
-pub(super) fn assert_clauses_allow(
-    clauses: &[RuleClause],
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-) {
-    let verdict = clauses_verdict(clauses, viewer, candidate);
-    assert!(
-        matches!(
-            verdict,
-            Verdict::Shown {
-                media: None,
-                engagement: None,
-            }
-        ),
-        "{} should allow, got {verdict:?}",
-        clauses
-            .first()
-            .map_or("<no clauses>", |clause| clause.rule_name)
-    );
+pub(crate) fn blurred(reason: InterstitialReason, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        media: Some(Decided {
+            value: MediaInterstitial {
+                legacy: FilteredReason::ContainNsfwMedia,
+                reason,
+            },
+            by,
+        }),
+        engagement: None,
+    }
 }
 
-pub(super) fn assert_drops(
-    spec: &RuleClause,
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-    expected: &FilteredReason,
-) {
-    assert_clauses_drop(from_ref(spec), viewer, candidate, expected);
+pub(crate) fn limited(reason: LimitedEngagementReason, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        media: None,
+        engagement: Some(Decided {
+            value: LimitedEngagement(reason),
+            by,
+        }),
+    }
 }
 
-pub(super) fn assert_allows(
-    spec: &RuleClause,
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-) {
-    assert_clauses_allow(from_ref(spec), viewer, candidate);
+pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
+    match (blur, limit) {
+        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => {
+            Verdict::Shown { media, engagement }
+        }
+        (blur, limit) => panic!("expected two Shown verdicts, got {blur:?} and {limit:?}"),
+    }
 }
 
 pub(crate) fn viewer(id: u64) -> ViewerFeatures {
@@ -132,6 +111,7 @@ pub(super) fn conversation_control(
         },
         root_author_follows_viewer: None,
         viewer_super_follows_root_author: None,
+        viewer_country: None,
     }
 }
 
@@ -157,18 +137,13 @@ impl CandidateBuilder {
         self
     }
 
-    pub(crate) fn author_id(mut self, id: u64) -> Self {
-        self.candidate.author_id = id;
-        self
-    }
-
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
         self.labels.insert(label);
         self
     }
 
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
-        self.candidate.author_features.user_labels.insert(label);
+        self.candidate.author_labels.insert(label);
         self
     }
 
@@ -187,8 +162,8 @@ impl CandidateBuilder {
         self
     }
 
-    pub(crate) fn followed(mut self) -> Self {
-        self.candidate.relationship.viewer_follows_author = true;
+    pub(crate) fn blocked_by(mut self, blocked_by: ViewerBlockedBy) -> Self {
+        self.candidate.blocked_by = blocked_by;
         self
     }
 

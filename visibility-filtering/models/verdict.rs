@@ -43,6 +43,9 @@ pub enum TombstoneReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitedEngagementReason {
     ConversationControl,
+    ReadonlyViewer,
+    BlockedViewer,
+    RootAuthorBlockedViewer,
 }
 
 impl Verdict {

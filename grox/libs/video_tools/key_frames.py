@@ -6,9 +6,8 @@ import av
 import cv2
 import numpy as np
 from av.container import InputContainer
-from pydantic import BaseModel, Field
 
-from video_tools.video_frames import VideoFrame, VideoFramesExtractor
+from video_tools.video_frames import VideoFramesExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -18,36 +17,20 @@ _SHOT_CUT_MIN = 6.0
 _BLANK_STDDEV = 8.0
 
 
-class KeyFrame(VideoFrame):
-    shot_start_sec: float
-    shot_end_sec: float
-    salience: float
-
-
-class KeyFramesData(BaseModel):
-    key_frames: list[KeyFrame]
-    scanned_frames: int
-    shots: int
-    window_sec: float
-    fps: float | None = None
-    total_duration: float | None = None
-    shot_bounds: list[tuple[float, float]] = Field(default_factory=list)
-
-
-class KeyFramesExtractor:
+class ShotKeyFramesExtractor:
     @classmethod
-    async def extract_key_frames(
+    async def extract(
         cls,
         video_bytes: bytes,
         window_sec: float = 3.0,
         max_fps: float = 15.0,
         max_key_frames: int = 3,
         tile_size: int | None = None,
-    ) -> KeyFramesData:
+    ) -> list[bytes]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
-            cls._extract_key_frames,
+            cls._extract,
             video_bytes,
             window_sec,
             max_fps,
@@ -56,14 +39,14 @@ class KeyFramesExtractor:
         )
 
     @classmethod
-    def _extract_key_frames(
+    def _extract(
         cls,
         video_bytes: bytes,
         window_sec: float,
         max_fps: float,
         max_key_frames: int,
         tile_size: int | None,
-    ) -> KeyFramesData:
+    ) -> list[bytes]:
         if window_sec <= 0 or max_fps <= 0 or max_key_frames <= 0:
             raise ValueError("window_sec, max_fps and max_key_frames must be positive")
         with av.open(io.BytesIO(video_bytes)) as container:
@@ -78,42 +61,20 @@ class KeyFramesExtractor:
             fps, ptss, times, signatures = cls._scan(container, window, max_fps)
             if not times:
                 logger.warning("No decodable frames in the opening window")
-                return KeyFramesData(
-                    key_frames=[],
-                    scanned_frames=0,
-                    shots=0,
-                    window_sec=window,
-                    fps=fps,
-                    total_duration=total_duration,
-                )
+                return []
             shots = cls._segment(signatures)
             picks = cls._rank(shots, signatures)[:max_key_frames]
             mids = [(a + b) // 2 for a, b, _ in picks]
             jpegs = cls._decode_at(container, [ptss[m] for m in mids])
-        key_frames = [
-            KeyFrame(
-                time_sec=times[m],
-                frame=VideoFramesExtractor._process_frame(jpeg, tile_size),
-                shot_start_sec=times[a],
-                shot_end_sec=times[b],
-                salience=round(salience, 3),
-            )
-            for (a, b, salience), m, jpeg in zip(picks, mids, jpegs, strict=True)
+        kept = sorted(
+            (times[m], VideoFramesExtractor._process_frame(jpeg, tile_size))
+            for m, jpeg in zip(mids, jpegs, strict=True)
             if jpeg is not None
-        ]
-        key_frames.sort(key=lambda k: k.time_sec)
+        )
         logger.info(
-            f"Scanned {len(times)} frames in {window:.2f}s at {fps}fps: {len(shots)} shots, {len(key_frames)} key frames"
+            f"Scanned {len(times)} frames in {window:.2f}s at {fps}fps: {len(shots)} shots, key frames at {[round(t, 2) for t, _ in kept]}"
         )
-        return KeyFramesData(
-            key_frames=key_frames,
-            scanned_frames=len(times),
-            shots=len(shots),
-            window_sec=window,
-            fps=fps,
-            total_duration=total_duration,
-            shot_bounds=[(times[a], times[b]) for a, b in shots],
-        )
+        return [frame for _, frame in kept]
 
     @classmethod
     def _scan(

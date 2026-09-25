@@ -7,7 +7,6 @@ pub struct AuthorFeatures {
     pub is_nsfw_admin: bool,
     pub is_erased: bool,
     pub is_offboarded: bool,
-    pub user_labels: AuthorLabelSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

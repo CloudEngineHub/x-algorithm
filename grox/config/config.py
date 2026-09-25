@@ -122,6 +122,11 @@ class MediaHydrationConfig(BaseModel):
     key_frames_window_seconds: float = 3.0
     key_frames_max_fps: float = 15.0
     key_frames_max: int = 3
+    key_frames_video_max_frames: int = 0
+    embedding_ranked_key_frames: bool = False
+    embedding_ranked_key_frames_max_seconds: float = 5.0
+    embedding_ranked_key_frames_model: str = "recsys-v5-embedding"
+    embedding_ranked_key_frames_embed_size: int = 336
 
 
 class GroxKafkaLoaderConfig(BaseModel):

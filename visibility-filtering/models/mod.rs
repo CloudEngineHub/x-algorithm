@@ -1,6 +1,6 @@
 pub mod author;
 pub mod conversation_control;
-pub mod exclusive_content;
+pub mod region;
 pub mod relationship;
 pub mod safety_labels;
 pub mod tweet;
@@ -9,8 +9,7 @@ pub mod viewer;
 
 pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 pub use conversation_control::ConversationControlFeatures;
-pub use exclusive_content::ExclusiveContentFeatures;
-pub use relationship::ViewerAuthorRelationship;
+pub use relationship::{ViewerAuthorRelationship, ViewerBlockedBy};
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
 pub use tweet::{MediaFeature, NsfwFeature, TweetFeatures};
 pub use verdict::{
@@ -43,6 +42,7 @@ impl AuthorId {
 pub struct PureCore {
     pub author_id: AuthorId,
     pub source_tweet_id: Option<TweetId>,
+    pub direct_reply_root_author_id: Option<AuthorId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,31 +81,12 @@ pub struct HydratedTweetCandidate {
     pub author_id: u64,
     pub tweet_features: TweetFeatures,
     pub author_features: AuthorFeatures,
+    pub author_labels: AuthorLabelSet,
     pub safety_labels: SafetyLabelMap,
     pub relationship: ViewerAuthorRelationship,
-    pub exclusive_content: Option<ExclusiveContentFeatures>,
+    pub blocked_by: ViewerBlockedBy,
+    pub viewer_super_follows_exclusive_author: bool,
     pub conversation_control: Option<ConversationControlFeatures>,
-}
-
-pub fn assemble(
-    candidate: &TweetCandidateInput,
-    tweet_features: TweetFeatures,
-    author_features: AuthorFeatures,
-    safety_labels: SafetyLabelMap,
-    relationship: ViewerAuthorRelationship,
-    exclusive_content: Option<ExclusiveContentFeatures>,
-    conversation_control: Option<ConversationControlFeatures>,
-) -> HydratedTweetCandidate {
-    HydratedTweetCandidate {
-        tweet_id: candidate.tweet_id.0,
-        author_id: candidate.author_id.get(),
-        tweet_features,
-        author_features,
-        safety_labels,
-        relationship,
-        exclusive_content,
-        conversation_control,
-    }
 }
 
 #[cfg(test)]
@@ -118,10 +99,14 @@ mod tests {
         let core = |author| PureCore {
             author_id: AuthorId(author),
             source_tweet_id: None,
+            direct_reply_root_author_id: None,
         };
-        let pure_cores = TweetHydrationBatch::from_values(
+        let pure_cores = TweetHydrationBatch::from_results(
             [TweetId(2), TweetId(3), TweetId(4)],
-            HashMap::from([(TweetId(2), core(20)), (TweetId(4), core(40))]),
+            HashMap::from([
+                (TweetId(2), Ok::<_, &str>(Some(core(20)))),
+                (TweetId(4), Ok(Some(core(40)))),
+            ]),
         );
         let raw = vec![
             RawCandidate {

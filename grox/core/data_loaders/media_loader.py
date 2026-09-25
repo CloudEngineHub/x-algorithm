@@ -9,14 +9,21 @@ from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
 from monitor.metrics import Metrics
 from video_tools.image import process_image_bytes, resize_tile, enhance_image_with_clahe
 from grox.config.config import grox_config
+from grox.core.data_loaders.embedding_ranked_key_frames import EmbeddingRankedKeyFrames
 from grox.core.data_loaders.descendant_hydrator import DescendantHydrator
 from grox.core.data_loaders.descendant_id_provider import DescendantIdProvider
 from grox.core.clients.nightowl_client import NightOwlClient
 from grox_fetcher_client import GroxFetcherClient
 from video_tools.subtitles import SubtitleAligner
-from video_tools.key_frames import KeyFramesExtractor
+from video_tools.key_frames import ShotKeyFramesExtractor
 from video_tools.video_frames import VideoFramesExtractor
-from grox.core.data_loaders.data_types import Post, Image, Video, BroadcastMetadata
+from grox.core.data_loaders.data_types import (
+    Post,
+    Image,
+    Video,
+    BroadcastMetadata,
+    RankingQuery,
+)
 from blobstore_http.cdn_downloader import CDNDownloader
 from html_render.tweet_render_for_grox import TweetRenderForGrox
 from strato_http.queries.video_subtitle import StratoVideoSubtitle
@@ -471,6 +478,7 @@ class MediaLoader:
                 enable_clahe_enhancement,
                 enable_motion_reveal,
                 max_duration=video.crop_seconds,
+                key_frames_ranking=video.key_frames_ranking,
             )
             Metrics.counter("media_loader.hydrate_video_success.count").add(
                 1, attributes=cls._metrics_attributes()
@@ -620,6 +628,7 @@ class MediaLoader:
         enable_clahe_enhancement: bool = False,
         enable_motion_reveal: bool = False,
         max_duration: float | None = None,
+        key_frames_ranking: RankingQuery | None = None,
     ) -> ConvoVideo:
         video_max_frames = grox_config.media_hydration.video_max_frames_light
         video_tile_size = grox_config.media_hydration.video_tile_size
@@ -629,13 +638,11 @@ class MediaLoader:
                 video_tile_size = grox_config.media_hydration.deluxe_video_tile_size
             else:
                 video_max_frames = grox_config.media_hydration.video_max_frames
+        if grox_config.media_hydration.use_key_frames:
+            video_max_frames = grox_config.media_hydration.key_frames_video_max_frames
         logger.info(
             f"video config video_tile_size {video_tile_size}, video_max_frames {video_max_frames}"
         )
-        if grox_config.media_hydration.use_key_frames:
-            return await cls._construct_convo_video_from_key_frames(
-                video_bytes, video_tile_size, is_main_post and is_high_fav
-            )
         video_data = await VideoFramesExtractor.extract_frames(
             video_bytes,
             video_max_frames,
@@ -684,6 +691,16 @@ class MediaLoader:
                 1, attributes=cls._metrics_attributes()
             )
 
+        shot_key_frames, ranked_key_frames = [], []
+        if grox_config.media_hydration.use_key_frames:
+            shot_key_frames, ranked_key_frames = await cls._key_frames(
+                video_bytes, video_tile_size, key_frames_ranking
+            )
+            if not frames and not shot_key_frames and not ranked_key_frames:
+                raise ValueError(
+                    "no sampled frames, shot key frames or ranked key frames"
+                )
+
         return ConvoVideo(
             frames=frames,
             subtitles=subtitles,
@@ -691,38 +708,49 @@ class MediaLoader:
             total_duration=total_duration,
             is_deluxe_target=is_main_post and is_high_fav,
             motion_reveal_frames=video_data.motion_reveal_frames,
+            shot_key_frames=shot_key_frames,
+            ranked_key_frames=ranked_key_frames,
         )
 
     @classmethod
-    async def _construct_convo_video_from_key_frames(
-        cls, video_bytes: bytes, tile_size: int, is_deluxe_target: bool
-    ) -> ConvoVideo:
+    async def _key_frames(
+        cls, video_bytes: bytes, tile_size: int, ranking: RankingQuery | None
+    ) -> tuple[list[bytes], list[bytes]]:
         cfg = grox_config.media_hydration
-        data = await KeyFramesExtractor.extract_key_frames(
-            video_bytes,
-            window_sec=cfg.key_frames_window_seconds,
-            max_fps=cfg.key_frames_max_fps,
-            max_key_frames=cfg.key_frames_max,
-            tile_size=tile_size,
-        )
-        Metrics.counter("media_loader.key_frames.count").add(
-            1,
-            attributes={
-                **cls._metrics_attributes(),
-                "shots": str(min(data.shots, 5)),
-                "frames": str(len(data.key_frames)),
-            },
-        )
-        logger.info(
-            f"key frames: scanned {data.scanned_frames} frames, {data.shots} shots, picked {[k.time_sec for k in data.key_frames]}"
-        )
-        if not data.key_frames:
-            raise ValueError(
-                f"no key frames in the opening {cfg.key_frames_window_seconds}s ({data.scanned_frames} frames scanned)"
+        shot_key_frames: list[bytes] = []
+        frames_label = "error"
+        try:
+            shot_key_frames = await ShotKeyFramesExtractor.extract(
+                video_bytes,
+                window_sec=cfg.key_frames_window_seconds,
+                max_fps=cfg.key_frames_max_fps,
+                max_key_frames=cfg.key_frames_max,
+                tile_size=tile_size,
             )
-        return ConvoVideo(
-            frames=[k.frame for k in data.key_frames],
-            duration=data.window_sec / max(len(data.key_frames), 1),
-            total_duration=data.window_sec,
-            is_deluxe_target=is_deluxe_target,
+            frames_label = str(len(shot_key_frames))
+        except Exception:
+            logger.warning(f"shot key frames failed: {traceback.format_exc()}")
+        Metrics.counter("media_loader.key_frames.count").add(
+            1, attributes={**cls._metrics_attributes(), "frames": frames_label}
         )
+        ranked_key_frames: list[bytes] = []
+        if ranking is not None and cfg.embedding_ranked_key_frames:
+            try:
+                ranked_key_frames = await EmbeddingRankedKeyFrames.select(
+                    video_bytes, tile_size, ranking
+                )
+                outcome = "ok" if ranked_key_frames else "no_frames"
+            except Exception:
+                logger.warning(
+                    f"embedding-ranked key frames failed: {traceback.format_exc()}"
+                )
+                outcome = "error"
+            Metrics.counter("media_loader.embedding_ranked_key_frames.count").add(
+                1,
+                attributes={
+                    **cls._metrics_attributes(),
+                    "query": ranking.name,
+                    "outcome": outcome,
+                },
+            )
+        return shot_key_frames, ranked_key_frames

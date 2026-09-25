@@ -1,10 +1,11 @@
+use crate::clients::about_this_account_client::ProdAboutThisAccountClient;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
 use crate::filter::{EvaluationStatus, FilterRequest, FilterResponse, FilterTweets};
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
+use crate::hydration::sources::ProdSources;
 use crate::hydration::tes_composite::ProdTweetForVisibilitySource;
-use crate::hydration::HydrationPipeline;
 use crate::models::{RawCandidate, TweetId};
 use crate::reference_compare::ReferenceCompareHarness;
 use crate::rules::metrics::Rpc;
@@ -112,14 +113,12 @@ pub async fn build_prod_server(
 
     let deterministic_aperture = std::env::var("APP_ENV").as_deref() == Ok("prod");
     let fallback_cache_enabled = crate::config::fallback_cache_enabled();
-    let fallback_cache = fallback_cache_enabled
-        .then(crate::hydration::gizmoduck_hydrator::GizmoduckAuthorHydrator::fallback_cache);
+    let fallback_cache =
+        fallback_cache_enabled.then(crate::hydration::gizmoduck_hydrator::fallback_cache);
     let author_id_fallback_enabled = crate::config::author_id_fallback_enabled();
     let author_id_fallback_capacity = crate::config::author_id_fallback_capacity();
     let pure_core_fallback_cache = author_id_fallback_enabled.then(|| {
-        crate::hydration::tes_hydrator::TesHydrator::pure_core_fallback_cache(
-            author_id_fallback_capacity,
-        )
+        crate::hydration::tes_hydrator::pure_core_fallback_cache(author_id_fallback_capacity)
     });
 
     let tes_client = Arc::new(
@@ -194,6 +193,29 @@ pub async fn build_prod_server(
             .expect("Failed to initialize SocialGraph client"),
         );
 
+    let about_this_account_client = Arc::new(ProdAboutThisAccountClient::new(
+        init_client_with_retry("strato_about_this_account", init_deadline, || {
+            let config = xai_strato::StratoGrpcConfig {
+                ca_cert_path: S2S_CHAIN_PATH.clone(),
+                client_cert_path: S2S_CRT_PATH.clone(),
+                client_key_path: S2S_KEY_PATH.clone(),
+                aperture_size: Some(STRATO_APERTURE_SIZE),
+                deterministic_aperture,
+                connect_timeout_ms: u64::try_from(STRATO_CONNECT_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX),
+                request_timeout_ms: u64::try_from(STRATO_REQUEST_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX),
+                client_id: Some(S2S_CLIENT_ID.clone()),
+                service_url: format!("stratostore.stratoserver.prod.{datacenter}.s2s.twttr.net"),
+                zone: datacenter.to_string(),
+                ..Default::default()
+            };
+            async move { StratoGrpc::new(config).await }
+        })
+        .await
+        .expect("Failed to initialize Strato about_this_account client"),
+    ));
+
     let mh_label_client: Arc<dyn ManhattanLabelFetcher> = Arc::new(
         init_client_with_retry("manhattan", init_deadline, || {
             let s2s = xai_manhattan::s2s::S2sConfig {
@@ -235,7 +257,13 @@ pub async fn build_prod_server(
         .await
         .expect("Failed to create twemcache client"),
     );
-    info!("Cache client connected to {CACHE_PATH}");
+    let start = Instant::now();
+    let server_count = twemcache.warm_up().await;
+    info!(
+        server_count,
+        latency_ms = elapsed_ms(start),
+        "Cache client connected to {CACHE_PATH}"
+    );
 
     let reference_compare = build_reference_compare_harness(datacenter, init_deadline).await;
 
@@ -256,11 +284,12 @@ pub async fn build_prod_server(
     let tweet_source = Arc::new(ProdTweetForVisibilitySource {
         grpc_client: tes_client.grpc_client.clone(),
     });
-    let hydration_pipeline = HydrationPipeline::new(
+    let sources = ProdSources::new(
         tes_client,
         tweet_source,
         gizmoduck_client,
         sg_client,
+        about_this_account_client,
         safety_label_source.clone(),
         fallback_cache,
         pure_core_fallback_cache,
@@ -271,7 +300,7 @@ pub async fn build_prod_server(
     gating_countries.spawn_refresh(feature_switches, fs_path);
     let rule_engine = crate::rules::RuleEngine::with_nsfw_gating_countries(gating_countries);
     let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
-    let filter_tweets = Arc::new(FilterTweets::new(hydration_pipeline, rule_engine));
+    let filter_tweets = Arc::new(FilterTweets::new(Arc::new(sources), rule_engine));
 
     warm_filter_tweets(&filter_tweets).await;
 

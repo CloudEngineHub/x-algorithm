@@ -19,6 +19,7 @@ const HYDRATOR_BATCH_SIZE: &str = "vf_hydrator_batch_size";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
 const AUTHOR_LABELS: &str = "vf_author_labels";
+const VIEWER_COUNTRY: &str = "vf_viewer_country";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -87,8 +88,8 @@ impl KeyedResultCounts {
 }
 
 pub(crate) fn record_hydrator_request(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     outcome: HydratorOutcome,
     candidate_count: usize,
@@ -136,8 +137,8 @@ pub(crate) fn record_hydrator_request(
 }
 
 fn record_keyed_hydrator_request(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     counts: KeyedResultCounts,
     latency_ms: f64,
@@ -210,7 +211,15 @@ pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
     }
 }
 
-pub(crate) fn record_batch_size(client: &'static str, candidate_count: usize) {
+pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLevel) {
+    incr(
+        VIEWER_COUNTRY,
+        &[("result", result), ("safety_level", safety_level.into())],
+        1,
+    );
+}
+
+pub(crate) fn record_batch_size(client: &str, candidate_count: usize) {
     observe(
         HYDRATOR_BATCH_SIZE,
         &[("client", client)],
@@ -243,8 +252,8 @@ pub(crate) fn record_fallback_cache_keys(
 }
 
 pub(crate) async fn timed_rpc<T: Default>(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     candidate_count: usize,
     timeout: Duration,
@@ -271,8 +280,8 @@ pub(crate) async fn timed_rpc<T: Default>(
 }
 
 pub(crate) async fn timed_results<K, V, E>(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     candidate_count_by_key: &HashMap<K, usize>,
     timeout: Duration,
@@ -294,32 +303,50 @@ where
     .await
 }
 
-pub(crate) async fn timed_values<K, V>(
-    client: &'static str,
-    method: &'static str,
+pub(crate) async fn timed_all_or_none<K, T>(
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     candidate_count_by_key: &HashMap<K, usize>,
     timeout: Duration,
-    fut: impl Future<Output = HashMap<K, V>>,
-) -> HydrationBatch<K, V>
-where
-    K: Copy + Eq + Hash,
-{
-    timed_batch(
+    fut: impl Future<Output = Option<T>>,
+) -> Option<T> {
+    let start = Instant::now();
+    let (answer, error) = match fut.with_budget(timeout).await {
+        Ok(Some(answer)) => (Some(answer), None),
+        Ok(None) => (None, Some(HydrationError::MissingResponse)),
+        Err(_) => (None, Some(HydrationError::Timeout)),
+    };
+    let mut counts = KeyedResultCounts::default();
+    for &candidates in candidate_count_by_key.values() {
+        match error {
+            None => {
+                counts.success_keys += 1;
+                counts.success_candidates += candidates;
+            }
+            Some(HydrationError::Timeout) => {
+                counts.timeout_keys += 1;
+                counts.timeout_candidates += candidates;
+            }
+            Some(_) => {
+                counts.error_keys += 1;
+                counts.error_candidates += candidates;
+            }
+        }
+    }
+    record_keyed_hydrator_request(
         client,
         method,
         safety_level,
-        candidate_count_by_key,
-        timeout,
-        fut,
-        |body| HydrationBatch::from_values(candidate_count_by_key.keys().copied(), body),
-    )
-    .await
+        counts,
+        start.elapsed().as_secs_f64() * 1000.0,
+    );
+    answer
 }
 
 async fn timed_batch<K, V, F: Future>(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     candidate_count_by_key: &HashMap<K, usize>,
     timeout: Duration,
@@ -376,7 +403,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dashboard_generator_pins_the_author_labels_metric_name() {
+    fn dashboard_generator_pins_the_author_labels_metric_and_root_edges_method() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -387,6 +414,13 @@ mod tests {
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
+        use crate::hydration::Hydrator;
+        let root_edges = format!(
+            "{}+{}",
+            Hydrator::RootFollowsViewer.spec().label.1,
+            Hydrator::SuperFollowsRoot.spec().label.1
+        );
+        assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
     }
 
     #[tokio::test(start_paused = true)]

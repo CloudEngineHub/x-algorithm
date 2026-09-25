@@ -103,7 +103,7 @@ _eapi_4_6_internal_breaker = CircuitBreaker(
 
 
 class SafetyPtosCategoryClassifier:
-    result_pattern = re.compile(r"(.*)<json>(.*)</json>", re.DOTALL)
+    result_pattern = re.compile(r"(.*)<json(?!\w)[>}\]]?(.*)</json>", re.DOTALL)
 
     def __init__(
         self,

@@ -148,9 +148,9 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
                 if media.convo_image and media.convo_image.content:
                     payloads.append(("image", media.convo_image.content))
             elif isinstance(media, Video):
-                if media.convo_video and media.convo_video.frames:
+                if media.convo_video and media.convo_video.stills():
                     for frame in cls._sample_uniform(
-                        media.convo_video.frames, _MAX_FRAMES_PER_VIDEO
+                        media.convo_video.stills(), _MAX_FRAMES_PER_VIDEO
                     ):
                         payloads.append(("video_frame", frame))
             if len(payloads) >= _MAX_PAYLOADS_PER_POST:

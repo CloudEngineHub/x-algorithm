@@ -6,7 +6,7 @@ from strato_http.queries.safety_post_annotations_result import (
     StratoSafetyPostAnnotationsResultDirectMh,
 )
 
-from grox.core.data_loaders.data_types import Post, Video
+from grox.core.data_loaders.data_types import Post, RankingQuery, Video
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task
 from grox.core.tasks.task_filters import TaskFilterWithPost
@@ -20,6 +20,12 @@ from grox.flows.ptos.state import (
 logger = logging.getLogger(__name__)
 
 _METRIC_PREFIX = "task.safety_ptos_key_frames_filter"
+NUDITY_RANKING = RankingQuery(
+    name="nudity",
+    frame_instruction="Represent this video frame for detecting nudity and exposed intimate body parts",
+    positive_query="a naked person with exposed intimate body parts",
+    negative_query="a fully clothed person",
+)
 
 
 class TaskSafetyPtosKeyFramesFilter(TaskFilterWithPost):
@@ -55,6 +61,9 @@ class TaskSafetyPtosKeyFramesFilter(TaskFilterWithPost):
             return cls._skip(
                 post, "no_prior_ptos" if prior is None else "no_adult_prior"
             )
+        for medium in media:
+            if isinstance(medium, Video):
+                medium.key_frames_ranking = NUDITY_RANKING
         Metrics.counter(f"{_METRIC_PREFIX}.eligible.count").add(
             1,
             attributes={

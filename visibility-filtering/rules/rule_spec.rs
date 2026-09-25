@@ -1,7 +1,7 @@
 use crate::hydration::{Hydrator, Hydrators};
+use crate::models::region::allows_country;
 use crate::models::{
-    AuthorFeatures, AuthorLabel, LimitedEngagementReason, SafetyLabelType, TombstoneReason,
-    ViewerProfile,
+    AuthorLabel, LimitedEngagementReason, SafetyLabelType, TombstoneReason, ViewerProfile,
 };
 use crate::rules::RuleContext;
 use xai_core_entities::entities::ConversationControlArm;
@@ -79,6 +79,7 @@ pub(super) enum ViewerPredicate {
     AllowsSensitiveMedia,
     InNsfwGatingCountry,
     HasVerifiedBadge,
+    ReadOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +97,9 @@ pub(super) enum RelationshipPredicate {
     ViewerIsInvitedToConversation,
     ViewerIsFollowedByConversationRootAuthor,
     ViewerSuperFollowsConversationRootAuthor,
+    ViewerIsBlockedByAuthor,
+    ViewerIsBlockedByConversationRootAuthor,
+    ViewerIsInAllowedCountry,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -140,7 +144,7 @@ impl Audience {
     pub(super) const fn hydrators(self) -> Hydrators {
         match self {
             Audience::Everyone | Audience::ExceptAuthor => Hydrators::empty(),
-            Audience::ExceptAuthorAndFollowers => Hydrators::of(Hydrator::Relationship),
+            Audience::ExceptAuthorAndFollowers => Hydrators::of(Hydrator::Follows),
         }
     }
 }
@@ -167,79 +171,23 @@ impl Predicate {
     pub(super) const fn hydrators(self) -> Hydrators {
         match self {
             Predicate::Tweet(fact) => fact.hydrators(),
-            Predicate::Author(_) => Hydrators::of(Hydrator::Author),
+            Predicate::Author(fact) => fact.hydrators(),
             Predicate::Viewer(fact) => fact.hydrators(),
             Predicate::Relationship(fact) => fact.hydrators(),
         }
     }
 }
 
-impl TweetPredicate {
-    const fn hydrators(self) -> Hydrators {
-        match self {
-            TweetPredicate::HasSafetyLabel(_) => Hydrators::of(Hydrator::TweetSafetyLabels),
-            TweetPredicate::CreatedAfter(_) => Hydrators::empty(),
-            TweetPredicate::NsfwUserFlag
-            | TweetPredicate::NsfwAdminFlag
-            | TweetPredicate::HasMedia
-            | TweetPredicate::HasDmcaMedia
-            | TweetPredicate::IsRetweet
-            | TweetPredicate::IsSupersededEdit
-            | TweetPredicate::IsNullcast
-            | TweetPredicate::IsCommunityTweet => Hydrators::of(Hydrator::Tweet),
-            TweetPredicate::HasExclusiveContent => EXCLUSIVE,
-            TweetPredicate::HasConversationControl(_) => {
-                Hydrators::of(Hydrator::ConversationControl)
-            }
-        }
-    }
-}
-
-impl ViewerPredicate {
-    const fn hydrators(self) -> Hydrators {
-        match self {
-            ViewerPredicate::LoggedOut => Hydrators::empty(),
-            ViewerPredicate::Underage
-            | ViewerPredicate::NoStatedAge
-            | ViewerPredicate::AllowsSensitiveMedia
-            | ViewerPredicate::InNsfwGatingCountry
-            | ViewerPredicate::HasVerifiedBadge => Hydrators::of(Hydrator::ViewerProfile),
-        }
-    }
-}
-
-impl RelationshipPredicate {
-    const fn hydrators(self) -> Hydrators {
-        match self {
-            RelationshipPredicate::ViewerBlocksAuthor
-            | RelationshipPredicate::ViewerMutesAuthor
-            | RelationshipPredicate::ViewerMutesRetweetsFromAuthor => {
-                Hydrators::of(Hydrator::Relationship)
-            }
-            RelationshipPredicate::ViewerIsConversationAuthor
-            | RelationshipPredicate::ViewerSuperFollowsAuthor => EXCLUSIVE,
-            RelationshipPredicate::ViewerIsConversationRootAuthor
-            | RelationshipPredicate::ViewerIsInvitedToConversation
-            | RelationshipPredicate::ViewerIsFollowedByConversationRootAuthor
-            | RelationshipPredicate::ViewerSuperFollowsConversationRootAuthor => {
-                Hydrators::of(Hydrator::ConversationControl)
-            }
-        }
-    }
-}
-
-const EXCLUSIVE: Hydrators = Hydrators::of(Hydrator::ExclusiveContent).with(Hydrator::Tweet);
-
 impl Audience {
     #[inline]
     pub(super) fn admits(self, context: &RuleContext<'_>) -> bool {
+        let facts = context.facts();
         match self {
             Audience::Everyone => true,
-            Audience::ExceptAuthor => !context.is_author_viewer(),
+            Audience::ExceptAuthor => !facts.is_author_viewer(),
             Audience::ExceptAuthorAndFollowers => {
-                !context.is_author_viewer()
-                    && (context.viewer_id().is_none()
-                        || !context.relationship().viewer_follows_author)
+                !facts.is_author_viewer()
+                    && (facts.viewer_id().is_none() || !context.viewer_follows_author())
             }
         }
     }
@@ -262,116 +210,147 @@ impl Predicate {
     pub(super) fn holds(self, context: &RuleContext<'_>) -> bool {
         match self {
             Predicate::Tweet(fact) => fact.holds(context),
-            Predicate::Author(fact) => fact.holds(context.author_features()),
+            Predicate::Author(fact) => fact.holds(context),
             Predicate::Viewer(fact) => fact.holds(context),
             Predicate::Relationship(fact) => fact.holds(context),
         }
     }
 }
 
-impl TweetPredicate {
-    #[inline]
-    fn holds(self, context: &RuleContext<'_>) -> bool {
-        match self {
-            TweetPredicate::HasSafetyLabel(label) => context.tweet_safety_labels().has_label(label),
-            TweetPredicate::CreatedAfter(unix_ms) => context.created_after(unix_ms),
-            TweetPredicate::NsfwUserFlag => context.tweet_features().nsfw.user,
-            TweetPredicate::NsfwAdminFlag => context.tweet_features().nsfw.admin,
-            TweetPredicate::HasMedia => context.tweet_features().has_media(),
-            TweetPredicate::HasDmcaMedia => context.tweet_features().has_dmca_media(),
-            TweetPredicate::IsRetweet => context.tweet_features().is_retweet(),
-            TweetPredicate::IsSupersededEdit => context
-                .tweet_features()
-                .is_superseded_edit(context.tweet_id()),
-            TweetPredicate::IsNullcast => context.tweet_features().is_nullcast,
-            TweetPredicate::IsCommunityTweet => context.tweet_features().is_community_tweet,
-            TweetPredicate::HasExclusiveContent => context.exclusive_content().is_some(),
-            TweetPredicate::HasConversationControl(arm) => context
-                .conversation_control()
-                .is_some_and(|features| features.control.arm == arm),
+macro_rules! predicates {
+    ($(
+        $predicate:ident {
+            $($variant:ident $(($($arg:ident),*))? reads $reads:tt
+                => |$facts:pat_param, $value:pat_param| $body:expr),+ $(,)?
         }
-    }
-}
-
-impl AuthorPredicate {
-    #[inline]
-    fn holds(self, author: &AuthorFeatures) -> bool {
-        match self {
-            AuthorPredicate::HasUserLabel(label) => author.user_labels.has_label(label),
-            AuthorPredicate::IsSuspended => author.is_suspended,
-            AuthorPredicate::IsDeactivated => author.is_deactivated,
-            AuthorPredicate::IsErased => author.is_erased,
-            AuthorPredicate::IsOffboarded => author.is_offboarded,
-            AuthorPredicate::IsProtected => author.is_protected,
-            AuthorPredicate::IsNsfwUser => author.is_nsfw_user,
-            AuthorPredicate::IsNsfwAdmin => author.is_nsfw_admin,
-        }
-    }
-}
-
-impl ViewerPredicate {
-    #[inline]
-    fn holds(self, context: &RuleContext<'_>) -> bool {
-        match self {
-            ViewerPredicate::LoggedOut => context.viewer_id().is_none(),
-            ViewerPredicate::Underage => context
-                .viewer_profile()
-                .is_some_and(ViewerProfile::is_underage),
-            ViewerPredicate::NoStatedAge => context
-                .viewer_profile()
-                .is_some_and(ViewerProfile::has_no_stated_age),
-            ViewerPredicate::AllowsSensitiveMedia => context
-                .viewer_profile()
-                .is_some_and(|profile| profile.allows_sensitive_media),
-            ViewerPredicate::HasVerifiedBadge => context
-                .viewer_profile()
-                .is_some_and(|profile| profile.has_verified_badge),
-            ViewerPredicate::InNsfwGatingCountry => context
-                .viewer_country()
-                .is_some_and(|country| context.nsfw_gating_country(country)),
-        }
-    }
-}
-
-impl RelationshipPredicate {
-    #[inline]
-    fn holds(self, context: &RuleContext<'_>) -> bool {
-        match self {
-            RelationshipPredicate::ViewerBlocksAuthor => {
-                context.relationship().viewer_blocks_author
+    )+) => {$(
+        impl $predicate {
+            const fn hydrators(self) -> Hydrators {
+                match self {
+                    $(Self::$variant { .. } => predicates!(@declare $reads),)+
+                }
             }
-            RelationshipPredicate::ViewerMutesAuthor => context.relationship().viewer_mutes_author,
-            RelationshipPredicate::ViewerMutesRetweetsFromAuthor => {
-                context.relationship().viewer_mutes_retweets_from_author
+
+            #[inline]
+            fn holds(self, context: &RuleContext<'_>) -> bool {
+                match self {
+                    $(Self::$variant $(($($arg),*))? => {
+                        let $facts = context.facts();
+                        let $value = predicates!(@read context $reads);
+                        $body
+                    })+
+                }
             }
-            RelationshipPredicate::ViewerIsConversationAuthor => context
-                .exclusive_content()
-                .zip(context.viewer_id())
-                .is_some_and(|(exclusive, viewer_id)| {
-                    viewer_id == exclusive.conversation_author_id
-                }),
-            RelationshipPredicate::ViewerSuperFollowsAuthor => context
-                .exclusive_content()
-                .is_some_and(|exclusive| exclusive.viewer_super_follows_author),
-            RelationshipPredicate::ViewerIsConversationRootAuthor => context
-                .conversation_control()
-                .zip(context.viewer_id())
-                .is_some_and(|(features, viewer_id)| {
-                    viewer_id == features.control.conversation_tweet_author_id
-                }),
-            RelationshipPredicate::ViewerIsInvitedToConversation => context
-                .conversation_control()
-                .zip(context.viewer_id())
-                .is_some_and(|(features, viewer_id)| {
-                    features.control.invited_user_ids.contains(&viewer_id)
-                }),
-            RelationshipPredicate::ViewerIsFollowedByConversationRootAuthor => context
-                .conversation_control()
-                .is_some_and(|features| features.root_author_follows_viewer == Some(true)),
-            RelationshipPredicate::ViewerSuperFollowsConversationRootAuthor => context
-                .conversation_control()
-                .is_some_and(|features| features.viewer_super_follows_root_author == Some(true)),
         }
+    )+};
+    (@declare ()) => { Hydrators::empty() };
+    (@declare ($($node:ident),+)) => { Hydrators::empty()$(.with(Hydrator::$node))+ };
+    (@declare $node:ident) => { Hydrators::of(Hydrator::$node) };
+    (@read $context:ident ()) => { () };
+    (@read $context:ident ($($node:ident),+)) => { ($(predicates!(@read $context $node)),+) };
+    (@read $context:ident Tweet) => { $context.tweet_features() };
+    (@read $context:ident ConversationControl) => { $context.conversation_control() };
+    (@read $context:ident TweetSafetyLabels) => { $context.tweet_safety_labels() };
+    (@read $context:ident ViewerProfile) => { $context.viewer_profile() };
+    (@read $context:ident AuthorSafety) => { $context.author_features() };
+    (@read $context:ident AuthorLabels) => { $context.author_labels() };
+    (@read $context:ident Follows) => { $context.viewer_follows_author() };
+    (@read $context:ident Blocks) => { $context.viewer_blocks_author() };
+    (@read $context:ident Mutes) => { $context.viewer_mutes_author() };
+    (@read $context:ident MuteRetweets) => { $context.viewer_mutes_retweets_from_author() };
+    (@read $context:ident BlockedByAuthor) => { $context.blocked_by_author() };
+    (@read $context:ident BlockedByReplyRoot) => { $context.blocked_by_reply_root_author() };
+    (@read $context:ident SuperFollowsExclusive) => {
+        $context.viewer_super_follows_exclusive_author()
+    };
+    (@read $context:ident RootFollowsViewer) => { $context.root_author_follows_viewer() };
+    (@read $context:ident SuperFollowsRoot) => { $context.viewer_super_follows_root_author() };
+    (@read $context:ident ViewerCountry) => { $context.viewer_country() };
+}
+
+predicates! {
+    TweetPredicate {
+        HasSafetyLabel(label) reads TweetSafetyLabels => |_, labels| labels.has_label(label),
+        CreatedAfter(unix_ms) reads () => |facts, ()| facts.created_after(unix_ms),
+        NsfwUserFlag reads Tweet => |_, tweet| tweet.nsfw.user,
+        NsfwAdminFlag reads Tweet => |_, tweet| tweet.nsfw.admin,
+        HasMedia reads Tweet => |_, tweet| tweet.has_media(),
+        HasDmcaMedia reads Tweet => |_, tweet| tweet.has_dmca_media(),
+        IsRetweet reads Tweet => |_, tweet| tweet.is_retweet(),
+        IsSupersededEdit reads Tweet => |facts, tweet| tweet.is_superseded_edit(facts.tweet_id()),
+        IsNullcast reads Tweet => |_, tweet| tweet.is_nullcast,
+        IsCommunityTweet reads Tweet => |_, tweet| tweet.is_community_tweet,
+        HasExclusiveContent reads Tweet
+            => |_, tweet| tweet.exclusive_conversation_author_id.is_some(),
+        HasConversationControl(arm) reads ConversationControl
+            => |_, control| control.is_some_and(|control| control.arm == arm),
+    }
+
+    AuthorPredicate {
+        HasUserLabel(label) reads AuthorLabels => |_, labels| labels.has_label(label),
+        IsSuspended reads AuthorSafety => |_, author| author.is_suspended,
+        IsDeactivated reads AuthorSafety => |_, author| author.is_deactivated,
+        IsErased reads AuthorSafety => |_, author| author.is_erased,
+        IsOffboarded reads AuthorSafety => |_, author| author.is_offboarded,
+        IsProtected reads AuthorSafety => |_, author| author.is_protected,
+        IsNsfwUser reads AuthorSafety => |_, author| author.is_nsfw_user,
+        IsNsfwAdmin reads AuthorSafety => |_, author| author.is_nsfw_admin,
+    }
+
+    ViewerPredicate {
+        LoggedOut reads () => |facts, ()| facts.viewer_id().is_none(),
+        Underage reads ViewerProfile => |_, profile| profile.is_some_and(ViewerProfile::is_underage),
+        NoStatedAge reads ViewerProfile
+            => |_, profile| profile.is_some_and(ViewerProfile::has_no_stated_age),
+        AllowsSensitiveMedia reads ViewerProfile
+            => |_, profile| profile.is_some_and(|profile| profile.allows_sensitive_media),
+        InNsfwGatingCountry reads ViewerProfile => |facts, profile| {
+            profile
+                .and_then(|profile| profile.account_country_code.as_deref())
+                .or(facts.request_country())
+                .is_some_and(|country| facts.nsfw_gating_country(country))
+        },
+        HasVerifiedBadge reads ViewerProfile
+            => |_, profile| profile.is_some_and(|profile| profile.has_verified_badge),
+        ReadOnly reads ViewerProfile
+            => |_, profile| profile.is_some_and(|profile| profile.is_read_only),
+    }
+
+    RelationshipPredicate {
+        ViewerBlocksAuthor reads Blocks => |_, blocks| blocks,
+        ViewerMutesAuthor reads Mutes => |_, mutes| mutes,
+        ViewerMutesRetweetsFromAuthor reads MuteRetweets => |_, mutes| mutes,
+        ViewerIsConversationAuthor reads Tweet => |facts, tweet| {
+            tweet
+                .exclusive_conversation_author_id
+                .is_some_and(|author| facts.viewer_id() == Some(author))
+        },
+        ViewerSuperFollowsAuthor reads (Tweet, SuperFollowsExclusive)
+            => |_, (tweet, super_follows)| {
+                tweet.exclusive_conversation_author_id.is_some() && super_follows
+            },
+        ViewerIsConversationRootAuthor reads ConversationControl => |facts, control| {
+            control
+                .zip(facts.viewer_id())
+                .is_some_and(|(control, viewer_id)| viewer_id == control.conversation_tweet_author_id)
+        },
+        ViewerIsInvitedToConversation reads ConversationControl => |facts, control| {
+            control
+                .zip(facts.viewer_id())
+                .is_some_and(|(control, viewer_id)| control.invited_user_ids.contains(&viewer_id))
+        },
+        ViewerIsFollowedByConversationRootAuthor reads RootFollowsViewer
+            => |_, follows| follows == Some(true),
+        ViewerSuperFollowsConversationRootAuthor reads SuperFollowsRoot
+            => |_, super_follows| super_follows == Some(true),
+        ViewerIsBlockedByAuthor reads BlockedByAuthor => |_, blocked| blocked,
+        ViewerIsBlockedByConversationRootAuthor reads BlockedByReplyRoot => |_, blocked| blocked,
+        ViewerIsInAllowedCountry reads (ConversationControl, ViewerCountry)
+            => |_, (control, country)| {
+                control.zip(country).is_some_and(|(control, country)| {
+                    allows_country(&control.allowed_country_codes, country)
+                })
+            },
     }
 }
 
@@ -402,6 +381,7 @@ mod tests {
                 },
                 root_author_follows_viewer,
                 viewer_super_follows_root_author,
+                viewer_country: None,
             })
             .build()
     }
