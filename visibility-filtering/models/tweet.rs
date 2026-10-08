@@ -35,6 +35,7 @@ pub struct TweetFeatures {
     pub edit_control: Option<EditControl>,
     pub exclusive_conversation_author_id: Option<u64>,
     pub article_id: Option<NonZeroU64>,
+    pub narrowcast_place_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

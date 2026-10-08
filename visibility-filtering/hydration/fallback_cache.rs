@@ -5,9 +5,7 @@ use quick_cache::sync::{Cache, EntryAction, EntryResult};
 use quick_cache::OptionsBuilder;
 
 use crate::hydration::batch::{Hydrated, RawHydrationBatch};
-use crate::hydration::metrics::{
-    record_fallback_cache_entries, record_fallback_cache_keys, record_fallback_cache_resident_keys,
-};
+use crate::hydration::metrics::{record_fallback_cache_entries, FallbackCacheCounts};
 
 const CACHE_SHARDS: usize = 64;
 const OCCUPANCY_SAMPLE_INTERVAL: u64 = 1024;
@@ -64,41 +62,43 @@ impl<E: Clone> FallbackCache<E> {
         &self,
         batch: RawHydrationBatch<C::Value>,
     ) -> RawHydrationBatch<C::Value> {
-        let mut fresh = 0;
-        let mut stale = 0;
-        let mut not_found = 0;
-        let mut partial = 0;
-        let mut unavailable = 0;
-        let mut resident = 0;
+        let mut counts = FallbackCacheCounts::default();
         let resolved = batch
             .into_hydrated()
             .into_iter()
             .map(|(key, hydrated)| {
                 let hydrated = match hydrated {
                     Hydrated::Found(value) => {
-                        resident += usize::from(self.set::<C>(key, &value));
-                        fresh += 1;
+                        counts.resident += usize::from(self.set::<C>(key, &value));
+                        counts.fresh += 1;
                         Hydrated::Found(value)
                     }
                     Hydrated::NotFound => {
-                        resident += usize::from(self.clear::<C>(key));
-                        not_found += 1;
+                        counts.resident += usize::from(self.clear::<C>(key));
+                        counts.not_found += 1;
                         Hydrated::NotFound
                     }
                     Hydrated::Partial(value) => {
-                        resident +=
-                            usize::from(self.entries.peek(&key).as_ref().is_some_and(C::holds));
-                        partial += 1;
-                        Hydrated::Partial(value)
+                        match self.entries.get(&key).as_ref().and_then(C::get) {
+                            Some(cached) => {
+                                counts.resident += 1;
+                                counts.partial_stale += 1;
+                                Hydrated::Found(cached)
+                            }
+                            None => {
+                                counts.partial += 1;
+                                Hydrated::Partial(value)
+                            }
+                        }
                     }
                     Hydrated::Failed(error) => {
                         match self.entries.get(&key).as_ref().and_then(C::get) {
                             Some(value) => {
-                                stale += 1;
+                                counts.stale += 1;
                                 Hydrated::Found(value)
                             }
                             None => {
-                                unavailable += 1;
+                                counts.unavailable += 1;
                                 Hydrated::Failed(error)
                             }
                         }
@@ -108,21 +108,7 @@ impl<E: Clone> FallbackCache<E> {
             })
             .collect();
 
-        record_fallback_cache_keys(
-            self.cache,
-            C::NAME,
-            fresh,
-            stale,
-            not_found,
-            partial,
-            unavailable,
-        );
-        record_fallback_cache_resident_keys(
-            self.cache,
-            C::NAME,
-            resident,
-            fresh + not_found + partial - resident,
-        );
+        counts.record(self.cache, C::NAME);
         if self
             .resolved_batches
             .fetch_add(1, Ordering::Relaxed)
@@ -293,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_answer_keeps_the_complete_entry_for_a_later_failure() {
+    fn a_partial_answer_takes_the_complete_entry_and_leaves_it() {
         let cache = cache();
         cache.resolve_hydration_batch::<Left>(batch([(1, found("complete"))]));
 
@@ -303,10 +289,7 @@ mod tests {
         )]));
         let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
 
-        assert_eq!(
-            partial.hydrated(&1),
-            Some(&Hydrated::Partial("partial".to_string()))
-        );
+        assert_eq!(partial.hydrated(&1), Some(&found("complete")));
         assert_eq!(later.hydrated(&1), Some(&found("complete")));
     }
 

@@ -67,6 +67,13 @@ pub(crate) fn build_served_log_events(
         .iter()
         .filter(|i| matches!(i.item, Some(feed_item::Item::WhoToFollow(_))))
         .count() as i64;
+    let video_carousel_count: i64 = items
+        .iter()
+        .filter_map(|i| match &i.item {
+            Some(feed_item::Item::VideoCarousel(carousel)) => Some(carousel.videos.len() as i64),
+            _ => None,
+        })
+        .sum();
     let post_count = posts.iter().map(|p| conversation_post_count(p)).sum();
 
     let base = ClientEventParams {
@@ -80,7 +87,13 @@ pub(crate) fn build_served_log_events(
     };
 
     let mut events = Vec::new();
-    events.extend(build_served_events(&base, post_count, ad_count, wtf_count));
+    events.extend(build_served_events(
+        &base,
+        post_count,
+        ad_count,
+        wtf_count,
+        video_carousel_count,
+    ));
     events.extend(build_tweet_type_events(&base, &posts));
     events.extend(build_served_type_events(&base, &posts));
     events.extend(build_video_events(&base, &posts));
@@ -118,6 +131,7 @@ fn build_served_events(
     post_count: i64,
     ad_count: i64,
     wtf_count: i64,
+    video_carousel_count: i64,
 ) -> Vec<LogEvent> {
     vec![
         build_log_event(&ClientEventParams {
@@ -138,6 +152,11 @@ fn build_served_events(
             component: Some("who_to_follow"),
             action: "served_users",
             value: wtf_count,
+            ..*base
+        }),
+        build_log_event(&ClientEventParams {
+            component: Some("video_carousel"),
+            value: video_carousel_count,
             ..*base
         }),
     ]

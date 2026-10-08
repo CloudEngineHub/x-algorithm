@@ -117,6 +117,7 @@ struct Restrictions {
     geo_allow_list: Vec<String>,
     geo_deny_list: Vec<String>,
     takedown_reasons: Vec<TakedownReason>,
+    narrowcast_place_id: Option<u64>,
 }
 
 impl CachedTweetRow {
@@ -138,9 +139,12 @@ impl CachedTweetRow {
             edit_control: _,
             exclusive_conversation_author_id,
             article_id,
+            narrowcast_place_id,
         } = tweet;
-        let restricted =
-            !(geo_allow_list.is_empty() && geo_deny_list.is_empty() && takedown_reasons.is_empty());
+        let restricted = !(geo_allow_list.is_empty()
+            && geo_deny_list.is_empty()
+            && takedown_reasons.is_empty()
+            && narrowcast_place_id.is_none());
         Self {
             has_media: *has_media,
             has_uploaded_media: *has_uploaded_media,
@@ -159,6 +163,7 @@ impl CachedTweetRow {
                     geo_allow_list: geo_allow_list.clone(),
                     geo_deny_list: geo_deny_list.clone(),
                     takedown_reasons: takedown_reasons.clone(),
+                    narrowcast_place_id: *narrowcast_place_id,
                 })
             }),
         }
@@ -169,6 +174,7 @@ impl CachedTweetRow {
             geo_allow_list,
             geo_deny_list,
             takedown_reasons,
+            narrowcast_place_id,
         } = self.restrictions.as_deref().cloned().unwrap_or_default();
         TweetFeatures {
             media: MediaFeature {
@@ -196,6 +202,7 @@ impl CachedTweetRow {
             }),
             exclusive_conversation_author_id: self.exclusive_conversation_author_id.map(read_id),
             article_id: self.article_id,
+            narrowcast_place_id,
         }
     }
 }
@@ -257,6 +264,15 @@ mod tests {
         };
         assert_eq!(CachedTweetRow::new(&circle).features(), circle);
         assert_eq!(size_of::<CachedTweetRow>(), 56);
+    }
+
+    #[test]
+    fn a_cached_row_keeps_the_place_of_a_local_post_with_no_other_restriction() {
+        let local = TweetFeatures {
+            narrowcast_place_id: Some(0xa000_0000_0000_0001),
+            ..Default::default()
+        };
+        assert_eq!(CachedTweetRow::new(&local).features(), local);
     }
 
     #[test]
@@ -325,6 +341,7 @@ mod tests {
             })),
             exclusive_conversation_author_id: Some(7),
             article_id: NonZeroU64::new(8),
+            narrowcast_place_id: Some(0xa000_0000_0000_0001),
         };
 
         let cached = CachedTweetRow::new(&tweet).features();

@@ -10,6 +10,7 @@ mod exclusive_content;
 mod interstitial;
 mod legacy_interstitial;
 mod local_regulations;
+mod local_tweet;
 mod oon_media;
 mod oon_tweet_label;
 mod oon_user_label;
@@ -228,6 +229,7 @@ fn rows() -> Vec<Row> {
         interstitial::rows(),
         legacy_interstitial::rows(),
         local_regulations::rows(),
+        local_tweet::rows(),
         oon_media::rows(),
         oon_tweet_label::rows(),
         oon_user_label::rows(),

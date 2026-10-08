@@ -11,8 +11,8 @@ pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
 pub use tweet::{ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, TweetFeatures};
 pub use verdict::{
-    Decided, DropReason, Evaluation, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, NsfwViewerDropReason, SoftIntervention, TombstoneReason, Verdict,
+    Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
     Withholding,
 };
 pub use viewer::{
@@ -66,6 +66,7 @@ pub struct HydratedTweetCandidate {
     pub conversation_control: Option<ConversationControlFeatures>,
     pub community_moderation: CommunityModeration,
     pub viewer_is_community_moderator: Option<bool>,
+    pub viewer_is_removed_from_community: bool,
     pub article_lifecycle: Option<ArticleLifecycle>,
     pub failed: Hydrators,
 }

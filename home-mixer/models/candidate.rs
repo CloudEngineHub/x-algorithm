@@ -49,6 +49,10 @@ pub struct PostCandidate {
     pub max_video_duration_ms: Option<i32>,
     pub has_photo: Option<bool>,
     pub has_video: Option<bool>,
+    #[serde(default)]
+    pub video_aspect_ratio: Option<f32>,
+    #[serde(default)]
+    pub video_carousel_extra: bool,
     pub media_count: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,
     pub quoted_has_media: Option<bool>,

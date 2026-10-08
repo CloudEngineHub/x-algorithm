@@ -16,7 +16,7 @@ use crate::models::{
 pub(crate) use decode::author::{AuthorFallbackCache, fallback_cache as author_fallback_cache};
 pub(crate) use decode::tweet::{TweetFallbackCache, tweet_fallback_cache};
 pub(crate) use plan::HydrationPlan;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,8 +64,10 @@ pub enum Hydrator {
     ViewerCountry,
     CommunityModeration,
     CommunityModerator,
+    CommunityViewerRemoved,
     ArticleLifecycle,
     TrustedFriends,
+    OutsideNarrowcastPlace,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -145,8 +147,9 @@ impl<'a> HydrationRequest<'a> {
 
 pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
     keys: impl Iterator<Item = K>,
-) -> HashMap<K, usize> {
-    let mut candidate_count_by_key = HashMap::with_capacity(keys.size_hint().0);
+) -> FxHashMap<K, usize> {
+    let mut candidate_count_by_key =
+        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());
     for key in keys {
         *candidate_count_by_key.entry(key).or_default() += 1;
     }
@@ -155,7 +158,7 @@ pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
 
 pub(crate) struct Hydration {
     viewer: ViewerFeatures,
-    tweets: HashMap<TweetId, HydratedTweet>,
+    tweets: FxHashMap<TweetId, HydratedTweet>,
     has_fetched_sources: bool,
 }
 

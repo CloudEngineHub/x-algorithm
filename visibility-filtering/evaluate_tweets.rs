@@ -91,16 +91,18 @@ impl EvaluateTweetsEndpoint {
             })
             .collect();
         let viewer_id = normalize_viewer_id(req.viewer_id);
-        let client_capability = self.client_switches.resolve(
-            twitter_context.as_ref(),
-            viewer_id,
-            req.country_code.as_deref(),
-        );
+        let country_code = twitter_context
+            .as_ref()
+            .map(|context| context.request_country_code.as_str())
+            .filter(|code| !code.is_empty());
+        let client_capability =
+            self.client_switches
+                .resolve(twitter_context.as_ref(), viewer_id, country_code);
         let outcomes = retweet::evaluate_merging_sources(
             &self.filter_tweets,
             FilterRequest {
                 viewer_id,
-                country_code: req.country_code.clone(),
+                country_code: country_code.map(str::to_owned),
                 client_capability,
                 safety_level,
                 candidates,
@@ -128,7 +130,7 @@ impl EvaluateTweetsEndpoint {
         let policies = self.client_switches.limited_actions_policies(
             twitter_context.as_ref(),
             viewer_id,
-            req.country_code.as_deref(),
+            country_code,
             outcomes
                 .iter()
                 .filter_map(|outcome| match outcome.evaluation.verdict() {
@@ -406,7 +408,6 @@ mod tests {
                             quote_context: None,
                         })
                         .to_vec(),
-                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -530,7 +531,6 @@ mod tests {
                         tweet_id: 1,
                         quote_context: None,
                     }],
-                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -592,7 +592,6 @@ mod tests {
                     tweet_id: 4,
                     quote_context: None,
                 }],
-                ..Default::default()
             });
             if let Some(header) = header {
                 request.metadata_mut().insert("twittercontext", header);

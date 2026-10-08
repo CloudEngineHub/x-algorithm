@@ -126,6 +126,12 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
+    pub(super) fn viewer_is_removed_from_community(&self) -> bool {
+        self.reads(Hydrator::CommunityViewerRemoved)
+            .viewer_is_removed_from_community
+    }
+
+    #[inline]
     pub(super) fn article_lifecycle(&self) -> Option<ArticleLifecycle> {
         self.reads(Hydrator::ArticleLifecycle).article_lifecycle
     }

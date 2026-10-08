@@ -39,6 +39,7 @@ AUTHOR_IDS_KEY = "post_embeddings.author_ids"
 POST_SCALES_KEY = "post_embeddings.scales"
 DATASET_RANGES_KEY = "post_embeddings.dataset_ranges"
 TOPIC_BITMAPS_KEY = "post_embeddings.topic_bitmaps"
+MOL_SIDE_TABLE_KEY = "post_embeddings.mol_side_table"
 TOPIC_QUERY_KEY = "topic_query"
 TOPIC_FILTER_MODES = 6
 
@@ -162,6 +163,7 @@ class RetrievalExport:
     max_age_seconds: tuple[float | None, ...] | None = None
     optional_targets: tuple[bool, ...] | None = None
     topic_filter: bool = False
+    mol_side_table_shape: tuple[int, int] | None = None
 
     @property
     def output_names(self) -> list[str]:
@@ -202,6 +204,9 @@ class RetrievalExport:
             query = jax.ShapeDtypeStruct((bs, NUM_TOPIC_INT32S + 1), np.int32)
             inputs.append(("topic_bitmaps", TOPIC_BITMAPS_KEY, bitmaps, "rows"))
             inputs.append(("topic_query", TOPIC_QUERY_KEY, query, "replicated"))
+        if self.mol_side_table_shape is not None:
+            side = jax.ShapeDtypeStruct(self.mol_side_table_shape, np.float32)
+            inputs.append(("weight", MOL_SIDE_TABLE_KEY, side, "replicated"))
         return inputs
 
     @property
@@ -716,6 +721,14 @@ def _make_retrieval_forward_fn(
         by_kind = dict(zip(derived_kinds, derived, strict=True))
         topic_bitmaps, topic_user_bitmasks = topic_inputs(by_kind)
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
+        mol_side_tables = None
+        side_table = by_kind.get("weight")
+        if side_table is not None:
+            components = model_config.mol_item_components
+            mol_side_tables = (
+                jax.numpy.transpose(side_table[:, :components]),
+                jax.numpy.transpose(side_table[:, components:]),
+            )
         results = model.forward(
             batch,
             recsys_embeddings,
@@ -731,6 +744,7 @@ def _make_retrieval_forward_fn(
             use_radix_select_topk=retrieval.use_radix_select_topk,
             post_scales=by_kind.get("post_scales"),
             dataset_capacities=retrieval.dataset_capacities,
+            mol_side_tables=mol_side_tables,
         )
         flat: list[jax.Array] = []
         for indices, scores in results:
@@ -976,6 +990,15 @@ def _retrieval_export(
             f"{dataset_types_rows}; the retrieval forward needs them to agree, so max_posts "
             "must be a multiple of training_ep"
         )
+    side_table = getattr(post_embeddings, "mol_side_table", None)
+    mol_side_table_shape = None
+    if side_table is not None:
+        mol_side_table_shape = (int(side_table.x.shape[0]), int(side_table.x.shape[1]))
+        if mol_side_table_shape[0] != int(table.shape[0]):
+            raise ValueError(
+                f"MoL side table has {mol_side_table_shape[0]} rows but the post table has "
+                f"{int(table.shape[0])}; the serving forward slices both per shard"
+            )
     return RetrievalExport(
         large_k=large_k,
         target_dataset_types=tuple((ds.name, int(ds.value)) for ds in datasets),
@@ -991,6 +1014,7 @@ def _retrieval_export(
         max_age_seconds=_split_max_age(runner, datasets) if split_home else None,
         optional_targets=_split_optional(runner, datasets) if split_home else None,
         topic_filter=topic_filter,
+        mol_side_table_shape=mol_side_table_shape,
     )
 
 

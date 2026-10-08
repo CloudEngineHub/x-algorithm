@@ -2,6 +2,7 @@ use crate::clients::about_this_account_client::ProdAboutThisAccountClient;
 use crate::clients::article_client::ProdArticleClient;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::clients::trusted_friends_client::ProdTrustedFriendsClient;
+use crate::clients::user_location_client::ProdUserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
 use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
@@ -50,6 +51,13 @@ const READINESS_PROBE_PORT: u16 = 8081;
 pub(crate) const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
 const CLIENT_INIT_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const CLIENT_INIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) fn with_metadata(strato: StratoGrpc, metadata: Option<&MetadataMap>) -> StratoGrpc {
+    match metadata {
+        Some(metadata) => strato.with_default_metadata(metadata.clone()),
+        None => strato,
+    }
+}
 
 pub(crate) async fn init_client_with_retry<T, E, Fut>(
     client: &str,
@@ -117,7 +125,7 @@ pub(crate) struct ServerDeps {
     clippy::expect_used,
     reason = "startup fail-fast: init failure is fatal"
 )]
-pub(crate) async fn build(datacenter: &str) -> ServerDeps {
+pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> ServerDeps {
     info!("Initializing prod clients for datacenter={}", datacenter);
 
     let (limited_actions_copy, copy_drift) = LimitedActionsCopy::load_baked(
@@ -138,7 +146,7 @@ pub(crate) async fn build(datacenter: &str) -> ServerDeps {
         deterministic_aperture,
         author_cache,
         tweet_cache,
-        None,
+        metadata,
     )
     .await;
     let stats = xai_stats_receiver::global_stats_receiver();
@@ -277,6 +285,7 @@ pub(crate) async fn prod_sources(
                     &S2S_CRT_PATH,
                     &S2S_KEY_PATH,
                     deterministic_aperture,
+                    metadata.cloned(),
                 )
             })
             .await
@@ -299,13 +308,7 @@ pub(crate) async fn prod_sources(
             zone: datacenter.to_string(),
             ..Default::default()
         };
-        async move {
-            let strato = StratoGrpc::new(config).await?;
-            anyhow::Ok(match metadata {
-                Some(metadata) => strato.with_default_metadata(metadata.clone()),
-                None => strato,
-            })
-        }
+        async move { anyhow::Ok(with_metadata(StratoGrpc::new(config).await?, metadata)) }
     })
     .await
     .expect("Failed to initialize the stratoserver client");
@@ -314,6 +317,7 @@ pub(crate) async fn prod_sources(
     };
     let about_this_account_client = Arc::new(ProdAboutThisAccountClient::new(stratoserver.clone()));
     let trusted_friends_client = Arc::new(ProdTrustedFriendsClient::new(stratoserver.clone()));
+    let user_location_client = Arc::new(ProdUserLocationClient::new(stratoserver.clone()));
     let article_client = Arc::new(ProdArticleClient::new(stratoserver));
 
     let wingman_client = Arc::new(
@@ -376,7 +380,8 @@ pub(crate) async fn prod_sources(
     warm_cache(&twemcache).await;
     warm_manhattan(mh_label_client.as_ref()).await;
 
-    let cache_warmer = build_cache_warmer(datacenter, init_deadline, deterministic_aperture).await;
+    let cache_warmer =
+        build_cache_warmer(datacenter, init_deadline, deterministic_aperture, metadata).await;
 
     let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
     let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
@@ -402,6 +407,7 @@ pub(crate) async fn prod_sources(
         wingman_client,
         article_client,
         trusted_friends_client,
+        user_location_client,
         Arc::clone(&safety_label_source),
         communities,
         author_cache,
@@ -420,6 +426,7 @@ async fn build_cache_warmer(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
     deterministic_aperture: bool,
+    metadata: Option<&MetadataMap>,
 ) -> Option<Arc<dyn Warmer>> {
     if !crate::config::cache_warm_enabled() {
         return None;
@@ -443,7 +450,7 @@ async fn build_cache_warmer(
             zone: datacenter.to_string(),
             ..Default::default()
         };
-        async move { StratoGrpc::new(config).await.map_err(|e| e.to_string()) }
+        async move { anyhow::Ok(with_metadata(StratoGrpc::new(config).await?, metadata)) }
     })
     .await
     .expect("Failed to initialize Strato cache-warm client");

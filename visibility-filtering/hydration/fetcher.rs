@@ -1,10 +1,10 @@
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
 use crate::hydration::Cause;
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 
 pub(super) struct Fetcher<V> {
-    states: HashMap<u64, State<V>>,
+    states: FxHashMap<u64, State<V>>,
 }
 
 enum State<V> {
@@ -24,7 +24,7 @@ impl<V> State<V> {
 impl<V> Default for Fetcher<V> {
     fn default() -> Self {
         Self {
-            states: HashMap::new(),
+            states: FxHashMap::default(),
         }
     }
 }
@@ -114,7 +114,7 @@ mod tests {
         let keys = fetcher.claim(vec![1, 2, 3, 4, 5]);
         fetcher.land(
             &keys[..4],
-            HydrationBatch::from_hydrated(HashMap::from([
+            HydrationBatch::from_hydrated(FxHashMap::from_iter([
                 (1, Hydrated::Found(7)),
                 (2, Hydrated::NotFound),
                 (3, Hydrated::Partial(7)),
@@ -138,7 +138,7 @@ mod tests {
         let keys = fetcher.claim(vec![1, 2]);
         fetcher.land(
             &keys,
-            HydrationBatch::from_hydrated(HashMap::from([(1, Hydrated::Found(7))])),
+            HydrationBatch::from_hydrated(FxHashMap::from_iter([(1, Hydrated::Found(7))])),
         );
     }
 }

@@ -17,7 +17,12 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Serve(ServeArgs),
+    Serve {
+        #[command(flatten)]
+        serve: ServeArgs,
+        #[arg(long)]
+        test_users: bool,
+    },
     Capture {
         #[arg(long)]
         test_users: bool,
@@ -30,7 +35,10 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
-        Command::Serve(serve) => server::serve::<StagingServer>(serve).await,
+        Command::Serve { serve, test_users } => {
+            server::serve::<StagingServer>(serve, test_users.then(capture::test_users_metadata))
+                .await
+        }
         Command::Capture {
             test_users,
             fixtures,

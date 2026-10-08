@@ -5,7 +5,7 @@ use crate::models::{
     MediaRestriction, NsfwViewerDropReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport,
     ViewerProfile,
 };
-use crate::params::CountryList;
+use crate::params::{CountryList, LimitedActionType};
 use crate::rules::context::CoreFacts;
 use crate::rules::RuleContext;
 use std::ops::Not;
@@ -38,6 +38,7 @@ pub(super) enum RuleId {
     FosnrAbuseInsults,
     FosnrAbuseInsultsNonFollower,
     FosnrAbuseInsultsFollower,
+    FosnrAuthor,
     FosnrFallback,
     NullcastedTweet,
     StaleTweet,
@@ -100,6 +101,8 @@ pub(super) enum RuleId {
     LimitRepliesVerified,
     LimitRepliesMyNetwork,
     LimitRepliesCo,
+    CommunityTweetViewerRemoved,
+    LocalTweet,
     ReadOnlyViewer,
 }
 
@@ -176,6 +179,7 @@ impl RuleClause {
                 };
                 ("soft_intervention", Some(policy), None)
             }
+            ActionSpec::Appealable(_) => ("appealable", None, None),
         };
         let keeps_reason = matches!(self.action, ActionSpec::SoftIntervention { .. });
         let squashed = |name: &str| name.replace('_', "");
@@ -223,6 +227,14 @@ pub(super) fn except_author(
     Clause {
         when: when.into_iter().collect(),
         applies_to: Audience::ExceptAuthor,
+        action,
+    }
+}
+
+pub(super) fn only_author(when: impl IntoIterator<Item = Condition>, action: ActionSpec) -> Clause {
+    Clause {
+        when: when.into_iter().collect(),
+        applies_to: Audience::OnlyAuthor,
         action,
     }
 }
@@ -371,6 +383,7 @@ pub(super) enum TweetPredicate {
     HasArticle,
     ArticleIsPublished,
     HasConversationControl(ConversationControlArm),
+    HasNarrowcastPlace,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -400,6 +413,7 @@ pub(super) enum ViewerPredicate {
     ClientVerifyBlurSupportIs(VerifyBlurSupport),
     ClientHasModernBlur,
     ClientHasStaleTweetLimits,
+    ClientHasCommunityViewerRemovedLimits,
     ClientBlursGoreIgnoringSettings,
     ClientHasFosnrRules,
     ClientNeedsFosnrFallbackDrops,
@@ -429,7 +443,9 @@ pub(super) enum RelationshipPredicate {
     ViewerIsBlockedByConversationRootAuthor,
     ViewerIsInAllowedCountry,
     ViewerIsCommunityModerator,
+    ViewerIsRemovedFromCommunity,
     ViewerIsTrustedFriendsListMemberOrOwner,
+    ViewerIsOutsideNarrowcastPlace,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -437,6 +453,15 @@ pub(super) enum RelationshipPredicate {
 pub(super) enum Audience {
     Everyone,
     ExceptAuthor,
+    OnlyAuthor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FosnrViolation {
+    pub(super) label: SafetyLabelType,
+    pub(super) policy: AppealablePolicy,
+    pub(super) level: i8,
+    pub(super) limited_actions: &'static [LimitedActionType],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -450,6 +475,7 @@ pub(super) enum ActionSpec {
         level: i8,
     },
     LimitedEngagement(LimitedEngagementReason),
+    Appealable(&'static [FosnrViolation]),
 }
 
 pub(super) fn drop_post(reason: FilteredReason) -> ActionSpec {
@@ -480,6 +506,10 @@ pub(super) fn soft_intervention(
     }
 }
 
+pub(super) const fn appealable(violations: &'static [FosnrViolation]) -> ActionSpec {
+    ActionSpec::Appealable(violations)
+}
+
 pub(super) fn blur(reason: InterstitialReason) -> ActionSpec {
     media_interstitial(reason, None)
 }
@@ -505,6 +535,7 @@ pub(super) const LEGACY_NSFW_INTERSTITIAL: ActionSpec =
 impl ActionSpec {
     pub(super) const fn severity(&self) -> u8 {
         match self {
+            Self::Appealable(_) => 18,
             Self::Drop(_) => 17,
             Self::Tombstone(_) => 16,
             Self::MediaRestriction(_) => 10,
@@ -644,6 +675,7 @@ impl Audience {
         match self {
             Audience::Everyone => true,
             Audience::ExceptAuthor => !facts.is_author_viewer(),
+            Audience::OnlyAuthor => facts.is_author_viewer(),
         }
     }
 }
@@ -738,6 +770,9 @@ macro_rules! predicates {
     (@read $context:ident ViewerCountry) => { $context.viewer_country() };
     (@read $context:ident CommunityModeration) => { $context.community_moderation() };
     (@read $context:ident CommunityModerator) => { $context.viewer_is_community_moderator() };
+    (@read $context:ident CommunityViewerRemoved) => {
+        $context.viewer_is_removed_from_community()
+    };
     (@read $context:ident ArticleLifecycle) => { $context.article_lifecycle() };
     (@read $context:ident $edge:ident) => {{
         const { assert!(Hydrator::$edge.is_edge()) };
@@ -774,6 +809,7 @@ predicates! {
             => |_, lifecycle| lifecycle == Some(ArticleLifecycle::Published),
         HasConversationControl(arm) reads ConversationControl
             => |_, control| control.is_some_and(|control| control.arm == arm),
+        HasNarrowcastPlace reads Tweet => |_, tweet| tweet.narrowcast_place_id.is_some(),
     }
 
     AuthorPredicate {
@@ -814,6 +850,8 @@ predicates! {
         ClientHasModernBlur reads () => |facts, ()| facts.client_capability().modern_blur,
         ClientHasStaleTweetLimits reads ()
             => |facts, ()| facts.client_capability().stale_tweet_limits,
+        ClientHasCommunityViewerRemovedLimits reads ()
+            => |facts, ()| facts.client_capability().community_viewer_removed_limits,
         ClientBlursGoreIgnoringSettings reads ()
             => |facts, ()| facts.client_capability().gore_blur_ignores_settings,
         ClientHasFosnrRules reads () => |facts, ()| facts.client_capability().fosnr_rules,
@@ -865,7 +903,9 @@ predicates! {
             },
         ViewerIsCommunityModerator reads CommunityModerator
             => |facts, is_moderator| facts.viewer_id().is_some() && is_moderator.unwrap_or(true),
+        ViewerIsRemovedFromCommunity reads CommunityViewerRemoved => |_, removed| removed,
         ViewerIsTrustedFriendsListMemberOrOwner reads TrustedFriends => |_, holds| holds,
+        ViewerIsOutsideNarrowcastPlace reads OutsideNarrowcastPlace => |_, outside| outside,
     }
 }
 
@@ -1094,6 +1134,7 @@ mod tests {
                 verify_blur_support: Some(IosNeedsUpdate),
                 modern_blur: true,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: true,
                 gore_blur_ignores_settings: true,
                 fosnr_rules: true,
                 fosnr_fallback_drops: true,
@@ -1109,9 +1150,15 @@ mod tests {
             let check = Predicate::Viewer(ViewerPredicate::ClientVerifyBlurSupportIs(support));
             assert_eq!(check.truth(&context), expected, "{support:?}");
         }
-        assert_eq!(
-            Predicate::Viewer(ViewerPredicate::ClientHasModernBlur).truth(&context),
-            Truth::True
-        );
+        for check in [
+            ViewerPredicate::ClientHasModernBlur,
+            ViewerPredicate::ClientHasCommunityViewerRemovedLimits,
+        ] {
+            assert_eq!(
+                Predicate::Viewer(check).truth(&context),
+                Truth::True,
+                "{check:?}"
+            );
+        }
     }
 }

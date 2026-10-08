@@ -11,12 +11,13 @@ use crate::hydration::{
     Hydrator, Hydrators, Lookup, Unresolved,
 };
 use crate::models::{
-    ArticleLifecycle, AuthorId, CommunityModeration, ConversationControlFeatures,
+    ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, ConversationControlFeatures,
     HydratedTweetCandidate, PureCore, RawCandidate, SafetyLabelMap, TweetFeatures, TweetId, Viewer,
     ViewerFeatures,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +40,7 @@ pub(super) struct CallRequest<'p> {
     pub(super) community_posts: Vec<CommunityPost>,
     pub(super) viewer_id: Option<u64>,
     pub(super) batch_size: Option<usize>,
-    pub(super) candidate_count_by_claimed_key: HashMap<u64, usize>,
+    pub(super) candidate_count_by_claimed_key: FxHashMap<u64, usize>,
 }
 
 fn claimed<'a>(keys: &'a [u64], queries: &'a [EdgeQuery]) -> impl Iterator<Item = u64> + 'a {
@@ -56,6 +57,7 @@ pub(super) enum Landing {
 #[derive(Default)]
 pub(super) struct Store {
     viewer_id: Option<u64>,
+    client_capability: ClientCapability,
     request_tweets: Vec<RequestTweet>,
     requested: usize,
     is_expanding_retweet_sources: bool,
@@ -71,6 +73,7 @@ pub(super) struct Store {
     viewer_country: Fetcher<Arc<str>>,
     community_moderations: Fetcher<CommunityModeration>,
     community_moderators: Fetcher<bool>,
+    community_viewer_removals: Fetcher<bool>,
     article_lifecycles: Fetcher<ArticleLifecycle>,
     pub(super) core_elapsed: Duration,
     pub(super) tweets_elapsed: Option<Duration>,
@@ -80,11 +83,13 @@ impl Store {
     pub(super) fn new(
         plan: &HydrationPlan,
         viewer_id: Option<u64>,
+        client_capability: ClientCapability,
         raw: &[RawCandidate],
         is_expanding_retweet_sources: bool,
     ) -> Self {
         Self {
             viewer_id,
+            client_capability,
             requested: raw.len(),
             is_expanding_retweet_sources,
             request_tweets: raw
@@ -173,10 +178,24 @@ impl Store {
                         .is_some_and(|moderation| moderation.is_moderated())
                 })
                 .map(|post| post.community_id),
+            KeyOrigin::TweetCommunity => self
+                .viewer_id
+                .filter(|_| self.client_capability.community_viewer_removed_limits)
+                .and(
+                    self.tweets
+                        .get(request_tweet.tweet_id.0)?
+                        .community_id
+                        .map(NonZeroU64::get),
+                ),
             KeyOrigin::TrustedFriendsList => {
                 self.tweets
                     .get(request_tweet.tweet_id.0)?
                     .trusted_friends_list_id
+            }
+            KeyOrigin::NarrowcastPlace => {
+                self.tweets
+                    .get(request_tweet.tweet_id.0)?
+                    .narrowcast_place_id
             }
         }
     }
@@ -233,7 +252,9 @@ impl Store {
                 | KeyOrigin::MyNetworkRootNotFollowingViewer
                 | KeyOrigin::CommunityPost
                 | KeyOrigin::ModeratedCommunity
-                | KeyOrigin::TrustedFriendsList => keys.extend(
+                | KeyOrigin::TweetCommunity
+                | KeyOrigin::TrustedFriendsList
+                | KeyOrigin::NarrowcastPlace => keys.extend(
                     self.request_tweets
                         .iter()
                         .filter_map(|request_tweet| self.key(origin, request_tweet)),
@@ -281,8 +302,9 @@ impl Store {
             Source::ViewerCountry => &self.viewer_country,
             Source::CommunityModeration => &self.community_moderations,
             Source::CommunityModerator => &self.community_moderators,
+            Source::CommunityViewerRemoved => &self.community_viewer_removals,
             Source::ArticleLifecycle => &self.article_lifecycles,
-            Source::Flock | Source::Wingman | Source::TrustedFriends => {
+            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
                 self.edge_fetcher(node.edge()?)?
             }
         };
@@ -300,15 +322,16 @@ impl Store {
             Source::ViewerCountry => &mut self.viewer_country,
             Source::CommunityModeration => &mut self.community_moderations,
             Source::CommunityModerator => &mut self.community_moderators,
+            Source::CommunityViewerRemoved => &mut self.community_viewer_removals,
             Source::ArticleLifecycle => &mut self.article_lifecycles,
-            Source::Flock | Source::Wingman | Source::TrustedFriends => {
+            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
                 self.edge_fetcher_mut(node.edge()?)?
             }
         };
         Some(fetcher)
     }
 
-    fn candidate_count_by_key(&self, nodes: Hydrators) -> HashMap<u64, usize> {
+    fn candidate_count_by_key(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
         match nodes.iter().next().map(|node| node.spec().key) {
             Some(KeyOrigin::RequestTweets) => {
                 return candidate_count_by_key(
@@ -334,7 +357,9 @@ impl Store {
                 | KeyOrigin::MyNetworkRootNotFollowingViewer
                 | KeyOrigin::CommunityPost
                 | KeyOrigin::ModeratedCommunity
-                | KeyOrigin::TrustedFriendsList,
+                | KeyOrigin::TweetCommunity
+                | KeyOrigin::TrustedFriendsList
+                | KeyOrigin::NarrowcastPlace,
             )
             | None => {}
         }
@@ -342,7 +367,7 @@ impl Store {
             .iter()
             .next()
             .is_some_and(|node| node.input() == Some(Hydrator::Tweet));
-        let mut counts = HashMap::new();
+        let mut counts = FxHashMap::default();
         for request_tweet in self
             .request_tweets
             .iter()
@@ -399,8 +424,10 @@ impl Store {
             | Source::ViewerCountry
             | Source::Wingman
             | Source::CommunityModerator
+            | Source::CommunityViewerRemoved
             | Source::ArticleLifecycle
-            | Source::TrustedFriends => Vec::new(),
+            | Source::TrustedFriends
+            | Source::UserLocation => Vec::new(),
         };
         if let Some(has_called) = self.has_called.get_mut(group.position) {
             *has_called = true;
@@ -424,12 +451,16 @@ impl Store {
 
     fn batch_size(&self, group: &Group, is_first: bool, key_count: usize) -> Option<usize> {
         let size = match group.source {
-            Source::TesTweet | Source::GizmoduckViewer | Source::ViewerCountry => return None,
+            Source::TesTweet
+            | Source::GizmoduckViewer
+            | Source::ViewerCountry
+            | Source::UserLocation => return None,
             Source::TesPureCore
             | Source::TesConversationControl
             | Source::GizmoduckAuthor
             | Source::CommunityModeration
             | Source::CommunityModerator
+            | Source::CommunityViewerRemoved
             | Source::ArticleLifecycle
             | Source::TrustedFriends => key_count,
             _ if !is_first => key_count,
@@ -504,13 +535,16 @@ impl Store {
             Reply::CommunityModerators(moderators) => {
                 self.community_moderators.land(keys, moderators);
             }
+            Reply::CommunityViewerRemovals(removals) => {
+                self.community_viewer_removals.land(keys, removals);
+            }
             Reply::ArticleLifecycles(lifecycles) => self.article_lifecycles.land(keys, lifecycles),
         }
         Landing::Answered
     }
 
     fn join_retweet_sources(&mut self) {
-        let mut known: HashSet<TweetId> = self
+        let mut known: FxHashSet<TweetId> = self
             .request_tweets
             .iter()
             .map(|request_tweet| request_tweet.tweet_id)
@@ -543,15 +577,15 @@ impl Store {
             })
             .fold(Hydrators::empty(), Hydrators::with);
         let mut unclaimed = Vec::new();
-        let mut tweet_misses: HashMap<TweetId, Option<Cause>> =
-            HashMap::with_capacity(self.request_tweets.len());
+        let mut tweet_misses: FxHashMap<TweetId, Option<Cause>> =
+            FxHashMap::with_capacity_and_hasher(self.request_tweets.len(), Default::default());
         for request_tweet in &self.request_tweets {
             if let Entry::Vacant(entry) = tweet_misses.entry(request_tweet.tweet_id) {
                 entry.insert(self.tweet_miss(request_tweet.tweet_id, &mut unclaimed));
             }
         }
-        let mut tweets: HashMap<TweetId, HydratedTweet> =
-            HashMap::with_capacity(self.request_tweets.len());
+        let mut tweets: FxHashMap<TweetId, HydratedTweet> =
+            FxHashMap::with_capacity_and_hasher(self.request_tweets.len(), Default::default());
         for request_tweet in &self.request_tweets {
             if let Entry::Vacant(entry) = tweets.entry(request_tweet.tweet_id) {
                 entry.insert(self.hydrated_tweet(
@@ -601,7 +635,7 @@ impl Store {
     fn hydrated_tweet(
         &self,
         request_tweet: &RequestTweet,
-        tweet_misses: &HashMap<TweetId, Option<Cause>>,
+        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
         incomplete: Hydrators,
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> HydratedTweet {
@@ -627,7 +661,7 @@ impl Store {
     fn resolve(
         &self,
         request_tweet: &RequestTweet,
-        tweet_misses: &HashMap<TweetId, Option<Cause>>,
+        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
     ) -> Result<AuthorId, Unresolved> {
         let tweet = |cause| Unresolved {
             lookup: Lookup::Tweet,
@@ -659,7 +693,7 @@ impl Store {
     fn shared_misses(
         &self,
         tweet_id: TweetId,
-        tweet_misses: &HashMap<TweetId, Option<Cause>>,
+        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
     ) -> Option<(Option<Cause>, Option<Cause>)> {
         let core = self
             .pure_cores
@@ -814,6 +848,11 @@ impl Store {
                 .key(KeyOrigin::ModeratedCommunity, request_tweet)
                 .and_then(|community_id| self.community_moderators.get(community_id))
                 .copied(),
+            viewer_is_removed_from_community: self
+                .key(KeyOrigin::TweetCommunity, request_tweet)
+                .and_then(|community_id| self.community_viewer_removals.get(community_id))
+                .copied()
+                .unwrap_or_default(),
             article_lifecycle: self
                 .key(KeyOrigin::TweetArticle, request_tweet)
                 .and_then(|article_id| self.article_lifecycles.get(article_id))
@@ -859,7 +898,7 @@ mod tests {
                 request_author_id: author,
             });
         let plan = HydrationPlan::new(SafetyLevel::FilterAll, Hydrators::empty());
-        let mut store = Store::new(&plan, None, &raw, false);
+        let mut store = Store::new(&plan, None, ClientCapability::default(), &raw, false);
         let group = plan.groups().next().unwrap();
         let call = store
             .offer(group)
@@ -887,7 +926,7 @@ mod tests {
             request_author_id: None,
         }];
         let plan = HydrationPlan::new(SafetyLevel::FilterAll, Hydrators::empty());
-        let mut store = Store::new(&plan, None, &raw, true);
+        let mut store = Store::new(&plan, None, ClientCapability::default(), &raw, true);
         let call = store.offer(plan.groups().next().unwrap()).unwrap();
         let retweet = PureCore {
             author_id: AuthorId(10),
@@ -912,5 +951,49 @@ mod tests {
             unclaimed_keys_by_label(unclaimed),
             HashMap::from([(Hydrator::PureCore.spec().label, 1)])
         );
+    }
+
+    #[test]
+    fn a_level_82_batch_with_no_community_post_offers_no_is_removed_call() {
+        use crate::rules::RuleEngine;
+
+        let is_removed_keys = |community_id: Option<NonZeroU64>, has_limits: bool| {
+            let engine = RuleEngine::for_tests();
+            let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
+            let raw = [RawCandidate {
+                tweet_id: TweetId(1),
+                request_author_id: Some(10),
+            }];
+            let client = ClientCapability {
+                community_viewer_removed_limits: has_limits,
+                ..ClientCapability::default()
+            };
+            let mut store = Store::new(plan, Some(99), client, &raw, false);
+            let tweet = plan
+                .groups()
+                .find(|group| group.source == Source::TesTweet)
+                .expect("level 82 plans tes tweets");
+            let call = store.offer(tweet).expect("tweet ids are keys");
+            let tweets = HydrationBatch::from_results(
+                [1],
+                HashMap::from([(
+                    1,
+                    Ok::<_, ()>(Some(TweetFeatures {
+                        community_id,
+                        ..Default::default()
+                    })),
+                )]),
+            );
+            store.land(&call, Reply::Tweets(tweets), Duration::ZERO);
+            let removed = plan
+                .groups()
+                .find(|group| group.source == Source::CommunityViewerRemoved)
+                .expect("level 82 plans is_removed");
+            store.offer(removed).map(|call| call.keys)
+        };
+
+        assert_eq!(is_removed_keys(None, true), None);
+        assert_eq!(is_removed_keys(NonZeroU64::new(500), true), Some(vec![500]));
+        assert_eq!(is_removed_keys(NonZeroU64::new(500), false), None);
     }
 }

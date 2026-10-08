@@ -182,8 +182,9 @@ pub(super) async fn build(
     init_deadline: Instant,
     filter_tweets: &Arc<FilterTweets>,
     client_switches: ClientSwitches,
+    metadata: Option<&MetadataMap>,
 ) -> Arc<TweetypieReference> {
-    let tweetypie = connect(init_deadline, None).await;
+    let tweetypie = connect(init_deadline, metadata).await;
     warn!("reference comparator: tweetypie enabled");
     Arc::new(TweetypieReference {
         tweetypie,
@@ -260,6 +261,7 @@ pub(crate) enum Client {
     IosOutdated,
     AndroidCurrent,
     AndroidOutdated,
+    AndroidWithoutFosnr,
     MacApp,
 }
 
@@ -289,6 +291,13 @@ impl Client {
                      (Google;panther;google;panther;0;;1;2022)",
                 ),
             ),
+            Self::AndroidWithoutFosnr => (
+                258_901,
+                Some(
+                    "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
             Self::MacApp => (
                 557_701,
                 Some("Twitter-Mac/11.11.5 macOS/14.0 (Apple;Mac14,2)"),
@@ -298,12 +307,12 @@ impl Client {
 
     pub(crate) fn context(
         self,
-        viewer_id: u64,
+        viewer_id: Option<u64>,
         country_code: Option<&str>,
     ) -> TwitterContextViewer {
         let (client_application_id, user_agent) = self.app();
         TwitterContextViewer {
-            user_id: viewer_id.cast_signed(),
+            user_id: viewer_id.map_or(0, u64::cast_signed),
             client_application_id,
             user_agent: user_agent.unwrap_or_default().to_string(),
             request_country_code: country_code.unwrap_or_default().to_string(),
@@ -376,7 +385,7 @@ impl TweetypieReference {
                 request_author_id: None,
             })
             .collect();
-        let client = Client::Web.context(viewer_id, country_code.as_deref());
+        let client = Client::Web.context(Some(viewer_id), country_code.as_deref());
         let client_capability =
             self.client_switches
                 .resolve(Some(&client), Some(viewer_id), country_code.as_deref());
@@ -463,7 +472,7 @@ pub(crate) async fn get_tweet_fields(
     tweet_ids: &[TweetId],
 ) -> Vec<TpResult> {
     let view = GetTweetFieldsOptions {
-        for_user_id: Some(client.user_id),
+        for_user_id: Some(client.user_id).filter(|&user_id| user_id != 0),
         language_tag: Some("en"),
         safety_level: ThriftSafetyLevel::TIMELINE_HOME_HYDRATION,
         visibility_policy: VISIBILITY_POLICY_USER_VISIBLE,
@@ -825,7 +834,11 @@ mod tests {
                 .find(|class| name == class.name)
                 .unwrap_or_else(|| panic!("no client class named {name}"));
             assert_eq!(
-                switches.resolve(Some(&client.context(1, Some("fr"))), Some(1), Some("fr")),
+                switches.resolve(
+                    Some(&client.context(Some(1), Some("fr"))),
+                    Some(1),
+                    Some("fr")
+                ),
                 class.capability,
                 "{name}"
             );

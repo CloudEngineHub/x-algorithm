@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ struct KeyedResultCounts {
 
 impl KeyedResultCounts {
     fn from_batch<K, V>(
-        candidate_count_by_claimed_key: &HashMap<K, usize>,
+        candidate_count_by_claimed_key: &FxHashMap<K, usize>,
         batches: &impl AsRef<[HydrationBatch<K, V>]>,
     ) -> Self
     where
@@ -98,7 +98,7 @@ pub(crate) fn record_keyed_hydrator_request<K, V>(
     client: &str,
     method: &str,
     safety_level: SafetyLevel,
-    candidate_count_by_claimed_key: &HashMap<K, usize>,
+    candidate_count_by_claimed_key: &FxHashMap<K, usize>,
     answer: &impl AsRef<[HydrationBatch<K, V>]>,
     latency_ms: f64,
 ) where
@@ -270,42 +270,36 @@ pub(crate) fn record_unasked_keys(client: &str, method: &str, keys: usize) {
     );
 }
 
-pub(crate) fn record_fallback_cache_keys(
-    cache: &'static str,
-    column: &'static str,
-    fresh: usize,
-    stale: usize,
-    not_found: usize,
-    partial: usize,
-    unavailable: usize,
-) {
-    for (result, count) in [
-        ("fresh", fresh),
-        ("stale", stale),
-        ("not_found", not_found),
-        ("partial", partial),
-        ("unavailable", unavailable),
-    ] {
-        incr_nonzero(
-            FALLBACK_CACHE_KEYS,
-            &[("cache", cache), ("column", column), ("result", result)],
-            count as u64,
-        );
-    }
+#[derive(Default)]
+pub(crate) struct FallbackCacheCounts {
+    pub(crate) fresh: usize,
+    pub(crate) stale: usize,
+    pub(crate) not_found: usize,
+    pub(crate) partial: usize,
+    pub(crate) partial_stale: usize,
+    pub(crate) unavailable: usize,
+    pub(crate) resident: usize,
 }
 
-pub(crate) fn record_fallback_cache_resident_keys(
-    cache: &'static str,
-    column: &'static str,
-    resident: usize,
-    absent: usize,
-) {
-    for (result, count) in [("resident", resident), ("absent", absent)] {
-        incr_nonzero(
-            FALLBACK_CACHE_RESIDENT_KEYS,
-            &[("cache", cache), ("column", column), ("result", result)],
-            count as u64,
-        );
+impl FallbackCacheCounts {
+    pub(crate) fn record(&self, cache: &'static str, column: &'static str) {
+        let live = self.fresh + self.not_found + self.partial + self.partial_stale;
+        for (metric, result, count) in [
+            (FALLBACK_CACHE_KEYS, "fresh", self.fresh),
+            (FALLBACK_CACHE_KEYS, "stale", self.stale),
+            (FALLBACK_CACHE_KEYS, "not_found", self.not_found),
+            (FALLBACK_CACHE_KEYS, "partial", self.partial),
+            (FALLBACK_CACHE_KEYS, "partial_stale", self.partial_stale),
+            (FALLBACK_CACHE_KEYS, "unavailable", self.unavailable),
+            (FALLBACK_CACHE_RESIDENT_KEYS, "resident", self.resident),
+            (FALLBACK_CACHE_RESIDENT_KEYS, "absent", live - self.resident),
+        ] {
+            incr_nonzero(
+                metric,
+                &[("cache", cache), ("column", column), ("result", result)],
+                count as u64,
+            );
+        }
     }
 }
 
@@ -342,8 +336,9 @@ mod tests {
     use crate::hydration::execute::Reply;
     use crate::hydration::plan::Source;
     use crate::hydration::store::Store;
-    use crate::models::{RawCandidate, TweetFeatures, TweetId};
+    use crate::models::{ClientCapability, RawCandidate, TweetFeatures, TweetId};
     use crate::rules::RuleEngine;
+    use std::collections::HashMap;
     use xai_x_rpc::WithBudget;
 
     #[test]
@@ -395,7 +390,7 @@ mod tests {
 
     #[test]
     fn partial_keys_make_a_partial_call_and_a_failed_one_key_call_is_an_error() {
-        use crate::hydration::decode::author::decode_authors;
+        use crate::hydration::decode::author::author_batch;
         use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
         let user = |state| {
             Ok::<_, ()>(Some(GizmoduckUserResult {
@@ -409,9 +404,9 @@ mod tests {
                 .map(|&(author, state)| (author, user(state)))
                 .collect::<HashMap<_, _>>();
             let expected: Vec<u64> = results.keys().copied().collect();
-            decode_authors(HydrationBatch::from_results(expected, results))
+            author_batch(HydrationBatch::from_results(expected, results))
         };
-        let counts = HashMap::from([(10, 1), (20, 2)]);
+        let counts = FxHashMap::from_iter([(10, 1), (20, 2)]);
 
         let one_partial = KeyedResultCounts::from_batch(
             &counts,
@@ -442,14 +437,14 @@ mod tests {
             [50],
             HashMap::from([(50, Err::<Option<u8>, _>("gizmoduck unavailable"))]),
         );
-        let viewer = KeyedResultCounts::from_batch(&HashMap::from([(50, 1)]), &viewer);
+        let viewer = KeyedResultCounts::from_batch(&FxHashMap::from_iter([(50, 1)]), &viewer);
         assert_eq!((viewer.error_keys, viewer.error_candidates), (1, 1));
         assert_eq!(viewer.outcome(), HydratorOutcome::Error);
     }
 
     #[test]
     fn from_batch_counts_not_found_as_success_and_missing_as_error() {
-        let expected = HashMap::from([(1, 1), (2, 2), (3, 3), (4, 4)]);
+        let expected = FxHashMap::from_iter([(1, 1), (2, 2), (3, 3), (4, 4)]);
         let batch: HydrationBatch<u64, u8> = HydrationBatch::from_results(
             [1, 2, 3, 4],
             HashMap::from([(1, Ok(Some(7))), (2, Ok(None)), (3, Err("boom"))]),
@@ -466,7 +461,7 @@ mod tests {
 
     #[test]
     fn from_batch_counts_timeout_keys() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
+        let expected = FxHashMap::from_iter([(1, 2), (2, 3)]);
         let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([1, 2]);
 
         let counts = KeyedResultCounts::from_batch(&expected, &batch);
@@ -484,7 +479,7 @@ mod tests {
             tweet_id: TweetId(1),
             request_author_id: None,
         }];
-        let mut store = Store::new(plan, Some(50), &raw, false);
+        let mut store = Store::new(plan, Some(50), ClientCapability::default(), &raw, false);
         let group = |source| plan.groups().find(|group| group.source == source).unwrap();
         let tweets = store.offer(group(Source::TesTweet)).unwrap();
         let circle = TweetFeatures {
@@ -507,7 +502,7 @@ mod tests {
     fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
         let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40]);
 
-        let counts = KeyedResultCounts::from_batch(&HashMap::from([(40, 0)]), &batch);
+        let counts = KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0)]), &batch);
 
         assert_eq!((counts.timeout_keys, counts.timeout_candidates), (1, 0));
         assert_eq!(counts.outcome(), HydratorOutcome::Timeout);

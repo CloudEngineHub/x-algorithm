@@ -3,7 +3,8 @@ use super::{Role, Row};
 use crate::hydration::Hydrator;
 use crate::models::{ClientCapability, SafetyLabelType, ViewerFeatures, ViewerProfile};
 use crate::rules::fixtures::{
-    allow, blurred, candidate, dropped, noticed, viewer, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
+    allow, appealed, blurred, candidate, dropped, noticed, viewer, viewer_with_profile, AUTHOR_ID,
+    VIEWER_ID,
 };
 use crate::rules::SafetyLevel::{
     ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
@@ -11,7 +12,7 @@ use crate::rules::SafetyLevel::{
 };
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::InterstitialReason;
+use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
 
 pub(super) fn rows() -> Vec<Row> {
     vec![
@@ -234,7 +235,17 @@ pub(super) fn rows() -> Vec<Row> {
                         "fosnr_abuse_insults_follower/soft_intervention/abuse",
                     ),
                 ),
-                (TimelineHomeHydration, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::ABUSE,
+                        1,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
                 (
                     TimelineHomeHydration,
                     Role::As("client_without_fosnr", client_without_fosnr(VIEWER_ID)),
@@ -262,15 +273,28 @@ pub(super) fn rows() -> Vec<Row> {
                 .with_agent_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
                 .with_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED)
                 .build(),
-            expect: vec![(
-                TimelineHomeHydration,
-                Role::Follower,
-                noticed(
-                    false,
-                    true,
-                    "fosnr_abuse_insults_follower/soft_intervention/abuse",
+            expect: vec![
+                (
+                    TimelineHomeHydration,
+                    Role::Follower,
+                    noticed(
+                        false,
+                        true,
+                        "fosnr_abuse_insults_follower/soft_intervention/abuse",
+                    ),
                 ),
-            )],
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::ABUSE,
+                        1,
+                        false,
+                        true,
+                        "fosnr_author/appealable",
+                    ),
+                ),
+            ],
         },
         Row {
             name: "fosnr_abuse_insults_on_nsfw_media",

@@ -11,6 +11,7 @@ use xai_twittercontext_proto::TwitterContextViewer;
 const TWEET_MODERATION: &str = "communities/moderationState.TweetCommunityRelationship";
 const AUTHOR_MODERATION: &str = "communities/moderationState.UserCommunityRelationship";
 const VISIBILITY_FEATURES: &str = "communities/visibility/visibilityFeatures.Community";
+const IS_REMOVED: &str = "communities/isRemoved.Community";
 
 const HIDDEN: i16 = 2;
 const REMOVED: i16 = 2;
@@ -69,9 +70,39 @@ impl CommunitySource {
         viewer_id: u64,
         community_ids: &[u64],
     ) -> HashMap<u64, Result<Option<bool>>> {
+        self.fetch_as_viewer(
+            VISIBILITY_FEATURES,
+            viewer_id,
+            community_ids,
+            |features: ViewerIsModerator| features.0,
+        )
+        .await
+    }
+
+    pub(crate) async fn viewer_removals(
+        &self,
+        viewer_id: u64,
+        community_ids: &[u64],
+    ) -> HashMap<u64, Result<Option<bool>>> {
+        self.fetch_as_viewer(
+            IS_REMOVED,
+            viewer_id,
+            community_ids,
+            |removed: IsRemoved| removed.0,
+        )
+        .await
+    }
+
+    async fn fetch_as_viewer<T: TSerializable>(
+        &self,
+        column: &str,
+        viewer_id: u64,
+        community_ids: &[u64],
+        holds: impl Fn(T) -> bool,
+    ) -> HashMap<u64, Result<Option<bool>>> {
         let calls = community_ids
             .iter()
-            .map(|&community_id| fetch(VISIBILITY_FEATURES, encode(&(community_id, ()))))
+            .map(|&community_id| fetch(column, encode(&(community_id, ()))))
             .collect();
         let viewer = TwitterContextViewer {
             user_id: viewer_id.cast_signed(),
@@ -84,10 +115,7 @@ impl CommunitySource {
             .into_iter();
         community_ids
             .iter()
-            .map(|&community_id| {
-                let is_moderator = read(replies.next(), |features: ViewerIsModerator| features.0);
-                (community_id, is_moderator.map(Some))
-            })
+            .map(|&community_id| (community_id, read(replies.next(), &holds).map(Some)))
             .collect()
     }
 }
@@ -203,6 +231,18 @@ impl TSerializable for ViewerIsModerator {
     }
 }
 
+struct IsRemoved(bool);
+
+impl TSerializable for IsRemoved {
+    fn read_from_in_protocol(proto: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+        Ok(Self(proto.read_bool()?))
+    }
+
+    fn write_to_out_protocol(&self, _proto: &mut dyn TOutputProtocol) -> thrift::Result<()> {
+        Err(decode_only("IsRemoved"))
+    }
+}
+
 fn read_fields(
     proto: &mut dyn TInputProtocol,
     mut read_field: impl FnMut(&mut dyn TInputProtocol, &TFieldIdentifier) -> thrift::Result<bool>,
@@ -238,13 +278,16 @@ mod tests {
     use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 
     fn fetched(value: Option<&[u8]>) -> Option<Result<Bytes>> {
-        let option = match value {
-            Some(value) => [&[0x0C, 0x69, 0x14][..], value, &[0x00]].concat(),
-            None => vec![0x01, 0x23, 0x58, 0x00],
-        };
+        match value {
+            Some(value) => answered(&[&[0x0C, 0x69, 0x14][..], value, &[0x00]].concat()),
+            None => answered(&[0x01, 0x23, 0x58, 0x00]),
+        }
+    }
+
+    fn answered(option: &[u8]) -> Option<Result<Bytes>> {
         let ok_value = [0x0C, 0x00, 0x04, 0x0C, 0x09, 0xFC, 0x0C, 0x00, 0x76];
         Some(Ok(Bytes::from(
-            [&ok_value[..], &option, &[0x00, 0x00, 0x00]].concat(),
+            [&ok_value[..], option, &[0x00, 0x00, 0x00]].concat(),
         )))
     }
 
@@ -282,6 +325,19 @@ mod tests {
                 features.0
             });
             assert_eq!(is_moderator.ok(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn the_removal_flag_is_the_column_bool_and_no_row_is_not_removed() {
+        for (reply, expected) in [
+            (answered(&[0x02, 0x69, 0x14, 0x01, 0x00]), Some(true)),
+            (answered(&[0x02, 0x69, 0x14, 0x00, 0x00]), Some(false)),
+            (fetched(None), Some(false)),
+            (strato_error(), None),
+        ] {
+            let is_removed = read(reply, |removed: IsRemoved| removed.0);
+            assert_eq!(is_removed.ok(), expected);
         }
     }
 

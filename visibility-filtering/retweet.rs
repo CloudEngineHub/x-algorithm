@@ -169,11 +169,12 @@ mod tests {
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
         MediaInterstitial, MediaRestriction, NsfwFeature, RawCandidate, SafetyLabelType,
-        TombstoneReason,
+        TombstoneReason, TweetFeatures,
     };
-    use crate::rules::fixtures::{allow, legacy_interstitial, noticed};
+    use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
     use crate::rules::metrics::Rpc;
     use crate::rules::{RuleEngine, SafetyLevel};
+    use std::num::NonZeroU64;
     use std::sync::Arc;
     use std::time::Duration;
     use xai_core_entities::entities::{ConversationControlArm, PureCoreData};
@@ -974,6 +975,39 @@ Flock follows-rev[80] super_follows-fwd[]",
                 ),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_removed_from_the_community_is_limited_on_any_retweet_of_its_post() {
+        let sources = InMemorySources::default()
+            .pure_core(1, retweet(10, 5, 20))
+            .tweet(5, 20)
+            .tweet_features(
+                5,
+                TweetFeatures {
+                    community_id: NonZeroU64::new(500),
+                    ..TweetFeatures::default()
+                },
+            )
+            .authors(&[10, 20])
+            .removed_from(500);
+        let filter_tweets = FilterTweets::new(Arc::new(sources), RuleEngine::for_tests());
+        let request = FilterRequest {
+            client_capability: ClientCapability {
+                community_viewer_removed_limits: true,
+                ..ClientCapability::default()
+            },
+            ..request(&[1, 5])
+        };
+        let outcomes = evaluate_merging_sources(&filter_tweets, request).await;
+        let removed_limit = Evaluation::Complete {
+            verdict: limited(
+                LimitedEngagementReason::CommunityTweetViewerRemoved,
+                "community_tweet_viewer_removed/limited_engagement",
+            ),
+        };
+        assert_eq!(outcomes[0].evaluation, removed_limit);
+        assert_eq!(outcomes[1].evaluation, removed_limit);
     }
 
     #[tokio::test(start_paused = true)]

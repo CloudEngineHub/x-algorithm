@@ -1,13 +1,13 @@
 use crate::models::tweet_timestamp_ms;
 use quanta::Clock;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
 use super::expiring_cache::{ExpiringCache, Lookup};
-use super::lookup::{LookupError, RemoteSource};
+use super::lookup::{LookupError, LookupResults, RemoteSource};
 use super::metrics::{self, BatchStage, CacheResult, CacheTier};
 
 const YOUNG_TWEET_AGE: Duration = Duration::from_secs(5 * 60);
@@ -56,10 +56,10 @@ impl SafetyLabelSource {
     pub async fn get(
         &self,
         ids: &[u64],
-    ) -> HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
+    ) -> FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
         let total = ids.len();
-        let mut results: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
-            HashMap::with_capacity(total);
+        let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
+            FxHashMap::with_capacity_and_hasher(total, Default::default());
 
         let (local_misses, expired) = self.get_local(ids, &mut results);
         let batch_size = local_misses.len();
@@ -75,7 +75,7 @@ impl SafetyLabelSource {
     fn get_local(
         &self,
         ids: &[u64],
-        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) -> (Vec<u64>, usize) {
         let Some(cache) = &self.cache else {
             return (ids.to_vec(), 0);
@@ -99,8 +99,8 @@ impl SafetyLabelSource {
 
     fn backfill_local(
         &self,
-        remote_results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
-        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        remote_results: LookupResults,
+        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) {
         let wall_now = SystemTime::now();
         for (id, result) in remote_results {
@@ -135,6 +135,7 @@ mod tests {
     use crate::safety_label_source::manhattan::ManhattanSource;
     use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::async_trait;
     use xai_cache::{KVCacheError, Key, Value};

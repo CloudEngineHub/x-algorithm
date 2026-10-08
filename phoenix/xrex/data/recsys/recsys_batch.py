@@ -35,6 +35,7 @@ from xrex.data.recsys.feature_config import (
     FLOAT_FEATURES,
     INT64_FEATURES,
     STALE_POST_14D_TTL_SEC,
+    STALE_POST_30D_TTL_SEC,
     BoolFeature,
     CategoricalFeature,
     FloatFeature,
@@ -496,6 +497,7 @@ def from_record_batch(
     sid_num_levels: int = 0,
     compute_post_unexplored_label: bool = False,
     zero_stale_post_14d_candidate_counts: bool = False,
+    stale_post_30d: bool = False,
     search_negative_clear_word_match: bool = False,
     ads_head_masking: bool = False,
 ) -> RecsysFeaturesBatch:
@@ -1058,7 +1060,7 @@ def from_record_batch(
         )
 
     if zero_stale_post_14d_candidate_counts:
-        ttl_sec = np.int64(STALE_POST_14D_TTL_SEC)
+        ttl_sec = np.int64(STALE_POST_30D_TTL_SEC if stale_post_30d else STALE_POST_14D_TTL_SEC)
         original_age_sec = candidate_impr_ts.astype(
             np.int64
         ) - candidate_post_creation_ts_sec.astype(np.int64)

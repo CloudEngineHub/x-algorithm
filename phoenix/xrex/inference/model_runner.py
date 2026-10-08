@@ -2135,6 +2135,14 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                         pspec=emb.pspec,
                     )
                 )
+            side_width = self.model_config.mol_side_table_width
+            if side_width:
+                post_embeddings = post_embeddings._replace(
+                    mol_side_table=Parameter(
+                        x=jnp.zeros((orig, side_width), dtype=jnp.float32),
+                        pspec=P(None, None),
+                    )
+                )
 
         initial_params = self.loss_fn.init(init_rng, batch, emb_table_init_data)
         return RecsysInferenceState(
@@ -4453,6 +4461,8 @@ class RetrievalModelRunner(
     enable_radix_select_topk: bool = False
     enable_int8_post_table: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
+    _mol_side_tables_cache: tuple | None = field(default=None, init=False)
+    _mol_side_tables_fn: Any = field(default=None, init=False)
     _all_topic_bitmaps: dict[int, jax.Array] = field(default_factory=dict)
 
     _mask_pinned_by_bs: dict[int, jax.Array] = field(default_factory=dict)
@@ -5154,9 +5164,50 @@ class RetrievalModelRunner(
         }
         return results_dict
 
+    @property
+    def _mol_serving_kernel(self) -> bool:
+        mc = self.model_config
+        return (
+            isinstance(mc, RecsysTwoTowerModelConfig)
+            and mc.mol_serving_kernel
+            and mc.mol_item_components > 0
+        )
+
+    def _mol_side_tables(self, state: RecsysInferenceState) -> tuple[jax.Array, jax.Array]:
+        x = state.post_embeddings.embeddings.x
+        cache = self._mol_side_tables_cache
+        if cache is not None and cache[0] is x and cache[1] is state.params:
+            return cache[2], cache[3]
+        if self._mol_side_tables_fn is None:
+            mesh = self.mesh
+
+            @hk.transform
+            def side_tables_fn(post_table: jax.Array):
+                model = self.model_config.make(sharding_context=make_legacy_sharding_context(mesh))
+                return model.mol_side_tables(post_table)
+
+            side_sharding = jax.sharding.NamedSharding(mesh, P(None, self.data_sharding.spec[0]))
+            self._mol_side_tables_fn = jax.jit(
+                side_tables_fn.apply,
+                in_shardings=(self.state_sharding.params, None, self.data_sharding),
+                out_shardings=(side_sharding, side_sharding),
+            )
+        t0 = time.time()
+        norms, ibias = jax.block_until_ready(self._mol_side_tables_fn(state.params, None, x))
+        logger.info(
+            "mol_serving_kernel: built side tables norms%s ibias%s in %.0fms",
+            norms.shape,
+            ibias.shape,
+            (time.time() - t0) * 1e3,
+        )
+        self._mol_side_tables_cache = (x, state.params, norms, ibias)
+        return norms, ibias
+
     def _post_table_forward_arg(self, state: RecsysInferenceState):
         x = state.post_embeddings.embeddings.x
         if not self.enable_int8_post_table:
+            if self._mol_serving_kernel:
+                return (x,) + self._mol_side_tables(state)
             return x
         cache = self._int8_post_table_cache
         if cache is None or cache[0] is not x:
@@ -5169,6 +5220,8 @@ class RetrievalModelRunner(
             )
             cache = (x, q8, scales)
             self._int8_post_table_cache = cache
+        if self._mol_serving_kernel:
+            return (cache[1], cache[2]) + self._mol_side_tables(state)
         return (cache[1], cache[2])
 
     def reply_request(
@@ -5370,8 +5423,16 @@ class RetrievalModelRunner(
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
             post_scales = None
+            mol_side_tables = None
             if isinstance(post_embeddings, tuple):
-                post_embeddings, post_scales = post_embeddings
+                if len(post_embeddings) == 2:
+                    post_embeddings, post_scales = post_embeddings
+                elif len(post_embeddings) == 3:
+                    post_embeddings, norms, ibias = post_embeddings
+                    mol_side_tables = (norms, ibias)
+                else:
+                    post_embeddings, post_scales, norms, ibias = post_embeddings
+                    mol_side_tables = (norms, ibias)
             sl = embedding_slices
 
             if self.using_seqpack:
@@ -5410,6 +5471,7 @@ class RetrievalModelRunner(
                 use_async_topk=self.enable_async_topk,
                 use_radix_select_topk=self.enable_radix_select_topk,
                 post_scales=post_scales,
+                mol_side_tables=mol_side_tables,
             )
 
         if self.enable_int8_post_table:
@@ -5419,6 +5481,16 @@ class RetrievalModelRunner(
             )
         else:
             post_table_in_sharding = self.data_sharding
+        if self._mol_serving_kernel:
+            side_sharding = jax.sharding.NamedSharding(
+                self.data_sharding.mesh, P(None, self.data_sharding.spec[0])
+            )
+            base = (
+                post_table_in_sharding
+                if isinstance(post_table_in_sharding, tuple)
+                else (post_table_in_sharding,)
+            )
+            post_table_in_sharding = base + (side_sharding, side_sharding)
 
         return JittedOrCompiled(
             jax.jit(

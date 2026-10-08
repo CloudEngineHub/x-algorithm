@@ -2,13 +2,13 @@ use crate::models::{
     AuthorLabel, LimitedEngagementReason, NsfwViewerDropReason, SafetyLabelType, TombstoneReason,
     VerifyBlurSupport,
 };
-use crate::params::CountryList;
+use crate::params::{CountryList, LimitedActionType};
 use crate::rules::rule_spec::{
-    author, blur, blur_with_age_prompt, drop_post, everyone, except_author, family,
-    has_tweet_label, has_user_label, label, limit, not, nsfw_viewer_drop, only_when, relationship,
-    rule, soft_intervention, tombstone, tweet, viewer, AuthorPredicate, Clause, Condition,
-    Predicate, RelationshipPredicate, RuleClause, RuleId, TweetPredicate, ViewerPredicate,
-    LEGACY_NSFW_INTERSTITIAL,
+    appealable, author, blur, blur_with_age_prompt, drop_post, everyone, except_author, family,
+    has_tweet_label, has_user_label, label, limit, not, nsfw_viewer_drop, only_author, only_when,
+    relationship, rule, soft_intervention, tombstone, tweet, viewer, AuthorPredicate, Clause,
+    Condition, FosnrViolation, Predicate, RelationshipPredicate, RuleClause, RuleId,
+    TweetPredicate, ViewerPredicate, LEGACY_NSFW_INTERSTITIAL,
 };
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::{Action, FilteredReason, SafetyResult, SafetyResultReason};
@@ -166,32 +166,44 @@ fn label_drop(id: RuleId, label_type: SafetyLabelType, reason: FilteredReason) -
     rule(id, except_author([label(label_type)], drop_post(reason)))
 }
 
-const FOSNR_LEVEL_3: [(RuleId, SafetyLabelType); 4] = [
-    (
-        RuleId::FosnrHatefulConduct,
-        SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
-    ),
-    (
-        RuleId::FosnrViolentSpeech,
-        SafetyLabelType::FOSNR_VIOLENT_SPEECH,
-    ),
-    (RuleId::FosnrAbuse, SafetyLabelType::FOSNR_ABUSE),
-    (
-        RuleId::FosnrCivicIntegrity,
-        SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
-    ),
+struct FosnrLevel3 {
+    id: RuleId,
+    label: SafetyLabelType,
+    policy: AppealablePolicy,
+}
+
+const FOSNR_LEVEL_3: [FosnrLevel3; 4] = [
+    FosnrLevel3 {
+        id: RuleId::FosnrHatefulConduct,
+        label: SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
+        policy: AppealablePolicy::HATEFUL_CONDUCT,
+    },
+    FosnrLevel3 {
+        id: RuleId::FosnrViolentSpeech,
+        label: SafetyLabelType::FOSNR_VIOLENT_SPEECH,
+        policy: AppealablePolicy::VIOLENT_SPEECH,
+    },
+    FosnrLevel3 {
+        id: RuleId::FosnrAbuse,
+        label: SafetyLabelType::FOSNR_ABUSE,
+        policy: AppealablePolicy::ABUSE,
+    },
+    FosnrLevel3 {
+        id: RuleId::FosnrCivicIntegrity,
+        label: SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
+        policy: AppealablePolicy::CIVIC_INTEGRITY,
+    },
 ];
 
 const FOSNR_LEVEL_1: SafetyLabelType = SafetyLabelType::FOSNR_ABUSE_INSULTS;
 
 const FOSNR: [Predicate; 5] = {
-    let [(_, hateful_conduct), (_, violent_speech), (_, abuse), (_, civic_integrity)] =
-        FOSNR_LEVEL_3;
+    let [hateful_conduct, violent_speech, abuse, civic_integrity] = FOSNR_LEVEL_3;
     [
-        has_tweet_label(hateful_conduct),
-        has_tweet_label(violent_speech),
-        has_tweet_label(abuse),
-        has_tweet_label(civic_integrity),
+        has_tweet_label(hateful_conduct.label),
+        has_tweet_label(violent_speech.label),
+        has_tweet_label(abuse.label),
+        has_tweet_label(civic_integrity.label),
         has_tweet_label(FOSNR_LEVEL_1),
     ]
 };
@@ -199,8 +211,8 @@ const FOSNR: [Predicate; 5] = {
 pub(super) fn fosnr_level_3_drops() -> Vec<RuleClause> {
     FOSNR_LEVEL_3
         .into_iter()
-        .flat_map(|(id, label_type)| {
-            label_drop(id, label_type, FilteredReason::PossiblyUndesirable)
+        .flat_map(|FosnrLevel3 { id, label, .. }| {
+            label_drop(id, label, FilteredReason::PossiblyUndesirable)
         })
         .collect()
 }
@@ -637,6 +649,63 @@ pub(super) fn fosnr_level_1_follower_soft_intervention() -> Vec<RuleClause> {
     )
 }
 
+const AUTHOR_LEVEL_3_LIMITED_ACTIONS: [LimitedActionType; 13] = {
+    use LimitedActionType as A;
+    [
+        A::Like,
+        A::Reply,
+        A::Retweet,
+        A::QuoteTweet,
+        A::ShareTweetVia,
+        A::AddToBookmarks,
+        A::PinToProfile,
+        A::CopyLink,
+        A::SendViaDm,
+        A::EditTweet,
+        A::Highlight,
+        A::Embed,
+        A::ListsAddRemove,
+    ]
+};
+
+const fn author_level_3(FosnrLevel3 { label, policy, .. }: FosnrLevel3) -> FosnrViolation {
+    FosnrViolation {
+        label,
+        policy,
+        level: 3,
+        limited_actions: &AUTHOR_LEVEL_3_LIMITED_ACTIONS,
+    }
+}
+
+const FOSNR_AUTHOR_VIOLATIONS: [FosnrViolation; 5] = {
+    let [hateful_conduct, violent_speech, abuse, civic_integrity] = FOSNR_LEVEL_3;
+    [
+        author_level_3(abuse),
+        author_level_3(civic_integrity),
+        author_level_3(hateful_conduct),
+        author_level_3(violent_speech),
+        FosnrViolation {
+            label: FOSNR_LEVEL_1,
+            policy: AppealablePolicy::ABUSE,
+            level: 1,
+            limited_actions: &[LimitedActionType::EditTweet],
+        },
+    ]
+};
+
+pub(super) fn fosnr_author_appealable() -> Vec<RuleClause> {
+    rule(
+        RuleId::FosnrAuthor,
+        only_author(
+            [
+                viewer(ViewerPredicate::ClientHasFosnrRules),
+                Condition::AnyOf(&FOSNR),
+            ],
+            appealable(&FOSNR_AUTHOR_VIOLATIONS),
+        ),
+    )
+}
+
 pub(super) fn fosnr_fallback_drop() -> Vec<RuleClause> {
     rule(
         RuleId::FosnrFallback,
@@ -787,11 +856,43 @@ fn read_only_viewer_limited_actions() -> Vec<RuleClause> {
     )
 }
 
+fn community_tweet_limited_actions() -> Vec<RuleClause> {
+    rule(
+        RuleId::CommunityTweetViewerRemoved,
+        everyone(
+            [
+                tweet(TweetPredicate::IsCommunityTweet),
+                relationship(RelationshipPredicate::ViewerIsRemovedFromCommunity),
+                viewer(ViewerPredicate::ClientHasCommunityViewerRemovedLimits),
+            ],
+            limit(LimitedEngagementReason::CommunityTweetViewerRemoved),
+        ),
+    )
+}
+
+fn local_tweet_limited_actions() -> Vec<RuleClause> {
+    rule(
+        RuleId::LocalTweet,
+        everyone(
+            [
+                tweet(TweetPredicate::HasNarrowcastPlace),
+                NOT_LOGGED_OUT,
+                NOT_CONVERSATION_ROOT_AUTHOR,
+                NOT_INVITED_TO_CONVERSATION,
+                relationship(RelationshipPredicate::ViewerIsOutsideNarrowcastPlace),
+            ],
+            limit(LimitedEngagementReason::LocalTweet),
+        ),
+    )
+}
+
 pub(super) fn limited_engagement_rules() -> Vec<RuleClause> {
     [
         blocked_viewer_limited_actions(),
         stale_tweet_limited_actions(),
         limit_replies_conversation_rules(),
+        community_tweet_limited_actions(),
+        local_tweet_limited_actions(),
         read_only_viewer_limited_actions(),
     ]
     .concat()

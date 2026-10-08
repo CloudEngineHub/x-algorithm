@@ -237,12 +237,12 @@ mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeQuery, Graph};
     use crate::hydration::plan::Source;
-    use crate::hydration::sources::{Fault, InMemorySources};
+    use crate::hydration::sources::{control, Fault, InMemorySources};
     use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator};
     use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};
     use crate::rules::fixtures::{allow, dropped, limited};
     use xai_core_entities::entities::{
-        GizmoduckUser, GizmoduckUserResult, PureCoreData, UserResponseState,
+        ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, UserResponseState,
     };
     use xai_visibility_filtering::models::FilteredReason;
 
@@ -268,6 +268,27 @@ mod tests {
             Arc::<InMemorySources>::clone(sources),
             RuleEngine::for_tests(),
         )
+    }
+
+    async fn home_hydration(
+        sources: &Arc<InMemorySources>,
+        viewer_id: Option<u64>,
+        ids: &[u64],
+    ) -> Vec<Evaluation> {
+        service(sources)
+            .run(FilterRequest {
+                viewer_id,
+                country_code: None,
+                client_capability: ClientCapability::default(),
+                safety_level: SafetyLevel::TimelineHomeHydration,
+                candidates: ids.iter().map(|&id| candidate(id, None)).collect(),
+                rpc: Rpc::FilterTweets,
+            })
+            .await
+            .outcomes
+            .into_iter()
+            .map(|outcome| outcome.evaluation)
+            .collect()
     }
 
     #[tokio::test(start_paused = true)]
@@ -389,25 +410,6 @@ mod tests {
                 .authors(&[10, 11, 12, 13])
                 .trusted_friend(7, 50)
         };
-        let judged = |sources: Arc<InMemorySources>, viewer_id, ids: &[u64]| {
-            let candidates = ids.iter().map(|&id| candidate(id, None)).collect();
-            async move {
-                service(&sources)
-                    .run(FilterRequest {
-                        viewer_id,
-                        country_code: None,
-                        client_capability: ClientCapability::default(),
-                        safety_level: SafetyLevel::TimelineHomeHydration,
-                        candidates,
-                        rpc: Rpc::FilterTweets,
-                    })
-                    .await
-                    .outcomes
-                    .into_iter()
-                    .map(|outcome| outcome.evaluation)
-                    .collect::<Vec<_>>()
-            }
-        };
         let shown = || Evaluation::Complete { verdict: allow() };
         let trusted_friends_drop = || Evaluation::Complete {
             verdict: dropped(
@@ -418,22 +420,76 @@ mod tests {
 
         let healthy = Arc::new(world());
         assert_eq!(
-            judged(Arc::clone(&healthy), Some(50), &[1, 2, 3, 4]).await,
+            home_hydration(&healthy, Some(50), &[1, 2, 3, 4]).await,
             [shown(), shown(), trusted_friends_drop(), shown()]
         );
         assert_eq!(healthy.keys(Source::TrustedFriends), [vec![7, 9]]);
 
         let failed = world().fault(Source::TrustedFriends, Fault::Fails);
         assert_eq!(
-            judged(Arc::new(failed), Some(50), &[1, 4]).await,
+            home_hydration(&Arc::new(failed), Some(50), &[1, 4]).await,
             [trusted_friends_drop(), shown()]
         );
 
         for (viewer_id, ids) in [(None, &[1, 2][..]), (Some(50), &[4][..])] {
             let sources = Arc::new(world());
-            judged(Arc::clone(&sources), viewer_id, ids).await;
+            home_hydration(&sources, viewer_id, ids).await;
             assert!(!sources.calls().contains(&Source::TrustedFriends));
         }
+    }
+
+    #[tokio::test]
+    async fn local_posts_limit_viewers_outside_their_place_and_a_failed_lookup_limits_none() {
+        const A: u64 = 0xa000_0000_0000_0001;
+        const B: u64 = 0xb000_0000_0000_0002;
+        let local = |place| TweetFeatures {
+            narrowcast_place_id: Some(place),
+            ..Default::default()
+        };
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .tweet_features(1, local(A))
+                .control(1, control(ConversationControlArm::Local, 10, &[]))
+                .tweet(2, 11)
+                .tweet_features(2, local(B))
+                .control(2, control(ConversationControlArm::Local, 11, &[]))
+                .tweet(3, 12)
+                .authors(&[10, 11, 12])
+        };
+        let shown = || Evaluation::Complete { verdict: allow() };
+        let local_limit = || Evaluation::Complete {
+            verdict: limited(
+                LimitedEngagementReason::LocalTweet,
+                "local_tweet/limited_engagement",
+            ),
+        };
+
+        let located = Arc::new(world().located_in(B));
+        assert_eq!(
+            home_hydration(&located, Some(50), &[1, 2, 3]).await,
+            [local_limit(), shown(), shown()]
+        );
+        assert_eq!(located.keys(Source::UserLocation), [vec![A, B]]);
+
+        assert_eq!(
+            home_hydration(&Arc::new(world()), Some(50), &[1, 2]).await,
+            [local_limit(), local_limit()]
+        );
+
+        let failed = world()
+            .located_in(B)
+            .fault(Source::UserLocation, Fault::Fails);
+        assert_eq!(
+            home_hydration(&Arc::new(failed), Some(50), &[1, 3]).await,
+            [
+                Evaluation::Partial {
+                    verdict: allow(),
+                    fail_open_defaults: Hydrators::of(Hydrator::OutsideNarrowcastPlace),
+                },
+                shown(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -553,13 +609,14 @@ mod tests {
         NotFound,
         Failed,
         FailedCacheHit,
+        PartialCacheHit,
     }
 
     fn lookups(
         pure_core: PureCore,
         tweet_row: TweetRow,
         author: Author,
-    ) -> (InMemorySources, Vec<Source>) {
+    ) -> (InMemorySources, Vec<(Source, Fault)>) {
         let mut broken = Vec::new();
         let sources = InMemorySources::default()
             .with_tweet_cache(tweet_fallback_cache(8))
@@ -569,7 +626,7 @@ mod tests {
             PureCore::NotFound => sources,
             PureCore::Failed => sources.tweet(1, 10).fail_key(Source::TesPureCore, 1),
             PureCore::FailedCacheHit => {
-                broken.push(Source::TesPureCore);
+                broken.push((Source::TesPureCore, Fault::Fails));
                 sources.tweet(1, 10)
             }
         };
@@ -582,7 +639,7 @@ mod tests {
             TweetRow::NotFound => sources.without_tweet_row(1),
             TweetRow::Failed => sources.fail_key(Source::TesTweet, 1),
             TweetRow::FailedCacheHit => {
-                broken.push(Source::TesTweet);
+                broken.push((Source::TesTweet, Fault::Fails));
                 sources.tweet_features(1, nullcast)
             }
         };
@@ -592,7 +649,11 @@ mod tests {
             Author::NotFound => sources,
             Author::Failed => sources.fail_key(Source::GizmoduckAuthor, 10),
             Author::FailedCacheHit => {
-                broken.push(Source::GizmoduckAuthor);
+                broken.push((Source::GizmoduckAuthor, Fault::Fails));
+                sources.authors(&[10])
+            }
+            Author::PartialCacheHit => {
+                broken.push((Source::GizmoduckAuthor, Fault::AnswersPartial));
                 sources.authors(&[10])
             }
         };
@@ -717,6 +778,12 @@ mod tests {
                 PureCore::Found,
                 TweetRow::Found,
                 Author::FailedCacheHit,
+                judged.clone(),
+            ),
+            (
+                PureCore::Found,
+                TweetRow::Found,
+                Author::PartialCacheHit,
                 judged,
             ),
         ];
@@ -740,8 +807,8 @@ mod tests {
                         .evaluation
                 };
                 run().await;
-                for source in broken {
-                    sources.break_source(source, Fault::Fails);
+                for (source, fault) in broken {
+                    sources.break_source(source, fault);
                 }
                 assert_eq!(
                     run().await,

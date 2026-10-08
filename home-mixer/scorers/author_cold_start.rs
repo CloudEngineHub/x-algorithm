@@ -344,6 +344,13 @@ pub(crate) struct ColdStartOutcome {
 }
 
 impl ColdStartOutcome {
+    fn unchanged(scores: &[f64]) -> Self {
+        Self {
+            scores: scores.to_vec(),
+            lift: None,
+        }
+    }
+
     pub fn lift_to_rank(&self, index: usize) -> Option<u32> {
         self.lift
             .as_ref()
@@ -374,6 +381,9 @@ impl AuthorColdStart {
         candidates: &[PostCandidate],
         scores: &[f64],
     ) -> ColdStartOutcome {
+        if query.is_topic_request() {
+            return ColdStartOutcome::unchanged(scores);
+        }
         let outcome = self.decide(query, candidates, scores);
         record_cold_start_slot(query, outcome.lift.is_some());
         outcome
@@ -395,10 +405,7 @@ impl AuthorColdStart {
         };
 
         if !params.enabled {
-            return ColdStartOutcome {
-                scores: scores.to_vec(),
-                lift: None,
-            };
+            return ColdStartOutcome::unchanged(scores);
         }
 
         match cold_start_target(&params, scores) {
@@ -410,10 +417,7 @@ impl AuthorColdStart {
                     lift: index.map(|index| ColdStartLift { index, rank }),
                 }
             }
-            None => ColdStartOutcome {
-                scores: scores.to_vec(),
-                lift: None,
-            },
+            None => ColdStartOutcome::unchanged(scores),
         }
     }
 }
@@ -777,6 +781,29 @@ rust_home_mixer:
         ];
         let result = author_cold_start.apply(&ts_query(true, 0), &candidates, &[10.0, 90.0]);
         assert_eq!(result, vec![10.0, 90.0]);
+    }
+
+    #[test]
+    fn topic_request_is_not_cold_started() {
+        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
+        let candidates = vec![
+            moe_candidate(1, minutes(10), 1000),
+            moe_candidate(2, minutes(20), 3),
+        ];
+        let scores = [40.0, 5.0];
+        let topic_query = |topic_ids: Vec<i64>| ScoredPostsQuery {
+            topic_ids,
+            ..codivert_query(false, true)
+        };
+
+        assert_eq!(
+            author_cold_start.apply(&topic_query(vec![]), &candidates, &scores),
+            vec![40.0, 40.0]
+        );
+        assert_eq!(
+            author_cold_start.apply(&topic_query(vec![42]), &candidates, &scores),
+            vec![40.0, 5.0]
+        );
     }
 
     const CODIVERT_EXPERIMENT: &str = "moe_codivert_viewer";

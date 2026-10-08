@@ -3,11 +3,13 @@
 import collections
 import concurrent.futures
 import enum
+import functools
 import gc
 import itertools
 import json
 import logging
 import math
+import operator
 import os
 import pathlib
 import shutil
@@ -282,6 +284,13 @@ class RecsysTrainer(Trainer):
     _last_history_user_dropout_count: int = field(default=0, init=False, repr=False)
     _last_history_user_dropout_bsz: int = field(default=0, init=False, repr=False)
     _retrieval_post_emb_built: bool = field(default=False, init=False, repr=False)
+    dense_params_ema_decay: float = 0.0
+    dense_params_ema_in_checkpoint: bool = False
+    _dense_params_ema: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_init_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_update_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_gap_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_as_params_jit: typing.Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.using_seqpack and self.seqpack_fixed_length:
@@ -312,6 +321,8 @@ class RecsysTrainer(Trainer):
     forward_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
     two_tower_forward_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
     two_tower_forward_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
+    mol_side_table_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
+    mol_side_table_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
     candidate_tower_forward_fn: typing.Any = field(
         init=False, repr=False, compare=False, default=None
     )
@@ -351,12 +362,15 @@ class RecsysTrainer(Trainer):
         return batch
 
     def prepare_data(self, batch):
+        return super().prepare_data(self.transform_batch(batch))
+
+    def transform_batch(self, batch: RecsysFeaturesBatch) -> RecsysFeaturesBatch:
         if self.using_seqpack:
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
             batch = pack_batch(
-                batch=typing.cast(RecsysFeaturesBatch, batch),
+                batch=batch,
                 num_devices_per_process=self.parallel_config.num_devices_per_process,
                 num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
                 dist=self.seqpack_distribution,
@@ -364,7 +378,8 @@ class RecsysTrainer(Trainer):
             )
             if self.using_fa4:
                 batch = self.add_block_sparse_layout(batch)
-        return super().prepare_data(batch)
+
+        return batch
 
     def _purchase_value_ema_keys(self) -> dict[str, jax.Array]:
         if not (
@@ -436,6 +451,15 @@ class RecsysTrainer(Trainer):
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
             post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            side_width = self.model_config.mol_side_table_width
+            if side_width:
+                emb = post_embeddings.embeddings
+                post_embeddings = post_embeddings._replace(
+                    mol_side_table=Parameter(
+                        x=jnp.zeros((emb.x.shape[0], side_width), dtype=jnp.float32),
+                        pspec=P(None, None),
+                    )
+                )
 
         packing_layout = batch.get("packing_layout")
         batch = jax.tree.map(jnp.ones_like, batch)
@@ -705,6 +729,7 @@ class RecsysTrainer(Trainer):
         assert isinstance(self.dataset, PhoenixDataset)
         aug_period = self._empty_history_augmentation_period()
         history_user_drop_rate = self.empty_history_user_dropout_rate
+        microbatches: list[tuple[RecsysFeaturesBatch, dict[int, int] | None]] = []
         for i, (batch, offsets) in enumerate(dataset):
             batch = self._maybe_inject_global_neg_embeddings(batch)
 
@@ -717,7 +742,11 @@ class RecsysTrainer(Trainer):
                     batch, history_user_drop_rate
                 )
 
-            yield self.local_global_hack(self.prepare_data(batch)), offsets
+            microbatches.append((self.transform_batch(batch), offsets))
+            if len(microbatches) == self.num_microbatch:
+                for packed, packed_offsets in microbatches:
+                    yield self.local_global_hack(super().prepare_data(packed)), packed_offsets
+                microbatches = []
 
             if aug_period > 0 and i % aug_period == 0:
                 for key in list(batch["history_seq"]):
@@ -1266,7 +1295,7 @@ class RecsysTrainer(Trainer):
 
         return new_state, metrics, {}
 
-    def _microbatch_scan(
+    def _run_microbatches(
         self,
         microbatch_loss_fn: typing.Callable[..., typing.Any],
         params: Parameter,
@@ -1290,32 +1319,33 @@ class RecsysTrainer(Trainer):
             out_specs=(P(), P(), P(), rows_spec, P(ctx.data_axis)),
             check_vma=False,
         )
-        def scan(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
-            def loss(params, rng, batch, embeddings, candidate_inputs):
-                return microbatch_loss_fn(
-                    params,
-                    rng,
-                    batch,
-                    embeddings,
-                    candidate_inputs=candidate_inputs,
-                    loss_normalizers=loss_normalizers,
-                )
-
-            def body(gradients, microbatch):
-                rng, batch, embeddings, candidate_inputs = microbatch
+        def run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
+            def body(gradients, loss_normalizers, rng, batch, embeddings, candidate_inputs):
                 rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
                 (loss_k, (stats, metric_inputs)), (gradients_k, emb_gradients) = jax.value_and_grad(
-                    loss, argnums=(0, 3), has_aux=True
-                )(params, rng, batch, embeddings, candidate_inputs)
+                    functools.partial(microbatch_loss_fn, loss_normalizers=loss_normalizers),
+                    argnums=(0, 3),
+                    has_aux=True,
+                )(params, rng, batch, embeddings, candidate_inputs=candidate_inputs)
                 gradients = jax.tree.map(
                     lambda a, g: a + g.astype(jnp.float32), gradients, gradients_k
                 )
                 return gradients, (loss_k, stats, emb_gradients, metric_inputs)
 
-            gradients, (losses, stats, emb_gradients, metric_inputs) = jax.lax.scan(
-                body,
-                jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params),
-                (rngs, batches, embeddings, candidate_inputs),
+            inputs = (rngs, batches, embeddings, candidate_inputs)
+            inputs, loss_normalizers = jax.lax.optimization_barrier((inputs, loss_normalizers))
+            gradients = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+            outputs = []
+            for k in range(rngs.shape[0]):
+                if k > 0:
+                    inputs, gradients, outputs[-1] = jax.lax.optimization_barrier(
+                        (inputs, gradients, outputs[-1])
+                    )
+                microbatch = jax.tree.map(operator.itemgetter(k), inputs)
+                gradients, output = body(gradients, loss_normalizers, *microbatch)
+                outputs.append(output)
+            losses, stats, emb_gradients, metric_inputs = jax.tree.map(
+                lambda *xs: jnp.stack(xs), *outputs
             )
             gradients = jax.tree.map(lambda g, p: g.astype(p.dtype), gradients, params)
             loss_sum, stats = jax.tree.map(lambda x: x.sum(0), (losses, stats))
@@ -1329,7 +1359,7 @@ class RecsysTrainer(Trainer):
                 joined,
             )
 
-        return scan(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers)
+        return run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers)
 
     def async_emb_step(
         self,
@@ -1363,15 +1393,19 @@ class RecsysTrainer(Trainer):
             ctx, prev_step_lookup_pin, token_ids.shape
         )
 
-        unique_tokens = segment_ids = None
-        if not self.use_row_emb:
-            fenced_token_ids, _ = jax.lax.optimization_barrier((token_ids, prefetched_embeddings))
+        def dedup_tokens(token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
             unique_tokens, segment_ids = compress_token_ids(
-                fenced_token_ids, fill_size=ctx.num_unique, fill_value=self._emb_hash_vocab
+                token_ids, fill_size=ctx.num_unique, fill_value=self._emb_hash_vocab
             )
             segment_ids = jax.lax.with_sharding_constraint(
                 segment_ids.reshape(token_ids.shape), P(None, ctx.data_axis, None)
             )
+            return unique_tokens, segment_ids
+
+        unique_tokens = segment_ids = None
+        if self.num_microbatch == 1 and not self.use_row_emb:
+            fenced_token_ids, _ = jax.lax.optimization_barrier((token_ids, prefetched_embeddings))
+            unique_tokens, segment_ids = dedup_tokens(fenced_token_ids)
 
         gate = prefetched_embeddings[0, :, 0, :1]
 
@@ -1385,8 +1419,6 @@ class RecsysTrainer(Trainer):
             gate = recsys_async_emb.depend(
                 ctx, gate, jnp.stack(jax.tree.leaves(loss_normalizers)).sum(), on_sharded=False
             )
-            if segment_ids is not None:
-                gate = recsys_async_emb.depend(ctx, gate, segment_ids[0])
 
         update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
@@ -1457,7 +1489,7 @@ class RecsysTrainer(Trainer):
             loss_normalizers = recsys_async_emb.depend(
                 ctx, loss_normalizers, next_step_lookup_pin, x_sharded=False
             )
-            gradients, loss, stats, emb_gradients, (metric_inputs, batch) = self._microbatch_scan(
+            gradients, loss, stats, emb_gradients, (metric_inputs, batch) = self._run_microbatches(
                 microbatch_loss_fn,
                 fprop_params,
                 batches,
@@ -1466,6 +1498,10 @@ class RecsysTrainer(Trainer):
                 candidate_inputs,
                 loss_normalizers,
             )
+            if not self.use_row_emb:
+                token_ids, gradients = jax.lax.optimization_barrier((token_ids, gradients))
+                unique_tokens, segment_ids = dedup_tokens(token_ids)
+                gradients, unique_tokens = jax.lax.optimization_barrier((gradients, unique_tokens))
             (
                 emb_grad_norm,
                 emb_valid_step,
@@ -1939,8 +1975,17 @@ class RecsysTrainer(Trainer):
                     head_index=head_index,
                 )
 
+            @hk.transform
+            def mol_side_table_fn(post_table: jax.Array):
+                assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
+                model = self.model_config.make(
+                    sharding_context=make_legacy_sharding_context(self.mesh)
+                )
+                return model.mol_side_table_rows(post_table)
+
             self.two_tower_forward_fn = two_tower_forward_fn
             self.candidate_tower_forward_fn = candidate_tower_forward_fn
+            self.mol_side_table_fn = mol_side_table_fn
 
         @hk.transform
         def forward_fn(
@@ -2021,6 +2066,9 @@ class RecsysTrainer(Trainer):
                 lr_shape,
                 compiler_options=compiler_options,
             )
+
+        if self.dense_params_ema_decay > 0.0:
+            self.update_jit = self._with_dense_params_ema(self.update_jit)
 
         self.forward_jit = JittedOrCompiled(
             jax.jit(
@@ -2566,6 +2614,18 @@ class RecsysTrainer(Trainer):
         return time.perf_counter() - start
 
     def save_checkpoint(self, *args, **kwargs):
+        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:
+            return self._save_checkpoint_current_params(*args, **kwargs)
+        live_params = self.state.params
+        self.state = self.state._replace(
+            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)
+        )
+        try:
+            return self._save_checkpoint_current_params(*args, **kwargs)
+        finally:
+            self.state = self.state._replace(params=live_params)
+
+    def _save_checkpoint_current_params(self, *args, **kwargs):
         dataset = self.dataset
         assert isinstance(dataset, PhoenixDataset), f"Got {type(dataset)}"
         assert isinstance(self.state, RecsysTrainingState), f"Got {type(self.state)}"
@@ -2882,7 +2942,77 @@ class RecsysTrainer(Trainer):
         high_32 = jnp.asarray(post_ids >> 32, dtype=jnp.int32)
         return jnp.stack([low_32, high_32], axis=1)
 
+    def _with_dense_params_ema(self, update_fn):
+        decay = self.dense_params_ema_decay
+        params_sharding = self.state_sharding.params
+
+        def ema_init(params):
+            return jax.tree.map(lambda p: jnp.copy(p.astype(jnp.float32)), params)
+
+        def ema_update(ema, params):
+            return jax.tree.map(
+                lambda e, p: decay * e + (1.0 - decay) * p.astype(jnp.float32), ema, params
+            )
+
+        def ema_gap(ema, params):
+            pairs = zip(jax.tree.leaves(ema), jax.tree.leaves(params))
+            gap_sq = sum(jnp.sum(jnp.square(e - p.astype(jnp.float32))) for e, p in pairs)
+            norm_sq = sum(
+                jnp.sum(jnp.square(p.astype(jnp.float32))) for p in jax.tree.leaves(params)
+            )
+            return jnp.sqrt(gap_sq), jnp.sqrt(norm_sq)
+
+        self._dense_params_ema_init_jit = jax.jit(
+            ema_init, in_shardings=(params_sharding,), out_shardings=params_sharding
+        )
+        self._dense_params_ema_update_jit = jax.jit(
+            ema_update,
+            in_shardings=(params_sharding, params_sharding),
+            out_shardings=params_sharding,
+            donate_argnums=(0,),
+        )
+        self._dense_params_ema_gap_jit = jax.jit(
+            ema_gap, in_shardings=(params_sharding, params_sharding)
+        )
+        self._dense_params_ema_as_params_jit = jax.jit(
+            lambda ema, params: jax.tree.map(lambda e, p: jnp.copy(e).astype(p.dtype), ema, params),
+            in_shardings=(params_sharding, params_sharding),
+            out_shardings=params_sharding,
+        )
+
+        def update_with_dense_params_ema(state, *args):
+            state, metrics, extras = update_fn(state, *args)
+            if self._dense_params_ema is None:
+                self._dense_params_ema = self._dense_params_ema_init_jit(state.params)
+                num_params = sum(int(np.prod(p.shape)) for p in jax.tree.leaves(state.params))
+                rank_logger.info(
+                    f"dense params EMA started: decay {decay}, {num_params:,} params "
+                    f"({num_params * 4 / 2**30:.2f} GiB in float32)"
+                )
+            else:
+                self._dense_params_ema = self._dense_params_ema_update_jit(
+                    self._dense_params_ema, state.params
+                )
+            return state, metrics, extras
+
+        return update_with_dense_params_ema
+
     def eval(self, soft_step: int):
+        if self._dense_params_ema is None:
+            return self._eval_current_params(soft_step)
+        live_params = self.state.params
+        gap, norm = self._dense_params_ema_gap_jit(self._dense_params_ema, live_params)
+        self.state = self.state._replace(
+            params=jax.tree.map(lambda e, p: e.astype(p.dtype), self._dense_params_ema, live_params)
+        )
+        try:
+            metrics = dict(self._eval_current_params(soft_step))
+        finally:
+            self.state = self.state._replace(params=live_params)
+        metrics["dense_params_ema/relative_gap"] = float(gap) / max(float(norm), 1e-12)
+        return metrics
+
+    def _eval_current_params(self, soft_step: int):
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
             return self.eval_two_tower(soft_step)
 
@@ -3060,6 +3190,22 @@ class RecsysTrainer(Trainer):
         ).reshape(-1, 1)
 
         original_embeddings = self.state.post_embeddings.embeddings
+        mol_side_table = self.state.post_embeddings.mol_side_table
+        if mol_side_table is not None:
+            if self.mol_side_table_jit is None:
+                self.mol_side_table_jit = jax.jit(
+                    self.mol_side_table_fn.apply,
+                    in_shardings=(self.state_sharding.params, None, self.data_sharding),
+                    out_shardings=NamedSharding(self.mesh, P(None, None)),
+                )
+            t_side = time.time()
+            side_rows = self.mol_side_table_jit(self.state.params, None, candidate_embeddings)
+            mol_side_table = replace(mol_side_table, x=side_rows, pspec=P(None, None))
+            rank_logger.info(
+                "MoL serving side table %s built in %.1fs",
+                tuple(side_rows.shape),
+                time.time() - t_side,
+            )
         post_embeddings = PostEmbeddings(
             post_ids=global_post_ids,
             author_ids=global_author_ids,
@@ -3067,6 +3213,7 @@ class RecsysTrainer(Trainer):
                 original_embeddings, x=candidate_embeddings, pspec=self.data_sharding.spec
             ),
             dataset_types=combined_dataset_types,
+            mol_side_table=mol_side_table,
         )
         self.state = self.state._replace(post_embeddings=post_embeddings)
 

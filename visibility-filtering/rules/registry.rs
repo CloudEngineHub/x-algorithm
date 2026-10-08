@@ -1,15 +1,16 @@
 use crate::hydration::{HydrationPlan, Hydrators};
 use crate::models::{
-    Decided, Evaluation, HydratedTweetCandidate, LimitedEngagement, SafetyLabelType,
-    SoftIntervention, Verdict, ViewerFeatures, Withholding,
+    Decided, Evaluation, FosnrReason, HydratedTweetCandidate, LimitedEngagement, Notice,
+    SafetyLabelMap, SafetyLabelType, Verdict, ViewerFeatures, Withholding,
 };
 use crate::params::CountryLists;
-use crate::rules::rule_spec::{ActionSpec, RuleClause, RuleId, Truth};
-use crate::rules::{author_rules, tweet_rules};
+use crate::rules::rule_spec::{ActionSpec, FosnrViolation, RuleClause, RuleId, Truth};
 use crate::rules::{RuleContext, SafetyLevel};
+use crate::rules::{author_rules, tweet_rules};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use strum::VariantArray;
+use xai_x_thrift::action::AppealablePolicy;
 
 pub(super) struct Policy {
     clauses: Vec<(&'static str, RuleClause)>,
@@ -67,6 +68,21 @@ impl Policy {
                 Truth::True | Truth::False => Hydrators::empty(),
             };
             match &rule.action {
+                ActionSpec::Appealable(violations) => {
+                    withholding_defaults = withholding_defaults.union(unknown_reads);
+                    if truth.resolves_true()
+                        && let Some(notice) = appeal(violations, context.tweet_safety_labels())
+                    {
+                        return (
+                            Verdict::Shown {
+                                notice: Some(Decided { value: notice, by }),
+                                media: None,
+                                engagement: None,
+                            },
+                            withholding_defaults,
+                        );
+                    }
+                }
                 ActionSpec::Drop(reason) => {
                     withholding_defaults = withholding_defaults.union(unknown_reads);
                     if truth.resolves_true() {
@@ -128,13 +144,9 @@ impl Policy {
                         return (
                             Verdict::Shown {
                                 notice: Some(Decided {
-                                    value: SoftIntervention {
-                                        policy: *policy,
-                                        level: *level,
-                                        proactive: !labels.is_by_agent(*label),
-                                        appeal_submitted: labels
-                                            .has_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED),
-                                    },
+                                    value: Notice::SoftIntervention(fosnr_reason(
+                                        *label, *policy, *level, labels,
+                                    )),
                                     by,
                                 }),
                                 media: None,
@@ -169,6 +181,30 @@ impl Policy {
 
     fn len(&self) -> usize {
         self.rule_names().count()
+    }
+}
+
+fn appeal(violations: &[FosnrViolation], labels: &SafetyLabelMap) -> Option<Notice> {
+    let violation = violations
+        .iter()
+        .find(|violation| labels.has_label(violation.label))?;
+    Some(Notice::Appealable {
+        reason: fosnr_reason(violation.label, violation.policy, violation.level, labels),
+        limited_actions: violation.limited_actions,
+    })
+}
+
+fn fosnr_reason(
+    label: SafetyLabelType,
+    policy: AppealablePolicy,
+    level: i8,
+    labels: &SafetyLabelMap,
+) -> FosnrReason {
+    FosnrReason {
+        policy,
+        level,
+        proactive: !labels.is_by_agent(label),
+        appeal_submitted: labels.has_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED),
     }
 }
 
@@ -215,6 +251,7 @@ pub(super) fn timeline_home_hydration() -> Vec<RuleClause> {
         tweet_rules::fosnr_level_3_drops(),
         tweet_rules::fosnr_level_1_non_follower_drop(),
         tweet_rules::fosnr_level_1_follower_soft_intervention(),
+        tweet_rules::fosnr_author_appealable(),
         tweet_rules::fosnr_fallback_drop(),
         tweet_rules::creator_tweet_nsfw_drop(),
         tweet_rules::protected_community_tweet_drop(),
@@ -294,7 +331,7 @@ impl RuleEngine {
         Self::with_country_lists(Arc::new(CountryLists::starting_at_default()))
     }
 
-    pub fn with_country_lists(country_lists: Arc<CountryLists>) -> Self {
+                pub fn with_country_lists(country_lists: Arc<CountryLists>) -> Self {
         let mut names = Vec::new();
         let levels = SafetyLevel::VARIANTS
             .iter()
@@ -367,7 +404,7 @@ mod tests {
         VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
-        candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
+        CandidateBuilder, VIEWER_ID, candidate, viewer, viewer_with_profile,
     };
     use crate::rules::rule_spec::Condition;
     use crate::rules::{holds_narrowed, test_context};
@@ -476,6 +513,7 @@ country_specific_nsfw_content_gating:
                 verify_blur_support: Some(VerifyBlurSupport::IosNeedsUpdate),
                 modern_blur: true,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: true,
                 gore_blur_ignores_settings: true,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
@@ -607,6 +645,7 @@ country_specific_nsfw_content_gating:
         assert_eq!(
             RuleEngine::for_tests().wired_rule_names(SafetyLevel::TimelineHomeHydration),
             vec![
+                "fosnr_author/appealable",
                 "erased_author/drop/inactive",
                 "deactivated_author/drop",
                 "suspended_author/drop",
@@ -682,6 +721,8 @@ country_specific_nsfw_content_gating:
                 "limit_replies_verified/limited_engagement/conversation_control",
                 "limit_replies_my_network/limited_engagement/conversation_control",
                 "limit_replies_co/limited_engagement/conversation_control",
+                "community_tweet_viewer_removed/limited_engagement",
+                "local_tweet/limited_engagement",
                 "read_only_viewer/limited_engagement",
             ]
         );

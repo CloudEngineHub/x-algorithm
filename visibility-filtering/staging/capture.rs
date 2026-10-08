@@ -1,20 +1,21 @@
 use crate::config::ENV_APP_ENV;
 use crate::filter::FilterTweets;
 use crate::models::TweetId;
-use crate::params::{ClientSwitches, CountryLists, SwitchFiles};
+use crate::params::{ClientSwitches, CountryList, CountryLists, SwitchFiles};
 use crate::rules::RuleEngine;
-use crate::server_deps::{prod_sources, CLIENT_INIT_RETRY_BUDGET};
-use crate::staging::recording::Recorder;
-use crate::staging::reference::tweetypie::{self, get_tweet_fields, Class, Client};
+use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, prod_sources};
+use crate::staging::recording::{Recorder, Recording};
 use crate::staging::reference::ENV_IMAGE;
+use crate::staging::reference::tweetypie::{self, Class, Client, get_tweet_fields};
 use crate::staging::reference_compare::resolve_build_sha;
-use crate::staging::replay_corpus::{evaluate, Case, Expected, Fixtures};
-use anyhow::{bail, Context};
+use crate::staging::replay_corpus::{Case, Expected, Fixtures, evaluate};
+use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use futures::future::join;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
-use std::io::{stdin, BufRead};
+use std::io::{BufRead, stdin};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,11 +32,30 @@ struct CaptureRequest {
     id: String,
     #[serde(default)]
     tags: Vec<String>,
-    viewer_id: u64,
+        viewer_id: Option<u64>,
     country_code: Option<String>,
     #[serde(default)]
     client: Client,
     tweets: Vec<CaptureTweet>,
+}
+
+#[derive(Serialize)]
+struct Captured {
+    #[serde(flatten)]
+    case: Case,
+            country_lists: BTreeMap<CountryList, Vec<String>>,
+    shared: Recording,
+}
+
+impl Captured {
+    fn new(case: Case, country_lists: BTreeMap<CountryList, Vec<String>>) -> Self {
+        let (recording, shared) = case.recording.split_shared();
+        Self {
+            case: Case { recording, ..case },
+            country_lists,
+            shared,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -87,10 +107,12 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
             continue;
         }
         let request: CaptureRequest = serde_json::from_str(&line).context("request line")?;
-        if !fixtures.users.contains(&request.viewer_id) {
+        if let Some(viewer_id) = request.viewer_id
+            && !fixtures.users.contains(&viewer_id)
+        {
             eprintln!(
-                "capture: skipped {}: viewer {} is not in fixtures.json",
-                request.id, request.viewer_id
+                "capture: skipped {}: viewer {viewer_id} is not in fixtures.json",
+                request.id
             );
             continue;
         }
@@ -112,7 +134,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
             .context(request.viewer_id, request.country_code.as_deref());
         let client_capability = client_switches.resolve(
             Some(&client),
-            Some(request.viewer_id),
+            request.viewer_id,
             request.country_code.as_deref(),
         );
         let tweet_ids: Vec<u64> = request.tweets.iter().map(|tweet| tweet.id).collect();
@@ -186,16 +208,18 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
             country_code: request.country_code,
             client: request.client,
             client_capability,
-            country_lists: country_lists.codes(),
             tweets,
             recording,
         };
-        println!("{}", serde_json::to_string(&case)?);
+        println!(
+            "{}",
+            serde_json::to_string(&Captured::new(case, country_lists.codes()))?
+        );
     }
     Ok(())
 }
 
-fn test_users_metadata() -> MetadataMap {
+pub fn test_users_metadata() -> MetadataMap {
     let mut metadata = MetadataMap::new();
     metadata.insert("dtab-local", MetadataValue::from_static(TEST_USERS_DTAB));
     metadata
@@ -204,6 +228,39 @@ fn test_users_metadata() -> MetadataMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hydration::batch::Hydrated;
+    use crate::hydration::sources::{Observer, exchange};
+    use crate::models::ClientCapability;
+    use std::iter;
+
+    #[test]
+    fn a_captured_line_is_its_case_beside_the_shared_answers() {
+        let recorder = Arc::new(Recorder::default());
+        recorder.answered::<exchange::TesPureCore>(iter::once((1, Hydrated::NotFound)));
+        recorder.answered::<exchange::GizmoduckViewer>(iter::once((50, Hydrated::NotFound)));
+        let case = Case {
+            id: "a".to_owned(),
+            tags: vec![],
+            captured_at_unix: 0,
+            build: String::new(),
+            viewer_id: Some(50),
+            country_code: None,
+            client: Client::Web,
+            client_capability: ClientCapability::default(),
+            tweets: vec![],
+            recording: recorder.take(),
+        };
+
+        let mut line = serde_json::to_value(Captured::new(case, BTreeMap::new())).unwrap();
+        let shared = line.as_object_mut().unwrap().remove("shared");
+        assert_eq!(
+            shared,
+            Some(serde_json::json!({"pure_cores": {"1": "not_found"}}))
+        );
+        let case: Case = serde_json::from_value(line).unwrap();
+        assert_eq!(case.id, "a");
+        assert_eq!(case.recording.names(), ["viewers"]);
+    }
 
     #[test]
     fn a_request_line_names_its_client_or_is_web() {

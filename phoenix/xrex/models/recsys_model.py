@@ -53,6 +53,8 @@ from xrex.models.loss_recsys import (
     binary_threshold_loss_compute,
     continuous_loss_compute,
     continuous_loss_weights,
+    cread_log_thresholds,
+    cread_loss_compute,
     multihot_loss_compute,
     multihot_loss_weights,
     purchase_value_loss_compute,
@@ -73,10 +75,15 @@ from xrex.models.recsys_embedding import (
     get_recsys_embed_param_to_jax_array,
 )
 from xrex.models.recsys_feature_prep import (
+    DWELL_TIME_DEFAULT_SENTINEL_SEC,
     FeaturePrepConfig,
     build_feature_prep_inputs,
 )
-from xrex.models.recsys_sid import reconstruct_entity_sid
+from xrex.models.recsys_sid import (
+    reconstruct_entity_sid,
+    sid_prefix2_lookup,
+    sid_prefix3_lookup,
+)
 from xrex.models.recsys_user_features import (
     UserFeaturesConfig,
     build_user_feature_parts,
@@ -241,11 +248,23 @@ class ContinuousActionLossConfig(Config):
 
     loss_weight: float = 0.0
 
-    loss_type: Literal["mse", "mae", "huber", "tweedie", "binary"] = "mae"
+    loss_type: Literal["mse", "mae", "huber", "tweedie", "binary", "cread"] = "mae"
 
     tweedie_power: float = 1.5
 
     binary_threshold: float = 10.0
+
+    cread_log_min_threshold: float = 2.0
+
+    cread_log_num_thresholds: int = 30
+
+    cread_restoration_weight: float = 0.5
+
+    cread_restoration_loss: Literal["mae", "huber"] = "huber"
+
+    cread_huber_delta_sec: float = 5.0
+
+    cread_mask_sentinel_labels: bool = True
 
     activation: Literal["sigmoid", "softplus"] | None = None
 
@@ -285,6 +304,37 @@ class ContinuousActionLossConfig(Config):
                 "loss_type='binary' outputs a probability in [0, 1]; output_cap does not apply"
             )
 
+        if self.loss_type == "cread":
+            _ = self.cread_threshold_values
+            if not 0.0 < self.cread_huber_delta_sec < self.norm_config.norm_scale:
+                raise ValueError(
+                    f"cread_huber_delta_sec ({self.cread_huber_delta_sec}) must be in "
+                    f"(0, norm_scale={self.norm_config.norm_scale})"
+                )
+
+    @property
+    def cread_threshold_values(self) -> tuple[float, ...]:
+        return cread_log_thresholds(
+            self.norm_config.norm_scale,
+            self.cread_log_min_threshold,
+            self.cread_log_num_thresholds,
+        )
+
+
+def validate_continuous_action_losses(losses: list[ContinuousActionLossConfig]) -> None:
+    seen: dict[tuple[int, tuple[int, ...], tuple[int, ...]], str | None] = {}
+    for lc in losses:
+        if lc.loss_weight <= 0:
+            continue
+        key = (lc.action_index, tuple(lc.product_surfaces), tuple(lc.exclude_product_surfaces))
+        if key in seen:
+            raise ValueError(
+                f"continuous_action_losses entries {seen[key]!r} and {lc.metric_name!r} are "
+                "both active (loss_weight > 0) with the same action index and surface "
+                "filters; zero out the one being replaced"
+            )
+        seen[key] = lc.metric_name
+
 
 def _get_surface_mask(
     loss_config: ContinuousActionLossConfig,
@@ -304,7 +354,11 @@ def _rescale_sigmoid_heads_for_inference(
     product_surface: jax.Array,
 ) -> jax.Array:
     for loss_config in continuous_action_losses:
-        if loss_config.activation != "sigmoid" or loss_config.loss_type == "binary":
+        if (
+            loss_config.activation != "sigmoid"
+            or loss_config.loss_type == "binary"
+            or loss_config.loss_weight <= 0
+        ):
             continue
         idx = loss_config.action_index
         scale = loss_config.norm_config.norm_scale
@@ -428,15 +482,15 @@ def metric_prauc(
     valid_y = y * valid_mask
     num_pos = jnp.sum(valid_y)
 
-    def compute_pr_at_threshold(threshold):
-        pred = p >= threshold
-        sum_pred = jnp.sum(pred * valid_mask)
-        sum_pred_y = jnp.sum(pred * valid_y)
-        precision = sum_pred_y / jnp.maximum(sum_pred, 1e-6)
-        recall = sum_pred_y / jnp.maximum(num_pos, 1e-6)
-        return precision, recall
-
-    precisions, recalls = jax.vmap(compute_pr_at_threshold)(auc_thresholds)
+    p = p.reshape(-1)
+    bucket = jnp.searchsorted(auc_thresholds, p, side="right", method="scan_unrolled")
+    bucket = jnp.where(jnp.isnan(p), 0, bucket)
+    weights = jnp.stack([valid_mask.reshape(-1), valid_y.reshape(-1)], axis=1).astype(jnp.float32)
+    hist = jnp.zeros((auc_thresholds.shape[0] + 1, 2), jnp.float32).at[bucket].add(weights)
+    cleared = jnp.cumsum(hist[::-1], axis=0)[::-1]
+    sum_pred, sum_pred_y = cleared[1:].T
+    precisions = sum_pred_y / jnp.maximum(sum_pred, 1e-6)
+    recalls = sum_pred_y / jnp.maximum(num_pos, 1e-6)
     sorted_indices = jnp.argsort(recalls)
     sorted_precisions = precisions[sorted_indices]
     sorted_recalls = recalls[sorted_indices]
@@ -789,6 +843,9 @@ class RecsysAggregatedModelConfig(Config):
     sid_codebook_size: int = 1024
     sid_hash_level: bool = False
     sid_cross_attn: bool = False
+    sid_prefix2_embed_dim: int = 0
+    sid_prefix3_embed_dim: int = 0
+    sid_prefix3_rows: int = 262144
 
     sid_embedding_mode: Literal["learned", "recon"] = "learned"
     sid_decoder_path: str = ""
@@ -883,6 +940,8 @@ class RecsysAggregatedModelConfig(Config):
                 and attn_config.num_user_prefix_tokens == self.num_user_prefix_tokens
             )
 
+        validate_continuous_action_losses(self.continuous_action_losses)
+
         return RecsysAggregatedModel(
             model=self.model_config.make(sharding_context=sharding_context),
             config=self,
@@ -966,12 +1025,12 @@ def get_candidate_tweet_counts(
 
     hashed_item_ids_masked_flat = hashed_item_ids_flat * negative_sample_mask
 
-    counts = jnp.bincount(
-        hashed_item_ids_masked_flat.ravel(),
-        length=log_q_num_bins,
-        minlength=log_q_num_bins,
+    sorted_ids = jnp.sort(hashed_item_ids_masked_flat.ravel())
+    tweet_counts_flat = jnp.searchsorted(
+        sorted_ids, hashed_item_ids_masked_flat, side="right", method="scan_unrolled"
+    ) - jnp.searchsorted(
+        sorted_ids, hashed_item_ids_masked_flat, side="left", method="scan_unrolled"
     )
-    tweet_counts_flat = counts[hashed_item_ids_masked_flat]
     tweet_counts_flat = jnp.where(negative_sample_mask, tweet_counts_flat, 0)
     return tweet_counts_flat
 
@@ -1157,6 +1216,9 @@ def embed_entity_sid(
     sid_hash_level: bool = False,
     entity_hashes: jnp.ndarray | None = None,
     sid_cross_attn: bool = False,
+    sid_prefix2_embed_dim: int = 0,
+    sid_prefix3_embed_dim: int = 0,
+    sid_prefix3_rows: int = 262144,
 ) -> jnp.ndarray:
     embed_init = hk.initializers.VarianceScaling(1.0, mode="fan_out")
     sids = sids.astype(jnp.int32)
@@ -1211,6 +1273,45 @@ def embed_entity_sid(
         summed = jnp.mean(attended, axis=-2) + jnp.mean(unigram_embs, axis=-2)
     else:
         summed = unigram_embs.sum(axis=-2)
+
+    if sid_prefix2_embed_dim > 0:
+        prefix2_embs = sid_prefix2_lookup(
+            sids,
+            sid_codebook_size,
+            sid_prefix2_embed_dim,
+            lr_multiplier_func,
+            embed_init_scale,
+            name_prefix,
+        )
+        prefix2_proj = get_parameter(
+            f"{name_prefix}_sid_prefix2_proj",
+            [sid_prefix2_embed_dim, sid_embed_dim],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=lr_multiplier_func(sid_prefix2_embed_dim),
+        )
+        summed = summed + jnp.dot(prefix2_embs, prefix2_proj).astype(summed.dtype)
+
+    if sid_prefix3_embed_dim > 0:
+        prefix3_embs = sid_prefix3_lookup(
+            sids,
+            sid_codebook_size,
+            sid_prefix3_embed_dim,
+            sid_prefix3_rows,
+            lr_multiplier_func,
+            embed_init_scale,
+            name_prefix,
+        )
+        prefix3_proj = get_parameter(
+            f"{name_prefix}_sid_prefix3_proj",
+            [sid_prefix3_embed_dim, sid_embed_dim],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=lr_multiplier_func(sid_prefix3_embed_dim),
+        )
+        summed = summed + jnp.dot(prefix3_embs, prefix3_proj).astype(summed.dtype)
 
     if sid_embed_dim == target_dim:
         return summed.astype(fprop_dtype)
@@ -2510,9 +2611,38 @@ class RecsysAggregatedModel(hk.Module):
         return with_sharding_constraint_unless_manual(unembed_mat, out_pspec)
 
     @hk.transparent
+    def _decode_cread(
+        self, inputs: jax.Array, loss_config: ContinuousActionLossConfig
+    ) -> jax.Array:
+        _config = self.config
+        emb_size = _config.model_config.emb_size
+        thresholds = loss_config.cread_threshold_values
+        num_thresholds = len(thresholds)
+        embed_init = hk.initializers.VarianceScaling(_config.embed_init_scale, mode="fan_out")
+        unembed_mat = get_parameter(
+            f"{loss_config.metric_name}_cread_unembeddings",
+            [emb_size, num_thresholds],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
+            pspec=P(None, None),
+            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(emb_size),
+            rms_clip_axes=(-1, -2),
+        )
+        cread_logits = jnp.dot(inputs.astype(unembed_mat.dtype), unembed_mat)
+        assert loss_config.metric_name is not None
+        self.cread_logits[loss_config.metric_name] = cread_logits
+        phi = jax.nn.sigmoid(cread_logits.astype(jnp.float32))
+        deltas = jnp.asarray(
+            [t - t_prev for t_prev, t in zip((0.0,) + thresholds, thresholds)], dtype=jnp.float32
+        )
+        restored = jnp.dot(phi, deltas)[..., None]
+        return restored.astype(inputs.dtype)
+
+    @hk.transparent
     def decode_continuous(
         self, inputs: jax.Array, product_surface: jax.Array | None = None
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
+        self.cread_logits: dict[str, jax.Array] = {}
         unembeddings = self._get_continuous_unembedding()
         logits = jnp.dot(inputs.astype(unembeddings.dtype), unembeddings).astype(inputs.dtype)
 
@@ -2526,7 +2656,8 @@ class RecsysAggregatedModel(hk.Module):
                     )
                     owner_by_index[lc.action_index] = lc
                 continue
-            configs_by_index.setdefault(lc.action_index, []).append(lc)
+            if lc.loss_weight > 0:
+                configs_by_index.setdefault(lc.action_index, []).append(lc)
 
         num_heads = logits.shape[-1]
         activated_slices = []
@@ -2557,15 +2688,21 @@ class RecsysAggregatedModel(hk.Module):
                 activated_slices.append(head_logits)
                 continue
 
+            def _activated_for_config(
+                c: ContinuousActionLossConfig, head_logits: jax.Array
+            ) -> jax.Array:
+                if c.loss_type == "cread":
+                    return self._decode_cread(inputs, c)
+                out = self._apply_activation(head_logits, c.activation)
+                if c.output_cap > 0:
+                    out = c.output_cap * jnp.tanh(out / c.output_cap)
+                return out
+
             needs_surface = len(configs) > 1 or any(
                 c.product_surfaces or c.exclude_product_surfaces for c in configs
             )
             if not needs_surface:
-                c = configs[0]
-                head_out = self._apply_activation(head_logits, c.activation)
-                if c.output_cap > 0:
-                    head_out = c.output_cap * jnp.tanh(head_out / c.output_cap)
-                activated_slices.append(head_out)
+                activated_slices.append(_activated_for_config(configs[0], head_logits))
             else:
                 assert product_surface is not None, (
                     f"product_surface required: action index {i} has surface-filtered configs"
@@ -2573,10 +2710,7 @@ class RecsysAggregatedModel(hk.Module):
                 head_out = head_logits
                 for c in configs:
                     smask = _get_surface_mask(c, product_surface)[..., None]
-                    activated = self._apply_activation(head_logits, c.activation)
-                    if c.output_cap > 0:
-                        activated = c.output_cap * jnp.tanh(activated / c.output_cap)
-                    head_out = jnp.where(smask, activated, head_out)
+                    head_out = jnp.where(smask, _activated_for_config(c, head_logits), head_out)
                 activated_slices.append(head_out)
 
         return jnp.concatenate(activated_slices, axis=-1), head_logits_by_index
@@ -3075,6 +3209,9 @@ class RecsysAggregatedModel(hk.Module):
                     sid_hash_level=_config.sid_hash_level,
                     entity_hashes=cast_jax(seq["post_hashes"]) if needs_hashes else None,
                     sid_cross_attn=_config.sid_cross_attn,
+                    sid_prefix2_embed_dim=_config.sid_prefix2_embed_dim,
+                    sid_prefix3_embed_dim=_config.sid_prefix3_embed_dim,
+                    sid_prefix3_rows=_config.sid_prefix3_rows,
                 )
 
             _sid_post_emb_h = _embed_post_sid("history_seq") if _config.use_post_sid else None
@@ -3393,12 +3530,25 @@ class RecsysAggregatedModel(hk.Module):
                                 head_valid_mask.dtype
                             )
                         continuous_heads[index] = (head_valid_mask, head_surface_mask)
+                        valid_mask = head_valid_mask
+                        if loss_config.loss_type == "cread":
+                            valid_mask = valid_mask.astype(jnp.bool_)
                         _, weights = continuous_loss_weights(
-                            head_valid_mask,
+                            valid_mask,
                             negative_sample_mask,
                             loss_config.mask_negatives,
                             loss_weights,
                         )
+                        if (
+                            loss_config.loss_type == "cread"
+                            and loss_config.cread_mask_sentinel_labels
+                        ):
+                            gt_raw = candidate_continuous_actions[
+                                :, :, loss_config.action_index
+                            ].astype(jnp.float32)
+                            weights = weights * (
+                                (gt_raw != 0.0) & (gt_raw != DWELL_TIME_DEFAULT_SENTINEL_SEC)
+                            )
                         total[f"continuous/{index}"] = jnp.sum(weights)
 
             purchase_value = None
@@ -3735,6 +3885,7 @@ class RecsysAggregatedModel(hk.Module):
 
         continuous_action_loss_total = jnp.array(0.0)
         continuous_metric_inputs = {}
+        cread_stats = {}
         for index, (head_valid_mask, _) in c.continuous_heads.items():
             loss_config = self.config.continuous_action_losses[index]
             assert c.continuous_actions is not None
@@ -3742,7 +3893,42 @@ class RecsysAggregatedModel(hk.Module):
             pred_raw = candidate_continuous_preds[:, :, loss_config.action_index]
             head_normalizer = normalizer(f"continuous/{index}")
 
-            if loss_config.loss_type == "tweedie":
+            if loss_config.loss_type == "cread":
+                assert loss_config.metric_name is not None
+                sentinel_values = (
+                    (0.0, DWELL_TIME_DEFAULT_SENTINEL_SEC)
+                    if loss_config.cread_mask_sentinel_labels
+                    else ()
+                )
+                (
+                    action_loss,
+                    gt_clamped,
+                    pred_in_original_units,
+                    cont_loss_mask,
+                    per_element_loss,
+                    cread_cls_loss,
+                    cread_restoration_loss,
+                ) = cread_loss_compute(
+                    gt_raw=gt_raw,
+                    cread_logits=self.cread_logits[loss_config.metric_name],
+                    restored_pred=pred_raw,
+                    valid_mask=head_valid_mask,
+                    negative_sample_mask=c.negative_sample_mask,
+                    thresholds=loss_config.cread_threshold_values,
+                    norm_scale=loss_config.norm_config.norm_scale,
+                    restoration_weight=loss_config.cread_restoration_weight,
+                    mask_negatives=loss_config.mask_negatives,
+                    sentinel_values=sentinel_values,
+                    raw_weights=loss_weights,
+                    restoration_loss_type=loss_config.cread_restoration_loss,
+                    huber_delta=(
+                        loss_config.cread_huber_delta_sec / loss_config.norm_config.norm_scale
+                    ),
+                    normalizer=head_normalizer,
+                )
+                cread_stats[f"{loss_config.metric_name}/cls_loss"] = cread_cls_loss
+                cread_stats[f"{loss_config.metric_name}/restore_loss"] = cread_restoration_loss
+            elif loss_config.loss_type == "tweedie":
                 (
                     action_loss,
                     gt_clamped,
@@ -3809,6 +3995,7 @@ class RecsysAggregatedModel(hk.Module):
             assert stats.keys() <= {"act-l2-loss", "attn-loss", "ffn-loss"}, stats.keys()
             stats = {key: value / loss_normalizers["num_partials"] for key, value in stats.items()}
         stats["origin-loss"] = loss
+        stats.update(cread_stats)
         if c.purchase_value is not None:
             value_ratio, baseline, value_mask = c.purchase_value
             value_loss, value_sums = purchase_value_loss_compute(
@@ -3998,6 +4185,12 @@ class RecsysAggregatedModel(hk.Module):
                     variant_loss_mask = head_variant_mask & (~c.negative_sample_mask)
                 else:
                     variant_loss_mask = head_variant_mask
+                if loss_config.loss_type == "cread" and loss_config.cread_mask_sentinel_labels:
+                    variant_loss_mask = (
+                        variant_loss_mask
+                        & (head["gt_raw"] != 0.0)
+                        & (head["gt_raw"] != DWELL_TIME_DEFAULT_SENTINEL_SEC)
+                    )
                 n_variant = jnp.sum(variant_loss_mask)
                 variant_loss = jnp.sum(head["per_element_loss"] * variant_loss_mask) / jnp.maximum(
                     n_variant, 1.0

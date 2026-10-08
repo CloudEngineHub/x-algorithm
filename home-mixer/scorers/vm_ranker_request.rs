@@ -60,6 +60,7 @@ impl RequestShape {
             min_video_duration_ms: c.min_video_duration_ms,
             phoenix_scores: Some(phoenix_scores_proto(&c.phoenix_scores)),
             weighted_score: c.weighted_score,
+            semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()
         };
         if self.debias || self.pacing {

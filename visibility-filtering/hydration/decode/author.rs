@@ -50,7 +50,7 @@ impl Column for AuthorColumn {
     }
 }
 
-pub(crate) fn decode_authors(
+pub(crate) fn author_batch(
     users: RawHydrationBatch<GizmoduckUserResult>,
 ) -> RawHydrationBatch<DecodedAuthor> {
     let mut label_counts = LabelCounts::default();

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-06T16:00:58Z
+// mirrored from config feature-switch defaults; last sync 2026-10-07T16:00:42Z
 use xai_feature_switches::param;
 
 param!(
@@ -1036,6 +1036,25 @@ param!(
     u32,
     "rust_home_mixer_feed_survey_fatigue_minutes",
     1440
+);
+
+param!(
+    EnableVideoCarousel,
+    bool,
+    "rust_home_mixer_enable_video_carousel",
+    false
+);
+param!(
+    VideoCarouselFatigueMinutes,
+    u32,
+    "rust_home_mixer_video_carousel_fatigue_minutes",
+    60
+);
+param!(
+    VideoCarouselPosition,
+    u32,
+    "rust_home_mixer_video_carousel_position",
+    6
 );
 
 param!(

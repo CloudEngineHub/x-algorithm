@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import dataclasses
+import enum
 import functools
+import hashlib
 import logging
 import os
 import re
@@ -14,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
-from typing import Any, Iterator, cast, final
+from typing import Any, Iterator, NamedTuple, cast, final
 
 import numpy as np
 import pandas as pd
@@ -27,7 +29,10 @@ from xrex.configs.config import Dataset
 from xrex.data import conversion_labels
 from xrex.data.parquet_recsys_metadata import (
     DataPosition,
+    load_batch_manifest,
     parse_date_bound,
+    parse_date_time,
+    remaining_steps_from_manifest,
 )
 from xrex.data.parquet_recsys_metadata import (
     batch_path as _batch_path,
@@ -202,10 +207,7 @@ class LazyRecordBatchIterator:
 
     def skip_batch(self):
         if self.rows_to_skip < self.num_rows:
-            num_rows = min(self.num_rows - self.rows_to_skip, self.batch_size)
             self.rows_to_skip += self.batch_size
-            if num_rows < int(0.5 * self.batch_size):
-                return False
             return True
         return False
 
@@ -256,7 +258,7 @@ def _shuffled_remaining_batches(
     start_bid: int,
     end_bid: int,
     window: int,
-    rows_per_bid: int,
+    rows_per_bid: int | np.ndarray,
     batch_size: int,
     resume_bid: int | None = None,
     resume_rows: int = 0,
@@ -267,12 +269,328 @@ def _shuffled_remaining_batches(
     total = 0
     while window_start < end_bid:
         window_end = min(_shuffle_window_end(window_start, window), end_bid)
-        rows = max(0, (window_end - window_start) * rows_per_bid - skip)
+        if isinstance(rows_per_bid, np.ndarray):
+            window_rows = int(rows_per_bid[window_start - start_bid : window_end - start_bid].sum())
+        else:
+            window_rows = (window_end - window_start) * rows_per_bid
+        rows = max(0, window_rows - skip)
         skip = 0
         full, rem = divmod(rows, batch_size)
         total += full + (1 if rem * 2 >= batch_size and rem > 0 else 0)
         window_start = window_end
     return total
+
+
+class ShuffleMode(str, enum.Enum):
+    description: str
+
+    def __new__(cls, value: str, description: str) -> "ShuffleMode":
+        obj = str.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description
+        return obj
+
+    NONE = (
+        "none",
+        "Chronological. For compatibility, shuffle_window_time_slices > 0 still selects "
+        "FILE_SHUFFLE.",
+    )
+    FILE_SHUFFLE = (
+        "file_shuffle",
+        "Each tumbling window of shuffle_window_time_slices batch_ids is read in a random "
+        "file order per shard, with rows optionally mixed through "
+        "shuffle_in_memory_buffer_rows.",
+    )
+    BLOCK_SHUFFLE = (
+        "block_shuffle",
+        "Each tumbling window of shuffle_window_time_slices batch_ids is cut into blocks of "
+        "block_shuffle_block_time_slices (e.g. 480 = 24 blocks of 20, ~1 day of ~1-hour blocks on "
+        "ads records); blocks are visited in a random order, the same on every shard unless "
+        "block_shuffle_order_per_shard, and each block is read in time order.",
+    )
+
+
+def _block_shuffle_order(
+    seed: int, window_start: int, window_blocks: int, shard: int | None
+) -> list[int]:
+    tag = f"{seed}:{window_start}:{'-' if shard is None else shard}"
+    return sorted(
+        range(window_blocks),
+        key=lambda j: (hashlib.blake2b(f"{tag}:{j}".encode(), digest_size=8).digest(), j),
+    )
+
+
+def _block_shuffle_fingerprint(
+    *,
+    window_start: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    per_shard: bool,
+    num_shards: int,
+) -> str:
+    first = _block_shuffle_order(seed, window_start, window_blocks, 0 if per_shard else None)
+    key = f"{block}:{window_blocks}:{num_shards if per_shard else '-'}:{first}"
+    return hashlib.blake2b(key.encode(), digest_size=8).hexdigest()
+
+
+def _block_shuffle_ranges(
+    *,
+    window_start: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    lo: int,
+    hi: int,
+    shard: int | None = None,
+) -> list[tuple[int, int]]:
+    order = _block_shuffle_order(seed, window_start, window_blocks, shard)
+    blocks = [(window_start + j * block, window_start + (j + 1) * block) for j in order]
+    return [(max(b0, lo), min(b1, hi)) for b0, b1 in blocks if max(b0, lo) < min(b1, hi)]
+
+
+def _block_shuffle_sequence(
+    *,
+    window_start: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    shard: int | None,
+    lo: int,
+    hi: int,
+) -> list[int]:
+    ranges = _block_shuffle_ranges(
+        window_start=window_start,
+        block=block,
+        window_blocks=window_blocks,
+        seed=seed,
+        lo=lo,
+        hi=hi,
+        shard=shard,
+    )
+    return [bid for b0, b1 in ranges for bid in range(b0, b1)]
+
+
+def _replay_block_segments(
+    *,
+    window_start: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    shard: int | None,
+    segments: list[list[int]],
+) -> tuple[set[int], list[int]]:
+    done: set[int] = set()
+    left: list[int] = []
+    for lo, hi, n in segments:
+        seq = _block_shuffle_sequence(
+            window_start=window_start,
+            block=block,
+            window_blocks=window_blocks,
+            seed=seed,
+            shard=shard,
+            lo=lo,
+            hi=hi,
+        )
+        seq = [bid for bid in seq if bid not in done]
+        done.update(seq[:n])
+        left = seq[n:]
+    return done, left
+
+
+def _block_window_grew(metadata_path: str, end_batch_id: int | None, hi: int) -> bool:
+    meta = _load_valid_batches_metadata(metadata_path)
+    if meta is None:
+        return False
+    end = meta["max_valid_batch"] + 1
+    return (end if end_batch_id is None else min(end, end_batch_id)) > hi
+
+
+@final
+class _BlockLog:
+    def __init__(
+        self,
+        *,
+        shard_index: int,
+        window_start: int,
+        window: int,
+        block: int,
+        order: list[tuple[int, int]],
+        segments: list[list[int]],
+    ):
+        self._shard, self._block, self._num_blocks = shard_index, block, len(order)
+        self._starts = {b0 // block: (i, b0, b1) for i, (b0, b1) in enumerate(order, 1)}
+        self._reading: int | None = None
+        rank_logger.info(
+            "Shard %d: block-shuffle window [%d, %d), segments %s, block order %s",
+            shard_index,
+            window_start,
+            window_start + window,
+            segments,
+            order,
+        )
+
+    def batch_id(self, bid: int) -> None:
+        key = bid // self._block
+        if key != self._reading and key in self._starts:
+            self._reading = key
+            i, b0, b1 = self._starts[key]
+            rank_logger.info(
+                "Shard %d: reading block %d/%d, batch_ids [%d, %d)",
+                self._shard,
+                i,
+                self._num_blocks,
+                b0,
+                b1,
+            )
+
+
+class _BlockResume(NamedTuple):
+    window_start: int
+    segments: list[list[int]]
+    reads: int
+    drop_in_progress: bool
+    rows_in_file: int | None = None
+    next_file_rows: int = 0
+
+
+def _block_shuffle_resume(
+    position: DataPosition,
+    *,
+    batch_size: int,
+    num_shards: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    per_shard: bool,
+    start_batch_id: int,
+    end_batch_id: int | None,
+) -> _BlockResume | None:
+    window = block * window_blocks
+    reads = position["rows_read_in_batch"]
+    saved_bs = position.get("batch_size")
+    drop = saved_bs is not None and saved_bs != batch_size
+    saved_ws = position.get("block_shuffle_window_start")
+    saved_segments = position.get("block_shuffle_segments")
+    if saved_ws is not None and saved_segments:
+        segments = [list(seg) for seg in saved_segments]
+        saved_shards = position.get("block_shuffle_num_shards")
+        shards_changed = saved_shards is not None and saved_shards != num_shards
+        saved_fp = position.get("block_shuffle_fingerprint")
+        fp = _block_shuffle_fingerprint(
+            window_start=saved_ws,
+            block=block,
+            window_blocks=window_blocks,
+            seed=seed,
+            per_shard=per_shard,
+            num_shards=num_shards,
+        )
+        if (saved_fp is not None and saved_fp != fp) or (per_shard and shards_changed):
+            end_read = max(hi for _, hi, _ in segments)
+            rank_logger.warning(
+                "Block order changed since the checkpoint; treating batch_ids before %d as read",
+                end_read,
+            )
+            ws = (end_read // window) * window
+            return _BlockResume(ws, [[ws, end_read, end_read - ws]], 0, False)
+        return _BlockResume(
+            saved_ws,
+            segments,
+            reads,
+            drop or shards_changed,
+            position.get("block_shuffle_rows_in_file"),
+            position.get("block_shuffle_rows_in_next_file", 0),
+        )
+    bid = position["last_batch_id"]
+    if bid < start_batch_id:
+        return None
+    if end_batch_id is not None and bid >= end_batch_id:
+        ws = (end_batch_id // window) * window
+        return _BlockResume(ws, [[ws, end_batch_id, end_batch_id - ws]], 0, False)
+    ws = (bid // window) * window
+    if saved_bs == 1:
+        return _BlockResume(ws, [[ws, ws + window, window]], 0, False)
+    return _BlockResume(ws, [[ws, bid, bid - ws], [bid, bid + 1, 0]], reads, drop)
+
+
+def _block_resume_window(
+    *,
+    segments: list[list[int]],
+    in_progress: bool,
+    drop_in_progress: bool,
+    window_start: int,
+    lo: int,
+    hi: int,
+    block: int,
+    window_blocks: int,
+    seed: int,
+    shard: int | None,
+    num_shards: int,
+    next_file_rows: int = 0,
+) -> tuple[list[list[int]], set[int], int | None, int]:
+    replay = functools.partial(
+        _replay_block_segments,
+        window_start=window_start,
+        block=block,
+        window_blocks=window_blocks,
+        seed=seed,
+        segments=segments,
+    )
+    done, left = replay(shard=shard)
+    current: int | None = None
+    if in_progress and left:
+        drop = drop_in_progress or not lo <= left[0] < hi
+        if not drop and shard is not None:
+            for s in range(num_shards):
+                s_left = replay(shard=s)[1]
+                if s_left and not lo <= s_left[0] < hi:
+                    drop = True
+                    break
+        if drop:
+            rank_logger.warning("Dropping the rest of in-progress batch_id %d", left[0])
+            segments[-1][2] += 1
+            done.add(left[0])
+        else:
+            current = left[0]
+    if shard is not None and lo > window_start:
+        left_to_read = {
+            sum(b not in replay(shard=s)[0] for b in range(lo, hi)) for s in range(num_shards)
+        }
+        if len(left_to_read) > 1:
+            window = block * window_blocks
+            rank_logger.warning(
+                "TTL removed unequal unread data per shard in window [%d, %d); "
+                "treating the rest of it as read",
+                window_start,
+                window_start + window,
+            )
+            segments.append([window_start, window_start + window, window])
+            done = set(range(window_start, window_start + window))
+            current = None
+    if next_file_rows and len(left) > 1 and left[1] not in done:
+        overflow = left[1]
+        sequence = _block_shuffle_sequence(
+            window_start=window_start,
+            block=block,
+            window_blocks=window_blocks,
+            seed=seed,
+            shard=shard,
+            lo=lo,
+            hi=hi,
+        )
+        upcoming = next((b for b in sequence if b not in done and b != left[0]), None)
+        if upcoming != overflow:
+            rank_logger.warning(
+                "Window grew before batch_id %d, whose first rows were read; dropping it",
+                overflow,
+            )
+            if lo <= overflow < hi:
+                segments.insert(0, [overflow, overflow + 1, 1])
+                done.add(overflow)
+            next_file_rows = 0
+    else:
+        next_file_rows = 0
+    return segments, done, current, next_file_rows
 
 
 def _same_schema(a: pa.RecordBatch, b: pa.RecordBatch) -> bool:
@@ -371,6 +689,9 @@ class InterleavingRecordBatchProvider:
         shuffle_window_time_slices: int = 0,
         shuffle_in_memory_buffer_rows: int = 0,
         shuffle_seed: int = 0,
+        shuffle_mode: ShuffleMode | str = ShuffleMode.NONE,
+        block_shuffle_block_time_slices: int = 0,
+        block_shuffle_order_per_shard: bool = False,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
@@ -391,9 +712,55 @@ class InterleavingRecordBatchProvider:
                 raise ValueError("shuffle requires metadata mode (.valid_batches.json)")
             if continuous:
                 raise ValueError("shuffle is not supported with continuous=True")
+        try:
+            shuffle_mode = ShuffleMode(shuffle_mode)
+        except ValueError:
+            raise ValueError(
+                f"shuffle_mode must be one of {[m.value for m in ShuffleMode]}, "
+                f"got {shuffle_mode!r}"
+            ) from None
+        if shuffle_mode == ShuffleMode.FILE_SHUFFLE and shuffle_window_time_slices <= 0:
+            raise ValueError("file_shuffle needs shuffle_window_time_slices > 0")
+        if shuffle_mode == ShuffleMode.BLOCK_SHUFFLE:
+            if block_shuffle_block_time_slices <= 0 or shuffle_window_time_slices <= 0:
+                raise ValueError(
+                    f"block_shuffle needs block_shuffle_block_time_slices ({block_shuffle_block_time_slices}) "
+                    f"and shuffle_window_time_slices ({shuffle_window_time_slices}) > 0"
+                )
+            if shuffle_window_time_slices % block_shuffle_block_time_slices:
+                raise ValueError(
+                    f"shuffle_window_time_slices ({shuffle_window_time_slices}) must be a "
+                    f"multiple of block_shuffle_block_time_slices ({block_shuffle_block_time_slices})"
+                )
+            if shuffle_in_memory_buffer_rows:
+                raise ValueError(
+                    "block_shuffle reads each block in time order; leave "
+                    "shuffle_in_memory_buffer_rows at 0"
+                )
+            if metadata_path is None:
+                raise ValueError("block_shuffle requires metadata mode (.valid_batches.json)")
+            if continuous:
+                raise ValueError("block_shuffle is not supported with continuous=True")
+            if num_kafka_partitions % num_shards:
+                rank_logger.warning(
+                    "block_shuffle: %d partitions over %d shards gives shards unequal file "
+                    "counts, so they drift apart and resume from one checkpoint is approximate",
+                    num_kafka_partitions,
+                    num_shards,
+                )
+        elif block_shuffle_order_per_shard:
+            raise ValueError("block_shuffle_order_per_shard requires shuffle_mode=block_shuffle")
         self._shuffle_window_time_slices = shuffle_window_time_slices
         self._shuffle_in_memory_buffer_rows = shuffle_in_memory_buffer_rows
         self._shuffle_seed = shuffle_seed
+        self._shuffle_mode = shuffle_mode
+        self._block_shuffle_block_time_slices = block_shuffle_block_time_slices
+        self._shuffle_window_blocks = (
+            shuffle_window_time_slices // block_shuffle_block_time_slices
+            if shuffle_mode == ShuffleMode.BLOCK_SHUFFLE
+            else 0
+        )
+        self._block_shuffle_order_per_shard = block_shuffle_order_per_shard
 
         if resume_position is not None and metadata_path is None:
             raise ValueError(
@@ -446,8 +813,40 @@ class InterleavingRecordBatchProvider:
         self._shuffle_skip_rows: int = 0
         self._shuffle_skip_spans_windows: bool = False
         self._rows_in_window: int = 0
+        self._range_start_batch_id: int = start_batch_id
+        self._block_resume: tuple[int, list[list[int]]] | None = None
+        self._block_drop_in_progress: bool = False
+        self._block_next_file_rows: int = 0
+        self._block_in_file: bool = False
+        self._block_state: tuple[int, list[list[int]], str] | None = None
 
-        if resume_position is not None:
+        block_resume = (
+            _block_shuffle_resume(
+                resume_position,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                block=block_shuffle_block_time_slices,
+                window_blocks=self._shuffle_window_blocks,
+                seed=shuffle_seed,
+                per_shard=block_shuffle_order_per_shard,
+                start_batch_id=start_batch_id,
+                end_batch_id=self._end_batch_id,
+            )
+            if resume_position is not None and shuffle_mode == ShuffleMode.BLOCK_SHUFFLE
+            else None
+        )
+        if resume_position is not None and block_resume is not None:
+            self._block_resume = (block_resume.window_start, block_resume.segments)
+            self._next_batch_id = block_resume.window_start
+            self._record_batches_to_skip = block_resume.reads
+            rows_in_file = block_resume.rows_in_file
+            saved_bs = resume_position.get("batch_size") or batch_size
+            self._block_drop_in_progress = block_resume.drop_in_progress or (
+                rows_in_file is not None and rows_in_file % saved_bs != 0
+            )
+            self._block_next_file_rows = block_resume.next_file_rows
+            self._block_in_file = bool(rows_in_file)
+        elif resume_position is not None:
             resume_bid = resume_position["last_batch_id"]
             resume_in_range = resume_bid >= start_batch_id and (
                 self._end_batch_id is None or resume_bid < self._end_batch_id
@@ -570,14 +969,8 @@ class InterleavingRecordBatchProvider:
 
         if self._date_range is not None:
             start_str, end_str = self._date_range
-            start_date = (
-                datetime.strptime(start_str, DATE_TIME_FORMAT)
-                if start_str.lower() != "none"
-                else None
-            )
-            end_date = (
-                datetime.strptime(end_str, DATE_TIME_FORMAT) if end_str.lower() != "none" else None
-            )
+            start_date = parse_date_time(start_str) if start_str.lower() != "none" else None
+            end_date = parse_date_time(end_str) if end_str.lower() != "none" else None
             if start_date is not None or end_date is not None:
                 filtered: list[str] = []
                 for file in all_files:
@@ -741,7 +1134,9 @@ class InterleavingRecordBatchProvider:
                 _fill_active_blocking()
 
     def get_record_batches(self) -> Iterator[pa.RecordBatch]:
-        if self._shuffle_window_time_slices > 0:
+        if self._shuffle_mode == ShuffleMode.BLOCK_SHUFFLE:
+            yield from self._get_record_batches_block_shuffle()
+        elif self._shuffle_window_time_slices > 0:
             yield from self._get_record_batches_shuffled()
         else:
             yield from self._get_record_batches_synced()
@@ -874,8 +1269,133 @@ class InterleavingRecordBatchProvider:
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
+    def _get_record_batches_block_shuffle(self) -> Iterator[pa.RecordBatch]:
+        assert self._metadata_path is not None
+        block, window_blocks = self._block_shuffle_block_time_slices, self._shuffle_window_blocks
+        window = block * window_blocks
+        shard = self._shard_index if self._block_shuffle_order_per_shard else None
+        self._remaining_skips = self._record_batches_to_skip
+        self._record_batches_to_skip = 0
+        resume = self._block_resume
+        window_start = resume[0] if resume else (self._next_batch_id // window) * window
+
+        pool = ThreadPoolExecutor(
+            max_workers=max(1, self._interleave_k), thread_name_prefix="block_shuffle_parquet"
+        )
+        try:
+            while True:
+                meta = _load_valid_batches_metadata(self._metadata_path)
+                if meta is None:
+                    return
+                end = meta["max_valid_batch"] + 1
+                if self._end_batch_id is not None:
+                    end = min(end, self._end_batch_id)
+                if window_start >= end:
+                    return
+                lo = max(meta["min_valid_batch"], self._range_start_batch_id)
+                hi = min(end, window_start + window)
+                num_partitions = meta["num_partitions"]
+                done: set[int] = set()
+                segments: list[list[int]] = [[lo, hi, 0]]
+                current: int | None = None
+                carry = 0
+                if resume is not None and resume[0] == window_start:
+                    segments, done, current, next_file_rows = _block_resume_window(
+                        segments=resume[1],
+                        in_progress=self._remaining_skips > 0 or self._block_in_file,
+                        drop_in_progress=self._block_drop_in_progress,
+                        window_start=window_start,
+                        lo=lo,
+                        hi=hi,
+                        block=block,
+                        window_blocks=window_blocks,
+                        seed=self._shuffle_seed,
+                        shard=shard,
+                        num_shards=self._num_shards,
+                        next_file_rows=self._block_next_file_rows,
+                    )
+                    pps = max(1, num_partitions // self._num_shards)
+                    carry = -(-next_file_rows // self._batch_size) * pps
+                    self._remaining_skips = 0 if current is None else self._remaining_skips
+                    self._block_in_file = self._block_drop_in_progress = False
+                    self._block_next_file_rows = 0
+                resume = None
+                fingerprint = _block_shuffle_fingerprint(
+                    window_start=window_start,
+                    block=block,
+                    window_blocks=window_blocks,
+                    seed=self._shuffle_seed,
+                    per_shard=shard is not None,
+                    num_shards=self._num_shards,
+                )
+                self._block_state = (window_start, segments, fingerprint)
+                block_log = _BlockLog(
+                    shard_index=self._shard_index,
+                    window_start=window_start,
+                    window=window,
+                    block=block,
+                    order=_block_shuffle_ranges(
+                        window_start=window_start,
+                        block=block,
+                        window_blocks=window_blocks,
+                        seed=self._shuffle_seed,
+                        lo=lo,
+                        hi=hi,
+                        shard=shard,
+                    ),
+                    segments=segments,
+                )
+                if current is not None:
+                    block_log.batch_id(current)
+                    yield from self._drain_batch_id(current, num_partitions, pool)
+                    self._remaining_skips = 0
+                    segments[-1][2] += 1
+                    self._reads_in_current_batch = 0
+                    done.add(current)
+                if segments[-1][:2] != [lo, hi]:
+                    segments.append([lo, hi, 0])
+                sequence = _block_shuffle_sequence(
+                    window_start=window_start,
+                    block=block,
+                    window_blocks=window_blocks,
+                    seed=self._shuffle_seed,
+                    shard=shard,
+                    lo=lo,
+                    hi=hi,
+                )
+                for bid in sequence:
+                    if bid in done:
+                        continue
+                    if carry:
+                        self._remaining_skips, carry = carry, 0
+                    block_log.batch_id(bid)
+                    yield from self._drain_batch_id(bid, num_partitions, pool)
+                    segments[-1][2] += 1
+                    self._reads_in_current_batch = 0
+                if hi < window_start + window and _block_window_grew(
+                    self._metadata_path, self._end_batch_id, hi
+                ):
+                    resume = (window_start, segments)
+                    continue
+                window_start += window
+                self._next_batch_id = window_start
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _drain_batch_id(
+        self, bid: int, num_partitions: int, pool: ThreadPoolExecutor
+    ) -> Iterator[pa.RecordBatch]:
+        files = [
+            _batch_path(self._topic_dir, p, bid)
+            for p in range(num_partitions)
+            if p % self._num_shards == self._shard_index
+        ]
+        self._current_drain_batch_id = bid
+        self._reads_in_current_batch = 0
+        yield from self._drain_files(files, pool=pool)
+
     def get_position(self) -> DataPosition:
-        if self._shuffle_window_time_slices > 0:
+        if self._shuffle_window_time_slices > 0 and self._shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
             return DataPosition(
                 last_batch_id=self._current_drain_batch_id,
                 rows_read_in_batch=self._rows_in_window,
@@ -891,11 +1411,18 @@ class InterleavingRecordBatchProvider:
             self._shard_index,
             self._num_shards,
         )
-        return DataPosition(
+        position = DataPosition(
             last_batch_id=self._current_drain_batch_id,
             rows_read_in_batch=self._reads_in_current_batch,
             batch_size=self._batch_size,
         )
+        state = self._block_state
+        if self._shuffle_mode == ShuffleMode.BLOCK_SHUFFLE and state is not None:
+            position["block_shuffle_window_start"] = state[0]
+            position["block_shuffle_segments"] = [list(seg) for seg in state[1]]
+            position["block_shuffle_num_shards"] = self._num_shards
+            position["block_shuffle_fingerprint"] = state[2]
+        return position
 
     def _get_record_batches_synced(self) -> Iterator[pa.RecordBatch]:
         @contextmanager
@@ -1161,6 +1688,7 @@ class PhoenixDataset(Dataset):
 
     compute_post_unexplored_label: bool = False
     enable_stale_post: bool = False
+    enable_stale_post_30d: bool = False
 
     ads_head_masking: bool = False
 
@@ -1187,10 +1715,16 @@ class PhoenixDataset(Dataset):
     shuffle_window_time_slices: int = 0
     shuffle_in_memory_buffer_rows: int = 0
     shuffle_seed: int = 0
+    shuffle_mode: ShuffleMode = ShuffleMode.NONE
+    block_shuffle_block_time_slices: int = 20
+    block_shuffle_order_per_shard: bool = False
 
     @staticmethod
     def _parse_date_bound(s: str) -> int | None:
         return parse_date_bound(s)
+
+    def _counts_steps_from_manifest(self) -> bool:
+        return True
 
     def compute_max_steps(
         self,
@@ -1219,67 +1753,144 @@ class PhoenixDataset(Dataset):
             min_ts,
             max_ts,
         )
+        resume_bid: int | None = None
+        saved_reads = 0
+        saved_bs: int | None = None
+        if resume_position is not None:
+            resume_bid = resume_position["last_batch_id"]
+            saved_reads = resume_position["rows_read_in_batch"]
+            saved_bs = resume_position.get("batch_size")
+
+        manifest = load_batch_manifest(topic_dir) if self._counts_steps_from_manifest() else None
+        num_partitions = meta["num_partitions"]
         files_per_shard = (self.num_kafka_partitions or 0) // num_shards
 
-        sample_path = _batch_path(topic_dir, 0, start_bid)
-        dump_rows = pq.ParquetFile(sample_path).metadata.num_rows
-        if self.shuffle_window_time_slices > 0 and not self.is_eval:
+        if (
+            self.shuffle_window_time_slices > 0
+            and self.shuffle_mode != ShuffleMode.BLOCK_SHUFFLE
+            and not self.is_eval
+        ):
             count = functools.partial(
                 _shuffled_remaining_batches,
                 start_bid=start_bid,
                 end_bid=end_bid,
                 window=self.shuffle_window_time_slices,
-                rows_per_bid=files_per_shard * dump_rows,
                 batch_size=batch_size,
             )
-            total_batches = count()
-            remaining = total_batches
-            if resume_position is not None:
-                saved_bs = resume_position.get("batch_size") or batch_size
-                remaining = count(
-                    resume_bid=resume_position["last_batch_id"],
-                    resume_rows=resume_position["rows_read_in_batch"] * saved_bs,
-                )
-            consumed = total_batches - remaining
-            data_end_step = current_step + remaining - 1
-            rank_logger.info(
-                "compute_max_steps (shuffled): %d (current_step=%d + %d remaining "
-                "of %d total batches, consumed=%d)",
-                data_end_step,
-                current_step,
-                remaining,
-                total_batches,
-                consumed,
+            resume = (
+                {}
+                if resume_bid is None
+                else {
+                    "resume_bid": resume_bid,
+                    "resume_rows": saved_reads * (saved_bs or batch_size),
+                }
             )
-            return data_end_step
-
-        chunks_per_file = dump_rows // batch_size
-        batches_per_bid = files_per_shard * chunks_per_file
-        total_batches = (end_bid - start_bid) * batches_per_bid
-
-        consumed = 0
-        if resume_position is not None:
-            resume_bid = resume_position["last_batch_id"]
-            if resume_bid >= start_bid:
-                saved_reads = resume_position["rows_read_in_batch"]
-                saved_bs = resume_position.get("batch_size")
-                if saved_bs is not None and saved_bs != batch_size:
-                    adjusted_reads = (saved_reads * saved_bs) // batch_size
-                else:
-                    adjusted_reads = saved_reads
-                consumed = (resume_bid - start_bid) * batches_per_bid + adjusted_reads
-        remaining = total_batches - consumed
+            if manifest is not None:
+                rows = manifest.rows_matrix(topic_dir, start_bid, end_bid, num_partitions)
+                shard_of = np.arange(num_partitions) % num_shards
+                remaining = min(
+                    count(rows_per_bid=rows[:, shard_of == s].sum(axis=1), **resume)
+                    for s in range(num_shards)
+                )
+                source = "batch manifest, shuffled windows"
+            else:
+                dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
+                remaining = count(rows_per_bid=files_per_shard * dump_rows, **resume)
+                source = f"{dump_rows}-row sample file, shuffled windows"
+        elif (
+            self.shuffle_mode == ShuffleMode.BLOCK_SHUFFLE
+            and not self.is_eval
+            and resume_position is not None
+            and (
+                block_resume := _block_shuffle_resume(
+                    resume_position,
+                    batch_size=batch_size,
+                    num_shards=num_shards,
+                    block=self.block_shuffle_block_time_slices,
+                    window_blocks=self.shuffle_window_time_slices
+                    // max(1, self.block_shuffle_block_time_slices),
+                    seed=self.shuffle_seed,
+                    per_shard=self.block_shuffle_order_per_shard,
+                    start_batch_id=start_bid,
+                    end_batch_id=end_bid,
+                )
+            )
+            is not None
+        ):
+            if manifest is not None:
+                rows = manifest.rows_matrix(topic_dir, start_bid, end_bid, num_partitions)
+                full, tail = np.divmod(rows, batch_size)
+                steps = full + ((tail > 0) & (tail * 2 >= batch_size))
+                shard_of = np.arange(num_partitions) % num_shards
+                per_bid = [steps[:, shard_of == s].sum(axis=1) for s in range(num_shards)]
+                source = "batch manifest, block shuffle"
+            else:
+                dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
+                uniform = np.full(end_bid - start_bid, files_per_shard * (dump_rows // batch_size))
+                per_bid = [uniform] * num_shards
+                source = f"{dump_rows}-row sample file, block shuffle"
+            block = self.block_shuffle_block_time_slices
+            remaining = None
+            for shard in range(num_shards):
+                done, left = _replay_block_segments(
+                    window_start=block_resume.window_start,
+                    block=block,
+                    window_blocks=self.shuffle_window_time_slices // max(1, block),
+                    seed=self.shuffle_seed,
+                    shard=shard if self.block_shuffle_order_per_shard else None,
+                    segments=block_resume.segments,
+                )
+                counts = per_bid[shard]
+                left_steps = sum(
+                    int(counts[b - start_bid])
+                    for b in range(max(start_bid, block_resume.window_start), end_bid)
+                    if b not in done
+                )
+                if left and start_bid <= left[0] < end_bid:
+                    in_bid = int(counts[left[0] - start_bid])
+                    left_steps -= (
+                        in_bid if block_resume.drop_in_progress else min(block_resume.reads, in_bid)
+                    )
+                remaining = left_steps if remaining is None else min(remaining, left_steps)
+            remaining = max(remaining or 0, 0)
+        else:
+            adjusted_reads = saved_reads
+            if saved_bs is not None and saved_bs != batch_size:
+                adjusted_reads = (saved_reads * saved_bs) // batch_size
+            if manifest is not None:
+                remaining = remaining_steps_from_manifest(
+                    topic_dir,
+                    manifest,
+                    num_partitions=num_partitions,
+                    num_shards=num_shards,
+                    batch_size=batch_size,
+                    start_batch_id=start_bid,
+                    end_batch_id=end_bid,
+                    resume_batch_id=resume_bid,
+                    resume_reads_in_batch=adjusted_reads,
+                )
+                source = "batch manifest"
+            else:
+                dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
+                batches_per_bid = files_per_shard * (dump_rows // batch_size)
+                total_batches = (end_bid - start_bid) * batches_per_bid
+                consumed = 0
+                if resume_bid is not None and resume_bid >= start_bid:
+                    consumed = (resume_bid - start_bid) * batches_per_bid + adjusted_reads
+                remaining = total_batches - consumed
+                source = f"{dump_rows}-row sample file"
 
         data_end_step = current_step + remaining - 1
 
         rank_logger.info(
-            "compute_max_steps: %d (current_step=%d + %d remaining "
-            "of %d total batches, consumed=%d)",
+            "compute_max_steps: %d (current_step=%d + %d remaining over batch_ids [%d, %d), "
+            "counted from the %s)",
             data_end_step,
             current_step,
             remaining,
-            total_batches,
-            consumed,
+            start_bid,
+            end_bid,
+            source,
         )
         return data_end_step
 
@@ -1381,6 +1992,7 @@ class PhoenixDataset(Dataset):
                     max_timestamp_ms = self._parse_date_bound(self.date_range[1])
 
                 shuffle_window = 0 if self.is_eval else self.shuffle_window_time_slices
+                shuffle_mode = ShuffleMode.NONE if self.is_eval else self.shuffle_mode
                 shuffle_buffer = 0 if self.is_eval else self.shuffle_in_memory_buffer_rows
 
                 if os.path.isfile(metadata_path):
@@ -1405,12 +2017,16 @@ class PhoenixDataset(Dataset):
                         shuffle_window_time_slices=shuffle_window,
                         shuffle_in_memory_buffer_rows=shuffle_buffer,
                         shuffle_seed=self.shuffle_seed,
+                        shuffle_mode=shuffle_mode,
+                        block_shuffle_block_time_slices=self.block_shuffle_block_time_slices,
+                        block_shuffle_order_per_shard=(
+                            self.block_shuffle_order_per_shard and not self.is_eval
+                        ),
                     )
                 else:
-                    if shuffle_window > 0:
+                    if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:
                         raise ValueError(
-                            f"shuffle_window_time_slices needs metadata mode; {metadata_path} "
-                            "does not exist"
+                            f"read-time shuffle needs metadata mode; {metadata_path} does not exist"
                         )
                     if resume_position is not None:
                         rank_logger.warning(
@@ -1494,6 +2110,7 @@ class PhoenixDataset(Dataset):
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+                        stale_post_30d=self.enable_stale_post_30d,
                         ads_head_masking=self.ads_head_masking,
                     )
 

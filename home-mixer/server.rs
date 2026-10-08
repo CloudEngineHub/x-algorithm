@@ -52,6 +52,7 @@ pub struct RequestContext {
 
 pub(crate) struct PipelineOutput {
     pub scored_posts: Vec<ScoredPost>,
+    pub video_carousel: Option<pb::VideoCarouselModule>,
     pub pipeline_result: PipelineResult<ScoredPostsQuery, PostCandidate>,
     pub pipeline_trace: Option<pb::PipelineTrace>,
 }

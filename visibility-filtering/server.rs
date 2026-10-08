@@ -24,7 +24,7 @@ pub struct ServeArgs {
     otel_endpoint: String,
 }
 
-pub async fn serve<S: XService<Config = ()>>(args: ServeArgs) -> anyhow::Result<()> {
+pub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::Result<()> {
     XServiceBuilder::new("visibility-filtering-service")
         .grpc_port(args.grpc_port)
         .metrics_port(args.metrics_port)
@@ -36,7 +36,7 @@ pub async fn serve<S: XService<Config = ()>>(args: ServeArgs) -> anyhow::Result<
         .with_layer(dark_traffic_setup::resolve_layer())
         .with_layer(RejectDarkTrafficLayer::from_env())
         .http_routes(xai_profiling::profiling_router())
-        .run::<S>(())
+        .run::<S>(config)
         .await
 }
 
@@ -66,7 +66,7 @@ impl XService for VFServer {
 impl VFServer {
     pub(crate) async fn new(datacenter: &str) -> Self {
         crate::config::refuse_reference();
-        server_deps::build(datacenter).await.into_server(None)
+        server_deps::build(datacenter, None).await.into_server(None)
     }
 
     pub(crate) fn from_endpoints(
@@ -117,7 +117,7 @@ mod tests {
     use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
     use crate::safety_label_source::SafetyLabelSource;
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
     use xai_visibility_filtering::vf_client::XaiVfClient;
     use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
     use xai_x_thrift::safety_result::FilteredReason;
@@ -130,14 +130,14 @@ mod tests {
 
     #[tonic::async_trait]
     impl TwemcacheLookup for NoLabels {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
             ids.iter().map(|&id| (id, TwemcacheOutcome::Miss)).collect()
         }
     }
 
     #[tonic::async_trait]
     impl ManhattanLookup for NoLabels {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
             ids.iter()
                 .map(|&id| (id, ManhattanOutcome::Resolved(Default::default())))
                 .collect()

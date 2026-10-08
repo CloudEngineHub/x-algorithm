@@ -19,8 +19,10 @@ pub(crate) enum Source {
     Wingman,
     CommunityModeration,
     CommunityModerator,
+    CommunityViewerRemoved,
     ArticleLifecycle,
     TrustedFriends,
+    UserLocation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +50,9 @@ impl Source {
             | Source::ViewerCountry
             | Source::CommunityModeration
             | Source::CommunityModerator
-            | Source::ArticleLifecycle => MissPolicy::FailsNode,
+            | Source::CommunityViewerRemoved
+            | Source::ArticleLifecycle
+            | Source::UserLocation => MissPolicy::FailsNode,
             Source::Wingman | Source::TrustedFriends => MissPolicy::ReadsNoEdge,
         }
     }
@@ -73,6 +77,7 @@ pub(super) enum Edge {
     FollowedBy,
     SecondDegree,
     TrustedFriends,
+    OutsidePlace,
 }
 
 impl Edge {
@@ -86,7 +91,7 @@ impl Edge {
             Edge::BlockedBy => Some((Graph::Blocks, Reverse)),
             Edge::SuperFollows => Some((Graph::SuperFollows, Forward)),
             Edge::FollowedBy => Some((Graph::Follows, Reverse)),
-            Edge::SecondDegree | Edge::TrustedFriends => None,
+            Edge::SecondDegree | Edge::TrustedFriends | Edge::OutsidePlace => None,
         }
     }
 }
@@ -105,7 +110,9 @@ pub(super) enum KeyOrigin {
     MyNetworkRootNotFollowingViewer,
     CommunityPost,
     ModeratedCommunity,
+    TweetCommunity,
     TrustedFriendsList,
+    NarrowcastPlace,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -125,8 +132,10 @@ impl KeyOrigin {
             | KeyOrigin::PureCoreReplyRoot => Some(Hydrator::PureCore),
             KeyOrigin::ExclusiveConversationAuthor
             | KeyOrigin::CommunityPost
+            | KeyOrigin::TweetCommunity
             | KeyOrigin::TweetArticle
-            | KeyOrigin::TrustedFriendsList => Some(Hydrator::Tweet),
+            | KeyOrigin::TrustedFriendsList
+            | KeyOrigin::NarrowcastPlace => Some(Hydrator::Tweet),
             KeyOrigin::ConversationRoot(_) | KeyOrigin::ViewerForCoAllowedList => {
                 Some(Hydrator::ConversationControl)
             }
@@ -153,7 +162,9 @@ impl KeyOrigin {
             | KeyOrigin::ConversationRoot(_)
             | KeyOrigin::ViewerForCoAllowedList
             | KeyOrigin::ModeratedCommunity
-            | KeyOrigin::TrustedFriendsList => input,
+            | KeyOrigin::TweetCommunity
+            | KeyOrigin::TrustedFriendsList
+            | KeyOrigin::NarrowcastPlace => input,
         }
     }
 }
@@ -312,6 +323,12 @@ impl Hydrator {
                 K::ModeratedCommunity,
                 ("communities", "visibility_features"),
             ),
+            H::CommunityViewerRemoved => node(
+                S::CommunityViewerRemoved,
+                Part::Column,
+                K::TweetCommunity,
+                ("communities", "is_removed"),
+            ),
             H::ArticleLifecycle => node(
                 S::ArticleLifecycle,
                 Part::Column,
@@ -323,6 +340,12 @@ impl Hydrator {
                 Part::Edge(Edge::TrustedFriends),
                 K::TrustedFriendsList,
                 ("trusted_friends", "is_member_or_owner"),
+            ),
+            H::OutsideNarrowcastPlace => node(
+                S::UserLocation,
+                Part::Edge(Edge::OutsidePlace),
+                K::NarrowcastPlace,
+                ("geoduck", "user_location"),
             ),
         }
     }
@@ -349,6 +372,7 @@ impl Hydrator {
                 KeyOrigin::Viewer
                     | KeyOrigin::ViewerForCoAllowedList
                     | KeyOrigin::ModeratedCommunity
+                    | KeyOrigin::TweetCommunity
             )
     }
 }
@@ -555,8 +579,10 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
         | Source::Wingman
         | Source::CommunityModeration
         | Source::CommunityModerator
+        | Source::CommunityViewerRemoved
         | Source::ArticleLifecycle
-        | Source::TrustedFriends => nodes,
+        | Source::TrustedFriends
+        | Source::UserLocation => nodes,
     };
     let mut fields = Vec::new();
     for node in nodes.iter() {
@@ -608,7 +634,9 @@ impl fmt::Display for KeyOrigin {
             }
             KeyOrigin::CommunityPost => f.write_str("community_post"),
             KeyOrigin::ModeratedCommunity => f.write_str("moderated_community"),
+            KeyOrigin::TweetCommunity => f.write_str("tweet_community"),
             KeyOrigin::TrustedFriendsList => f.write_str("trusted_friends_list"),
+            KeyOrigin::NarrowcastPlace => f.write_str("narrowcast_place"),
         }
     }
 }
@@ -686,7 +714,7 @@ gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: 
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-timeline_home_hydration: 15 calls
+timeline_home_hydration: 17 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 conversation_control/get_conversation_controls after: - nodes: conversation_control
@@ -700,8 +728,10 @@ conversation_control/exists_intersect after: root_follows_viewer nodes: root_fol
 conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out)
 communities/moderation_state after: tweet nodes: community_moderation
 communities/visibility_features after: community_moderation nodes: community_moderator (skipped logged out)
+communities/is_removed after: tweet nodes: community_viewer_removed (skipped logged out)
 article/get_lifecycles after: tweet nodes: article_lifecycle
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
+geoduck/user_location after: tweet nodes: outside_narrowcast_place (skipped logged out)
 immersive_expanded_recommendations: 8 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet

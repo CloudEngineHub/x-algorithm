@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -24,16 +25,16 @@ impl LookupError {
     }
 }
 
-pub(crate) type LookupResults = HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;
+pub(crate) type LookupResults = FxHashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;
 
 #[async_trait]
 pub(crate) trait TwemcacheLookup: Send + Sync {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome>;
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome>;
 }
 
 #[async_trait]
 pub(crate) trait ManhattanLookup: Send + Sync {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome>;
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome>;
 }
 
 pub(crate) struct RemoteSource {
@@ -64,7 +65,7 @@ impl RemoteSource {
 
     pub(crate) async fn get(&self, ids: &[u64]) -> LookupResults {
         let mut twemcache_results = self.twemcache.get(ids).await;
-        let mut results = HashMap::with_capacity(ids.len());
+        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         let mut fallback_ids = Vec::new();
         let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();
         let mut warm_ids = Vec::new();
@@ -159,7 +160,7 @@ mod tests {
 
     #[async_trait]
     impl TwemcacheLookup for FakeTwemcache {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
             let mut results = self.results.lock().unwrap();
             ids.iter()
                 .filter_map(|id| results.remove(id).map(|result| (*id, result)))
@@ -187,7 +188,7 @@ mod tests {
 
     #[async_trait]
     impl ManhattanLookup for FakeManhattan {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
             self.calls.lock().unwrap().push(ids.to_vec());
             let mut results = self.results.lock().unwrap();
             ids.iter()

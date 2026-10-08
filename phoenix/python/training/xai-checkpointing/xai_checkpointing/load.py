@@ -107,9 +107,12 @@ def _node_lock_path() -> str:
     path = os.getenv(_NODE_LOCK_FILE_ENV)
     if path:
         return path
-    if os.path.isdir("/dev/shm"):
-        return "/dev/shm/xai_restore_node_lock"
-    return "/tmp/xai_restore_node_lock"
+    base = (
+        "/dev/shm/xai_restore_node_lock"
+        if os.path.isdir("/dev/shm")
+        else "/tmp/xai_restore_node_lock"
+    )
+    return common.node_lock_path(base, "XAI_RESTORE_NODE_LOCK_SCOPE")
 
 
 class _NodeBatchLock:

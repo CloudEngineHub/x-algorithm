@@ -2164,7 +2164,7 @@ impl HoldStore for FakeHoldStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -2222,7 +2222,7 @@ mod tests {
         GatedAction::Label { name: name.into() }
     }
 
-                    static METRICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+                    pub(crate) static METRICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 
     #[test]

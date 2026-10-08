@@ -3,7 +3,8 @@ use crate::safety_label_source::metrics::{self, BatchStage, RequestMetricsGuard}
 use crate::safety_label_source::types::FailureKind;
 use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
@@ -48,7 +49,7 @@ impl GetSafetyLabelsEndpoint {
         let unique_ids: Vec<u64> = req
             .tweet_ids
             .into_iter()
-            .collect::<HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .into_iter()
             .collect();
         metrics::record_batch_size(BatchStage::Request, unique_ids.len());
@@ -79,7 +80,7 @@ pub(crate) struct GetSafetyLabelsOutcome {
 
 impl GetSafetyLabelsOutcome {
     pub(crate) fn try_from_resolved(
-        resolved: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        resolved: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
         requested_count: usize,
     ) -> Result<Self, Status> {
         let mut results = HashMap::with_capacity(resolved.len());
@@ -157,7 +158,7 @@ mod tests {
     #[test]
     fn try_from_resolved_reports_partial_failure() {
         let outcome = GetSafetyLabelsOutcome::try_from_resolved(
-            HashMap::from([
+            FxHashMap::from_iter([
                 (1, Ok(Arc::new(labels_with_entry(11)))),
                 (4, Ok(Arc::new(labels_with_entry(44)))),
                 (
@@ -184,7 +185,7 @@ mod tests {
     #[test]
     fn try_from_resolved_rejects_missing_ids() {
         let status = GetSafetyLabelsOutcome::try_from_resolved(
-            HashMap::from([(7, Ok(Arc::new(labels_with_entry(22))))]),
+            FxHashMap::from_iter([(7, Ok(Arc::new(labels_with_entry(22))))]),
             2,
         )
         .unwrap_err();

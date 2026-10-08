@@ -1,11 +1,12 @@
 use crate::hydration::Hydrator;
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
-    SoftIntervention, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
+    DropReason, FosnrReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
     ViewerFeatures, ViewerProfile, Withholding,
 };
+use crate::params::LimitedActionType;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
@@ -15,6 +16,7 @@ const TWEET_ID: u64 = 1;
 pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
+#[derive(Clone, Copy)]
 pub(crate) struct ClientClass {
     pub(crate) name: &'static str,
     pub(crate) app_id: i64,
@@ -22,7 +24,7 @@ pub(crate) struct ClientClass {
     pub(crate) capability: ClientCapability,
 }
 
-pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
+pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
     use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported};
     const RWEB: i64 = 3033300;
     const IPHONE: i64 = 129032;
@@ -44,10 +46,22 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
                 verify_blur_support: Some(verify_blur_support),
                 modern_blur,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: matches!(app_id, RWEB | IPHONE | ANDROID),
                 gore_blur_ignores_settings,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
             },
+        }
+    }
+    const fn android_9_82(class: ClientClass) -> ClientClass {
+        ClientClass {
+            capability: ClientCapability {
+                fosnr_rules: false,
+                fosnr_fallback_drops: true,
+                community_viewer_removed_limits: false,
+                ..class.capability
+            },
+            ..class
         }
     }
     [
@@ -94,6 +108,15 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
             true,
             true,
         ),
+        android_9_82(class(
+            "android_without_fosnr",
+            ANDROID,
+            "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+             (Google;panther;google;panther;0;;1;2022)",
+            AndroidNeedsUpdate,
+            false,
+            false,
+        )),
         class(
             "mac_app",
             MAC,
@@ -124,11 +147,56 @@ pub(crate) fn allow() -> Verdict {
 pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
     Verdict::Shown {
         notice: Some(Decided {
-            value: SoftIntervention {
+            value: Notice::SoftIntervention(FosnrReason {
                 policy: AppealablePolicy::ABUSE,
                 level: 1,
                 proactive,
                 appeal_submitted,
+            }),
+            by,
+        }),
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn appealed(
+    policy: AppealablePolicy,
+    level: i8,
+    proactive: bool,
+    appeal_submitted: bool,
+    by: &'static str,
+) -> Verdict {
+    use LimitedActionType as A;
+    let limited_actions: &'static [LimitedActionType] = if level == 1 {
+        &[A::EditTweet]
+    } else {
+        &[
+            A::Like,
+            A::Reply,
+            A::Retweet,
+            A::QuoteTweet,
+            A::ShareTweetVia,
+            A::AddToBookmarks,
+            A::PinToProfile,
+            A::CopyLink,
+            A::SendViaDm,
+            A::EditTweet,
+            A::Highlight,
+            A::Embed,
+            A::ListsAddRemove,
+        ]
+    };
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::Appealable {
+                reason: FosnrReason {
+                    policy,
+                    level,
+                    proactive,
+                    appeal_submitted,
+                },
+                limited_actions,
             },
             by,
         }),

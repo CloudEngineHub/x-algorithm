@@ -1,4 +1,5 @@
 use crate::hydration::{Hydrators, Lookup};
+use crate::params::LimitedActionType;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
@@ -6,14 +7,23 @@ use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialRea
 pub enum Verdict {
     Withheld(Decided<Withholding>),
     Shown {
-        notice: Option<Decided<SoftIntervention>>,
+        notice: Option<Decided<Notice>>,
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SoftIntervention {
+pub enum Notice {
+    SoftIntervention(FosnrReason),
+    Appealable {
+        reason: FosnrReason,
+        limited_actions: &'static [LimitedActionType],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FosnrReason {
     pub policy: AppealablePolicy,
     pub level: i8,
     pub proactive: bool,
@@ -123,6 +133,13 @@ pub enum LimitedEngagementReason {
     BlockedViewer,
     RootAuthorBlockedViewer,
     StaleTweet,
+    CommunityTweetHidden,
+    CommunityTweetMemberRemoved,
+    CommunityTweetCommunityNotFound,
+    CommunityTweetCommunityDeleted,
+    CommunityTweetCommunitySuspended,
+    CommunityTweetViewerRemoved,
+    LocalTweet,
 }
 
 impl LimitedEngagementReason {
@@ -133,6 +150,13 @@ impl LimitedEngagementReason {
             Self::BlockedViewer => "blocked_viewer",
             Self::RootAuthorBlockedViewer => "root_author_blocked_viewer",
             Self::StaleTweet => "stale_tweet",
+            Self::CommunityTweetHidden => "community_tweet_hidden",
+            Self::CommunityTweetMemberRemoved => "community_tweet_member_removed",
+            Self::CommunityTweetCommunityNotFound => "community_tweet_community_not_found",
+            Self::CommunityTweetCommunityDeleted => "community_tweet_community_deleted",
+            Self::CommunityTweetCommunitySuspended => "community_tweet_community_suspended",
+            Self::CommunityTweetViewerRemoved => "community_tweet_viewer_removed",
+            Self::LocalTweet => "local_tweet",
         }
     }
 }

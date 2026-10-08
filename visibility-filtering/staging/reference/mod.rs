@@ -3,12 +3,13 @@ use crate::filter::FilterTweets;
 use crate::filter_tweets::{Comparator, FinishComparison};
 use crate::params::ClientSwitches;
 use crate::rules::SafetyLevel;
-use crate::server_deps::init_client_with_retry;
+use crate::server_deps::{init_client_with_retry, with_metadata};
 use crate::staging::reference_compare::{ReferenceCompareHarness, TweetVerdict};
 use std::env;
 use std::sync::Arc;
 use strum::VariantNames;
 use tokio::time::Instant;
+use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
@@ -73,12 +74,21 @@ pub(crate) async fn build(
     init_deadline: Instant,
     filter_tweets: &Arc<FilterTweets>,
     client_switches: &ClientSwitches,
+    metadata: Option<&MetadataMap>,
 ) -> Option<Box<dyn Comparator>> {
     match reference() {
         Reference::None => None,
-        Reference::VfService => Some(Box::new(build_vf_service(datacenter, init_deadline).await)),
+        Reference::VfService => Some(Box::new(
+            build_vf_service(datacenter, init_deadline, metadata).await,
+        )),
         Reference::Tweetypie => Some(Box::new(
-            tweetypie::build(init_deadline, filter_tweets, client_switches.clone()).await,
+            tweetypie::build(
+                init_deadline,
+                filter_tweets,
+                client_switches.clone(),
+                metadata,
+            )
+            .await,
         )),
     }
 }
@@ -90,6 +100,7 @@ pub(crate) async fn build(
 async fn build_vf_service(
     datacenter: &str,
     init_deadline: Instant,
+    metadata: Option<&MetadataMap>,
 ) -> Arc<ReferenceCompareHarness> {
     let client_id = format!(
         "visibility-filtering-service.{}",
@@ -99,7 +110,7 @@ async fn build_vf_service(
         init_client_with_retry("strato_vf", init_deadline, || {
             let client_id = client_id.clone();
             async move {
-                StratoVfClient::new(
+                let mut client = StratoVfClient::new(
                     S2S_CHAIN_PATH.clone(),
                     S2S_CRT_PATH.clone(),
                     S2S_KEY_PATH.clone(),
@@ -107,7 +118,12 @@ async fn build_vf_service(
                     datacenter.to_string(),
                 )
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                client.grpc_client = Arc::new(with_metadata(
+                    Arc::unwrap_or_clone(client.grpc_client),
+                    metadata,
+                ));
+                Ok::<_, String>(client)
             }
         })
         .await

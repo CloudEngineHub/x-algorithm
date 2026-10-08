@@ -18,6 +18,7 @@ use crate::candidate_hydrators::subscription_hydrator::SubscriptionHydrator;
 use crate::candidate_hydrators::topic_feedback_context_hydrator::TopicFeedbackContextHydrator;
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
 use crate::candidate_hydrators::vf_candidate_hydrator::VFCandidateHydrator;
+use crate::candidate_hydrators::video_aspect_ratio_hydrator::VideoAspectRatioHydrator;
 use crate::clients::author_brand_safety_client::{
     AuthorBrandSafetyClient, MockAuthorBrandSafetyClient,
 };
@@ -68,6 +69,7 @@ use crate::filters::retweet_deduplication_filter::RetweetDeduplicationFilter;
 use crate::filters::self_tweet_filter::SelfTweetFilter;
 use crate::filters::topic_ids_filter::TopicIdsFilter;
 use crate::filters::vf_filter::VFFilter;
+use crate::filters::video_carousel_filter::VideoCarouselFilter;
 use crate::filters::video_filter::VideoFilter;
 use crate::filters::viewer_muted_keyword_filter::ViewerMutedKeywordFilter;
 use crate::models::candidate::PostCandidate;
@@ -474,12 +476,14 @@ impl PhoenixCandidatePipeline {
             Box::new(AiTrendFeedbackContextHydrator {
                 strato_client: strato_client.clone(),
             }),
+            Box::new(VideoAspectRatioHydrator::new(tes_client.clone())),
         ];
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(VFFilter),
             Box::new(AncillaryVFFilter),
             Box::new(DedupConversationFilter),
+            Box::new(VideoCarouselFilter),
         ];
 
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, PostCandidate>>>> =
@@ -1126,6 +1130,17 @@ mod tests {
         assert_eq!(hydrated_query.user_id, 12);
         assert!(hydrated_query.scoring_sequence.is_some());
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn video_carousel_filter_is_the_last_post_selection_filter() {
+        xai_init_utils::init().rustls();
+        let pipeline = PhoenixCandidatePipeline::mock().await;
+        let last = pipeline
+            .post_selection_filters()
+            .last()
+            .map(|filter| filter.name());
+        assert_eq!(last, Some("VideoCarouselFilter"));
     }
 
     #[test]

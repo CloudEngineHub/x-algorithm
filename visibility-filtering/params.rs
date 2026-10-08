@@ -15,8 +15,9 @@ use xai_stats_receiver::StatsReceiverExt;
 pub(crate) use client_switches::ClientSwitches;
 pub(crate) use limited_actions_policy::{LimitedActionType, LimitedActionsPolicies};
 
-const SCALA_FILES: [&str; 5] = [
+const SCALA_FILES: [&str; 6] = [
     "age_verification.yml",
+    "community_tweet.yml",
     "country_specific_nsfw_content_gating.yml",
     "freedom_of_speech_not_reach.yml",
     "media_visibility_treatments.yml",
@@ -382,6 +383,7 @@ country_specific_nsfw_content_gating:
             stats.take(),
             [
                 failed("rust_vf.yml"),
+                failed("community_tweet.yml"),
                 failed("freedom_of_speech_not_reach.yml"),
                 failed("media_visibility_treatments.yml"),
                 failed("stale_tweet.yml"),
@@ -395,6 +397,10 @@ country_specific_nsfw_content_gating:
             "media_visibility_treatments:\n  parameters: {}\n",
         );
         write("stale_tweet.yml", "stale_tweet:\n  parameters: {}\n");
+        write(
+            "community_tweet.yml",
+            "community_tweet:\n  parameters: {}\n",
+        );
         write(
             "freedom_of_speech_not_reach.yml",
             "freedom_of_speech_not_reach:\n  parameters: {}\n",

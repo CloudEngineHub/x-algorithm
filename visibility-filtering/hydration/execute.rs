@@ -16,7 +16,7 @@ use crate::models::{ArticleLifecycle, CommunityModeration, PureCore, TweetFeatur
 use crate::rules::SafetyLevel;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::convert::identity;
 use std::future::Future;
 use std::mem;
@@ -48,6 +48,7 @@ pub(super) enum Reply {
     ViewerCountry(RawHydrationBatch<Arc<str>>),
     CommunityModerations(RawHydrationBatch<CommunityModeration>),
     CommunityModerators(RawHydrationBatch<bool>),
+    CommunityViewerRemovals(RawHydrationBatch<bool>),
     ArticleLifecycles(RawHydrationBatch<ArticleLifecycle>),
 }
 
@@ -57,7 +58,7 @@ struct Timed {
     client: String,
     method: String,
     level: SafetyLevel,
-    candidate_count_by_claimed_key: HashMap<u64, usize>,
+    candidate_count_by_claimed_key: FxHashMap<u64, usize>,
 }
 
 impl Timed {
@@ -113,6 +114,7 @@ impl HydrationPlan {
         let mut store = Store::new(
             self,
             request.viewer_id,
+            request.client_capability,
             request.raw_candidates,
             request.is_expanding_retweet_sources,
         );
@@ -263,6 +265,15 @@ impl HydrationPlan {
                     |answers| Reply::Edge(Edge::TrustedFriends, answers),
                 )
             }
+            Source::UserLocation => {
+                let viewer_id = call.viewer_id?;
+                timed.keyed(
+                    call,
+                    move |call| sources.outside_places(viewer_id, &call.keys),
+                    identity,
+                    |answers| Reply::Edge(Edge::OutsidePlace, answers),
+                )
+            }
             Source::CommunityModeration => timed.keyed(
                 call,
                 |call| sources.community_moderations(&call.community_posts),
@@ -276,6 +287,15 @@ impl HydrationPlan {
                     move |call| sources.community_moderators(viewer_id, &call.keys),
                     identity,
                     Reply::CommunityModerators,
+                )
+            }
+            Source::CommunityViewerRemoved => {
+                let viewer_id = call.viewer_id?;
+                timed.keyed(
+                    call,
+                    move |call| sources.community_viewer_removals(viewer_id, &call.keys),
+                    identity,
+                    Reply::CommunityViewerRemovals,
                 )
             }
             Source::ArticleLifecycle => timed.keyed(
@@ -302,7 +322,7 @@ fn fall_back<C: Column>(
 fn missing_sets_read_no_edge(
     edges: Vec<RawHydrationBatch<bool>>,
 ) -> (Vec<RawHydrationBatch<bool>>, usize) {
-    let mut missing = HashSet::new();
+    let mut missing = FxHashSet::default();
     let edges = edges
         .into_iter()
         .map(|edge| {
@@ -348,6 +368,7 @@ mod tests {
     };
     use crate::rules::fixtures::{allow, limited};
     use crate::rules::{RuleEngine, SafetyLevel};
+    use std::collections::{HashMap, HashSet};
     use std::num::NonZeroU64;
     use xai_core_entities::entities::{
         ConversationControlArm, ExtendedProfile, GizmoduckUser, GizmoduckUserResult, PureCoreData,
@@ -426,7 +447,10 @@ mod tests {
                 HydrationRequest::new(
                     viewer_id,
                     Some("US".into()),
-                    ClientCapability::default(),
+                    ClientCapability {
+                        community_viewer_removed_limits: true,
+                        ..ClientCapability::default()
+                    },
                     raw,
                 ),
             )
@@ -773,6 +797,7 @@ mod tests {
         )
         .await;
         assert!(!logged_in.calls().contains(&Source::ViewerCountry));
+        assert!(!logged_in.calls().contains(&Source::UserLocation));
         assert_eq!(
             logged_in.selects(),
             [vec![
@@ -1460,7 +1485,7 @@ mod tests {
         let engine = RuleEngine::for_tests();
         let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
         let raw = [raw(1, None)];
-        let mut store = Store::new(plan, Some(VIEWER), &raw, true);
+        let mut store = Store::new(plan, Some(VIEWER), ClientCapability::default(), &raw, true);
         let call = store.offer(plan.groups().next().unwrap()).unwrap();
         let retweet = PureCore {
             author_id: AuthorId(10),
@@ -1526,6 +1551,7 @@ mod tests {
                     TweetFeatures {
                         article_id: article_tweet(70).article_id,
                         trusted_friends_list_id: Some(7),
+                        narrowcast_place_id: Some(0xa000_0000_0000_0001),
                         ..community_tweet(500)
                     },
                 )
@@ -1533,7 +1559,7 @@ mod tests {
                 .control(3, control(MyNetwork, 40, &[]))
                 .lifecycle(70, ArticleLifecycle::Published)
         };
-        let rows: [(SafetyLevel, Source, &[&str]); 19] = [
+        let rows: [(SafetyLevel, Source, &[&str]); 21] = [
             (
                 TimelineHome,
                 Source::TesPureCore,
@@ -1568,8 +1594,10 @@ mod tests {
                     "ArticleLifecycle",
                     "CommunityModeration",
                     "CommunityModerator",
+                    "CommunityViewerRemoved",
                     "Flock super_follows",
                     "TrustedFriends",
+                    "UserLocation",
                 ],
             ),
             (
@@ -1589,8 +1617,10 @@ mod tests {
                 &["CommunityModerator"],
             ),
             (TimelineHomeHydration, Source::CommunityModerator, &[]),
+            (TimelineHomeHydration, Source::CommunityViewerRemoved, &[]),
             (TimelineHomeHydration, Source::ArticleLifecycle, &[]),
             (TimelineHomeHydration, Source::TrustedFriends, &[]),
+            (TimelineHomeHydration, Source::UserLocation, &[]),
         ];
         let raw = [raw(1, None), raw(2, None), raw(3, None)];
         for (level, hung, waiting) in rows {
@@ -1699,6 +1729,58 @@ mod tests {
                 .evaluate(level, &hydrated.viewer_features, first)
                 .into_verdict(),
             allow()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_community_post_asks_once_per_community_whether_the_viewer_was_removed() {
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .tweet_features(1, community_tweet(500))
+                .tweet(2, 10)
+                .tweet_features(2, community_tweet(501))
+                .tweet(3, 10)
+                .tweet(4, VIEWER)
+                .tweet_features(4, community_tweet(500))
+                .authors(&[10, VIEWER])
+                .removed_from(500)
+        };
+        let level = SafetyLevel::TimelineHomeHydration;
+        let raw = [raw(1, None), raw(2, None), raw(3, None), raw(4, None)];
+        let removed = |hydrated: &InRequestOrder| -> Vec<bool> {
+            hydrated
+                .candidates
+                .iter()
+                .map(|c| c.viewer_is_removed_from_community)
+                .collect()
+        };
+
+        let logged_in = world();
+        let hydrated = hydrate(&logged_in, level, Some(VIEWER), &raw).await;
+        assert_eq!(
+            logged_in.keys(Source::CommunityViewerRemoved),
+            [vec![500, 501]]
+        );
+        assert_eq!(removed(&hydrated), [true, false, false, true]);
+        assert!(hydrated.failed_ids.is_empty());
+
+        let logged_out = world();
+        let hydrated = hydrate(&logged_out, level, None, &raw).await;
+        assert!(logged_out.keys(Source::CommunityViewerRemoved).is_empty());
+        assert_eq!(removed(&hydrated), [false; 4]);
+
+        let failing = world().fault(Source::CommunityViewerRemoved, Fault::Fails);
+        let hydrated = hydrate(&failing, level, Some(VIEWER), &raw).await;
+        assert_eq!(removed(&hydrated), [false; 4]);
+        assert_eq!(
+            hydrated.failed_nodes,
+            [
+                Ok(Hydrators::of(Hydrator::CommunityViewerRemoved)),
+                Ok(Hydrators::of(Hydrator::CommunityViewerRemoved)),
+                Ok(Hydrators::empty()),
+                Ok(Hydrators::of(Hydrator::CommunityViewerRemoved)),
+            ]
         );
     }
 }
