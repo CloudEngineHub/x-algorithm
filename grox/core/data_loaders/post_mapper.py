@@ -171,6 +171,12 @@ class PostMapper:
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
             space_metadata=space_metadata,
+            mentioned_users=[
+                cls._from_strato_user_metadata_to_user(m)
+                for m in post_metadata.mentionedUsersMetadata
+            ]
+            if post_metadata.mentionedUsersMetadata
+            else None,
         )
 
     @classmethod

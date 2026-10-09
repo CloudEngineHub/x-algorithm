@@ -171,6 +171,9 @@ message PredictNextActionsRequest {
 
   repeated PurchaseValueBaseline purchase_value_baselines = 23;
   EngagementCounts user_ads_engagement_counts = 24;
+
+  FeedRequestContext feed_request_context = 25;
+  FeedCursorDirection feed_cursor_direction = 26;
 }
 
 message PurchaseValueBaseline {

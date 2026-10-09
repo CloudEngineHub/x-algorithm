@@ -263,6 +263,9 @@ class CutedslRankerVarlenAttention(CustomAttention):
         from xrex.cutedsl.ranker_attention_varlen_fa4 import (
             ranker_attention_varlen_fa4,
         )
+        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
+            ranker_candidate_attention_fa4,
+        )
 
         def sharded_mha(
             q,
@@ -285,6 +288,7 @@ class CutedslRankerVarlenAttention(CustomAttention):
             bsp_bwd_diag_idx,
             bsp_valid_block_upper,
             bsp_valid_block_lower,
+            *candidate_region_args,
         ):
             del segment_ids, segment_ids_k, temp
             fwd_bs = (
@@ -303,8 +307,25 @@ class CutedslRankerVarlenAttention(CustomAttention):
                 bsp_bwd_diag_cnt,
                 bsp_bwd_diag_idx,
             )
-            return (
-                ranker_attention_varlen_fa4(
+            if candidate_region_args:
+                candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
+                    candidate_region_args
+                )
+                attn_out = ranker_candidate_attention_fa4(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    (fwd_bs, bwd_bs),
+                    bsp_valid_block_upper,
+                    bsp_valid_block_lower,
+                    candidate_cu_seqlens[0],
+                    key_starts[0],
+                    key_counts[0],
+                    history_region_len=q.shape[1] - candidate_token_to_slot.shape[-1],
+                )
+            else:
+                attn_out = ranker_attention_varlen_fa4(
                     q,
                     k,
                     v,
@@ -312,9 +333,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     block_sparse_layout=(fwd_bs, bwd_bs),
                     valid_block_upper=bsp_valid_block_upper,
                     valid_block_lower=bsp_valid_block_lower,
-                ),
-                None,
-            )
+                )
+            return attn_out, None
 
         def _rep(s):
             return NamedShape(s, ("batch_attn",) + tuple("replicated" for _ in s[1:]))
@@ -336,4 +356,14 @@ class CutedslRankerVarlenAttention(CustomAttention):
             "bsp_valid_block_lower",
         )
         extras = tuple((name, _rep) for name in bsp_names)
+        if kwargs.get("candidate_cu_seqlens") is not None:
+            extras += tuple(
+                (name, _rep)
+                for name in (
+                    "candidate_cu_seqlens",
+                    "candidate_token_to_slot",
+                    "candidate_key_starts",
+                    "candidate_key_counts",
+                )
+            )
         return sharded_mha, extras

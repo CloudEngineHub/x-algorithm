@@ -47,7 +47,7 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch
 from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats
-from xrex.data.recsys.sequence_packing import SequencePackedLayout
+from xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions
 from xrex.models.layers import Linear, get_parameter
 from xrex.models.loss_recsys import (
     binary_threshold_loss_compute,
@@ -3136,7 +3136,7 @@ class RecsysAggregatedModel(hk.Module):
                 ).reshape(num_devices, bs_per_device, -1)
 
             padding_mask = cast_jax(layout.padding_mask)
-            seq_starts = cast_jax(layout.cu_seqlens[:, :-1])
+            seq_starts = cast_jax(packed_prefix_positions(layout))
             device_idx = jnp.arange(num_devices, dtype=jnp.int32)[:, None]
 
             embeddings = jnp.zeros(

@@ -797,6 +797,10 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     ):
         init_params = t.to_dict()
         init_params.pop("__class")
+        init_params.pop("num_microbatch")
+        init_params.pop("use_async_emb")
+        init_params.pop("seqpack_drop_empty_candidates")
+        init_params.pop("overlap_step_host_work")
 
         init_params["inference_batch_size"] = inference_batch_size
         init_params["history_seq_len"] = history_seq_len

@@ -58,8 +58,11 @@ else:
 
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import (
+    PACK_BLOCK_SIZE,
     FixedLengthDistribution,
     LengthDistribution,
+    candidate_region_history_schedule,
+    candidate_tokens_per_user_needed,
     pack_batch,
 )
 from xrex.data.retrieval_dataset import RetrievalDataset
@@ -166,6 +169,31 @@ def pbroadcast(x, axis_name, source):
     return jax.lax.psum(masked, axis_name)
 
 
+_CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000
+
+
+def _pad_axis(x: jax.Array, axis: int, length: int | None) -> jax.Array:
+    if length is None or x.shape[axis] == length:
+        return x
+    pad = [(0, 0)] * x.ndim
+    pad[axis] = (0, length - x.shape[axis])
+    return jnp.pad(x, pad)
+
+
+def max_over_processes(client, key_prefix: str, round_: int, value: int, timeout_ms: int) -> int:
+    num_processes = jax.process_count()
+    if num_processes == 1:
+        return value
+    round_key = f"{key_prefix}/{round_}"
+    client.key_value_set(f"{round_key}/values/{jax.process_index()}", str(value))
+    if client.key_value_increment(f"{round_key}/arrived", 1) == num_processes:
+        values = client.key_value_dir_get(f"{round_key}/values/")
+        client.key_value_set(f"{round_key}/max", str(max(int(v) for _, v in values)))
+        if round_ > 0:
+            client.key_value_delete(f"{key_prefix}/{round_ - 1}")
+    return int(client.blocking_key_value_get(f"{round_key}/max", timeout_ms))
+
+
 def _num_users(data: RecsysFeaturesBatch) -> int:
     return math.prod(data["user_hashes"].shape[:-1])
 
@@ -260,6 +288,8 @@ class RecsysTrainer(Trainer):
     seqpack_distribution: LengthDistribution | None = None
 
     seqpack_fixed_length: bool = False
+    seqpack_drop_empty_candidates: bool = False
+    seqpack_candidate_tokens_per_user: list[int] = field(default_factory=lambda: [32, 128])
 
     use_async_emb: bool = False
 
@@ -270,8 +300,12 @@ class RecsysTrainer(Trainer):
     _async_emb_context: AsyncEmbContextHandle | None = field(default=None, init=False, repr=False)
     _emb_hash_vocab: int = field(default=0, init=False, repr=False)
     _first_step_embedding_lookup_start_jit: typing.Any = field(default=None, init=False, repr=False)
-    _async_emb_step_jit: typing.Any = field(default=None, init=False, repr=False)
+    _async_emb_step_jits: dict[int, typing.Any] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _candidate_size_round: int = field(default=0, init=False, repr=False)
     _async_emb_lookup_pin: jax.Array | None = field(default=None, init=False, repr=False)
+    _small_buffer_anchor: jax.Array | None = field(default=None, init=False, repr=False)
     _batch_pipeline: BatchPipelineState = field(
         default_factory=BatchPipelineState, init=False, repr=False
     )
@@ -343,42 +377,96 @@ class RecsysTrainer(Trainer):
             ctx.coordinator_port = int(os.environ["JAX_COORDINATOR_PORT"])
         super().create_runtime(ctx)
 
-    def example_data(self, bs: int) -> RecsysFeaturesBatch:
+    def example_data(
+        self, bs: int, candidate_tokens_per_user: int | None = None
+    ) -> RecsysFeaturesBatch:
         assert isinstance(self.dataset, PhoenixDataset)
         batch = self.dataset.example_data(bs)
         if self.using_seqpack:
-            assert isinstance(
-                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
-            )
-            batch = pack_batch(
-                batch=batch,
-                num_devices_per_process=self.parallel_config.num_devices_per_process,
-                num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                dist=self.seqpack_distribution,
-                rng=np.random.default_rng(0),
-            )
-            if self.using_fa4:
-                batch = self.add_block_sparse_layout(batch)
+            batch = self._pack_batch(batch, np.random.default_rng(0), candidate_tokens_per_user)
         return batch
 
-    def prepare_data(self, batch):
-        return super().prepare_data(self.transform_batch(batch))
+    def prepare_data(self, batch, candidate_tokens_per_user: int | None = None):
+        return super().prepare_data(self.transform_batch(batch, candidate_tokens_per_user))
 
-    def transform_batch(self, batch: RecsysFeaturesBatch) -> RecsysFeaturesBatch:
+    def transform_batch(
+        self, batch: RecsysFeaturesBatch, candidate_tokens_per_user: int | None = None
+    ) -> RecsysFeaturesBatch:
         if self.using_seqpack:
-            assert isinstance(
-                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
-            )
-            batch = pack_batch(
-                batch=batch,
-                num_devices_per_process=self.parallel_config.num_devices_per_process,
-                num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                dist=self.seqpack_distribution,
-                rng=self._seqpack_rng,
-            )
-            if self.using_fa4:
-                batch = self.add_block_sparse_layout(batch)
+            batch = self._pack_batch(batch, self._seqpack_rng, candidate_tokens_per_user)
+        return batch
 
+    def _total_candidate_seq_len(self) -> int:
+        assert isinstance(self.dataset, PhoenixDataset)
+        num_neg_blocks = 2 if self.dataset.search_query_embedding_dim > 0 else 1
+        return (
+            self.dataset.candidate_seq_len
+            * (1 + num_neg_blocks * self.dataset.num_negatives_per_example)
+            + self.dataset.num_global_negatives_per_example
+        )
+
+    def _history_mean_len(self, candidate_tokens_per_user: int) -> int:
+        assert self.seqpack_distribution is not None
+        return self.seqpack_distribution.mean_len - (
+            candidate_tokens_per_user - self.seqpack_candidate_tokens_per_user[0]
+        )
+
+    @property
+    def _candidate_region_sizes(self) -> list[int]:
+        return self.seqpack_candidate_tokens_per_user if self.seqpack_drop_empty_candidates else []
+
+    def _history_lookup_len(self, hashes_per_token: int) -> int | None:
+        if not self.seqpack_drop_empty_candidates:
+            return None
+        assert self.seqpack_distribution is not None
+        return self.seqpack_distribution.mean_len * hashes_per_token
+
+    def _step_candidate_tokens_per_user(
+        self, microbatches: list[RecsysFeaturesBatch]
+    ) -> int | None:
+        from jax._src.distributed import global_state as jax_distributed
+
+        sizes = self._candidate_region_sizes
+        if len(sizes) < 2:
+            return sizes[0] if sizes else None
+        num_devices = self.parallel_config.num_devices_per_process
+        needed = max(candidate_tokens_per_user_needed(b, num_devices) for b in microbatches)
+        needed = max_over_processes(
+            jax_distributed.client,
+            "seqpack_candidate_tokens",
+            self._candidate_size_round,
+            needed,
+            _CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS,
+        )
+        self._candidate_size_round += 1
+        return next((size for size in sizes if size >= needed), sizes[-1])
+
+    def _pack_batch(
+        self,
+        batch: RecsysFeaturesBatch,
+        rng: np.random.Generator | None,
+        candidate_tokens_per_user: int | None,
+    ) -> RecsysFeaturesBatch:
+        assert isinstance(
+            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+        )
+        dist = self.seqpack_distribution
+        if self.seqpack_drop_empty_candidates:
+            candidate_tokens_per_user = (
+                candidate_tokens_per_user or self.seqpack_candidate_tokens_per_user[0]
+            )
+            assert dist is not None
+            dist = replace(dist, mean_len=self._history_mean_len(candidate_tokens_per_user))
+        batch = pack_batch(
+            batch=batch,
+            num_devices_per_process=self.parallel_config.num_devices_per_process,
+            num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
+            dist=dist,
+            rng=rng,
+            candidate_tokens_per_user=candidate_tokens_per_user,
+        )
+        if self.using_fa4:
+            batch = self.add_block_sparse_layout(batch)
         return batch
 
     def _purchase_value_ema_keys(self) -> dict[str, jax.Array]:
@@ -591,7 +679,7 @@ class RecsysTrainer(Trainer):
         new_x = _gather(embedding_table_param.x, token_ids)
         return replace(embedding_table_param, x=new_x)
 
-    def _get_embedding_hash_leaves(self, data: RecsysFeaturesBatch) -> list[jax.Array]:
+    def _embedding_hash_leaves(self, data: RecsysFeaturesBatch) -> list[tuple[jax.Array, bool]]:
         use_ip = (
             isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
             and self.model_config.use_ip_address
@@ -604,31 +692,37 @@ class RecsysTrainer(Trainer):
             isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
             and self.model_config.use_post_embedding
         )
-        leaves: list[jax.Array] = []
+        leaves: list[tuple[jax.Array, bool]] = []
         if use_user_embedding:
-            leaves.append(data["user_hashes"])
+            leaves.append((data["user_hashes"], False))
         if use_post_embedding:
-            leaves.append(data["history_seq"]["post_hashes"])
-        leaves.append(data["history_seq"]["auth_hashes"])
+            leaves.append((data["history_seq"]["post_hashes"], True))
+        leaves.append((data["history_seq"]["auth_hashes"], True))
         if use_post_embedding:
-            leaves.append(data["candidate_seq"]["post_hashes"])
-        leaves.append(data["candidate_seq"]["auth_hashes"])
+            leaves.append((data["candidate_seq"]["post_hashes"], False))
+        leaves.append((data["candidate_seq"]["auth_hashes"], False))
         if use_ip:
-            leaves.append(data["user_ip_hashes"])
+            leaves.append((data["user_ip_hashes"], False))
         return leaves
+
+    def _lookup_hash_ids(self, data: RecsysFeaturesBatch) -> jax.Array:
+        users = _num_users(data)
+        return jnp.concatenate(
+            [
+                _pad_axis(x.reshape(users, -1), 1, self._history_lookup_len(x.shape[-1]))
+                if is_history
+                else x.reshape(users, -1)
+                for x, is_history in self._embedding_hash_leaves(data)
+            ],
+            axis=1,
+        )
 
     def get_recsys_embeddings(
         self, data: RecsysFeaturesBatch, emb_table: Parameter
     ) -> RecsysEmbeddingsParameter:
         data_axis = tuple(self.model_config.model_config.data_axis)
 
-        hash_leaves = self._get_embedding_hash_leaves(data)
-
-        users = _num_users(data)
-        flat_hashes = [x.reshape(users, -1) for x in hash_leaves]
-        all_hashes = jax.lax.with_sharding_constraint(
-            jnp.concatenate(flat_hashes, axis=1), P(data_axis)
-        )
+        all_hashes = jax.lax.with_sharding_constraint(self._lookup_hash_ids(data), P(data_axis))
         all_embeddings = self._lookup(emb_table, all_hashes)
         all_embeddings = replace(
             all_embeddings,
@@ -641,9 +735,15 @@ class RecsysTrainer(Trainer):
     ) -> RecsysEmbeddingsParameter:
         cfg = self.model_config
         has_emb_flags = isinstance(cfg, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-        hash_leaves = self._get_embedding_hash_leaves(data)
+        leaves = self._embedding_hash_leaves(data)
+        hash_leaves = [x for x, _ in leaves]
         lengths = [x.reshape(_num_users(data), -1).shape[1] for x in hash_leaves]
-        splits = jnp.split(table.x, np.cumsum(lengths[:-1]), axis=-2)
+        padded_lengths = [
+            (self._history_lookup_len(x.shape[-1]) if is_history else None) or length
+            for (x, is_history), length in zip(leaves, lengths, strict=True)
+        ]
+        splits = jnp.split(table.x, np.cumsum(padded_lengths[:-1]), axis=-2)
+        splits = [split[..., :length, :] for split, length in zip(splits, lengths, strict=True)]
 
         if self.using_seqpack:
             splits = [
@@ -667,16 +767,26 @@ class RecsysTrainer(Trainer):
         cfg = self.model_config
         has_emb_flags = isinstance(cfg, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
         enabled = [
-            (grads.user_embeddings, has_emb_flags and cfg.use_user_embedding),
-            (grads.history_post_embeddings, has_emb_flags and cfg.use_post_embedding),
-            (grads.history_author_embeddings, True),
-            (grads.candidate_post_embeddings, has_emb_flags and cfg.use_post_embedding),
-            (grads.candidate_author_embeddings, True),
-            (grads.user_ip_embeddings, has_emb_flags and cfg.use_ip_address),
+            (grads.user_embeddings, has_emb_flags and cfg.use_user_embedding, False),
+            (grads.history_post_embeddings, has_emb_flags and cfg.use_post_embedding, True),
+            (grads.history_author_embeddings, True, True),
+            (grads.candidate_post_embeddings, has_emb_flags and cfg.use_post_embedding, False),
+            (grads.candidate_author_embeddings, True, False),
+            (grads.user_ip_embeddings, has_emb_flags and cfg.use_ip_address, False),
         ]
-        segments = [p.x for p, on in enabled if on and p is not None]
-        width = segments[0].shape[-1]
-        return jnp.concatenate([s.reshape(s.shape[0], users, -1, width) for s in segments], axis=2)
+        segments = [(p.x, is_history) for p, on, is_history in enabled if on and p is not None]
+        width = segments[0][0].shape[-1]
+        return jnp.concatenate(
+            [
+                _pad_axis(
+                    x.reshape(x.shape[0], users, -1, width),
+                    2,
+                    self._history_lookup_len(x.shape[-2]) if is_history else None,
+                )
+                for x, is_history in segments
+            ],
+            axis=2,
+        )
 
     def local_global_hack(self, batch):
         batch = multihost_utils.global_array_to_host_local_array(
@@ -742,8 +852,14 @@ class RecsysTrainer(Trainer):
                     batch, history_user_drop_rate
                 )
 
-            microbatches.append((self.transform_batch(batch), offsets))
+            microbatches.append((batch, offsets))
             if len(microbatches) == self.num_microbatch:
+                candidate_tokens_per_user = self._step_candidate_tokens_per_user(
+                    [b for b, _ in microbatches]
+                )
+                microbatches = [
+                    (self.transform_batch(b, candidate_tokens_per_user), o) for b, o in microbatches
+                ]
                 for packed, packed_offsets in microbatches:
                     yield self.local_global_hack(super().prepare_data(packed)), packed_offsets
                 microbatches = []
@@ -756,7 +872,10 @@ class RecsysTrainer(Trainer):
                     batch["user_hashes"] = np.zeros_like(batch["user_hashes"])
                 if batch.get("user_ip_hashes") is not None:
                     batch["user_ip_hashes"] = np.zeros_like(batch["user_ip_hashes"])
-                yield self.local_global_hack(self.prepare_data(batch)), offsets
+                yield (
+                    self.local_global_hack(self.prepare_data(batch, candidate_tokens_per_user)),
+                    offsets,
+                )
 
     def dataset_without_prepare(
         self,
@@ -765,18 +884,7 @@ class RecsysTrainer(Trainer):
         assert isinstance(self.dataset, PhoenixDataset)
         for batch, offsets in dataset:
             if self.using_seqpack:
-                assert isinstance(
-                    self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
-                )
-                batch = pack_batch(
-                    batch=batch,
-                    num_devices_per_process=self.parallel_config.num_devices_per_process,
-                    num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                    dist=self.seqpack_distribution,
-                    rng=np.random.default_rng(0),
-                )
-                if self.using_fa4:
-                    batch = self.add_block_sparse_layout(batch)
+                batch = self._pack_batch(batch, np.random.default_rng(0), None)
             yield batch, offsets
 
     def dataset_thread_iterator(
@@ -1023,12 +1131,7 @@ class RecsysTrainer(Trainer):
         history_author_len = (
             self.model_config.hash_table.num_author_hashes * self.dataset.history_seq_len
         )
-        num_neg_blocks = 2 if self.dataset.search_query_embedding_dim > 0 else 1
-        total_candidate_seq_len = (
-            self.dataset.candidate_seq_len
-            * (1 + num_neg_blocks * self.dataset.num_negatives_per_example)
-            + self.dataset.num_global_negatives_per_example
-        )
+        total_candidate_seq_len = self._total_candidate_seq_len()
         candidate_post_len = self.model_config.hash_table.num_item_hashes * total_candidate_seq_len
         candidate_author_len = (
             self.model_config.hash_table.num_author_hashes * total_candidate_seq_len
@@ -1068,31 +1171,7 @@ class RecsysTrainer(Trainer):
         return jnp.clip(jnp.where(ids < 0, ids + rows, ids), 0, rows - 1)
 
     def get_flattened_token_ids(self, data: RecsysFeaturesBatch) -> jax.Array:
-        use_ip = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_ip_address
-        )
-        use_user_embedding = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_user_embedding
-        )
-        use_post_embedding = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_post_embedding
-        )
-        segments: list[jax.Array] = []
-        if use_user_embedding:
-            segments.append(data["user_hashes"])
-        if use_post_embedding:
-            segments.append(data["history_seq"]["post_hashes"])
-        segments.append(data["history_seq"]["auth_hashes"])
-        if use_post_embedding:
-            segments.append(data["candidate_seq"]["post_hashes"])
-        segments.append(data["candidate_seq"]["auth_hashes"])
-        if use_ip:
-            segments.append(data["user_ip_hashes"])
-        users = _num_users(data)
-        ids = jnp.concatenate([x.reshape(users, -1) for x in segments], axis=1)
+        ids = self._lookup_hash_ids(data)
         return self._row_embedding_token_ids(ids) if self.use_row_emb else ids
 
     def _segment_sum(
@@ -1565,6 +1644,8 @@ class RecsysTrainer(Trainer):
         new_rce_ema = stats.pop("_rce_ema", state.rce_ema)
         new_calib_ema = stats.pop("_calib_ema", state.calib_ema)
         metrics.update(**stats)
+        if self.seqpack_drop_empty_candidates:
+            metrics.update(self._candidate_region_metrics(data, grad_update_done_pin))
         metrics["offset_zero_values"] = jnp.sum(state.offset_values == 0)
         metrics = jax.tree.map(lambda x: x.astype(jnp.float32), metrics)
 
@@ -1608,12 +1689,19 @@ class RecsysTrainer(Trainer):
         assert self._batch_pipeline.reserve is not None
         try:
             if self._async_emb_lookup_pin is None:
+                if len(self._candidate_region_sizes) > 1:
+                    self._reserve_small_buffer_region()
                 state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(
-                    state, data
+                    state, self._lookup_hash_fields(data)
                 )
 
-            state, metrics, extras, self._async_emb_lookup_pin = self._async_emb_step_jit(
-                state, data, lr, self._batch_pipeline.reserve.batch, self._async_emb_lookup_pin
+            step_jit = self._async_emb_step_jits[self._candidate_region_len(data)]
+            state, metrics, extras, self._async_emb_lookup_pin = step_jit(
+                state,
+                data,
+                lr,
+                self._lookup_hash_fields(self._batch_pipeline.reserve.batch),
+                self._async_emb_lookup_pin,
             )
         except Exception:
             assert self._async_emb_context is not None
@@ -1623,6 +1711,77 @@ class RecsysTrainer(Trainer):
             raise
 
         return state, metrics, extras
+
+    def _reserve_small_buffer_region(self) -> None:
+        region_bytes, anchor_bytes = 256 << 20, 64 << 20
+        data_axis = ("stage", *self.model_config.model_config.data_axis)
+        sharding = NamedSharding(self.mesh, P(data_axis))
+        num_devices = math.prod(self.mesh.shape[a] for a in data_axis)
+        zeros = jax.jit(
+            lambda n: jnp.zeros((n,), jnp.uint8), static_argnums=0, out_shardings=sharding
+        )
+        region = zeros(region_bytes * num_devices)
+        region.block_until_ready()
+        self._small_buffer_anchor = zeros(anchor_bytes * num_devices).block_until_ready()
+        del region
+
+    def _lookup_hash_fields(
+        self, data: tuple[RecsysFeaturesBatch, ...]
+    ) -> tuple[RecsysFeaturesBatch, ...]:
+        def pad_history(x: jax.Array, users_per_device: int) -> jax.Array:
+            length = self._history_lookup_len(x.shape[-1])
+            if length is None or x.shape[1] * x.shape[-1] == users_per_device * length:
+                return x
+            per_user = _pad_axis(x.reshape(x.shape[0], users_per_device, -1), 2, length)
+            return per_user.reshape(x.shape[0], -1, x.shape[-1])
+
+        return tuple(
+            typing.cast(
+                RecsysFeaturesBatch,
+                {
+                    "user_hashes": batch["user_hashes"],
+                    "user_ip_hashes": batch.get("user_ip_hashes"),
+                    "history_seq": {
+                        k: pad_history(batch["history_seq"][k], batch["user_hashes"].shape[1])
+                        for k in ("post_hashes", "auth_hashes")
+                    },
+                    "candidate_seq": {
+                        k: batch["candidate_seq"][k] for k in ("post_hashes", "auth_hashes")
+                    },
+                },
+            )
+            for batch in data
+        )
+
+    def _candidate_region_metrics(
+        self, data: tuple[RecsysFeaturesBatch, ...], update_done_pin: jax.Array
+    ) -> dict[str, jax.Array]:
+        used_tokens, dropped = [], []
+        for batch in data:
+            layout = batch["packing_layout"]
+            assert layout is not None and layout.candidate_cu_seqlens is not None
+            assert layout.dropped_candidate_slots is not None
+            used_tokens.append(layout.candidate_cu_seqlens[:, -1])
+            dropped.append(layout.dropped_candidate_slots)
+        assert self._async_emb_context is not None
+        used_tokens, dropped = recsys_async_emb.depend(
+            self._async_emb_context,
+            (jnp.stack(used_tokens, axis=1), jnp.concatenate(dropped, axis=1)),
+            update_done_pin,
+            on_sharded=False,
+        )
+        return {
+            "train/seqpack_candidate_tokens_used_max": jnp.max(used_tokens),
+            "train/seqpack_candidate_token_budget": jnp.int32(self._candidate_region_len(data) - 1),
+            "train/seqpack_dropped_candidate_slots": jnp.sum(dropped),
+        }
+
+    def _candidate_region_len(self, data: tuple[RecsysFeaturesBatch, ...]) -> int:
+        if not self.seqpack_drop_empty_candidates:
+            return 0
+        layout = data[0]["packing_layout"]
+        assert layout is not None and layout.candidate_token_to_slot is not None
+        return layout.candidate_token_to_slot.shape[-1]
 
     @property
     def using_seqpack(self) -> bool:
@@ -1661,13 +1820,21 @@ class RecsysTrainer(Trainer):
             else self.model_config
         )
         cand_slot_lens = getattr(layout, "cand_slot_lens", None)
+        cu_seqlens, padding_mask = layout.cu_seqlens, layout.padding_mask
+        num_user_prefix_tokens = _mc.num_user_prefix_tokens
+        if layout.candidate_cu_seqlens is not None:
+            cu_seqlens, padding_mask = candidate_region_history_schedule(
+                layout, transformer_candidate_seq_len, num_user_prefix_tokens
+            )
+            transformer_candidate_seq_len = 0
+            num_user_prefix_tokens = 0
         block_sparse = build_block_sparse_layout(
-            cu_seqlens=layout.cu_seqlens,
+            cu_seqlens=cu_seqlens,
             transformer_candidate_seq_len=transformer_candidate_seq_len,
             max_history_seq_len=(_mc.num_user_prefix_tokens + _mc.history_seq_len),
             packed_seq_len=int(layout.segment_ids.shape[1]),
-            padding_mask=layout.padding_mask,
-            num_user_prefix_tokens=_mc.num_user_prefix_tokens,
+            padding_mask=padding_mask,
+            num_user_prefix_tokens=num_user_prefix_tokens,
             candidate_slot_lens=(
                 np.asarray(cand_slot_lens) if cand_slot_lens is not None else None
             ),
@@ -1774,7 +1941,7 @@ class RecsysTrainer(Trainer):
             return (state._replace(emb_table=replace(state.emb_table, x=emb_table)), lookup_pin)
 
         lookup_pin_shape = jax.ShapeDtypeStruct((data_shards, 1), jnp.float32)
-        step_data = (init_data,) * self.num_microbatch
+        lookup_data = self._lookup_hash_fields((init_data,) * self.num_microbatch)
 
         self._first_step_embedding_lookup_start_jit = JittedOrCompiled(
             jax.jit(
@@ -1787,33 +1954,65 @@ class RecsysTrainer(Trainer):
         self.register_jit_function(
             self._first_step_embedding_lookup_start_jit,
             self.state_shape,
-            step_data,
+            lookup_data,
             compiler_options=compiler_options,
         )
 
-        self._async_emb_step_jit = JittedOrCompiled(
-            jax.jit(
-                self.async_emb_step,
-                in_shardings=(
-                    self.state_sharding,
-                    self.data_sharding,
-                    None,
-                    self.data_sharding,
-                    row_sharding,
-                ),
-                out_shardings=(self.state_sharding, None, None, row_sharding),
-                donate_argnums=(0, 4),
+        sizes = self._candidate_region_sizes
+        if sizes and sizes[-1] <= self._total_candidate_seq_len():
+            rank_logger.warning(
+                "seqpack_candidate_tokens_per_user ends at %d, not above the %d candidate slots, so "
+                "batches whose users fill nearly every slot drop candidates "
+                "(train/seqpack_dropped_candidate_slots)",
+                sizes[-1],
+                self._total_candidate_seq_len(),
             )
-        )
-        self.register_jit_function(
-            self._async_emb_step_jit,
-            self.state_shape,
-            step_data,
-            lr_shape,
-            step_data,
-            lookup_pin_shape,
-            compiler_options=compiler_options,
-        )
+        metrics_sharding = None
+        if len(sizes) > 1:
+            memory_kind = "pinned_host" if jax.default_backend() == "gpu" else "unpinned_host"
+            metrics_sharding = NamedSharding(self.mesh, P(), memory_kind=memory_kind)
+        for candidate_tokens_per_user in sizes or [None]:
+            data = init_data
+            if candidate_tokens_per_user is not None and candidate_tokens_per_user != sizes[0]:
+                data = jax.tree.map(
+                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding),
+                    super().prepare_data(
+                        self.example_data(
+                            self.read_bsz_per_process // self.num_microbatch,
+                            candidate_tokens_per_user,
+                        )
+                    ),
+                )
+            step_data = (data,) * self.num_microbatch
+            step_jit = JittedOrCompiled(
+                jax.jit(
+                    self.async_emb_step,
+                    in_shardings=(
+                        self.state_sharding,
+                        self.data_sharding,
+                        None,
+                        self.data_sharding,
+                        row_sharding,
+                    ),
+                    out_shardings=(self.state_sharding, metrics_sharding, None, row_sharding),
+                    donate_argnums=(0, 4),
+                ),
+                name=(
+                    None
+                    if candidate_tokens_per_user is None
+                    else f"async_emb_step_{candidate_tokens_per_user}"
+                ),
+            )
+            self.register_jit_function(
+                step_jit,
+                self.state_shape,
+                step_data,
+                lr_shape,
+                lookup_data,
+                lookup_pin_shape,
+                compiler_options=compiler_options,
+            )
+            self._async_emb_step_jits[self._candidate_region_len(step_data)] = step_jit
 
         self.update_jit = self.async_emb_update
 
@@ -1831,6 +2030,35 @@ class RecsysTrainer(Trainer):
             if self.empty_history_augmentation_rate > 0:
                 raise ValueError(
                     "num_microbatch > 1 does not support empty_history_augmentation_rate"
+                )
+        if self.seqpack_drop_empty_candidates:
+            sizes = self.seqpack_candidate_tokens_per_user
+            if not (isinstance(self.model_config, RecsysAggregatedModelConfig) and self.using_fa4):
+                raise ValueError(
+                    "seqpack_drop_empty_candidates needs a seqpack ranker on "
+                    "cutedsl_ranker_varlen_attn"
+                )
+            if self.seqpack_distribution is None:
+                raise ValueError("seqpack_drop_empty_candidates needs seqpack_distribution")
+            if not sizes or list(sizes) != sorted(set(sizes)):
+                raise ValueError(
+                    f"seqpack_candidate_tokens_per_user must be ascending and unique: {sizes}"
+                )
+            if not self.use_async_emb:
+                raise ValueError("seqpack_drop_empty_candidates needs use_async_emb=True")
+            users_per_microbatch = int(self.bs_per_device) // self.num_microbatch
+            if any(users_per_microbatch * size % PACK_BLOCK_SIZE for size in sizes):
+                raise ValueError(
+                    f"every seqpack_candidate_tokens_per_user times the {users_per_microbatch} "
+                    f"users per device and microbatch must be a multiple of {PACK_BLOCK_SIZE}: "
+                    f"{sizes}"
+                )
+            shortest_mean_history = self._history_mean_len(sizes[-1])
+            if shortest_mean_history < self.seqpack_distribution.min_len:
+                raise ValueError(
+                    f"the largest candidate size leaves a mean history of {shortest_mean_history} "
+                    f"tokens, below seqpack_distribution.min_len="
+                    f"{self.seqpack_distribution.min_len}"
                 )
 
         self._init_shmem_write_pool()

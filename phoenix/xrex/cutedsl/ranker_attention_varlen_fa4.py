@@ -323,15 +323,7 @@ def build_block_sparse_layout(
 _FA4_PACKED_CACHE = {}
 
 
-def ranker_attention_varlen_fa4(
-    q,
-    k,
-    v,
-    sm_scale,
-    block_sparse_layout,
-    valid_block_upper=None,
-    valid_block_lower=None,
-):
+def varlen_kernels(q, k, v, sm_scale, block_sparse_layout, valid_block_upper, valid_block_lower):
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -724,65 +716,83 @@ def ranker_attention_varlen_fa4(
             hdr=hdr,
         )
 
-    c = _FA4_PACKED_CACHE[cache_key]
     fwd_bs, bwd_bs = block_sparse_layout
+    return _FA4_PACKED_CACHE[cache_key], (
+        *fwd_bs,
+        *bwd_bs,
+        valid_block_upper,
+        valid_block_lower,
+    )
+
+
+def zeros_after(shape, dtype, anchor: jax.Array) -> jax.Array:
+    zero, _ = jax.lax.optimization_barrier((jnp.zeros((), dtype), anchor))
+    return jnp.broadcast_to(zero, shape)
+
+
+def varlen_forward(kernels, q, k, v, bs_args):
+    return kernels["fwd_call"](q, k, v, *bs_args[:6], *bs_args[12:])
+
+
+def varlen_backward(kernels, q, k, v, out, lse, bs_args, g):
+    bbs = bs_args[6:12]
+    valid_bounds = bs_args[12:]
+    dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
+    if dpsum.shape[-1] < kernels["sr_q"]:
+        dpsum = jnp.pad(dpsum, ((0, 0), (0, 0), (0, kernels["sr_q"] - dpsum.shape[-1])))
+    lse_log2 = lse * jnp.float32(math.log2(math.e))
+    if lse_log2.shape[-1] < kernels["sr_q"]:
+        lse_log2 = jnp.pad(lse_log2, ((0, 0), (0, 0), (0, kernels["sr_q"] - lse_log2.shape[-1])))
+
+    dq_accum_init = zeros_after(kernels["dq_accum_shape"], jnp.float32, g)
+    dk_init = zeros_after(kernels["dkv_shape"], kernels["dkv_dtype"], g)
+    dv_init = zeros_after(kernels["dkv_shape"], kernels["dkv_dtype"], g)
+    dq_accum, dk, dv = kernels["bwd_call"](
+        q,
+        k,
+        v,
+        g,
+        lse_log2,
+        dpsum,
+        *bbs,
+        *valid_bounds,
+        dq_accum_init,
+        dk_init,
+        dv_init,
+    )
+    (dq,) = kernels["post_dq_call"](dq_accum)
+    if kernels["dKV_postprocess"]:
+        (dk,) = kernels["post_dk_call"](dk)
+        (dv,) = kernels["post_dv_call"](dv)
+    return dq, dk, dv
+
+
+def ranker_attention_varlen_fa4(
+    q,
+    k,
+    v,
+    sm_scale,
+    block_sparse_layout,
+    valid_block_upper=None,
+    valid_block_lower=None,
+):
+    kernels, bs_args = varlen_kernels(
+        q, k, v, sm_scale, block_sparse_layout, valid_block_upper, valid_block_lower
+    )
 
     @jax.custom_vjp
     def _attention(q, k, v, *bs_args):
-        fbs = bs_args[:6]
-        valid_bounds = bs_args[12:]
-        out, _lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
-        return out
+        return varlen_forward(kernels, q, k, v, bs_args)[0]
 
     def _attention_fwd(q, k, v, *bs_args):
-        fbs = bs_args[:6]
-        valid_bounds = bs_args[12:]
-        out, lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
+        out, lse = varlen_forward(kernels, q, k, v, bs_args)
         out = checkpoint_name(out, "cutedsl_attn_outputs")
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
         return out, (q, k, v, out, lse, bs_args)
 
     def _attention_bwd(res, g):
         q, k, v, out, lse, bs_args = res
-        bbs = bs_args[6:12]
-        valid_bounds = bs_args[12:]
-        dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
-        if dpsum.shape[-1] < c["sr_q"]:
-            dpsum = jnp.pad(dpsum, ((0, 0), (0, 0), (0, c["sr_q"] - dpsum.shape[-1])))
-        lse_log2 = lse * jnp.float32(math.log2(math.e))
-        if lse_log2.shape[-1] < c["sr_q"]:
-            lse_log2 = jnp.pad(lse_log2, ((0, 0), (0, 0), (0, c["sr_q"] - lse_log2.shape[-1])))
-
-        dq_accum_init = jnp.zeros(c["dq_accum_shape"], dtype=jnp.float32)
-        dk_init = jnp.zeros(c["dkv_shape"], dtype=c["dkv_dtype"])
-        dv_init = jnp.zeros_like(dk_init)
-        dq_accum, dk, dv = c["bwd_call"](
-            q,
-            k,
-            v,
-            g,
-            lse_log2,
-            dpsum,
-            *bbs,
-            *valid_bounds,
-            dq_accum_init,
-            dk_init,
-            dv_init,
-        )
-        (dq,) = c["post_dq_call"](dq_accum)
-        if c["dKV_postprocess"]:
-            (dk,) = c["post_dk_call"](dk)
-            (dv,) = c["post_dv_call"](dv)
-
-        return (dq, dk, dv) + (None,) * len(bs_args)
+        return varlen_backward(kernels, q, k, v, out, lse, bs_args, g) + (None,) * len(bs_args)
 
     _attention.defvjp(_attention_fwd, _attention_bwd)
-    return _attention(
-        q,
-        k,
-        v,
-        *fwd_bs,
-        *bwd_bs,
-        valid_block_upper,
-        valid_block_lower,
-    )
+    return _attention(q, k, v, *bs_args)

@@ -322,8 +322,14 @@ def _home_direct_packed_base() -> dict:
 
 
 _H100_OVERRIDES = {
-    "bs_per_device": 256,
-    "ep": 256,
+    "bs_per_device": 512,
+    "num_microbatch": 2,
+    "ep": 128,
+    "use_async_emb": True,
+    "seqpack_drop_empty_candidates": True,
+    "overlap_step_host_work": True,
+    "remat_policy": RematType.SAVE_H100_QKV_ATTN_FFN,
+    "unroll_layer_stack": True,
     "attn_impl": "cutedsl_ranker_varlen_attn",
     "learning_rate": 7.1e-4,
     "checkpoint_every_n": 150,
@@ -332,6 +338,7 @@ _H100_OVERRIDES = {
         muon_consistent_rms=0.2,
         muon_matrix_weight_decay=0.014,
         muon_split_fused="qkv:128",
+        muon_ns_shard_group_size=8,
         adam_embedding_weight_decay=0.014,
         b1=0.95,
         b2=0.98,
@@ -880,6 +887,9 @@ for config in configs:
         ),
         bs_per_device=mparams["bs_per_device"],
         num_microbatch=mparams.get("num_microbatch", 1),
+        use_async_emb=mparams.get("use_async_emb", False),
+        overlap_step_host_work=mparams.get("overlap_step_host_work", False),
+        seqpack_drop_empty_candidates=mparams.get("seqpack_drop_empty_candidates", False),
         seqpack_distribution=seqpack_distribution,
         dataset=dataset,
         parallel_config=ParallelConfig(

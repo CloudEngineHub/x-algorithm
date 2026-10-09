@@ -708,6 +708,7 @@ class Post(BaseModel):
     list_metadata: ListMetadata | None = None
     chat_group_metadata: ChatGroupMetadata | None = None
     space_metadata: SpaceMetadata | None = None
+    mentioned_users: list[User] | None = None
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -858,6 +859,11 @@ class Post(BaseModel):
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
             space_metadata=space_metadata,
+            mentioned_users=[
+                User.from_thrift_model(m) for m in post_metadata.mentionedUsersMetadata
+            ]
+            if post_metadata.mentionedUsersMetadata
+            else None,
         )
 
     @classmethod
