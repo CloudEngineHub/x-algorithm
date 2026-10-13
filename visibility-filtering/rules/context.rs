@@ -1,8 +1,8 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     tweet_timestamp_ms, ArticleLifecycle, AuthorFeatures, AuthorLabelSet, ClientCapability,
-    CommunityModeration, HydratedTweetCandidate, SafetyLabelMap, TweetFeatures, Viewer,
-    ViewerFeatures, ViewerProfile,
+    CommunityModeration, PostCandidate, SafetyLabelMap, TweetFeatures, Viewer, ViewerFeatures,
+    ViewerProfile,
 };
 use crate::params::{CountryList, CountryLists};
 use xai_core_entities::entities::ConversationControl;
@@ -16,14 +16,14 @@ pub(crate) struct RuleContext<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct CoreFacts<'a> {
     viewer: &'a ViewerFeatures,
-    candidate: &'a HydratedTweetCandidate,
+    candidate: &'a PostCandidate,
     country_lists: &'a CountryLists,
 }
 
 impl<'a> RuleContext<'a> {
     pub(super) fn new(
         viewer: &'a ViewerFeatures,
-        candidate: &'a HydratedTweetCandidate,
+        candidate: &'a PostCandidate,
         country_lists: &'a CountryLists,
     ) -> Self {
         Self {
@@ -43,7 +43,7 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
-    fn reads(&self, hydrator: Hydrator) -> &'a HydratedTweetCandidate {
+    fn reads(&self, hydrator: Hydrator) -> &'a PostCandidate {
         #[cfg(test)]
         assert!(
             self.hydrated.contains(hydrator),
@@ -60,45 +60,60 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
+    pub(super) fn is_author_viewer(&self) -> bool {
+        self.facts.viewer_id() == Some(self.facts.candidate.author.id)
+    }
+
+    #[inline]
     pub(super) fn failed(&self) -> Hydrators {
         self.facts.candidate.failed
     }
 
     #[inline]
     pub(super) fn source_tweet_id(&self) -> Option<u64> {
-        self.reads(Hydrator::PureCore).source_tweet_id
+        self.reads(Hydrator::PureCore).post.source_tweet_id
     }
 
     #[inline]
     pub(super) fn tweet_features(&self) -> &'a TweetFeatures {
-        &self.reads(Hydrator::Tweet).tweet_features
+        &self.reads(Hydrator::Tweet).post.tweet_features
     }
 
     #[inline]
     pub(super) fn tweet_safety_labels(&self) -> &'a SafetyLabelMap {
-        &self.reads(Hydrator::TweetSafetyLabels).safety_labels
+        &self.reads(Hydrator::TweetSafetyLabels).post.safety_labels
     }
 
     #[inline]
-    pub(super) fn author_features(&self) -> &'a AuthorFeatures {
-        &self.reads(Hydrator::AuthorSafety).author_features
+    pub(super) fn author_features(&self) -> AuthorFeatures {
+        self.reads(Hydrator::AuthorSafety).author.features()
     }
 
     #[inline]
     pub(super) fn author_labels(&self) -> AuthorLabelSet {
-        self.reads(Hydrator::AuthorLabels).author_labels
+        self.reads(Hydrator::AuthorLabels).author.labels
     }
 
     #[inline]
     pub(super) fn edge(&self, node: Hydrator) -> bool {
         debug_assert!(node.is_edge(), "{node:?} is not an edge node");
-        self.reads(node).edges.contains(node)
+        let candidate = self.reads(node);
+        debug_assert!(candidate
+            .post
+            .edges
+            .iter()
+            .all(|edge| candidate.viewer_relationship.get(edge).is_none()));
+        candidate
+            .viewer_relationship
+            .get(node)
+            .unwrap_or_else(|| candidate.post.edges.contains(node))
     }
 
     #[inline]
     pub(super) fn conversation_control(&self) -> Option<&'a ConversationControl> {
         let features = self
             .reads(Hydrator::ConversationControl)
+            .post
             .conversation_control
             .as_ref();
         features.map(|features| &features.control)
@@ -108,6 +123,7 @@ impl<'a> RuleContext<'a> {
     pub(super) fn viewer_country(&self) -> Option<&'a str> {
         let features = self
             .reads(Hydrator::ViewerCountry)
+            .post
             .conversation_control
             .as_ref();
         features.and_then(|features| features.viewer_country.as_deref())
@@ -116,24 +132,43 @@ impl<'a> RuleContext<'a> {
     #[inline]
     pub(super) fn community_moderation(&self) -> CommunityModeration {
         self.reads(Hydrator::CommunityModeration)
+            .post
             .community_moderation
     }
 
     #[inline]
     pub(super) fn viewer_is_community_moderator(&self) -> Option<bool> {
         self.reads(Hydrator::CommunityModerator)
+            .post
             .viewer_is_community_moderator
     }
 
     #[inline]
     pub(super) fn viewer_is_removed_from_community(&self) -> bool {
         self.reads(Hydrator::CommunityViewerRemoved)
+            .post
             .viewer_is_removed_from_community
     }
 
     #[inline]
+    pub(super) fn article_has_media_entities(&self) -> bool {
+        self.reads(Hydrator::ArticleMediaEntities)
+            .post
+            .article_has_media_entities
+    }
+
+    #[inline]
+    pub(super) fn article_has_cover_media(&self) -> bool {
+        self.reads(Hydrator::ArticleCoverMedia)
+            .post
+            .article_has_cover_media
+    }
+
+    #[inline]
     pub(super) fn article_lifecycle(&self) -> Option<ArticleLifecycle> {
-        self.reads(Hydrator::ArticleLifecycle).article_lifecycle
+        self.reads(Hydrator::ArticleLifecycle)
+            .post
+            .article_lifecycle
     }
 
     #[inline]
@@ -161,7 +196,7 @@ impl<'a> RuleContext<'a> {
 impl<'a> CoreFacts<'a> {
     #[inline]
     pub(super) fn tweet_id(self) -> u64 {
-        self.candidate.tweet_id
+        self.candidate.post.tweet_id
     }
 
     #[inline]
@@ -180,13 +215,13 @@ impl<'a> CoreFacts<'a> {
     }
 
     #[inline]
-    pub(super) fn is_author_viewer(self) -> bool {
-        self.viewer_id() == Some(self.candidate.author_id)
+    pub(super) fn is_reply(self) -> bool {
+        self.candidate.post.is_reply
     }
 
     #[inline]
     pub(super) fn created_after(self, unix_ms: u64) -> bool {
-        tweet_timestamp_ms(self.candidate.tweet_id) > unix_ms
+        tweet_timestamp_ms(self.candidate.post.tweet_id) > unix_ms
     }
 
     #[inline]

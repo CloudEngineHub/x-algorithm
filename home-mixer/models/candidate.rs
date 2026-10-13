@@ -43,7 +43,11 @@ pub struct PostCandidate {
     pub ancestors: Vec<u64>,
     pub tombstone_ancestor_ids: Vec<u64>,
     pub ancestor_users: Vec<u64>,
+    #[serde(default)]
+    pub conversation_id: Option<u64>,
     pub ancestor_texts: HashMap<u64, String>,
+    #[serde(default)]
+    pub ancestor_has_video: Option<bool>,
     pub quoted_tweet_text: Option<String>,
     pub min_video_duration_ms: Option<i32>,
     pub max_video_duration_ms: Option<i32>,

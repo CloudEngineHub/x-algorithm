@@ -476,6 +476,10 @@ def metric_rce(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.n
     )
 
 
+def ne_from_rce(rce: jax.Array) -> jax.Array:
+    return 1.0 - rce / 100.0
+
+
 def metric_prauc(
     p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray, auc_thresholds: jnp.ndarray
 ) -> jnp.ndarray:
@@ -576,11 +580,17 @@ def metrics_calc(
     mask_keys: list[str],
     mask_values: list[jax.Array],
     stats: dict,
+    per_head_mask_values: jax.Array | None = None,
 ):
     auc_thresholds = jnp.geomspace(_INITIAL_AUC_THRESHOLD, 1.0, num=_NUM_AUC_THRESHOLDS)
-    res = jax.vmap(engagement_metrics, in_axes=(0, 0, None, None))(
-        jnp.stack(p_list), jnp.stack(y_list), jnp.stack(mask_values), auc_thresholds
-    )
+    if per_head_mask_values is None:
+        res = jax.vmap(engagement_metrics, in_axes=(0, 0, None, None))(
+            jnp.stack(p_list), jnp.stack(y_list), jnp.stack(mask_values), auc_thresholds
+        )
+    else:
+        res = jax.vmap(engagement_metrics, in_axes=(0, 0, 0, None))(
+            jnp.stack(p_list), jnp.stack(y_list), per_head_mask_values, auc_thresholds
+        )
     stats.update(
         {
             f"{eng_name}_{mask_key}_{name}": res[i][j][k]
@@ -589,6 +599,13 @@ def metrics_calc(
                 ("loss", "RCE", "NDCG", "ratio_pos", "calib", "PRAUC", "num_tokens")
             )
             for k, mask_key in enumerate(mask_keys)
+        }
+    )
+    stats.update(
+        {
+            f"{eng_name}_{mask_key}_NE": ne_from_rce(stats[f"{eng_name}_{mask_key}_RCE"])
+            for eng_name in eng_names
+            for mask_key in mask_keys
         }
     )
 
@@ -639,6 +656,7 @@ def conversion_delay_slice_metrics(
     delay_ms: jax.Array,
     raw_weights: jax.Array | None,
     stats: dict,
+    per_head_eligible: dict[str, jax.Array] | None = None,
 ) -> dict[tuple[str, str], jax.Array]:
     auc_thresholds = jnp.geomspace(_INITIAL_AUC_THRESHOLD, 1.0, num=_NUM_AUC_THRESHOLDS)
     masks: dict[tuple[str, str], jax.Array] = {}
@@ -646,13 +664,17 @@ def conversion_delay_slice_metrics(
     for s in slices:
         p, y = prob_labels[s.head]
         head_delay = delay_ms[..., s.column_index]
-        m = s.mask(base, y, head_delay)
+        head_base = base
+        if per_head_eligible is not None:
+            head_base = head_base * per_head_eligible[s.head]
+        m = s.mask(head_base, y, head_delay)
         if raw_weights is not None:
             m = m * raw_weights
         masks[(s.head, s.name)] = m
         prefix = f"{s.head}_{s.name}"
         stats[f"{prefix}_loss"] = metric_loss(p, y, m)
         stats[f"{prefix}_RCE"] = metric_rce(p, y, m)
+        stats[f"{prefix}_NE"] = ne_from_rce(stats[f"{prefix}_RCE"])
         stats[f"{prefix}_NDCG"] = metric_ndcg(p, y, m)
         stats[f"{prefix}_ratio_pos"] = metric_ratio_pos(p, y, m)
         stats[f"{prefix}_calib"] = metric_calib(p, y, m)
@@ -791,6 +813,10 @@ class RecsysAggregatedModelConfig(Config):
                 "ads_head_masking is not supported with use_seqpack: the per-candidate, "
                 "per-head trained_candidate_mask has no packed-layout equivalent"
             )
+        if self.ads_pixel_head_masking and not self.ads_head_masking:
+            raise ValueError("ads_pixel_head_masking requires ads_head_masking")
+        if self.ads_pixel_head_masking and self.use_seqpack:
+            raise ValueError("ads_pixel_head_masking is not supported with use_seqpack")
 
     continuous_action_hidden_dim: int = 64
 
@@ -864,6 +890,8 @@ class RecsysAggregatedModelConfig(Config):
     mask_neg_feedback_on_negatives: bool = True
 
     ads_head_masking: bool = False
+
+    ads_pixel_head_masking: bool = False
 
     mact_in_app_loss_weight: float = 1.0
 
@@ -990,6 +1018,15 @@ class RecsysAggregatedModelConfig(Config):
             else self.sequence_len
         )
         return self.model_config.compute_mfu(num_seq_per_sec, S)
+
+    def compute_forward_tflops(self, num_seq_per_sec: float) -> float:
+        S = (
+            self.effective_sequence_len
+            if self.effective_sequence_len is not None
+            else self.sequence_len
+        )
+        attn, ffn = self.model_config.compute_forward_flops_per_sec(num_seq_per_sec, S)
+        return round(attn + ffn, 2)
 
     @property
     def num_user_prefix_tokens(self) -> int:
@@ -1811,6 +1848,7 @@ class CandidateInputs(NamedTuple):
     dpa_product_key: jax.Array | None
     source_id: jax.Array | None
     trained_heads: jax.Array | None
+    eligible_heads: jax.Array | None
     loss_padding_mask: jax.Array
     loss_weights: jax.Array | None
     continuous_heads: dict[int, tuple[jax.Array, jax.Array | None]]
@@ -1840,6 +1878,7 @@ class RecsysAggregatedModel(hk.Module):
         raw_weights: jax.Array | None = None,
         conversion_delay_base: jax.Array | None = None,
         conversion_delay_ms: jax.Array | None = None,
+        head_eligible_mask: jax.Array | None = None,
     ) -> dict:
         prob_labels = get_probs_and_labels(logits, raw_targets, self.config.metric_group)
 
@@ -1855,22 +1894,58 @@ class RecsysAggregatedModel(hk.Module):
         if raw_weights is not None:
             mask_values = [m * raw_weights for m in mask_values]
 
-        metrics_calc(p_list, y_list, eng_names, mask_keys, mask_values, stats)
+        per_head_eligible: dict[str, jax.Array] | None = None
+        per_head_mask_values: jax.Array | None = None
+        if head_eligible_mask is not None:
+            eng_to_ids = engagement_to_ids(self.config.metric_group)
+            eligible = head_eligible_mask.astype(mask_values[0].dtype)
+            per_head_eligible = {
+                eng_name: jnp.max(eligible[..., jnp.array(eng_to_ids[eng_name])], axis=-1)
+                for eng_name in eng_names
+            }
+            per_head_mask_values = (
+                jnp.stack(mask_values)[None]
+                * jnp.stack([per_head_eligible[eng_name] for eng_name in eng_names])[:, None]
+            )
+
+        metrics_calc(
+            p_list,
+            y_list,
+            eng_names,
+            mask_keys,
+            mask_values,
+            stats,
+            per_head_mask_values=per_head_mask_values,
+        )
 
         metrics_calc_global_num_tokens(masks, stats)
 
         for mask_key, mval in zip(mask_keys, mask_values):
             stats[f"{mask_key}_effective_num_tokens"] = mval.sum()
 
-        cells: list[tuple[str, str, jax.Array, jax.Array]] = [
-            (eng_name, mask_key, mask_val, stats[f"{mask_key}_effective_num_tokens"])
-            for eng_name in eng_names
-            for mask_key, mask_val in zip(mask_keys, mask_values)
-        ]
+        cells: list[tuple[str, str, jax.Array, jax.Array]]
+        if per_head_mask_values is None:
+            cells = [
+                (eng_name, mask_key, mask_val, stats[f"{mask_key}_effective_num_tokens"])
+                for eng_name in eng_names
+                for mask_key, mask_val in zip(mask_keys, mask_values)
+            ]
+        else:
+            cells = [
+                (eng_name, mask_key, mask_val, mask_val.sum())
+                for eng_idx, eng_name in enumerate(eng_names)
+                for mask_key, mask_val in zip(mask_keys, per_head_mask_values[eng_idx])
+            ]
         slices = self.config.conversion_delay_slices()
         if slices and conversion_delay_base is not None and conversion_delay_ms is not None:
             slice_masks = conversion_delay_slice_metrics(
-                slices, prob_labels, conversion_delay_base, conversion_delay_ms, raw_weights, stats
+                slices,
+                prob_labels,
+                conversion_delay_base,
+                conversion_delay_ms,
+                raw_weights,
+                stats,
+                per_head_eligible=per_head_eligible,
             )
             cells.extend(
                 (head, name, m, stats[f"{head}_{name}_effective_num_tokens"])
@@ -1892,9 +1967,11 @@ class RecsysAggregatedModel(hk.Module):
                     smoothing_windows,
                 )
                 s_rce = _smoothed_rce(updated)
+                s_ne = ne_from_rce(s_rce)
                 for i, ws in enumerate(smoothing_windows):
                     new_rce_ema[f"{base_key}/{ws}"] = updated[i]
                     stats[f"{eng_name}_{mask_key}_smoothed_RCE_{ws}"] = s_rce[i]
+                    stats[f"{eng_name}_{mask_key}_smoothed_NE_{ws}"] = s_ne[i]
             stats["_rce_ema"] = new_rce_ema
 
         if calib_ema is not None and rce_alpha is not None and smoothing_windows is not None:
@@ -1949,6 +2026,9 @@ class RecsysAggregatedModel(hk.Module):
                     (num_pos > 0) & (total - num_pos > 0),
                     metric_rce(p, y, bucket_mask_f),
                     0.0,
+                )
+                stats[f"{eng_name}_{bucket_name}_NE"] = ne_from_rce(
+                    stats[f"{eng_name}_{bucket_name}_RCE"]
                 )
 
                 pred_sum = jnp.sum(p * bucket_mask_f)
@@ -2018,6 +2098,7 @@ class RecsysAggregatedModel(hk.Module):
         calib_ema: dict[str, jax.Array] | None = None,
         raw_weights: jax.Array | None = None,
         conversion_delay_ms: jax.Array | None = None,
+        head_eligible_mask: jax.Array | None = None,
     ) -> dict:
         if stats is None:
             stats = {}
@@ -2054,6 +2135,7 @@ class RecsysAggregatedModel(hk.Module):
             raw_weights=raw_weights,
             conversion_delay_base=conversion_delay_base,
             conversion_delay_ms=conversion_delay_ms,
+            head_eligible_mask=head_eligible_mask,
         )
 
     def compute_timestamp_metrics(
@@ -3483,6 +3565,7 @@ class RecsysAggregatedModel(hk.Module):
                 raw_weights = logq_weight if raw_weights is None else raw_weights * logq_weight
 
             trained_heads: jax.Array | None = None
+            eligible_heads: jax.Array | None = None
             if self.config.use_seqpack:
                 layout = batch.get("packing_layout")
                 assert layout is not None
@@ -3495,6 +3578,9 @@ class RecsysAggregatedModel(hk.Module):
                 if trained_candidate_mask is not None:
                     trained_heads = cast_jax(trained_candidate_mask)
                     target_padding_mask = target_padding_mask & trained_heads.any(-1)
+                head_eligible_mask = batch["candidate_seq"].get("head_eligible_mask")
+                if self.config.ads_pixel_head_masking and head_eligible_mask is not None:
+                    eligible_heads = cast_jax(head_eligible_mask)
 
             negative_sample_mask = jnp.broadcast_to(negative_sample_mask, target_padding_mask.shape)
 
@@ -3605,6 +3691,7 @@ class RecsysAggregatedModel(hk.Module):
                     dpa_product_key=dpa_product_key,
                     source_id=source_id,
                     trained_heads=trained_heads,
+                    eligible_heads=eligible_heads,
                     loss_padding_mask=loss_padding_mask,
                     loss_weights=loss_weights,
                     continuous_heads=continuous_heads,
@@ -3741,6 +3828,11 @@ class RecsysAggregatedModel(hk.Module):
                 trained_heads=None
                 if c.trained_heads is None
                 else jnp.pad(c.trained_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True),
+                eligible_heads=None
+                if c.eligible_heads is None
+                else jnp.pad(
+                    c.eligible_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True
+                ),
                 target_padding_mask=pad(c.target_padding_mask),
                 loss_padding_mask=pad(c.loss_padding_mask),
                 continuous_heads=jax.tree.map(pad, c.continuous_heads),
@@ -3797,10 +3889,11 @@ class RecsysAggregatedModel(hk.Module):
                 :, None
             ]
 
-        targets, negative_sample_mask, trained_heads = (
+        targets, negative_sample_mask, trained_heads, eligible_heads = (
             c.targets,
             c.negative_sample_mask,
             c.trained_heads,
+            c.eligible_heads,
         )
 
         targets_for_loss = targets
@@ -3850,6 +3943,9 @@ class RecsysAggregatedModel(hk.Module):
 
         if trained_heads is not None:
             loss_mask = loss_mask * trained_heads.astype(loss_mask.dtype)
+
+        if eligible_heads is not None:
+            loss_mask = loss_mask * eligible_heads.astype(loss_mask.dtype)
 
         if self.config.mact_in_app_loss_weight != 1.0:
             mact_w = (
@@ -4141,6 +4237,7 @@ class RecsysAggregatedModel(hk.Module):
             calib_ema=calib_ema,
             raw_weights=c.loss_weights,
             conversion_delay_ms=conversion_delay_ms,
+            head_eligible_mask=c.eligible_heads,
         )
         stats = self.compute_timestamp_metrics(batch=batch, stats=stats)
         stats = self.compute_sid_metrics(batch=batch, stats=stats)

@@ -145,10 +145,10 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
 }
 
 fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
-    if dataset_type == RetrievalDatasetType::HomeCold as u32 {
-        pb::ServedType::ForYouPhoenixRetrievalCold
-    } else {
-        pb::ServedType::ForYouPhoenixRetrieval
+    match RetrievalDatasetType::try_from(dataset_type as i32) {
+        Ok(RetrievalDatasetType::HomeCold) => pb::ServedType::ForYouPhoenixRetrievalCold,
+        Ok(RetrievalDatasetType::ZeroFav) => pb::ServedType::ForYouPhoenixRetrievalZeroFav,
+        _ => pb::ServedType::ForYouPhoenixRetrieval,
     }
 }
 

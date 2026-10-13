@@ -6,6 +6,9 @@ from typing import List, Literal, Tuple, overload
 import numpy as np
 import numpy.typing as npt
 
+class PySemanticIdClient:
+    def __init__(self, endpoint: str, sid_num_levels: int) -> None: ...
+
 class PyMmEmbeddingsClient:
     def __init__(
         self,
@@ -174,7 +177,9 @@ class RecsysPredictorServer:
         channel_size: int = 2048,
         enqueue_timeout_ms: int = 1000,
         queue_max_staleness_ms: int = 0,
+        queue_batch_wait_ms: float = 0.0,
         mm_client: PyMmEmbeddingsClient | None = None,
+        sid_client: PySemanticIdClient | None = None,
         user_id_table_size: int = 100_000,
         user_hash_scales: list[int] = ...,
         user_biases: list[int] = ...,
@@ -274,7 +279,9 @@ class RecsysRetrievalPredictorServer:
         channel_size: int = 2048,
         enqueue_timeout_ms: int = 1000,
         queue_max_staleness_ms: int = 0,
+        queue_batch_wait_ms: float = 0.0,
         mm_client: PyMmEmbeddingsClient | None = None,
+        sid_client: PySemanticIdClient | None = None,
         user_id_table_size: int = 100_000,
         user_hash_scales: list[int] = ...,
         user_biases: list[int] = ...,

@@ -528,6 +528,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     channel_size: int = 2048
     enqueue_timeout_ms: int = 1000
     queue_max_staleness_ms: int = 1200
+    queue_batch_wait_ms: float = 0.0
 
     enable_deadline_admission: bool = False
     deadline_margin_ms: float = 30.0
@@ -541,6 +542,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     pinned_d2h_num_buffers: int = 3
 
     enable_bloom_filter: bool = False
+
+    sid_endpoint: str | None = None
 
     log_rotate: bool = False
     log_rotate_max_bytes: int = 3 * 1024 * 1024 * 1024
@@ -558,6 +561,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     )
 
     _last_observed_reload_trigger: int = field(default=0, init=False)
+    reload_trigger_poll_interval_s: float = 0.0
+    _last_reload_trigger_poll: float = field(default=0.0, init=False)
 
     _reload_probe_executor: concurrent.futures.ThreadPoolExecutor | None = field(
         default=None, init=False
@@ -688,6 +693,11 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         )
 
     def _observe_peer_reload_trigger(self) -> bool:
+        if self.reload_trigger_poll_interval_s > 0:
+            now = time.monotonic()
+            if now - self._last_reload_trigger_poll < self.reload_trigger_poll_interval_s:
+                return False
+            self._last_reload_trigger_poll = now
         current = self._read_reload_trigger()
         if current <= self._last_observed_reload_trigger:
             return False
@@ -719,6 +729,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     _standby_emb_prefaulted: bool = field(default=False, init=False)
     _host_state_slots: list[Any] = field(default_factory=list, init=False)
     _active_host_slot: int = field(default=0, init=False)
+    _server_for_hotswap: Any = field(default=None, init=False)
     _reload_requested: threading.Event = field(default_factory=threading.Event, init=False)
     _hotswap_cycle_inflight: threading.Event = field(default_factory=threading.Event, init=False)
     _swap_ready: threading.Event = field(default_factory=threading.Event, init=False)
@@ -2127,7 +2138,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             dataset_types=jnp.array([RetrievalDataset.PAD.value], dtype=jnp.int32),
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
-            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings(
+                self.model_config.num_table_slots
+            )
             padded = self.padded_max_posts
             orig = self.model_config.candidate_tower_config.max_posts
             if padded > orig:
@@ -2321,7 +2334,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             row_sharded_keys = {pe_key} if pe_checksum is not None else set()
             state = {k: v for k, v in state.items() if k not in row_sharded_keys}
             sums = jax.tree.map(adler32.adler32, state)
-            errors = [k for k, v in sums.items() if k != "opt_state" and v.item() != saved[k]]
+            errors = [k for k, v in sums.items() if v is not None and v.item() != saved[k]]
             if errors:
                 if self.metrics_publisher is not None:
                     self.metrics_publisher.checkpoint_reload_failure_total.labels(
@@ -2447,9 +2460,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                 if self.checkpoint_config.verify_checksums:
                     state_dict = tree_to_dict(unwrap_tree(self.state).purge_opt_state())
                     nfs_checksums = {
-                        k: adler32.adler32(v).item()
-                        for k, v in state_dict.items()
-                        if k != "opt_state"
+                        k: adler32.adler32(v).item() for k, v in state_dict.items() if v is not None
                     }
                 nfs_checksums_json = json.dumps({"global_checksums": nfs_checksums})
                 _save_tensors_to_shm(
@@ -3482,7 +3493,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self.dequeued_batch_id += 1
             dequeue_t = Timer()
 
-            if self.is_multi_worker:
+            if self.is_multi_worker and self.queue_batch_wait_ms <= 0:
                 _dq_result: list = [None]
                 _dq_event = threading.Event()
 
@@ -3655,6 +3666,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
         if self.enable_hotswap:
             self._init_hotswap_buffers()
+            self._server_for_hotswap = server
             if getattr(self, "_is_hotswap_leader", True):
                 target = self._coordinator_loop
                 role = "leader"
@@ -4177,6 +4189,17 @@ class RankingModelRunner(
         engine_sid_num_levels = (
             self.model_config.sid_num_levels if self.model_config.use_post_sid else 0
         )
+        post_int64_size, user_int64_size = self.dataset.int64_feature_sizes()
+        sid_client = None
+        if self.sid_endpoint and engine_sid_num_levels > 0:
+            sid_client = xai_recsys_engine.PySemanticIdClient(
+                self.sid_endpoint, engine_sid_num_levels
+            )
+            logger.info(
+                "Request-path SID hydration enabled: endpoint=%s sid_num_levels=%d",
+                self.sid_endpoint,
+                engine_sid_num_levels,
+            )
         return xai_recsys_engine.RecsysPredictorServer(
             self.grpc_port,
             self.metrics_port,
@@ -4185,6 +4208,7 @@ class RankingModelRunner(
             channel_size=self.channel_size,
             enqueue_timeout_ms=self.enqueue_timeout_ms,
             queue_max_staleness_ms=self.queue_max_staleness_ms,
+            queue_batch_wait_ms=self.queue_batch_wait_ms,
             enable_deadline_admission=self.enable_deadline_admission,
             deadline_margin_ms=self.deadline_margin_ms,
             deadline_post_ms=self.deadline_post_ms,
@@ -4192,6 +4216,7 @@ class RankingModelRunner(
             service_time_ewma_alpha=self.service_time_ewma_alpha,
             pipeline_depth=1 if self.use_pipelining else 0,
             mm_client=mm_client,
+            sid_client=sid_client,
             user_id_table_size=hash_keys.user_id_table_size,
             user_hash_scales=hash_keys.user_hash_scales,
             user_biases=hash_keys.user_biases,
@@ -4218,7 +4243,7 @@ class RankingModelRunner(
             num_user_categorical_features=recsys_batch.USER_CATEGORICAL_FEATURE_SIZE,
             num_user_bool_features=recsys_batch.USER_BOOL_FEATURE_SIZE,
             num_user_float_features=recsys_batch.USER_FLOAT_FEATURE_SIZE,
-            num_user_int64_features=recsys_batch.USER_INT64_FEATURE_SIZE,
+            num_user_int64_features=user_int64_size,
             num_user_installed_apps=recsys_batch.NUM_USER_INSTALLED_APPS,
             num_post_categorical_features=recsys_batch.POST_CATEGORICAL_FEATURE_SIZE,
             num_post_bool_features=recsys_batch.POST_BOOL_FEATURE_SIZE,
@@ -4228,7 +4253,7 @@ class RankingModelRunner(
                 )
             ),
             num_post_float_features=recsys_batch.POST_FLOAT_FEATURE_SIZE,
-            num_post_int64_features=recsys_batch.POST_INT64_FEATURE_SIZE,
+            num_post_int64_features=post_int64_size,
             enable_async_response_compression=self.enable_async_response_compression,
             sid_num_levels=engine_sid_num_levels,
         )

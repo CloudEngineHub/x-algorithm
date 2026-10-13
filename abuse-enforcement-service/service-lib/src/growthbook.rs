@@ -256,6 +256,14 @@ impl DynamicConfig {
         crate::overturn_hold::HoldGateConfig::from_config(self.snapshot().config.as_ref())
     }
 
+    pub fn off_switch_enabled(&self) -> bool {
+        crate::off_switch::enabled_from_config(self.snapshot().config.as_ref())
+    }
+
+    pub fn action_control_config(&self) -> crate::action_control::ControlConfig {
+        crate::action_control::ControlConfig::from_config(self.snapshot().config.as_ref())
+    }
+
     pub fn config(&self) -> Option<Value> {
         self.snapshot().config.clone()
     }

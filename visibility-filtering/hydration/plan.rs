@@ -1,29 +1,12 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
+pub(crate) use crate::hydration::inventory::Source;
+use crate::hydration::sources::Scope;
 use crate::hydration::{Hydrator, Hydrators};
 use crate::rules::SafetyLevel;
 use std::fmt;
 use strum::VariantArray;
 use xai_core_entities::entities::ConversationControlArm;
 use xai_core_entities::gizmoduck_client::QueryFields;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
-pub(crate) enum Source {
-    TesPureCore,
-    TesTweet,
-    TesConversationControl,
-    SafetyLabels,
-    GizmoduckViewer,
-    GizmoduckAuthor,
-    Flock,
-    ViewerCountry,
-    Wingman,
-    CommunityModeration,
-    CommunityModerator,
-    CommunityViewerRemoved,
-    ArticleLifecycle,
-    TrustedFriends,
-    UserLocation,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MissPolicy {
@@ -40,21 +23,7 @@ pub(super) enum Subject {
 
 impl Source {
     pub(super) const fn miss_policy(self) -> MissPolicy {
-        match self {
-            Source::TesPureCore | Source::TesTweet => MissPolicy::Unresolves(Subject::Tweet),
-            Source::GizmoduckAuthor => MissPolicy::Unresolves(Subject::Author),
-            Source::TesConversationControl
-            | Source::SafetyLabels
-            | Source::GizmoduckViewer
-            | Source::Flock
-            | Source::ViewerCountry
-            | Source::CommunityModeration
-            | Source::CommunityModerator
-            | Source::CommunityViewerRemoved
-            | Source::ArticleLifecycle
-            | Source::UserLocation => MissPolicy::FailsNode,
-            Source::Wingman | Source::TrustedFriends => MissPolicy::ReadsNoEdge,
-        }
+        self.row().miss
     }
 }
 
@@ -106,6 +75,9 @@ pub(super) enum KeyOrigin {
     ExclusiveConversationAuthor,
     TweetArticle,
     ConversationRoot(&'static [ConversationControlArm]),
+    ConversationControlBlockAuthor,
+    ConversationRootToFetch,
+    ConversationRootPostAuthor,
     ViewerForCoAllowedList,
     MyNetworkRootNotFollowingViewer,
     CommunityPost,
@@ -113,6 +85,18 @@ pub(super) enum KeyOrigin {
     TweetCommunity,
     TrustedFriendsList,
     NarrowcastPlace,
+}
+
+const COMMUNITY_OR_MY_NETWORK: &[ConversationControlArm] = &[
+    ConversationControlArm::Community,
+    ConversationControlArm::MyNetwork,
+];
+const SUBSCRIBERS: &[ConversationControlArm] = &[ConversationControlArm::Subscribers];
+
+pub(super) fn arm_starts_conversation_root_select(arm: ConversationControlArm) -> bool {
+    [COMMUNITY_OR_MY_NETWORK, SUBSCRIBERS]
+        .into_iter()
+        .any(|arms| arms.contains(&arm))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,16 +113,18 @@ impl KeyOrigin {
             KeyOrigin::RequestTweets | KeyOrigin::Viewer => None,
             KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
-            | KeyOrigin::PureCoreReplyRoot => Some(Hydrator::PureCore),
+            | KeyOrigin::PureCoreReplyRoot
+            | KeyOrigin::ConversationRootToFetch => Some(Hydrator::PureCore),
+            KeyOrigin::ConversationRootPostAuthor => Some(Hydrator::ConversationRootPost),
             KeyOrigin::ExclusiveConversationAuthor
             | KeyOrigin::CommunityPost
             | KeyOrigin::TweetCommunity
             | KeyOrigin::TweetArticle
             | KeyOrigin::TrustedFriendsList
             | KeyOrigin::NarrowcastPlace => Some(Hydrator::Tweet),
-            KeyOrigin::ConversationRoot(_) | KeyOrigin::ViewerForCoAllowedList => {
-                Some(Hydrator::ConversationControl)
-            }
+            KeyOrigin::ConversationRoot(_)
+            | KeyOrigin::ConversationControlBlockAuthor
+            | KeyOrigin::ViewerForCoAllowedList => Some(Hydrator::ConversationControl),
             KeyOrigin::MyNetworkRootNotFollowingViewer => Some(Hydrator::RootFollowsViewer),
             KeyOrigin::ModeratedCommunity => Some(Hydrator::CommunityModeration),
         }
@@ -150,8 +136,15 @@ impl KeyOrigin {
             None => Hydrators::empty(),
         };
         match self {
-            KeyOrigin::MyNetworkRootNotFollowingViewer => input.with(Hydrator::ConversationControl),
-            KeyOrigin::CommunityPost => input.with(Hydrator::PureCore),
+            KeyOrigin::MyNetworkRootNotFollowingViewer | KeyOrigin::ConversationRootToFetch => {
+                input.with(Hydrator::ConversationControl)
+            }
+            KeyOrigin::CommunityPost | KeyOrigin::ConversationControlBlockAuthor => {
+                input.with(Hydrator::PureCore)
+            }
+            KeyOrigin::ConversationRootPostAuthor => input
+                .with(Hydrator::PureCore)
+                .with(Hydrator::ConversationControl),
             KeyOrigin::RequestTweets
             | KeyOrigin::Viewer
             | KeyOrigin::PureCoreAuthor
@@ -191,7 +184,7 @@ impl Hydrator {
         const BLOCKED_BY: (&str, &str) = ("blocked_by", "batch_check_blocked_by");
         match self {
             H::PureCore => node(
-                S::TesPureCore,
+                S::TesPureCoreData,
                 Part::Column,
                 K::RequestTweets,
                 ("tes", "get_tweet_core_datas"),
@@ -287,10 +280,7 @@ impl Hydrator {
             H::RootFollowsViewer => node(
                 S::Flock,
                 Part::Edge(Edge::FollowedBy),
-                K::ConversationRoot(&[
-                    ConversationControlArm::Community,
-                    ConversationControlArm::MyNetwork,
-                ]),
+                K::ConversationRoot(COMMUNITY_OR_MY_NETWORK),
                 ("conversation_control", "batch_check_followed_by"),
             ),
             H::RootFollowsViewerSecondDegree => node(
@@ -302,8 +292,26 @@ impl Hydrator {
             H::SuperFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::SuperFollows),
-                K::ConversationRoot(&[ConversationControlArm::Subscribers]),
+                K::ConversationRoot(SUBSCRIBERS),
                 ("conversation_control", "batch_check_super_follows"),
+            ),
+            H::BlockedByConversationRoot => node(
+                S::Flock,
+                Part::Edge(Edge::BlockedBy),
+                K::ConversationControlBlockAuthor,
+                ("conversation_control", "batch_check_blocked_by"),
+            ),
+            H::ConversationRootPost => node(
+                S::TesConversationRoot,
+                Part::Column,
+                K::ConversationRootToFetch,
+                ("conversation_root", "get_tweet_core_datas"),
+            ),
+            H::BlockedByConversationRootPost => node(
+                S::Flock,
+                Part::Edge(Edge::BlockedBy),
+                K::ConversationRootPostAuthor,
+                ("conversation_root", "batch_check_blocked_by"),
             ),
             H::ViewerCountry => node(
                 S::ViewerCountry,
@@ -334,6 +342,18 @@ impl Hydrator {
                 Part::Column,
                 K::TweetArticle,
                 ("article", "get_lifecycles"),
+            ),
+            H::ArticleMediaEntities => node(
+                S::ArticleMediaEntities,
+                Part::Column,
+                K::TweetArticle,
+                ("article", "get_media_entities"),
+            ),
+            H::ArticleCoverMedia => node(
+                S::ArticleCoverMedia,
+                Part::Column,
+                K::TweetArticle,
+                ("article", "get_cover_media"),
             ),
             H::TrustedFriends => node(
                 S::TrustedFriends,
@@ -370,6 +390,7 @@ impl Hydrator {
             || matches!(
                 self.spec().key,
                 KeyOrigin::Viewer
+                    | KeyOrigin::ConversationRootToFetch
                     | KeyOrigin::ViewerForCoAllowedList
                     | KeyOrigin::ModeratedCommunity
                     | KeyOrigin::TweetCommunity
@@ -410,8 +431,26 @@ const fn miss_policies_fit_their_nodes() -> bool {
     true
 }
 
+const fn viewer_scopes_fit_their_nodes() -> bool {
+    let mut rest = Hydrator::VARIANTS;
+    while let [node, tail @ ..] = rest {
+        let is_viewer_scope = matches!(node.spec().source.scope(), Scope::Viewer);
+        let fits = if matches!(node, Hydrator::ConversationRootPost) {
+            node.needs_viewer() && !is_viewer_scope
+        } else {
+            node.needs_viewer() == is_viewer_scope
+        };
+        if !fits {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
 const _: () = assert!(inputs_precede_nodes());
 const _: () = assert!(miss_policies_fit_their_nodes());
+const _: () = assert!(viewer_scopes_fit_their_nodes());
 const _: () = assert!(Hydrator::VARIANTS.len() <= u32::BITS as usize);
 
 impl Hydrators {
@@ -569,7 +608,8 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
             .copied()
             .filter(|node| node.spec().source == source)
             .fold(Hydrators::empty(), Hydrators::with),
-        Source::TesPureCore
+        Source::TesPureCoreData
+        | Source::TesConversationRoot
         | Source::TesTweet
         | Source::TesConversationControl
         | Source::SafetyLabels
@@ -581,6 +621,8 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
         | Source::CommunityModerator
         | Source::CommunityViewerRemoved
         | Source::ArticleLifecycle
+        | Source::ArticleMediaEntities
+        | Source::ArticleCoverMedia
         | Source::TrustedFriends
         | Source::UserLocation => nodes,
     };
@@ -628,6 +670,9 @@ impl fmt::Display for KeyOrigin {
                 let arms: Vec<String> = arms.iter().map(|arm| format!("{arm:?}")).collect();
                 write!(f, "root:{}", arms.join("|"))
             }
+            KeyOrigin::ConversationControlBlockAuthor => f.write_str("control_root_author"),
+            KeyOrigin::ConversationRootToFetch => f.write_str("conversation_root_to_fetch"),
+            KeyOrigin::ConversationRootPostAuthor => f.write_str("conversation_root_post_author"),
             KeyOrigin::ViewerForCoAllowedList => f.write_str("viewer:co_allowed_list"),
             KeyOrigin::MyNetworkRootNotFollowingViewer => {
                 f.write_str("root:MyNetwork:not_followed")
@@ -696,7 +741,7 @@ mod tests {
     const PLANS: &str = "\
 filter_all: 1 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
-timeline_home: 8 calls
+timeline_home: 10 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -704,8 +749,10 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
+article/get_media_entities after: tweet nodes: article_media_entities
+article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-timeline_home_recommendations: 8 calls
+timeline_home_recommendations: 10 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -713,8 +760,10 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
+article/get_media_entities after: tweet nodes: article_media_entities
+article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-timeline_home_hydration: 17 calls
+timeline_home_hydration: 21 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 conversation_control/get_conversation_controls after: - nodes: conversation_control
@@ -723,16 +772,20 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile,viewer_labels fields: A
 gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
 socialgraph+blocked_by/batch_check_relationships+batch_check_blocked_by after: pure_core nodes: follows,blocked_by_author,blocked_by_reply_root follows-fwd[author] blocks-rev[author,reply_root] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-conversation_control/batch_check_followed_by+batch_check_super_follows after: conversation_control nodes: root_follows_viewer,super_follows_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] (skipped logged out)
+conversation_control/batch_check_followed_by+batch_check_super_follows+batch_check_blocked_by after: conversation_control nodes: root_follows_viewer,super_follows_root,blocked_by_conversation_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] blocks-rev[control_root_author] (skipped logged out)
 conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out)
+conversation_root/get_tweet_core_datas after: pure_core nodes: conversation_root_post (skipped logged out)
+conversation_root/batch_check_blocked_by after: conversation_root_post nodes: blocked_by_conversation_root_post blocks-rev[conversation_root_post_author] (skipped logged out)
 conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out)
 communities/moderation_state after: tweet nodes: community_moderation
 communities/visibility_features after: community_moderation nodes: community_moderator (skipped logged out)
 communities/is_removed after: tweet nodes: community_viewer_removed (skipped logged out)
 article/get_lifecycles after: tweet nodes: article_lifecycle
+article/get_media_entities after: tweet nodes: article_media_entities
+article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
 geoduck/user_location after: tweet nodes: outside_narrowcast_place (skipped logged out)
-immersive_expanded_recommendations: 8 calls
+immersive_expanded_recommendations: 10 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
 safety_labels/get after: - nodes: tweet_safety_labels
@@ -740,6 +793,8 @@ gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDE
 gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
 socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
+article/get_media_entities after: tweet nodes: article_media_entities
+article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
 ";
 

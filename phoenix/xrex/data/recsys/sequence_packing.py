@@ -146,6 +146,37 @@ def fit_sample_budget(lengths: np.ndarray, target_sum: int, lo: int, hi: int) ->
     return lengths
 
 
+def shrink_empty_history_slots(
+    history_len: np.ndarray,
+    real_history_len: np.ndarray,
+    off: int,
+    block_size: int,
+    max_len: int,
+) -> np.ndarray:
+    blocks = (history_len + off) // block_size
+    empty = real_history_len == 0
+    if not empty.any():
+        return history_len
+    row_total = blocks.sum(axis=1)
+    min_blocks = max(1, (off + block_size - 1) // block_size)
+    max_blocks = (max_len + off + block_size - 1) // block_size
+    blocks = np.where(empty, np.minimum(blocks, min_blocks), blocks)
+    for d in range(blocks.shape[0]):
+        others = np.flatnonzero(~empty[d])
+        if others.size == 0:
+            continue
+        need = int(row_total[d] - blocks[d].sum())
+        if need > 0:
+            sub = fit_sample_budget(
+                blocks[d, others][None, :],
+                int(blocks[d, others].sum()) + need,
+                min_blocks,
+                max_blocks,
+            )
+            blocks[d, others] = sub[0]
+    return (blocks * block_size - off).astype(np.int32, copy=False)
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True, slots=True)
 class SequencePackedLayout:
@@ -288,10 +319,30 @@ def pack_batch(
     rng: np.random.Generator | None,
     block_size: int = PACK_BLOCK_SIZE,
     candidate_tokens_per_user: int | None = None,
+    min_packed_history_len: int | None = None,
+    empty_history_min_slot: bool = False,
 ) -> RecsysFeaturesBatch:
+    if empty_history_min_slot and dist is not None:
+        if not isinstance(dist, BetaLengthDistribution) or dist.block_size != block_size:
+            raise ValueError("empty_history_min_slot requires a block-matched Beta distribution")
+        if candidate_tokens_per_user is not None:
+            raise ValueError("empty_history_min_slot does not support candidate-region packing")
+    if min_packed_history_len is not None:
+        if (
+            isinstance(min_packed_history_len, bool)
+            or type(min_packed_history_len) is not int
+            or min_packed_history_len < 1
+        ):
+            raise ValueError("min_packed_history_len must be an integer >= 1")
+        if dist is None:
+            raise ValueError("min_packed_history_len requires a training distribution")
     _tcm = batch["candidate_seq"].get("trained_candidate_mask")
     assert _tcm is None or bool(np.asarray(_tcm).all()), (
         "trained_candidate_mask with masked candidates is not supported with sequence packing"
+    )
+    _hem = batch["candidate_seq"].get("head_eligible_mask")
+    assert _hem is None or bool(np.asarray(_hem).all()), (
+        "head_eligible_mask with masked heads is not supported with sequence packing"
     )
 
     read_bsz_per_process = batch["user_hashes"].shape[0]
@@ -425,6 +476,36 @@ def pack_batch(
             num_user_prefix_tokens=num_user_prefix_tokens,
             transformer_candidate_seq_len=transformer_candidate_seq_len,
         )
+        if min_packed_history_len is not None:
+            off = num_user_prefix_tokens + transformer_candidate_seq_len
+            slot_granularity = dist.block_size if isinstance(dist, BetaLengthDistribution) else 1
+            slot_offset = off if isinstance(dist, BetaLengthDistribution) else 0
+            lo = (
+                max(min_packed_history_len, dist.min_len) + slot_offset + slot_granularity - 1
+            ) // slot_granularity
+            hi = (dist.max_len + slot_offset + slot_granularity - 1) // slot_granularity
+            total_tokens = bs_per_device * (dist.mean_len + slot_offset)
+            if (
+                total_tokens % slot_granularity
+                or not bs_per_device * lo <= total_tokens // slot_granularity <= bs_per_device * hi
+            ):
+                raise ValueError("min_packed_history_len is infeasible for the sampled budget")
+            sampled_slots = (sampled_history_len + slot_offset) // slot_granularity
+            sampled_slots = np.clip(sampled_slots, lo, hi)
+            sampled_slots = fit_sample_budget(
+                sampled_slots, total_tokens // slot_granularity, lo, hi
+            )
+            sampled_history_len = (sampled_slots * slot_granularity - slot_offset).astype(
+                np.int32, copy=False
+            )
+        if empty_history_min_slot:
+            sampled_history_len = shrink_empty_history_slots(
+                sampled_history_len,
+                real_history_len,
+                off=num_user_prefix_tokens + transformer_candidate_seq_len,
+                block_size=block_size,
+                max_len=dist.max_len,
+            )
         history_real_to_use = np.minimum(sampled_history_len, real_history_len)
         history_len = sampled_history_len
         packed_history_len = bs_per_device * dist.mean_len

@@ -43,10 +43,13 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
+from xrex.data.recsys import reply_features
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
     NUM_USER_INSTALLED_APPS,
+    POST_INT64_FEATURE_SIZE,
+    USER_INT64_FEATURE_SIZE,
     CandidateNegativeFilter,
     CandidateNegativeMode,
     EmbeddingType,
@@ -1570,6 +1573,10 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             padded["trained_candidate_mask"] = np.pad(
                 _tcm, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
             )
+        if (_hem := post_seq.get("head_eligible_mask")) is not None:
+            padded["head_eligible_mask"] = np.pad(
+                _hem, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
+            )
         if (value_valid := post_seq.get("value_label_valid")) is not None:
             padded["value_label_valid"] = pad_array(value_valid)
         if (value_baseline := post_seq.get("value_baseline_mean_usd")) is not None:
@@ -1638,6 +1645,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         if (ss := batch_unpadded.get("sample_source")) is not None
         else None,
     }
+    if (cp := batch_unpadded.get("candidate_positions")) is not None:
+        padded["candidate_positions"] = pad_array(cp)
 
     extras = cast(dict[str, np.ndarray], batch_unpadded)
     padded_dict = cast(dict[str, np.ndarray], padded)
@@ -1691,6 +1700,7 @@ class PhoenixDataset(Dataset):
     enable_stale_post_30d: bool = False
 
     ads_head_masking: bool = False
+    ads_pixel_head_masking: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -1718,6 +1728,16 @@ class PhoenixDataset(Dataset):
     shuffle_mode: ShuffleMode = ShuffleMode.NONE
     block_shuffle_block_time_slices: int = 20
     block_shuffle_order_per_shard: bool = False
+
+    reply_parent_mode: bool = False
+
+    def int64_feature_sizes(self) -> tuple[int, int]:
+        if self.reply_parent_mode:
+            return (
+                reply_features.REPLY_POST_INT64_FEATURE_SIZE,
+                reply_features.REPLY_USER_INT64_FEATURE_SIZE,
+            )
+        return (POST_INT64_FEATURE_SIZE, USER_INT64_FEATURE_SIZE)
 
     @staticmethod
     def _parse_date_bound(s: str) -> int | None:
@@ -2112,6 +2132,8 @@ class PhoenixDataset(Dataset):
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                         stale_post_30d=self.enable_stale_post_30d,
                         ads_head_masking=self.ads_head_masking,
+                        ads_pixel_head_masking=self.ads_pixel_head_masking,
+                        reply_parent_mode=self.reply_parent_mode,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2236,13 +2258,29 @@ class PhoenixDataset(Dataset):
             if (ss := example_data.get("sample_source")) is not None
             else None,
         }
+        if self.reply_parent_mode:
+            batch_shape["candidate_positions"] = jax.ShapeDtypeStruct(
+                candidate_seq["impr_ts"].shape, np.int32
+            )
 
         return batch_shape
+
+    def _example_head_eligible_mask(
+        self, batch_size: int, candidate_seq_len: int
+    ) -> dict[str, np.ndarray]:
+        if not self.ads_pixel_head_masking:
+            return {}
+        return {
+            "head_eligible_mask": np.ones(
+                (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
+            )
+        }
 
     def example_data(
         self,
         batch_size: int,
     ) -> RecsysFeaturesBatch:
+        post_int64_size, user_int64_size = self.int64_feature_sizes()
         history_seq_len = self.history_seq_len
         num_negatives_per_example = self.num_negatives_per_example
         num_global_negatives_per_example = self.num_global_negatives_per_example
@@ -2285,7 +2323,7 @@ class PhoenixDataset(Dataset):
                 )
                 if self.use_post_sid
                 else None,
-                **empty_feature_arrays(batch_size, history_seq_len),
+                **empty_feature_arrays(batch_size, history_seq_len, post_int64_size),
             ),
             candidate_seq=PostSeq(
                 impr_ts=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
@@ -2310,6 +2348,7 @@ class PhoenixDataset(Dataset):
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
+                **self._example_head_eligible_mask(batch_size, candidate_seq_len),
                 value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
@@ -2336,9 +2375,9 @@ class PhoenixDataset(Dataset):
                 )
                 if self.use_post_sid
                 else None,
-                **empty_feature_arrays(batch_size, candidate_seq_len),
+                **empty_feature_arrays(batch_size, candidate_seq_len, post_int64_size),
             ),
-            **empty_user_feature_arrays(batch_size),
+            **empty_user_feature_arrays(batch_size, user_int64_size),
             user_installed_apps_multihot=np.zeros(
                 (batch_size, NUM_USER_INSTALLED_APPS), dtype=np.bool_
             ),
@@ -2446,6 +2485,7 @@ class PhoenixToyDataset(PhoenixDataset):
                 trained_candidate_mask=np.ones(
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
+                **self._example_head_eligible_mask(batch_size, candidate_seq_len),
                 value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),

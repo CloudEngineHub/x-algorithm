@@ -101,6 +101,7 @@ from xrex.train.trainer import (
 from xrex.utils import recsys_async_emb
 from xrex.utils.aot import JittedOrCompiled
 from xrex.utils.checkpointing import wait_until_finished
+from xrex.utils.gpu import peak_tflops
 from xrex.utils.metrics import norm_metrics
 from xrex.utils.utils import (
     cast_bfloat16,
@@ -114,6 +115,8 @@ OUT_PATH = "/dev/shm"
 
 _DATA_POSITION_FILENAME = "data_position.json"
 _CONFIG_FILENAME = "config.json"
+_FORWARD_ONLY_PROGRESS_FILENAME = "forward_only_progress.json"
+_FORWARD_ONLY_PROGRESS_EVERY_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -286,7 +289,9 @@ class RecsysTrainer(Trainer):
     reset_data_position: bool = False
 
     seqpack_distribution: LengthDistribution | None = None
+    min_packed_history_len: int | None = None
 
+    seqpack_empty_history_min_slot: bool = False
     seqpack_fixed_length: bool = False
     seqpack_drop_empty_candidates: bool = False
     seqpack_candidate_tokens_per_user: list[int] = field(default_factory=lambda: [32, 128])
@@ -296,6 +301,10 @@ class RecsysTrainer(Trainer):
     use_row_emb: bool = False
     row_emb_recv_factor: float = 2.0
     num_microbatch: int = 1
+
+    forward_only: bool = False
+    _forward_only_first_metrics_s: float | None = field(default=None, init=False, repr=False)
+    _forward_only_progress_written_s: float | None = field(default=None, init=False, repr=False)
 
     _async_emb_context: AsyncEmbContextHandle | None = field(default=None, init=False, repr=False)
     _emb_hash_vocab: int = field(default=0, init=False, repr=False)
@@ -333,6 +342,13 @@ class RecsysTrainer(Trainer):
             self.seqpack_distribution = FixedLengthDistribution(min_len=hl, max_len=hl, mean_len=hl)
         if self.export_stablehlo_bundle and not self.checkpoint_config.copy_port:
             raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
+        if self.forward_only and (
+            self.use_async_emb or self.use_row_emb or self.num_microbatch > 1
+        ):
+            raise ValueError(
+                "forward_only runs the synchronous step: set use_async_emb=False, "
+                "use_row_emb=False and num_microbatch=1"
+            )
 
     state: RecsysTrainingState = field(init=False, repr=False, compare=False)
     _pending_shmem_ckpt_write_s: float | None = field(default=None, init=False, repr=False)
@@ -463,7 +479,9 @@ class RecsysTrainer(Trainer):
             num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
             dist=dist,
             rng=rng,
+            min_packed_history_len=self.min_packed_history_len if dist is not None else None,
             candidate_tokens_per_user=candidate_tokens_per_user,
+            empty_history_min_slot=self.seqpack_empty_history_min_slot,
         )
         if self.using_fa4:
             batch = self.add_block_sparse_layout(batch)
@@ -538,7 +556,9 @@ class RecsysTrainer(Trainer):
             dataset_types=jnp.array([RetrievalDataset.PAD.value], dtype=jnp.int32),
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
-            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings(
+                self.model_config.num_table_slots
+            )
             side_width = self.model_config.mol_side_table_width
             if side_width:
                 emb = post_embeddings.embeddings
@@ -949,6 +969,16 @@ class RecsysTrainer(Trainer):
     ) -> dict[str, float | int]:
         metrics = super().handle_metrics(soft_step, metrics)
 
+        if self.forward_only:
+            assert isinstance(
+                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+            )
+            num_seq_per_sec_per_device = (
+                self.batch_size / float(metrics["step_time"]) / self.num_devices
+            )
+            metrics["tflops"] = self.model_config.compute_forward_tflops(num_seq_per_sec_per_device)
+            metrics["mfu"] = metrics["tflops"] / peak_tflops()
+
         if self.empty_history_user_dropout_rate > 0.0 and self._last_history_user_dropout_bsz > 0:
             metrics["train/empty_history_user_dropout_frac"] = (
                 self._last_history_user_dropout_count / self._last_history_user_dropout_bsz
@@ -962,7 +992,71 @@ class RecsysTrainer(Trainer):
                 metrics_dict=metrics,
             )
 
+        if self.forward_only:
+            self._maybe_write_forward_only_progress(int(metrics["step"]))
+
         return metrics
+
+    def forward_only_progress_path(self) -> str:
+        from xrex.utils.metadata import checkpoint_dir_or_default
+
+        ckpt_dir = checkpoint_dir_or_default(self.checkpoint_config.checkpoint_dir)
+        return os.path.join(ckpt_dir, self.name, _FORWARD_ONLY_PROGRESS_FILENAME)
+
+    def _maybe_write_forward_only_progress(self, step: int) -> None:
+        now = time.monotonic()
+        if self._forward_only_first_metrics_s is None:
+            self._forward_only_first_metrics_s = now
+            return
+        last = self._forward_only_progress_written_s or self._forward_only_first_metrics_s
+        if now - last < _FORWARD_ONLY_PROGRESS_EVERY_S:
+            return
+        path = self.forward_only_progress_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(
+                {
+                    "step": step,
+                    "elapsed_samples": self.elapsed_samples,
+                    "updated_at_unix": time.time(),
+                },
+                f,
+            )
+        os.replace(tmp_path, path)
+        self._forward_only_progress_written_s = now
+
+    def _resume_forward_only(self, res: tuple[bool, int, int]) -> tuple[bool, int, int]:
+        path = self.forward_only_progress_path()
+        buf = np.zeros(1024, dtype=np.uint8)
+        if jax.process_index() == 0 and os.path.isfile(path):
+            with open(path, "rb") as f:
+                raw = f.read()
+            buf[: len(raw)] = list(raw)
+        buf = multihost_utils.broadcast_one_to_all(buf)
+        raw_progress = bytes(np.asarray(buf, dtype=np.uint8)).rstrip(b"\x00").decode("utf-8")
+        if not raw_progress:
+            return res
+        progress = json.loads(raw_progress)
+
+        if isinstance(self.dataset, PhoenixKafkaDataset):
+            self.dataset.seek_to_offset = None
+        assert isinstance(self.state, RecsysTrainingState)
+        rce_ema = self.state.rce_ema
+        calib_ema = self.state.calib_ema
+        self.state = self.state._replace(
+            step=jnp.array(int(progress["step"]) + 1),
+            rce_ema=None if rce_ema is None else jax.tree.map(jnp.zeros_like, rce_ema),
+            calib_ema=None if calib_ema is None else jax.tree.map(jnp.zeros_like, calib_ema),
+        )
+        rank_logger.info(
+            "forward_only restart: resuming from the consumer group's committed offsets "
+            "at step=%s elapsed_samples=%s (%s)",
+            progress["step"],
+            progress["elapsed_samples"],
+            path,
+        )
+        return res[0], int(progress["elapsed_samples"]), res[2]
 
     def create_dataset(self, ctx: TrainerContext):
         assert isinstance(self.dataset, PhoenixDataset)
@@ -1373,6 +1467,69 @@ class RecsysTrainer(Trainer):
         }
 
         return new_state, metrics, {}
+
+    def forward_only_step(
+        self,
+        state: RecsysTrainingState,
+        data: RecsysFeaturesBatch,
+        lr: float,
+    ):
+        del lr
+        assert state.emb_table is not None
+        assert isinstance(
+            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+        )
+
+        token_ids = self.get_flattened_token_ids(data)
+        rng, new_rng = jax.random.split(state.rng)
+
+        fprop_params = state.params
+        if self.precision_level < 3:
+            fprop_params = jax.tree.map(cast_bfloat16, state.params)
+
+        recsys_embeddings = self.get_recsys_embeddings(data, state.emb_table)
+        recsys_embeddings, _ = self._emb_optim.transform_embeddings(
+            recsys_embeddings, token_ids, state.emb_table_state
+        )
+
+        rce_alpha = None
+        if state.rce_ema is not None and self.smoothing_windows:
+            rce_alpha = jnp.array(
+                [min(1.0, self.batch_size / w) for w in self.smoothing_windows],
+                dtype=jnp.float32,
+            )
+
+        loss, stats = self.loss_fn.apply(
+            fprop_params, rng, data, recsys_embeddings, state.rce_ema, rce_alpha, state.calib_ema
+        )
+        new_rce_ema = stats.pop("_rce_ema", state.rce_ema)
+        new_calib_ema = stats.pop("_calib_ema", state.calib_ema)
+
+        valid_step = jnp.array(True)
+        examples = np.prod(data["user_hashes"].shape[:-1])
+        metrics = {
+            "step": state.step,
+            "loss": loss,
+            "examples_per_batch": examples,
+            "valid_step": valid_step,
+        }
+        metrics.update(**stats)
+        metrics["offset_zero_values"] = jnp.sum(state.offset_values == 0)
+        metrics = jax.tree.map(lambda x: x.astype(jnp.float32), metrics)
+
+        metric_keys, metric_values = zip(*metrics.items())
+        packed_metrics = {
+            metric_keys: jnp.stack([jnp.float32(v) for v in metric_values], axis=0),
+            ("valid_step",): valid_step,
+        }
+
+        new_state = state._replace(
+            rng=new_rng,
+            step=state.step + 1,
+            rce_ema=new_rce_ema,
+            calib_ema=new_calib_ema,
+        )
+        return new_state, packed_metrics, {}
 
     def _run_microbatches(
         self,
@@ -2134,7 +2291,8 @@ class RecsysTrainer(Trainer):
 
         @hk.transform
         def user_forward_fn(
-            batch: RecsysFeaturesBatch, recsys_embeddings: RecsysEmbeddingsParameter
+            batch: RecsysFeaturesBatch,
+            recsys_embeddings: RecsysEmbeddingsParameter,
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
             return self.model_config.make(
@@ -2167,6 +2325,7 @@ class RecsysTrainer(Trainer):
                 top_k: int,
                 target_dataset_types,
                 eval_bs_per_device: int = 0,
+                query_head_weights: tuple[float, float] | None = None,
             ):
                 assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
                 model = self.model_config.make(
@@ -2180,6 +2339,7 @@ class RecsysTrainer(Trainer):
                     top_k,
                     target_dataset_types,
                     eval_bs_per_device=eval_bs_per_device,
+                    query_head_weights=query_head_weights,
                 )
                 top_k_indices, top_k_scores = results[0]
                 return top_k_indices, top_k_scores
@@ -2275,9 +2435,10 @@ class RecsysTrainer(Trainer):
         if self.use_async_emb:
             self._create_async_emb_executables(init_data, lr_shape, compiler_options)
         else:
+            step_fn = self.forward_only_step if self.forward_only else self.update
             self.update_jit = JittedOrCompiled(
                 jax.jit(
-                    self.update,
+                    step_fn,
                     in_shardings=(
                         self.state_sharding,
                         self.data_sharding,
@@ -2345,7 +2506,7 @@ class RecsysTrainer(Trainer):
                     None,
                     None,
                 ),
-                static_argnums=[6, 7, 8],
+                static_argnums=[6, 7, 8, 9],
             )
 
             self.loss_fn_eval_jit = jax.jit(
@@ -2603,6 +2764,9 @@ class RecsysTrainer(Trainer):
             self.state = self.state._replace(step=jnp.array(self.step_count_start))
             res = (True, 0, 0)
 
+        if self.forward_only:
+            res = self._resume_forward_only(res)
+
         return res
 
     def purge_opt_state_on_load(self, host_state):
@@ -2842,6 +3006,8 @@ class RecsysTrainer(Trainer):
         return time.perf_counter() - start
 
     def save_checkpoint(self, *args, **kwargs):
+        if self.forward_only:
+            return None
         if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:
             return self._save_checkpoint_current_params(*args, **kwargs)
         live_params = self.state.params
@@ -3402,10 +3568,20 @@ class RecsysTrainer(Trainer):
                 head_indices_shard,
             )
             for h in range(1, num_heads):
+                if h not in dataset_to_head.values():
+                    continue
                 emb_h = _forward_chunked(h)
                 mask_h = post_head_jax == h
                 candidate_embeddings = jnp.where(mask_h, emb_h, candidate_embeddings)
                 del emb_h
+
+        ld_head = self.model_config.ld_head
+        if ld_head is not None:
+            emb_ld = _forward_chunked(ld_head)
+            candidate_embeddings = jax.device_put(
+                jnp.concatenate([candidate_embeddings, emb_ld], axis=-1), self.data_sharding
+            )
+            del emb_ld
 
         global_post_ids = multihost_utils.host_local_array_to_global_array(
             self.int64_to_two_int32(post_ids), self.mesh, P(None)
@@ -3455,7 +3631,13 @@ class RecsysTrainer(Trainer):
         rng, _new_rng = jax.random.split(self.state.rng)
 
         def _two_tower_eval_forward_fn(
-            batch, post_embeddings, dataset_types, top_k, target_dataset_types, eval_bs_per_device=0
+            query_head_weights,
+            batch,
+            post_embeddings,
+            dataset_types,
+            top_k,
+            target_dataset_types,
+            eval_bs_per_device=0,
         ):
             recsys_embeddings_parameter = self.get_recsys_embeddings(
                 batch,
@@ -3475,6 +3657,7 @@ class RecsysTrainer(Trainer):
                 top_k,
                 target_dataset_types,
                 eval_bs_per_device,
+                query_head_weights,
             )
 
         _eval_user_cfg = self.model_config.user_tower_config
@@ -3557,11 +3740,12 @@ class RecsysTrainer(Trainer):
             if head_dataset_mapping is not None:
                 eval_head_idx = head_dataset_mapping.get(eval_conf.target_dataset_type.name, 0)
             eval_cand_fn = _make_candidate_tower_eval_fn(eval_head_idx)
+            query_head_weights = eval_conf.query_head_weights
 
             eval_results = run_recsys_evals(
                 evals=[(eval_name, eval_conf)],
                 train_dataset=self.dataset_thread_iterator(self._eval_dataset, prepare_data=False),
-                forward_fn=_two_tower_eval_forward_fn,
+                forward_fn=functools.partial(_two_tower_eval_forward_fn, query_head_weights),
                 loss_fn=_loss_fn,
                 mesh=self.mesh,
                 rng=rng,

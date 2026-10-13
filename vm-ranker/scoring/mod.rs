@@ -6,7 +6,7 @@ use std::sync::Arc;
 use log::error;
 
 use xai_feature_switches::Params;
-use xai_vm_ranker_proto::{RankRequest, RankedCandidate};
+use xai_vm_ranker_proto::{DppParams, RankRequest, RankedCandidate};
 
 use crate::dpp::DppConfig;
 use crate::embedding_store::EmbeddingStore;
@@ -48,14 +48,7 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
                 dpp.config.theta = p.get(DppTheta);
                 dpp.config.max_selected_rank = p.get(DppMaxSelectedRank) as usize;
             }
-            (None, Some(overrides)) => {
-                if overrides.theta != 0.0 {
-                    dpp.config.theta = overrides.theta;
-                }
-                if overrides.max_selected_rank != 0 {
-                    dpp.config.max_selected_rank = overrides.max_selected_rank as usize;
-                }
-            }
+            (None, Some(overrides)) => apply_dpp_overrides(&mut dpp.config, overrides),
             (None, None) => {}
         }
 
@@ -87,6 +80,18 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
         .map(|s| s.unwrap_or(0.0))
         .collect();
     Ok(ranked_candidates(&req, served, value_model.as_ref()))
+}
+
+fn apply_dpp_overrides(config: &mut DppConfig, overrides: &DppParams) {
+    if overrides.theta != 0.0 {
+        config.theta = overrides.theta;
+    }
+    if overrides.max_selected_rank != 0 {
+        config.max_selected_rank = overrides.max_selected_rank as usize;
+    }
+    if overrides.top_k != 0 {
+        config.top_k = overrides.top_k as usize;
+    }
 }
 
 fn resolve_params(req: &RankRequest, config: Option<&RankingConfig>) -> Option<Params> {
@@ -350,5 +355,25 @@ rust_home_mixer_author_exploration:
             assert_eq!(boosted[1].score, base[1].score);
             assert_eq!(boosted[0].weighted_score, base[0].weighted_score);
         }
+    }
+
+    #[test]
+    fn dpp_overrides_apply_only_non_zero_fields() {
+        let mut config = DppConfig {
+            top_k: 120,
+            theta: 0.7,
+            max_selected_rank: 150,
+            debug_viewer_id: 0,
+        };
+        apply_dpp_overrides(
+            &mut config,
+            &DppParams {
+                top_k: 24,
+                ..Default::default()
+            },
+        );
+        assert_eq!(config.theta, 0.7);
+        assert_eq!(config.max_selected_rank, 150);
+        assert_eq!(config.top_k, 24);
     }
 }

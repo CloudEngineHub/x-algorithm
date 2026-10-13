@@ -33,6 +33,7 @@ fn has_age_verified_18_label(labels: &Labels) -> bool {
 pub(crate) struct DecodedViewer {
     pub(crate) profile: ViewerProfile,
     pub(crate) has_age_verified_18_label: bool,
+    pub(crate) found: bool,
 }
 
 pub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {
@@ -40,6 +41,7 @@ pub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]
         Some(user) => DecodedViewer {
             profile: profile(ViewerData::from_user(user, fields)),
             has_age_verified_18_label: has_age_verified_18_label(&user.labels),
+            found: true,
         },
         None => DecodedViewer::default(),
     }

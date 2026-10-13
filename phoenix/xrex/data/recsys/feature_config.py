@@ -157,6 +157,7 @@ OPTIONAL_COLUMNS: list[str] = [
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
     "conversionKeepBits",
+    "conversionEligibleTypesSeq",
     "conversionDelayMsSeq",
     "conversionDelayMsSeq_KEY",
     "conversionDelayMsSeq_PURCHASE",

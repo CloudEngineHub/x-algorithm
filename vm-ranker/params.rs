@@ -100,6 +100,12 @@ param!(
     false
 );
 param!(
+    ReactWithVideoWeight,
+    f64,
+    "rust_home_mixer_react_with_video_weight",
+    0.0
+);
+param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",

@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::DropGuard;
 use tonic::{Request, Response, Status, service::RoutesBuilder};
-use xai_recsys::{model_config::ModelConfig, util::InputBuffer};
+use xai_recsys::{model_config::ModelConfig, reply::ReplyMetadata, util::InputBuffer};
 use xai_recsys_server::LoadGauge;
 use xai_recsys_server::{CancellationToken, GrpcConfig, HttpServer};
 
@@ -205,6 +205,7 @@ const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 const CHANNEL_SIZE: usize = 2048;
 const ENQUEUE_TIMEOUT_MS: u64 = 1000;
 const QUEUE_MAX_STALENESS_MS: u64 = 1200;
+const QUEUE_BATCH_WAIT_MS: f64 = 0.0;
 
 #[pyclass(module = "xai_recsys_engine", get_all)]
 pub struct ReqCandidateSequence {
@@ -905,6 +906,7 @@ struct RecsysPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
+    sid_client: Option<crate::sid_client::SemanticIdClient>,
     admission: Arc<AdmissionController>,
     #[allow(dead_code)]
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
@@ -1031,7 +1033,7 @@ impl RecsysPredictorImpl {
 
         let columnar_sequence_bytes = request.columnar_sequences.pop().filter(|b| !b.is_empty());
 
-        let candidate_set = match request.candidate_sets.pop() {
+        let mut candidate_set = match request.candidate_sets.pop() {
             Some(candidate_set) => candidate_set,
             _ => {
                 return Err(Status::invalid_argument(
@@ -1039,6 +1041,21 @@ impl RecsysPredictorImpl {
                 ));
             }
         };
+
+        let mut reply = ReplyMetadata::parse(&request.metadata);
+        if let Some(reply) = reply.as_mut()
+            && let Some(sid_client) = self.sid_client.as_ref()
+        {
+            sid_client
+                .hydrate(
+                    &mut candidate_set,
+                    reply,
+                    self.model_config.candidate_seq_len,
+                    deadline,
+                )
+                .await;
+        }
+
         let cancel_token_clone = cancel_token.clone();
         let request_id_clone = request_id.clone();
         tokio::spawn(async move {
@@ -1054,6 +1071,7 @@ impl RecsysPredictorImpl {
 
         let distribution_sets = handle_request(
             candidate_set,
+            reply,
             sequence,
             columnar_sequence_bytes,
             request.return_logprob,
@@ -1182,6 +1200,7 @@ impl pb::recsys_predictor_server::RecsysPredictor for RecsysPredictorImpl {
 
 async fn handle_request(
     candidate_set: CandidateSet,
+    reply: Option<ReplyMetadata>,
     sequence: Option<UserActionSequence>,
     columnar_sequence_bytes: Option<Bytes>,
     return_logprob: bool,
@@ -1206,7 +1225,7 @@ async fn handle_request(
 
     let start = std::time::Instant::now();
 
-    let input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
+    let mut input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
         log::debug!(
             "Computing input buffer from columnar bytes for request_id: {} ({} bytes)",
             request_id,
@@ -1301,6 +1320,9 @@ async fn handle_request(
             conversion_history.as_ref(),
         )
     };
+    if let Some(reply) = &reply {
+        input_buffer.apply_reply_features(model_config, &candidate_set, sequence.as_ref(), reply);
+    }
     let duration = start.elapsed();
     INPUT_BUFFER_COMPUTATION_TIME.observe(duration.as_secs_f64());
     log::debug!(
@@ -2745,6 +2767,8 @@ struct RecsysRetrievalPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
+    #[allow(dead_code)]
+    sid_client: Option<crate::sid_client::SemanticIdClient>,
     admission: Arc<AdmissionController>,
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
 }
@@ -3114,7 +3138,9 @@ macro_rules! server_impl {
                         channel_size = CHANNEL_SIZE,
                         enqueue_timeout_ms = ENQUEUE_TIMEOUT_MS,
                         queue_max_staleness_ms = QUEUE_MAX_STALENESS_MS,
+                        queue_batch_wait_ms = QUEUE_BATCH_WAIT_MS,
                         mm_client = None,
+                        sid_client = None,
                         user_id_table_size = 100_000,
                         user_hash_scales = vec![196742702, 1852108266],
                         user_biases = vec![1935840681, 167407236],
@@ -3178,7 +3204,9 @@ macro_rules! server_impl {
                         channel_size: usize,
                         enqueue_timeout_ms: u64,
                         queue_max_staleness_ms: u64,
+                        queue_batch_wait_ms: f64,
                         mm_client: Option<&PyMmEmbeddingsClient>,
+                        sid_client: Option<&crate::sid_client::PySemanticIdClient>,
                         user_id_table_size: usize,
                         user_hash_scales: Vec<i64>,
                         user_biases: Vec<i64>,
@@ -3244,10 +3272,12 @@ macro_rules! server_impl {
                             Duration::from_millis(queue_max_staleness_ms)
                         };
                         let (request_queue, sender, background_task) =
-                            RequestQueue::<$item_type>::new(
+                            RequestQueue::<$item_type>::with_batch_wait(
                                 batch_size,
                                 channel_size,
                                 queue_max_staleness,
+                                (queue_batch_wait_ms > 0.0)
+                                    .then(|| Duration::from_secs_f64(queue_batch_wait_ms / 1000.0)),
                             );
 
                         let admission = Arc::new(AdmissionController::new(AdmissionConfig {
@@ -3365,6 +3395,7 @@ macro_rules! server_impl {
                             reload_directive: reload_directive.clone(),
                             enqueue_timeout_ms,
                             mm_embeddings_client,
+                            sid_client: sid_client.map(|c| c.build()),
                             admission: admission.clone(),
                             prefetch_mm_query_config,
                         };
@@ -3703,6 +3734,7 @@ pub fn xai_recsys_engine(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<RankingBatchPrep>()?;
     m.add_class::<RetrievalBatchPrep>()?;
     m.add_class::<PyMmEmbeddingsClient>()?;
+    m.add_class::<crate::sid_client::PySemanticIdClient>()?;
     m.add_class::<RecsysPredictorServer>()?;
     m.add_class::<RecsysRetrievalPredictorServer>()?;
     m.add_class::<PredictRequestBatch>()?;

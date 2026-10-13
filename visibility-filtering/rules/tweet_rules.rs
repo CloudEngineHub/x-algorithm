@@ -1,653 +1,45 @@
-use crate::models::{
-    AuthorLabel, LimitedEngagementReason, NsfwViewerDropReason, SafetyLabelType, TombstoneReason,
-    VerifyBlurSupport,
-};
+use crate::models::{LimitedEngagementReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport};
 use crate::params::{CountryList, LimitedActionType};
-use crate::rules::rule_spec::{
-    appealable, author, blur, blur_with_age_prompt, drop_post, everyone, except_author, family,
-    has_tweet_label, has_user_label, label, limit, not, nsfw_viewer_drop, only_author, only_when,
-    relationship, rule, soft_intervention, tombstone, tweet, viewer, AuthorPredicate, Clause,
-    Condition, FosnrViolation, Predicate, RelationshipPredicate, RuleClause, RuleId,
-    TweetPredicate, ViewerPredicate, LEGACY_NSFW_INTERSTITIAL,
-};
+use crate::rules::rule_spec::conditions::*;
+use crate::rules::rule_spec::Audience::{Everyone, NonAuthors, NonFollowers, OnlyAuthor};
+use crate::rules::rule_spec::*;
 use xai_core_entities::entities::ConversationControlArm;
-use xai_visibility_filtering::models::{Action, FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
 
-pub(super) const NSFW_HIGH_PRECISION_REASON: FilteredReason =
-    FilteredReason::SafetyResult(SafetyResult {
-        reason: Some(SafetyResultReason::NsfwHighPrecision),
-        action: Action::Drop(xai_visibility_filtering::models::DropReason {}),
-    });
-
-const HAS_MEDIA: Condition = tweet(TweetPredicate::HasMedia);
-const NOT_RETWEET: Condition = not(tweet(TweetPredicate::IsRetweet));
-const SENSITIVE_MEDIA_DISABLED: Condition = not(viewer(ViewerPredicate::AllowsSensitiveMedia));
-const LOGGED_OUT: Condition = viewer(ViewerPredicate::LoggedOut);
-const UNDERAGE: Condition = viewer(ViewerPredicate::Underage);
-const NO_STATED_AGE: Condition = viewer(ViewerPredicate::NoStatedAge);
-const IN_NSFW_GATING_COUNTRY: Condition = viewer(ViewerPredicate::AccountOrRequestCountryIn(
-    CountryList::NsfwGating,
-));
-const NSFW_MEDIA_LABEL: Condition = Condition::AnyOf(&[
-    has_tweet_label(SafetyLabelType::NSFW_HIGH_PRECISION),
-    has_tweet_label(SafetyLabelType::NSFW_HIGH_RECALL),
-    has_tweet_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-]);
-const NSFW_FLAGGED: Condition = Condition::AnyOf(&[
-    Predicate::Author(AuthorPredicate::IsNsfwUser),
-    Predicate::Author(AuthorPredicate::IsNsfwAdmin),
-    Predicate::Tweet(TweetPredicate::NsfwUserFlag),
-    Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
-]);
-const NSFW_TEXT_OR_CARD_LABEL: Condition = Condition::AnyOf(&[
-    has_tweet_label(SafetyLabelType::NSFW_TEXT),
-    has_tweet_label(SafetyLabelType::NSFW_CARD_IMAGE),
-]);
-const HAS_EXCLUSIVE_CONTENT: Condition = tweet(TweetPredicate::HasExclusiveContent);
-const NOT_CONVERSATION_AUTHOR: Condition = not(relationship(
-    RelationshipPredicate::ViewerIsConversationAuthor,
-));
-const NOT_SUPER_FOLLOWER: Condition = not(relationship(
-    RelationshipPredicate::ViewerSuperFollowsAuthor,
-));
-const NOT_LOGGED_OUT: Condition = not(viewer(ViewerPredicate::LoggedOut));
-const NOT_CONVERSATION_ROOT_AUTHOR: Condition = not(relationship(
-    RelationshipPredicate::ViewerIsConversationRootAuthor,
-));
-const NOT_INVITED_TO_CONVERSATION: Condition = not(relationship(
-    RelationshipPredicate::ViewerIsInvitedToConversation,
-));
-
-pub(super) fn protected_community_tweet_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::ProtectedCommunityTweet,
-        except_author(
-            [
-                tweet(TweetPredicate::IsCommunityTweet),
-                author(AuthorPredicate::IsProtected),
-            ],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
-
-pub(super) fn hidden_community_tweet_drop() -> Vec<RuleClause> {
-    moderated_community_tweet_drop(
-        RuleId::HiddenCommunityTweet,
-        TweetPredicate::CommunityTweetIsHidden,
-    )
-}
-
-pub(super) fn author_removed_community_tweet_drop() -> Vec<RuleClause> {
-    moderated_community_tweet_drop(
-        RuleId::AuthorRemovedCommunityTweet,
-        TweetPredicate::CommunityTweetAuthorIsRemoved,
-    )
-}
-
-fn moderated_community_tweet_drop(id: RuleId, moderated: TweetPredicate) -> Vec<RuleClause> {
-    rule(
-        id,
-        except_author(
-            [
-                tweet(TweetPredicate::IsCommunityTweet),
-                tweet(moderated),
-                not(relationship(
-                    RelationshipPredicate::ViewerIsCommunityModerator,
-                )),
-            ],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
-
-fn pdna_tweet_label_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::Pdna,
-        except_author(
-            [label(SafetyLabelType::PDNA)],
-            drop_post(NSFW_HIGH_PRECISION_REASON),
-        ),
-    )
-}
-
-fn bounce_tweet_label_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::Bounce,
-        except_author(
-            [label(SafetyLabelType::BOUNCE)],
-            drop_post(FilteredReason::TweetIsBounced),
-        ),
-    )
-}
-
-fn spam_tweet_label_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::Spam,
-        except_author(
-            [label(SafetyLabelType::SPAM)],
-            drop_post(FilteredReason::PossiblyUndesirable),
-        ),
-    )
-}
-
-fn for_emergency_use_only_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::ForEmergencyUseOnly,
-        everyone(
-            [label(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
-
-pub(super) fn tweet_label_drops() -> Vec<RuleClause> {
-    [
-        pdna_tweet_label_drop(),
-        bounce_tweet_label_drop(),
-        spam_tweet_label_drop(),
-        for_emergency_use_only_drop(),
-    ]
-    .concat()
-}
-
-pub(super) fn home_hydration_tweet_label_drops() -> Vec<RuleClause> {
-    [
-        spam_tweet_label_drop(),
-        pdna_tweet_label_drop(),
-        bounce_tweet_label_drop(),
-        for_emergency_use_only_drop(),
-    ]
-    .concat()
-}
-
-fn label_drop(id: RuleId, label_type: SafetyLabelType, reason: FilteredReason) -> Vec<RuleClause> {
-    rule(id, except_author([label(label_type)], drop_post(reason)))
-}
-
-struct FosnrLevel3 {
-    id: RuleId,
-    label: SafetyLabelType,
-    policy: AppealablePolicy,
-}
-
-const FOSNR_LEVEL_3: [FosnrLevel3; 4] = [
-    FosnrLevel3 {
-        id: RuleId::FosnrHatefulConduct,
-        label: SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
-        policy: AppealablePolicy::HATEFUL_CONDUCT,
-    },
-    FosnrLevel3 {
-        id: RuleId::FosnrViolentSpeech,
-        label: SafetyLabelType::FOSNR_VIOLENT_SPEECH,
-        policy: AppealablePolicy::VIOLENT_SPEECH,
-    },
-    FosnrLevel3 {
-        id: RuleId::FosnrAbuse,
-        label: SafetyLabelType::FOSNR_ABUSE,
-        policy: AppealablePolicy::ABUSE,
-    },
-    FosnrLevel3 {
-        id: RuleId::FosnrCivicIntegrity,
-        label: SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
-        policy: AppealablePolicy::CIVIC_INTEGRITY,
-    },
-];
-
-const FOSNR_LEVEL_1: SafetyLabelType = SafetyLabelType::FOSNR_ABUSE_INSULTS;
-
-const FOSNR: [Predicate; 5] = {
-    let [hateful_conduct, violent_speech, abuse, civic_integrity] = FOSNR_LEVEL_3;
-    [
-        has_tweet_label(hateful_conduct.label),
-        has_tweet_label(violent_speech.label),
-        has_tweet_label(abuse.label),
-        has_tweet_label(civic_integrity.label),
-        has_tweet_label(FOSNR_LEVEL_1),
-    ]
+pub(super) const FILTER_ALL_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::FilterAll,
+    when: &[],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) fn fosnr_level_3_drops() -> Vec<RuleClause> {
-    FOSNR_LEVEL_3
-        .into_iter()
-        .flat_map(|FosnrLevel3 { id, label, .. }| {
-            label_drop(id, label, FilteredReason::PossiblyUndesirable)
-        })
-        .collect()
-}
+pub(super) const PDNA_DROP_SAFETY_RESULT: Clause = Clause {
+    id: RuleId::Pdna,
+    when: &[tweet_has_label(SafetyLabelType::PDNA)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwHighPrecisionSafetyResult),
+};
 
-const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
+pub(super) const BOUNCE_DROP_BOUNCED: Clause = Clause {
+    id: RuleId::Bounce,
+    when: &[tweet_has_label(SafetyLabelType::BOUNCE)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::TweetIsBounced),
+};
 
-const NSFW_HIGH_PRECISION: Condition = label(SafetyLabelType::NSFW_HIGH_PRECISION);
-const CREATED_AFTER_NSFW_HIGH_PRECISION_CHANGE: Condition =
-    tweet(TweetPredicate::CreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT));
-const CREATED_BEFORE_NSFW_HIGH_PRECISION_CHANGE: Condition = not(tweet(
-    TweetPredicate::CreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT),
-));
-const GORE_AND_VIOLENCE_HIGH_PRECISION: Condition =
-    label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION);
-const NSFW_CARD_IMAGE: Condition = label(SafetyLabelType::NSFW_CARD_IMAGE);
-const NSFW_REPORTED_HEURISTICS: Condition = label(SafetyLabelType::NSFW_REPORTED_HEURISTICS);
-const GORE_AND_VIOLENCE_REPORTED_HEURISTICS: Condition =
-    label(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS);
-const NSFW_ADMIN: Condition = Condition::AnyOf(&[
-    Predicate::Author(AuthorPredicate::IsNsfwAdmin),
-    Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
-]);
-const NSFW_USER: Condition = Condition::AnyOf(&[
-    Predicate::Author(AuthorPredicate::IsNsfwUser),
-    Predicate::Tweet(TweetPredicate::NsfwUserFlag),
-]);
-const TWEET_NSFW_ADMIN: Condition = tweet(TweetPredicate::NsfwAdminFlag);
-const TWEET_NSFW_USER: Condition = tweet(TweetPredicate::NsfwUserFlag);
-const TWEET_NSFW_FLAGGED: Condition = Condition::AnyOf(&[
-    Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
-    Predicate::Tweet(TweetPredicate::NsfwUserFlag),
-]);
+pub(super) const SPAM_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::Spam,
+    when: &[tweet_has_label(SafetyLabelType::SPAM)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-const CLIENT_HAS_VERIFY_BLUR: Condition = viewer(ViewerPredicate::ClientVerifyBlurSupportIs(
-    VerifyBlurSupport::Supported,
-));
-const REQUEST_IS_FROM_AGE_VERIFICATION_COUNTRIES: Condition = viewer(
-    ViewerPredicate::RequestCountryIn(CountryList::AgeVerification),
-);
-const VIEWER_IS_NOT_AGE_VERIFIED: Condition = not(viewer(ViewerPredicate::AgeVerified));
-const REQUEST_IS_FROM_LOCAL_REGULATIONS_COUNTRIES: Condition = viewer(
-    ViewerPredicate::RequestCountryIn(CountryList::LocalRegulations),
-);
-const MODERN_BLUR_CLIENT: Condition = viewer(ViewerPredicate::ClientHasModernBlur);
-const LEGACY_INTERSTITIAL_CLIENT: Condition = not(viewer(ViewerPredicate::ClientHasModernBlur));
-const GORE_BLUR_IGNORES_SETTINGS_CLIENT: Condition =
-    viewer(ViewerPredicate::ClientBlursGoreIgnoringSettings);
-
-fn sensitive_media_blur(reason: InterstitialReason) -> Clause {
-    except_author([SENSITIVE_MEDIA_DISABLED], blur(reason))
-}
-
-fn modern_blur(reason: InterstitialReason) -> Clause {
-    everyone([SENSITIVE_MEDIA_DISABLED, MODERN_BLUR_CLIENT], blur(reason))
-}
-
-fn age_prompt_blur(reason: InterstitialReason) -> Clause {
-    except_author(
-        [
-            CLIENT_HAS_VERIFY_BLUR,
-            REQUEST_IS_FROM_AGE_VERIFICATION_COUNTRIES,
-            VIEWER_IS_NOT_AGE_VERIFIED,
-        ],
-        blur_with_age_prompt(reason),
-    )
-}
-
-fn legacy_client_interstitial() -> Clause {
-    everyone([LEGACY_INTERSTITIAL_CLIENT], LEGACY_NSFW_INTERSTITIAL)
-}
-
-fn age_gated_blurs(reason: InterstitialReason) -> [Clause; 3] {
-    [
-        age_prompt_blur(reason.clone()),
-        modern_blur(reason),
-        legacy_client_interstitial(),
-    ]
-}
-
-#[derive(Clone, Copy)]
-enum Rungs {
-    All,
-    UpdateApp,
-}
-
-fn age_gate_ladder(countries: CountryList, rungs: Rungs) -> Vec<Clause> {
-    use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Unsupported};
-    let generic = match rungs {
-        Rungs::All => Some((Unsupported, TombstoneReason::SensitiveViewerAgeVerification)),
-        Rungs::UpdateApp => None,
-    };
-    generic
-        .into_iter()
-        .chain([
-            (IosNeedsUpdate, TombstoneReason::UpdateAppIos),
-            (AndroidNeedsUpdate, TombstoneReason::UpdateAppAndroid),
-        ])
-        .map(|(client, reason)| {
-            except_author(
-                [
-                    viewer(ViewerPredicate::ClientVerifyBlurSupportIs(client)),
-                    viewer(ViewerPredicate::RequestCountryIn(countries)),
-                    VIEWER_IS_NOT_AGE_VERIFIED,
-                ],
-                tombstone(reason),
-            )
-        })
-        .collect()
-}
-
-pub(super) mod nsfw_high_precision {
-    use super::*;
-
-    pub(in crate::rules) fn blurs() -> Vec<RuleClause> {
-        use InterstitialReason::{Nudity, Sensitive};
-        family(RuleId::NsfwHighPrecision)
-            .when([NSFW_HIGH_PRECISION])
-            .clauses(only_when(
-                CREATED_AFTER_NSFW_HIGH_PRECISION_CHANGE,
-                [sensitive_media_blur(Nudity(true))],
-            ))
-            .clauses(only_when(
-                CREATED_BEFORE_NSFW_HIGH_PRECISION_CHANGE,
-                [sensitive_media_blur(Sensitive(true))],
-            ))
-            .into()
-    }
-
-    pub(in crate::rules) fn oon_drop() -> Vec<RuleClause> {
-        rule(
-            RuleId::NsfwHighPrecision,
-            except_author(
-                [NSFW_HIGH_PRECISION],
-                drop_post(FilteredReason::ContainNsfwMedia),
-            ),
-        )
-    }
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        use InterstitialReason::{Nudity, Sensitive};
-        family(RuleId::NsfwHighPrecision)
-            .when([NSFW_HIGH_PRECISION])
-            .clauses(only_when(
-                CREATED_BEFORE_NSFW_HIGH_PRECISION_CHANGE,
-                [
-                    age_prompt_blur(Sensitive(true)),
-                    modern_blur(Sensitive(true)),
-                ],
-            ))
-            .clauses(only_when(
-                CREATED_AFTER_NSFW_HIGH_PRECISION_CHANGE,
-                [age_prompt_blur(Nudity(true)), modern_blur(Nudity(true))],
-            ))
-            .clause(except_author(
-                [REQUEST_IS_FROM_LOCAL_REGULATIONS_COUNTRIES],
-                tombstone(TombstoneReason::LocalRegulations),
-            ))
-            .clause(legacy_client_interstitial())
-            .clauses(age_gate_ladder(CountryList::Tombstone, Rungs::All))
-            .into()
-    }
-}
-
-pub(super) mod nsfw_admin {
-    use super::*;
-
-    pub(in crate::rules) fn blurs() -> Vec<RuleClause> {
-        family(RuleId::NsfwAdmin)
-            .when([NSFW_ADMIN, HAS_MEDIA])
-            .clause(sensitive_media_blur(InterstitialReason::Sensitive(true)))
-            .into()
-    }
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::NsfwAdmin)
-            .when([TWEET_NSFW_ADMIN, HAS_MEDIA])
-            .clause(age_prompt_blur(InterstitialReason::Sensitive(true)))
-            .clause(modern_blur(InterstitialReason::Sensitive(true)))
-            .into()
-    }
-}
-
-pub(super) mod nsfw_user {
-    use super::*;
-
-    pub(in crate::rules) fn blurs() -> Vec<RuleClause> {
-        family(RuleId::NsfwUser)
-            .when([NSFW_USER, HAS_MEDIA])
-            .clause(sensitive_media_blur(InterstitialReason::SensitiveUser(
-                true,
-            )))
-            .into()
-    }
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::NsfwUser)
-            .when([TWEET_NSFW_USER, HAS_MEDIA])
-            .clause(age_prompt_blur(InterstitialReason::SensitiveUser(true)))
-            .clause(modern_blur(InterstitialReason::SensitiveUser(true)))
-            .into()
-    }
-}
-
-pub(super) mod nsfw_account {
-    use super::*;
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::NsfwAccount)
-            .when([TWEET_NSFW_FLAGGED, HAS_MEDIA])
-            .clause(everyone(
-                [SENSITIVE_MEDIA_DISABLED, LEGACY_INTERSTITIAL_CLIENT],
-                LEGACY_NSFW_INTERSTITIAL,
-            ))
-            .clauses(age_gate_ladder(CountryList::AgeVerification, Rungs::All))
-            .into()
-    }
-}
-
-pub(super) mod gore_and_violence_high_precision {
-    use super::*;
-
-    pub(in crate::rules) fn blurs() -> Vec<RuleClause> {
-        family(RuleId::GoreAndViolenceHighPrecision)
-            .when([GORE_AND_VIOLENCE_HIGH_PRECISION])
-            .clause(sensitive_media_blur(InterstitialReason::Violence(true)))
-            .into()
-    }
-
-    pub(in crate::rules) fn oon_drop() -> Vec<RuleClause> {
-        rule(
-            RuleId::GoreAndViolenceHighPrecision,
-            except_author(
-                [GORE_AND_VIOLENCE_HIGH_PRECISION],
-                drop_post(FilteredReason::ContainNsfwMedia),
-            ),
-        )
-    }
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        let gore = || {
-            family(RuleId::GoreAndViolenceHighPrecision).when([GORE_AND_VIOLENCE_HIGH_PRECISION])
-        };
-        [
-            gore()
-                .clause(modern_blur(InterstitialReason::Violence(true)))
-                .into(),
-            rule(
-                RuleId::GoreAndViolenceIgnoringSettings,
-                except_author(
-                    [
-                        GORE_AND_VIOLENCE_HIGH_PRECISION,
-                        GORE_BLUR_IGNORES_SETTINGS_CLIENT,
-                    ],
-                    blur(InterstitialReason::Violence(true)),
-                ),
-            ),
-            gore().clause(legacy_client_interstitial()).into(),
-        ]
-        .concat()
-    }
-
-    pub(in crate::rules) fn all_users_age_verification() -> Vec<RuleClause> {
-        family(RuleId::GoreAndViolenceHighPrecision)
-            .when([GORE_AND_VIOLENCE_HIGH_PRECISION])
-            .clause(age_prompt_blur(InterstitialReason::Violence(true)))
-            .clauses(age_gate_ladder(CountryList::Tombstone, Rungs::UpdateApp))
-            .into()
-    }
-}
-
-pub(super) mod nsfw_reported_heuristics {
-    use super::*;
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::NsfwReportedHeuristics)
-            .when([NSFW_REPORTED_HEURISTICS])
-            .clauses(age_gated_blurs(InterstitialReason::Sensitive(true)))
-            .clauses(age_gate_ladder(CountryList::AgeVerification, Rungs::All))
-            .into()
-    }
-}
-
-pub(super) mod gore_and_violence_reported_heuristics {
-    use super::*;
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::GoreAndViolenceReportedHeuristics)
-            .when([GORE_AND_VIOLENCE_REPORTED_HEURISTICS])
-            .clause(modern_blur(InterstitialReason::Sensitive(true)))
-            .clause(legacy_client_interstitial())
-            .into()
-    }
-}
-
-pub(super) mod nsfw_card_image {
-    use super::*;
-
-    pub(in crate::rules) fn blurs() -> Vec<RuleClause> {
-        family(RuleId::NsfwCardImage)
-            .when([NSFW_CARD_IMAGE])
-            .clause(sensitive_media_blur(InterstitialReason::Sensitive(true)))
-            .into()
-    }
-
-    pub(in crate::rules) fn oon_drop() -> Vec<RuleClause> {
-        rule(
-            RuleId::NsfwCardImage,
-            except_author(
-                [NSFW_CARD_IMAGE],
-                drop_post(FilteredReason::ContainNsfwMedia),
-            ),
-        )
-    }
-
-    pub(in crate::rules) fn all_users() -> Vec<RuleClause> {
-        family(RuleId::NsfwCardImage)
-            .when([NSFW_CARD_IMAGE])
-            .clauses(age_gated_blurs(InterstitialReason::Sensitive(true)))
-            .clauses(age_gate_ladder(CountryList::AgeVerification, Rungs::All))
-            .into()
-    }
-}
-
-pub(super) fn nsfw_media_interstitials() -> Vec<RuleClause> {
-    [
-        nsfw_high_precision::blurs(),
-        gore_and_violence_high_precision::blurs(),
-        nsfw_card_image::blurs(),
-    ]
-    .concat()
-}
-
-pub(super) fn nsfw_author_interstitials() -> Vec<RuleClause> {
-    [nsfw_admin::blurs(), nsfw_user::blurs()].concat()
-}
-
-pub(super) fn home_hydration_nsfw_rules() -> Vec<RuleClause> {
-    [
-        nsfw_high_precision::all_users(),
-        nsfw_admin::all_users(),
-        nsfw_user::all_users(),
-        nsfw_account::all_users(),
-        gore_and_violence_high_precision::all_users(),
-        nsfw_reported_heuristics::all_users(),
-        gore_and_violence_reported_heuristics::all_users(),
-        nsfw_card_image::all_users(),
-        gore_and_violence_high_precision::all_users_age_verification(),
-    ]
-    .concat()
-}
-
-pub(super) fn oon_tweet_flag_drops() -> Vec<RuleClause> {
-    let nsfw_media = || drop_post(FilteredReason::ContainNsfwMedia);
-    [
-        rule(
-            RuleId::NsfwUserTweetFlag,
-            everyone([tweet(TweetPredicate::NsfwUserFlag)], nsfw_media()),
-        ),
-        rule(
-            RuleId::NsfwAdminTweetFlag,
-            everyone([tweet(TweetPredicate::NsfwAdminFlag)], nsfw_media()),
-        ),
-    ]
-    .concat()
-}
-
-pub(super) fn oon_nsfw_media_label_drops() -> Vec<RuleClause> {
-    [
-        label_drop(
-            RuleId::NsfwHighRecall,
-            SafetyLabelType::NSFW_HIGH_RECALL,
-            FilteredReason::ContainNsfwMedia,
-        ),
-        nsfw_high_precision::oon_drop(),
-        nsfw_card_image::oon_drop(),
-    ]
-    .concat()
-}
-
-pub(super) fn oon_low_quality_tweet_label_drops() -> Vec<RuleClause> {
-    use SafetyLabelType as L;
-    let undesirable = FilteredReason::PossiblyUndesirable;
-    [
-        label_drop(RuleId::DoNotAmplify, L::DO_NOT_AMPLIFY, undesirable.clone()),
-        label_drop(RuleId::MaliciousUrl, L::MALICIOUS_URL, undesirable.clone()),
-        label_drop(RuleId::SpamHighRecall, L::SPAM_HIGH_RECALL, undesirable),
-        rule(
-            RuleId::BrazilElectionLegal,
-            except_author(
-                [
-                    label(L::BRAZIL_ELECTION_LEGAL),
-                    viewer(ViewerPredicate::RequestCountryIs("br")),
-                ],
-                drop_post(FilteredReason::PossiblyUndesirable),
-            ),
-        ),
-    ]
-    .concat()
-}
-
-pub(super) fn oon_text_label_drops() -> Vec<RuleClause> {
-    label_drop(
-        RuleId::FosnrAbuseInsults,
-        SafetyLabelType::FOSNR_ABUSE_INSULTS,
-        FilteredReason::PossiblyUndesirable,
-    )
-}
-
-pub(super) fn fosnr_level_1_non_follower_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::FosnrAbuseInsultsNonFollower,
-        except_author(
-            [
-                label(FOSNR_LEVEL_1),
-                not(relationship(RelationshipPredicate::ViewerFollowsAuthor)),
-                viewer(ViewerPredicate::ClientHasFosnrRules),
-            ],
-            drop_post(FilteredReason::PossiblyUndesirable),
-        ),
-    )
-}
-
-pub(super) fn fosnr_level_1_follower_soft_intervention() -> Vec<RuleClause> {
-    rule(
-        RuleId::FosnrAbuseInsultsFollower,
-        except_author(
-            [
-                label(FOSNR_LEVEL_1),
-                relationship(RelationshipPredicate::ViewerFollowsAuthor),
-                viewer(ViewerPredicate::ClientHasFosnrRules),
-            ],
-            soft_intervention(FOSNR_LEVEL_1, AppealablePolicy::ABUSE, 1),
-        ),
-    )
-}
+pub(super) const FOR_EMERGENCY_USE_ONLY_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::ForEmergencyUseOnly,
+    when: &[tweet_has_label(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
 const AUTHOR_LEVEL_3_LIMITED_ACTIONS: [LimitedActionType; 13] = {
     use LimitedActionType as A;
@@ -668,415 +60,1076 @@ const AUTHOR_LEVEL_3_LIMITED_ACTIONS: [LimitedActionType; 13] = {
     ]
 };
 
-const fn author_level_3(FosnrLevel3 { label, policy, .. }: FosnrLevel3) -> FosnrViolation {
+pub(super) const FOSNR_AUTHOR_VIOLATIONS: [FosnrViolation; 5] = [
     FosnrViolation {
-        label,
-        policy,
+        label: SafetyLabelType::FOSNR_ABUSE,
+        policy: AppealablePolicy::ABUSE,
         level: 3,
         limited_actions: &AUTHOR_LEVEL_3_LIMITED_ACTIONS,
-    }
-}
+    },
+    FosnrViolation {
+        label: SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
+        policy: AppealablePolicy::CIVIC_INTEGRITY,
+        level: 3,
+        limited_actions: &AUTHOR_LEVEL_3_LIMITED_ACTIONS,
+    },
+    FosnrViolation {
+        label: SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
+        policy: AppealablePolicy::HATEFUL_CONDUCT,
+        level: 3,
+        limited_actions: &AUTHOR_LEVEL_3_LIMITED_ACTIONS,
+    },
+    FosnrViolation {
+        label: SafetyLabelType::FOSNR_VIOLENT_SPEECH,
+        policy: AppealablePolicy::VIOLENT_SPEECH,
+        level: 3,
+        limited_actions: &AUTHOR_LEVEL_3_LIMITED_ACTIONS,
+    },
+    FosnrViolation {
+        label: SafetyLabelType::FOSNR_ABUSE_INSULTS,
+        policy: AppealablePolicy::ABUSE,
+        level: 1,
+        limited_actions: &[LimitedActionType::EditTweet],
+    },
+];
 
-const FOSNR_AUTHOR_VIOLATIONS: [FosnrViolation; 5] = {
-    let [hateful_conduct, violent_speech, abuse, civic_integrity] = FOSNR_LEVEL_3;
-    [
-        author_level_3(abuse),
-        author_level_3(civic_integrity),
-        author_level_3(hateful_conduct),
-        author_level_3(violent_speech),
-        FosnrViolation {
-            label: FOSNR_LEVEL_1,
-            policy: AppealablePolicy::ABUSE,
-            level: 1,
-            limited_actions: &[LimitedActionType::EditTweet],
-        },
-    ]
+pub(super) const FOSNR_HATEFUL_CONDUCT_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrHatefulConduct,
+    when: &[tweet_has_label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
 };
 
-pub(super) fn fosnr_author_appealable() -> Vec<RuleClause> {
-    rule(
-        RuleId::FosnrAuthor,
-        only_author(
-            [
-                viewer(ViewerPredicate::ClientHasFosnrRules),
-                Condition::AnyOf(&FOSNR),
-            ],
-            appealable(&FOSNR_AUTHOR_VIOLATIONS),
-        ),
-    )
-}
+pub(super) const FOSNR_VIOLENT_SPEECH_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrViolentSpeech,
+    when: &[tweet_has_label(SafetyLabelType::FOSNR_VIOLENT_SPEECH)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-pub(super) fn fosnr_fallback_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::FosnrFallback,
-        everyone(
-            [
-                viewer(ViewerPredicate::ClientNeedsFosnrFallbackDrops),
-                Condition::AnyOf(&FOSNR),
-            ],
-            drop_post(FilteredReason::PossiblyUndesirable),
-        ),
-    )
-}
+pub(super) const FOSNR_ABUSE_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrAbuse,
+    when: &[tweet_has_label(SafetyLabelType::FOSNR_ABUSE)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-pub(super) fn creator_tweet_nsfw_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::CreatorTweetNsfw,
-        except_author(
-            [HAS_MEDIA, NSFW_HIGH_PRECISION, HAS_EXCLUSIVE_CONTENT],
-            drop_post(FilteredReason::ContainNsfwMedia),
-        ),
-    )
-}
+pub(super) const FOSNR_CIVIC_INTEGRITY_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrCivicIntegrity,
+    when: &[tweet_has_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-pub(super) fn exclusive_tweet_drop() -> Vec<RuleClause> {
-    let exclusive = || drop_post(FilteredReason::ExclusiveTweet);
-    family(RuleId::ExclusiveTweet)
-        .when([HAS_EXCLUSIVE_CONTENT])
-        .clause(everyone([LOGGED_OUT], exclusive()))
-        .clause(everyone(
-            [
-                NOT_CONVERSATION_AUTHOR,
-                NOT_SUPER_FOLLOWER,
-                tweet(TweetPredicate::IsRetweet),
-            ],
-            exclusive(),
-        ))
-        .clause(except_author(
-            [NOT_CONVERSATION_AUTHOR, NOT_SUPER_FOLLOWER],
-            exclusive(),
-        ))
-        .into()
-}
+pub(super) const FOSNR_ABUSE_INSULTS_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrAbuseInsults,
+    when: &[tweet_has_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-pub(super) fn trusted_friends_tweet_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::TrustedFriendsTweet,
-        except_author(
-            [
-                tweet(TweetPredicate::IsTrustedFriendsTweet),
-                not(relationship(
-                    RelationshipPredicate::ViewerIsTrustedFriendsListMemberOrOwner,
-                )),
-            ],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
+pub(super) const FOSNR_ABUSE_INSULTS_NON_FOLLOWER_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrAbuseInsultsNonFollower,
+    when: &[
+        tweet_has_label(SafetyLabelType::FOSNR_ABUSE_INSULTS),
+        client_has_fosnr_rules(),
+    ],
+    audience: NonFollowers,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
 
-pub(super) fn author_blocks_viewer_exclusive_content_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::AuthorBlocksViewerExclusiveContent,
-        except_author(
-            [
-                relationship(RelationshipPredicate::ViewerIsBlockedByAuthor),
-                HAS_EXCLUSIVE_CONTENT,
-            ],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
+pub(super) const FOSNR_ABUSE_INSULTS_FOLLOWER_SOFT_INTERVENTION_ABUSE: Clause = Clause {
+    id: RuleId::FosnrAbuseInsultsFollower,
+    when: &[
+        tweet_has_label(SafetyLabelType::FOSNR_ABUSE_INSULTS),
+        viewer_follows_author(),
+        client_has_fosnr_rules(),
+    ],
+    audience: NonAuthors,
+    action: soft_intervention(
+        SafetyLabelType::FOSNR_ABUSE_INSULTS,
+        AppealablePolicy::ABUSE,
+        1,
+    ),
+};
 
-fn limit_replies(
-    id: RuleId,
-    arm: ConversationControlArm,
-    exemption: impl IntoIterator<Item = Condition>,
-) -> Vec<RuleClause> {
-    family(id)
-        .when([
-            tweet(TweetPredicate::HasConversationControl(arm)),
-            NOT_LOGGED_OUT,
-            NOT_RETWEET,
-            NOT_CONVERSATION_ROOT_AUTHOR,
-            NOT_INVITED_TO_CONVERSATION,
-        ])
-        .clause(everyone(
-            exemption,
-            limit(LimitedEngagementReason::ConversationControl),
-        ))
-        .into()
-}
+pub(super) const FOSNR_AUTHOR_APPEALABLE: Clause = Clause {
+    id: RuleId::FosnrAuthor,
+    when: &[client_has_fosnr_rules(), has_fosnr_label()],
+    audience: OnlyAuthor,
+    action: appealable(&FOSNR_AUTHOR_VIOLATIONS),
+};
 
-fn limit_replies_conversation_rules() -> Vec<RuleClause> {
-    use ConversationControlArm::{ByInvitation, Co, Community, MyNetwork, Subscribers, Verified};
-    use RelationshipPredicate::{
-        ViewerIsFollowedByConversationRootAuthor, ViewerIsInAllowedCountry,
-        ViewerIsInConversationRootAuthorNetwork, ViewerSuperFollowsConversationRootAuthor,
+pub(super) const FOSNR_FALLBACK_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::FosnrFallback,
+    when: &[client_needs_fosnr_fallback_drops(), has_fosnr_label()],
+    audience: Everyone,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const NULLCASTED_TWEET_DROP: Clause = Clause {
+    id: RuleId::NullcastedTweet,
+    when: &[
+        tweet_is_nullcast(),
+        not(tweet_is_retweet()),
+        not(tweet_is_community_tweet()),
+    ],
+    audience: Everyone,
+    action: drop_post(DropAs::TweetIsNullcast),
+};
+
+pub(super) const STALE_TWEET_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::StaleTweet,
+    when: &[tweet_is_superseded_edit(), not(tweet_is_retweet())],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const STALE_TWEET_LIMITED_ENGAGEMENT: Clause = Clause {
+    id: RuleId::StaleTweet,
+    when: &[tweet_is_superseded_edit(), client_has_stale_tweet_limits()],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::StaleTweet),
+};
+
+pub(super) const LEGAL_TAKEDOWN_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::LegalTakedown,
+    when: &[tweet_legal_takedown_in_request_country()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const LOCAL_LAWS_TAKEDOWN_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::LocalLawsTakedown,
+    when: &[tweet_local_laws_takedown_in_request_country()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const ARTICLE_TWEET_CONTENT_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::ArticleTweetContent,
+    when: &[tweet_has_article(), not(tweet_article_is_published())],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const PROTECTED_COMMUNITY_TWEET_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::ProtectedCommunityTweet,
+    when: &[tweet_is_community_tweet(), author_is_protected()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const HIDDEN_COMMUNITY_TWEET_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::HiddenCommunityTweet,
+    when: &[
+        tweet_is_community_tweet(),
+        tweet_community_tweet_is_hidden(),
+        not(viewer_is_community_moderator()),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const AUTHOR_REMOVED_COMMUNITY_TWEET_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::AuthorRemovedCommunityTweet,
+    when: &[
+        tweet_is_community_tweet(),
+        tweet_community_tweet_author_is_removed(),
+        not(viewer_is_community_moderator()),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const SENSITIVE_VIEWER_LOGGED_OUT_DROP_MEDIA_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerLoggedOut,
+    when: &[
+        viewer_logged_out(),
+        tweet_has_media(),
+        has_nsfw_media_label(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerLoggedOut),
+};
+
+pub(super) const SENSITIVE_VIEWER_LOGGED_OUT_DROP_NSFW_FLAG: Clause = Clause {
+    id: RuleId::SensitiveViewerLoggedOut,
+    when: &[
+        viewer_logged_out(),
+        tweet_has_media(),
+        not(tweet_is_retweet()),
+        is_nsfw_flagged(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerLoggedOut),
+};
+
+pub(super) const SENSITIVE_VIEWER_LOGGED_OUT_DROP_TEXT_OR_CARD_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerLoggedOut,
+    when: &[viewer_logged_out(), has_nsfw_text_or_card_label()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerLoggedOut),
+};
+
+pub(super) const SENSITIVE_VIEWER_UNDERAGE_DROP_MEDIA_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerUnderage,
+    when: &[viewer_underage(), tweet_has_media(), has_nsfw_media_label()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerIsUnderage),
+};
+
+pub(super) const SENSITIVE_VIEWER_UNDERAGE_DROP_NSFW_FLAG: Clause = Clause {
+    id: RuleId::SensitiveViewerUnderage,
+    when: &[
+        viewer_underage(),
+        tweet_has_media(),
+        not(tweet_is_retweet()),
+        is_nsfw_flagged(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerIsUnderage),
+};
+
+pub(super) const SENSITIVE_VIEWER_UNDERAGE_DROP_TEXT_OR_CARD_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerUnderage,
+    when: &[viewer_underage(), has_nsfw_text_or_card_label()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerIsUnderage),
+};
+
+pub(super) const SENSITIVE_VIEWER_NO_STATED_AGE_DROP_MEDIA_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerNoStatedAge,
+    when: &[
+        viewer_no_stated_age(),
+        viewer_account_or_request_country_in(CountryList::NsfwGating),
+        tweet_has_media(),
+        has_nsfw_media_label(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerHasNoStatedAge),
+};
+
+pub(super) const SENSITIVE_VIEWER_NO_STATED_AGE_DROP_NSFW_FLAG: Clause = Clause {
+    id: RuleId::SensitiveViewerNoStatedAge,
+    when: &[
+        viewer_no_stated_age(),
+        viewer_account_or_request_country_in(CountryList::NsfwGating),
+        tweet_has_media(),
+        not(tweet_is_retweet()),
+        is_nsfw_flagged(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerHasNoStatedAge),
+};
+
+pub(super) const SENSITIVE_VIEWER_NO_STATED_AGE_DROP_TEXT_OR_CARD_LABEL: Clause = Clause {
+    id: RuleId::SensitiveViewerNoStatedAge,
+    when: &[
+        viewer_no_stated_age(),
+        viewer_account_or_request_country_in(CountryList::NsfwGating),
+        has_nsfw_text_or_card_label(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::NsfwViewerHasNoStatedAge),
+};
+
+pub(super) const NSFW_SENSITIVE_VIEWER_TWEET_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwSensitiveViewerTweet,
+    when: &[
+        not(viewer_allows_sensitive_media()),
+        is_nsfw_sensitive_tweet(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const NSFW_SENSITIVE_VIEWER_USER_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwSensitiveViewerUser,
+    when: &[
+        not(viewer_allows_sensitive_media()),
+        is_nsfw_sensitive_author(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const EXCLUSIVE_TWEET_DROP_LOGGED_OUT: Clause = Clause {
+    id: RuleId::ExclusiveTweet,
+    when: &[tweet_has_exclusive_content(), viewer_logged_out()],
+    audience: Everyone,
+    action: drop_post(DropAs::ExclusiveTweet),
+};
+
+pub(super) const EXCLUSIVE_TWEET_DROP_RETWEET: Clause = Clause {
+    id: RuleId::ExclusiveTweet,
+    when: &[
+        tweet_has_exclusive_content(),
+        not(viewer_is_conversation_author()),
+        not(viewer_super_follows_author()),
+        tweet_is_retweet(),
+    ],
+    audience: Everyone,
+    action: drop_post(DropAs::ExclusiveTweet),
+};
+
+pub(super) const EXCLUSIVE_TWEET_DROP_NON_SUPER_FOLLOWER: Clause = Clause {
+    id: RuleId::ExclusiveTweet,
+    when: &[
+        tweet_has_exclusive_content(),
+        not(viewer_is_conversation_author()),
+        not(viewer_super_follows_author()),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ExclusiveTweet),
+};
+
+pub(super) const AUTHOR_BLOCKS_VIEWER_EXCLUSIVE_CONTENT_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::AuthorBlocksViewerExclusiveContent,
+    when: &[viewer_is_blocked_by_author(), tweet_has_exclusive_content()],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const CREATOR_TWEET_NSFW_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::CreatorTweetNsfw,
+    when: &[
+        tweet_has_media(),
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_has_exclusive_content(),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const TRUSTED_FRIENDS_TWEET_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::TrustedFriendsTweet,
+    when: &[
+        tweet_is_trusted_friends_tweet(),
+        not(viewer_is_trusted_friends_list_member_or_owner()),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_NUDITY: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_after(NSFW_HIGH_PRECISION_CHANGED_AT),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Nudity(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_SENSITIVE: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_before(NSFW_HIGH_PRECISION_CHANGED_AT),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_TOMBSTONE_LOCAL_REGULATIONS: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        request_country_in(CountryList::LocalRegulations),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::LocalRegulations),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_TOMBSTONE_AGE_VERIFICATION: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::Unsupported),
+        request_country_in(CountryList::Tombstone),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::SensitiveViewerAgeVerification),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_TOMBSTONE_UPDATE_APP_IOS: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::IosNeedsUpdate),
+        request_country_in(CountryList::Tombstone),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppIos),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_TOMBSTONE_UPDATE_APP_ANDROID: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::AndroidNeedsUpdate),
+        request_country_in(CountryList::Tombstone),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppAndroid),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_SENSITIVE_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_before(NSFW_HIGH_PRECISION_CHANGED_AT),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_SENSITIVE_ALL_USERS: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_before(NSFW_HIGH_PRECISION_CHANGED_AT),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_NUDITY_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_after(NSFW_HIGH_PRECISION_CHANGED_AT),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Nudity(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_BLUR_NUDITY_ALL_USERS: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        tweet_created_after(NSFW_HIGH_PRECISION_CHANGED_AT),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Nudity(true)),
+};
+
+pub(super) const NSFW_HIGH_PRECISION_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::NsfwHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_HIGH_PRECISION),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_BLUR: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Violence(true)),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[tweet_has_label(
+        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+    )],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_TOMBSTONE_UPDATE_APP_IOS: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::IosNeedsUpdate),
+        request_country_in(CountryList::Tombstone),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppIos),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_TOMBSTONE_UPDATE_APP_ANDROID: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::AndroidNeedsUpdate),
+        request_country_in(CountryList::Tombstone),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppAndroid),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_BLUR_ALL_USERS: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Violence(true)),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_BLUR_AGE_PROMPT: Clause = Clause {
+    id: RuleId::GoreAndViolenceHighPrecision,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Violence(true)),
+};
+
+pub(super) const GORE_AND_VIOLENCE_IGNORING_SETTINGS_BLUR: Clause = Clause {
+    id: RuleId::GoreAndViolenceIgnoringSettings,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
+        client_blurs_gore_ignoring_settings(),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Violence(true)),
+};
+
+pub(super) const NSFW_CARD_IMAGE_BLUR_SENSITIVE: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_CARD_IMAGE_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const NSFW_CARD_IMAGE_TOMBSTONE_AGE_VERIFICATION: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        client_verify_blur_support_is(VerifyBlurSupport::Unsupported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::SensitiveViewerAgeVerification),
+};
+
+pub(super) const NSFW_CARD_IMAGE_TOMBSTONE_UPDATE_APP_IOS: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        client_verify_blur_support_is(VerifyBlurSupport::IosNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppIos),
+};
+
+pub(super) const NSFW_CARD_IMAGE_TOMBSTONE_UPDATE_APP_ANDROID: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        client_verify_blur_support_is(VerifyBlurSupport::AndroidNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppAndroid),
+};
+
+pub(super) const NSFW_CARD_IMAGE_BLUR_SENSITIVE_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_CARD_IMAGE_BLUR_SENSITIVE_ALL_USERS: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_CARD_IMAGE_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::NsfwCardImage,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_CARD_IMAGE),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const NSFW_ADMIN_BLUR_SENSITIVE: Clause = Clause {
+    id: RuleId::NsfwAdmin,
+    when: &[
+        is_nsfw_admin(),
+        tweet_has_media(),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_ADMIN_BLUR_SENSITIVE_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwAdmin,
+    when: &[
+        tweet_nsfw_admin_flag(),
+        tweet_has_media(),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_ADMIN_BLUR_SENSITIVE_ALL_USERS: Clause = Clause {
+    id: RuleId::NsfwAdmin,
+    when: &[
+        tweet_nsfw_admin_flag(),
+        tweet_has_media(),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_USER_BLUR_SENSITIVE_USER: Clause = Clause {
+    id: RuleId::NsfwUser,
+    when: &[
+        is_nsfw_user(),
+        tweet_has_media(),
+        not(viewer_allows_sensitive_media()),
+    ],
+    audience: NonAuthors,
+    action: blur(InterstitialReason::SensitiveUser(true)),
+};
+
+pub(super) const NSFW_USER_BLUR_SENSITIVE_USER_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwUser,
+    when: &[
+        tweet_nsfw_user_flag(),
+        tweet_has_media(),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::SensitiveUser(true)),
+};
+
+pub(super) const NSFW_USER_BLUR_SENSITIVE_USER_ALL_USERS: Clause = Clause {
+    id: RuleId::NsfwUser,
+    when: &[
+        tweet_nsfw_user_flag(),
+        tweet_has_media(),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::SensitiveUser(true)),
+};
+
+pub(super) const NSFW_ACCOUNT_TOMBSTONE_AGE_VERIFICATION: Clause = Clause {
+    id: RuleId::NsfwAccount,
+    when: &[
+        tweet_is_nsfw_flagged(),
+        tweet_has_media(),
+        client_verify_blur_support_is(VerifyBlurSupport::Unsupported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::SensitiveViewerAgeVerification),
+};
+
+pub(super) const NSFW_ACCOUNT_TOMBSTONE_UPDATE_APP_IOS: Clause = Clause {
+    id: RuleId::NsfwAccount,
+    when: &[
+        tweet_is_nsfw_flagged(),
+        tweet_has_media(),
+        client_verify_blur_support_is(VerifyBlurSupport::IosNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppIos),
+};
+
+pub(super) const NSFW_ACCOUNT_TOMBSTONE_UPDATE_APP_ANDROID: Clause = Clause {
+    id: RuleId::NsfwAccount,
+    when: &[
+        tweet_is_nsfw_flagged(),
+        tweet_has_media(),
+        client_verify_blur_support_is(VerifyBlurSupport::AndroidNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppAndroid),
+};
+
+pub(super) const NSFW_ACCOUNT_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::NsfwAccount,
+    when: &[
+        tweet_is_nsfw_flagged(),
+        tweet_has_media(),
+        not(viewer_allows_sensitive_media()),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_AGE_VERIFICATION: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        client_verify_blur_support_is(VerifyBlurSupport::Unsupported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::SensitiveViewerAgeVerification),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_UPDATE_APP_IOS: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        client_verify_blur_support_is(VerifyBlurSupport::IosNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppIos),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_UPDATE_APP_ANDROID: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        client_verify_blur_support_is(VerifyBlurSupport::AndroidNeedsUpdate),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: tombstone(TombstoneReason::UpdateAppAndroid),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_BLUR_SENSITIVE_AGE_PROMPT: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        client_verify_blur_support_is(VerifyBlurSupport::Supported),
+        request_country_in(CountryList::AgeVerification),
+        not(viewer_age_verified()),
+    ],
+    audience: NonAuthors,
+    action: blur_with_age_prompt(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_BLUR_SENSITIVE: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const NSFW_REPORTED_HEURISTICS_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::NsfwReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const GORE_AND_VIOLENCE_REPORTED_HEURISTICS_BLUR_SENSITIVE: Clause = Clause {
+    id: RuleId::GoreAndViolenceReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS),
+        not(viewer_allows_sensitive_media()),
+        client_has_modern_blur(),
+    ],
+    audience: Everyone,
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const GORE_AND_VIOLENCE_REPORTED_HEURISTICS_LEGACY_INTERSTITIAL: Clause = Clause {
+    id: RuleId::GoreAndViolenceReportedHeuristics,
+    when: &[
+        tweet_has_label(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS),
+        is_client_deprecated(),
+    ],
+    audience: Everyone,
+    action: legacy_nsfw_interstitial(),
+};
+
+pub(super) const DMCA_MEDIA_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::DmcaMedia,
+    when: &[tweet_has_dmca_media()],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const GEO_RESTRICTED_MEDIA_DROP_UNSPECIFIED: Clause = Clause {
+    id: RuleId::GeoRestrictedMedia,
+    when: &[tweet_media_geo_restricted_in_request_country()],
+    audience: Everyone,
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NSFW_USER_TWEET_FLAG_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwUserTweetFlag,
+    when: &[tweet_nsfw_user_flag()],
+    audience: Everyone,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const NSFW_ADMIN_TWEET_FLAG_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwAdminTweetFlag,
+    when: &[tweet_nsfw_admin_flag()],
+    audience: Everyone,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const NSFW_HIGH_RECALL_DROP_NSFW_MEDIA: Clause = Clause {
+    id: RuleId::NsfwHighRecall,
+    when: &[tweet_has_label(SafetyLabelType::NSFW_HIGH_RECALL)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
+
+pub(super) const DO_NOT_AMPLIFY_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::DoNotAmplify,
+    when: &[tweet_has_label(SafetyLabelType::DO_NOT_AMPLIFY)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const MALICIOUS_URL_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::MaliciousUrl,
+    when: &[tweet_has_label(SafetyLabelType::MALICIOUS_URL)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const SPAM_HIGH_RECALL_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::SpamHighRecall,
+    when: &[tweet_has_label(SafetyLabelType::SPAM_HIGH_RECALL)],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const BRAZIL_ELECTION_LEGAL_DROP_UNDESIRABLE: Clause = Clause {
+    id: RuleId::BrazilElectionLegal,
+    when: &[
+        tweet_has_label(SafetyLabelType::BRAZIL_ELECTION_LEGAL),
+        request_country_is("br"),
+    ],
+    audience: NonAuthors,
+    action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const BLOCKED_VIEWER_LIMITED_ENGAGEMENT: Clause = Clause {
+    id: RuleId::BlockedViewer,
+    when: &[viewer_is_blocked_by_author()],
+    audience: NonAuthors,
+    action: limit(LimitedEngagementReason::BlockedViewer),
+};
+
+pub(super) const BLOCKED_VIEWER_LIMITED_ENGAGEMENT_ROOT_AUTHOR_BLOCKED_VIEWER: Clause = Clause {
+    id: RuleId::BlockedViewer,
+    when: &[viewer_is_blocked_by_conversation_root_author()],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::RootAuthorBlockedViewer),
+};
+
+pub(super) const LIMIT_REPLIES_BY_INVITATION_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause =
+    Clause {
+        id: RuleId::LimitRepliesByInvitation,
+        when: &[
+            tweet_has_conversation_control(ConversationControlArm::ByInvitation),
+            not(viewer_logged_out()),
+            not(tweet_is_retweet()),
+            not(viewer_is_conversation_root_author()),
+            not(viewer_is_invited_to_conversation()),
+        ],
+        audience: Everyone,
+        action: limit(LimitedEngagementReason::ConversationControl),
     };
-    let unless = |leaf| [not(relationship(leaf))];
-    [
-        limit_replies(RuleId::LimitRepliesByInvitation, ByInvitation, []),
-        limit_replies(
-            RuleId::LimitRepliesCommunity,
-            Community,
-            unless(ViewerIsFollowedByConversationRootAuthor),
-        ),
-        limit_replies(
-            RuleId::LimitRepliesSubscribers,
-            Subscribers,
-            unless(ViewerSuperFollowsConversationRootAuthor),
-        ),
-        limit_replies(
-            RuleId::LimitRepliesVerified,
-            Verified,
-            [not(viewer(ViewerPredicate::HasVerifiedBadge))],
-        ),
-        limit_replies(
-            RuleId::LimitRepliesMyNetwork,
-            MyNetwork,
-            unless(ViewerIsInConversationRootAuthorNetwork),
-        ),
-        limit_replies(RuleId::LimitRepliesCo, Co, unless(ViewerIsInAllowedCountry)),
-    ]
-    .concat()
-}
 
-fn blocked_viewer_limited_actions() -> Vec<RuleClause> {
-    family(RuleId::BlockedViewer)
-        .clause(except_author(
-            [relationship(RelationshipPredicate::ViewerIsBlockedByAuthor)],
-            limit(LimitedEngagementReason::BlockedViewer),
-        ))
-        .clause(everyone(
-            [relationship(
-                RelationshipPredicate::ViewerIsBlockedByConversationRootAuthor,
-            )],
-            limit(LimitedEngagementReason::RootAuthorBlockedViewer),
-        ))
-        .into()
-}
+pub(super) const LIMIT_REPLIES_COMMUNITY_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause = Clause {
+    id: RuleId::LimitRepliesCommunity,
+    when: &[
+        tweet_has_conversation_control(ConversationControlArm::Community),
+        not(viewer_logged_out()),
+        not(tweet_is_retweet()),
+        not(viewer_is_conversation_root_author()),
+        not(viewer_is_invited_to_conversation()),
+        not(viewer_is_followed_by_conversation_root_author()),
+    ],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::ConversationControl),
+};
 
-fn read_only_viewer_limited_actions() -> Vec<RuleClause> {
-    rule(
-        RuleId::ReadOnlyViewer,
-        everyone(
-            [viewer(ViewerPredicate::ReadOnly)],
-            limit(LimitedEngagementReason::ReadonlyViewer),
-        ),
-    )
-}
+pub(super) const LIMIT_REPLIES_SUBSCRIBERS_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause =
+    Clause {
+        id: RuleId::LimitRepliesSubscribers,
+        when: &[
+            tweet_has_conversation_control(ConversationControlArm::Subscribers),
+            not(viewer_logged_out()),
+            not(tweet_is_retweet()),
+            not(viewer_is_conversation_root_author()),
+            not(viewer_is_invited_to_conversation()),
+            not(viewer_super_follows_conversation_root_author()),
+        ],
+        audience: Everyone,
+        action: limit(LimitedEngagementReason::ConversationControl),
+    };
 
-fn community_tweet_limited_actions() -> Vec<RuleClause> {
-    rule(
-        RuleId::CommunityTweetViewerRemoved,
-        everyone(
-            [
-                tweet(TweetPredicate::IsCommunityTweet),
-                relationship(RelationshipPredicate::ViewerIsRemovedFromCommunity),
-                viewer(ViewerPredicate::ClientHasCommunityViewerRemovedLimits),
-            ],
-            limit(LimitedEngagementReason::CommunityTweetViewerRemoved),
-        ),
-    )
-}
+pub(super) const LIMIT_REPLIES_VERIFIED_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause = Clause {
+    id: RuleId::LimitRepliesVerified,
+    when: &[
+        tweet_has_conversation_control(ConversationControlArm::Verified),
+        not(viewer_logged_out()),
+        not(tweet_is_retweet()),
+        not(viewer_is_conversation_root_author()),
+        not(viewer_is_invited_to_conversation()),
+        not(viewer_has_verified_badge()),
+    ],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::ConversationControl),
+};
 
-fn local_tweet_limited_actions() -> Vec<RuleClause> {
-    rule(
-        RuleId::LocalTweet,
-        everyone(
-            [
-                tweet(TweetPredicate::HasNarrowcastPlace),
-                NOT_LOGGED_OUT,
-                NOT_CONVERSATION_ROOT_AUTHOR,
-                NOT_INVITED_TO_CONVERSATION,
-                relationship(RelationshipPredicate::ViewerIsOutsideNarrowcastPlace),
-            ],
-            limit(LimitedEngagementReason::LocalTweet),
-        ),
-    )
-}
+pub(super) const LIMIT_REPLIES_MY_NETWORK_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause =
+    Clause {
+        id: RuleId::LimitRepliesMyNetwork,
+        when: &[
+            tweet_has_conversation_control(ConversationControlArm::MyNetwork),
+            not(viewer_logged_out()),
+            not(tweet_is_retweet()),
+            not(viewer_is_conversation_root_author()),
+            not(viewer_is_invited_to_conversation()),
+            not(viewer_is_in_conversation_root_author_network()),
+        ],
+        audience: Everyone,
+        action: limit(LimitedEngagementReason::ConversationControl),
+    };
 
-pub(super) fn limited_engagement_rules() -> Vec<RuleClause> {
-    [
-        blocked_viewer_limited_actions(),
-        stale_tweet_limited_actions(),
-        limit_replies_conversation_rules(),
-        community_tweet_limited_actions(),
-        local_tweet_limited_actions(),
-        read_only_viewer_limited_actions(),
-    ]
-    .concat()
-}
+pub(super) const LIMIT_REPLIES_CO_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Clause = Clause {
+    id: RuleId::LimitRepliesCo,
+    when: &[
+        tweet_has_conversation_control(ConversationControlArm::Co),
+        not(viewer_logged_out()),
+        not(tweet_is_retweet()),
+        not(viewer_is_conversation_root_author()),
+        not(viewer_is_invited_to_conversation()),
+        not(viewer_is_in_allowed_country()),
+    ],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::ConversationControl),
+};
 
-fn sensitive_viewer_drop(
-    id: RuleId,
-    reason: NsfwViewerDropReason,
-    viewer_class: impl IntoIterator<Item = Condition>,
-) -> Vec<RuleClause> {
-    family(id)
-        .when(viewer_class)
-        .clause(except_author(
-            [HAS_MEDIA, NSFW_MEDIA_LABEL],
-            nsfw_viewer_drop(reason),
-        ))
-        .clause(except_author(
-            [HAS_MEDIA, NOT_RETWEET, NSFW_FLAGGED],
-            nsfw_viewer_drop(reason),
-        ))
-        .clause(except_author(
-            [NSFW_TEXT_OR_CARD_LABEL],
-            nsfw_viewer_drop(reason),
-        ))
-        .into()
-}
+pub(super) const COMMUNITY_TWEET_VIEWER_REMOVED_LIMITED_ENGAGEMENT: Clause = Clause {
+    id: RuleId::CommunityTweetViewerRemoved,
+    when: &[
+        tweet_is_community_tweet(),
+        viewer_is_removed_from_community(),
+        client_has_community_viewer_removed_limits(),
+    ],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::CommunityTweetViewerRemoved),
+};
 
-pub(super) fn sensitive_viewer_drops() -> Vec<RuleClause> {
-    [
-        sensitive_viewer_drop(
-            RuleId::SensitiveViewerLoggedOut,
-            NsfwViewerDropReason::LoggedOut,
-            [LOGGED_OUT],
-        ),
-        sensitive_viewer_drop(
-            RuleId::SensitiveViewerUnderage,
-            NsfwViewerDropReason::IsUnderage,
-            [UNDERAGE],
-        ),
-        sensitive_viewer_drop(
-            RuleId::SensitiveViewerNoStatedAge,
-            NsfwViewerDropReason::HasNoStatedAge,
-            [NO_STATED_AGE, IN_NSFW_GATING_COUNTRY],
-        ),
-    ]
-    .concat()
-}
+pub(super) const LOCAL_TWEET_LIMITED_ENGAGEMENT: Clause = Clause {
+    id: RuleId::LocalTweet,
+    when: &[
+        tweet_has_narrowcast_place(),
+        not(viewer_logged_out()),
+        not(viewer_is_conversation_root_author()),
+        not(viewer_is_invited_to_conversation()),
+        viewer_is_outside_narrowcast_place(),
+    ],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::LocalTweet),
+};
 
-const NSFW_SENSITIVE_TWEET: Condition = Condition::AnyOf(&[
-    has_tweet_label(SafetyLabelType::NSFW_HIGH_PRECISION),
-    has_tweet_label(SafetyLabelType::NSFW_HIGH_RECALL),
-    has_tweet_label(SafetyLabelType::NSFW_TEXT),
-    has_tweet_label(SafetyLabelType::NSFW_TEXT_HIGH_PRECISION),
-    has_tweet_label(SafetyLabelType::NSFW_VIDEO),
-    Predicate::Tweet(TweetPredicate::NsfwAdminFlag),
-    Predicate::Tweet(TweetPredicate::NsfwUserFlag),
-]);
-
-const NSFW_SENSITIVE_AUTHOR: Condition = Condition::AnyOf(&[
-    has_user_label(AuthorLabel::NsfwAvatarImage),
-    has_user_label(AuthorLabel::NsfwBannerImage),
-    has_user_label(AuthorLabel::NsfwHighPrecision),
-    has_user_label(AuthorLabel::NsfwHighRecall),
-    has_user_label(AuthorLabel::NsfwNearPerfect),
-    Predicate::Author(AuthorPredicate::IsNsfwAdmin),
-    Predicate::Author(AuthorPredicate::IsNsfwUser),
-]);
-
-pub(super) fn sensitive_media_opt_out_drops() -> Vec<RuleClause> {
-    let nsfw_media = || drop_post(FilteredReason::ContainNsfwMedia);
-    [
-        rule(
-            RuleId::NsfwSensitiveViewerTweet,
-            except_author(
-                [SENSITIVE_MEDIA_DISABLED, NSFW_SENSITIVE_TWEET],
-                nsfw_media(),
-            ),
-        ),
-        rule(
-            RuleId::NsfwSensitiveViewerUser,
-            except_author(
-                [SENSITIVE_MEDIA_DISABLED, NSFW_SENSITIVE_AUTHOR],
-                nsfw_media(),
-            ),
-        ),
-    ]
-    .concat()
-}
-
-pub(super) fn nullcast_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::NullcastedTweet,
-        everyone(
-            [
-                tweet(TweetPredicate::IsNullcast),
-                NOT_RETWEET,
-                not(tweet(TweetPredicate::IsCommunityTweet)),
-            ],
-            drop_post(FilteredReason::TweetIsNullcast),
-        ),
-    )
-}
-
-pub(super) fn stale_tweet_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::StaleTweet,
-        everyone(
-            [tweet(TweetPredicate::IsSupersededEdit), NOT_RETWEET],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
-
-fn stale_tweet_limited_actions() -> Vec<RuleClause> {
-    rule(
-        RuleId::StaleTweet,
-        everyone(
-            [
-                tweet(TweetPredicate::IsSupersededEdit),
-                viewer(ViewerPredicate::ClientHasStaleTweetLimits),
-            ],
-            limit(LimitedEngagementReason::StaleTweet),
-        ),
-    )
-}
-
-pub(super) fn takedown_drops() -> Vec<RuleClause> {
-    let unspecified = || drop_post(FilteredReason::UnspecifiedReason);
-    [
-        rule(
-            RuleId::LegalTakedown,
-            except_author(
-                [tweet(TweetPredicate::LegalTakedownInRequestCountry)],
-                unspecified(),
-            ),
-        ),
-        rule(
-            RuleId::LocalLawsTakedown,
-            except_author(
-                [tweet(TweetPredicate::LocalLawsTakedownInRequestCountry)],
-                unspecified(),
-            ),
-        ),
-    ]
-    .concat()
-}
-
-pub(super) fn article_tweet_content_drop() -> Vec<RuleClause> {
-    rule(
-        RuleId::ArticleTweetContent,
-        everyone(
-            [
-                tweet(TweetPredicate::HasArticle),
-                not(tweet(TweetPredicate::ArticleIsPublished)),
-            ],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
-
-pub(super) fn filter_all() -> Vec<RuleClause> {
-    rule(
-        RuleId::FilterAll,
-        everyone([], drop_post(FilteredReason::UnspecifiedReason)),
-    )
-}
-
-pub(super) fn recs_media_drops() -> Vec<RuleClause> {
-    let unspecified = || drop_post(FilteredReason::UnspecifiedReason);
-    [
-        rule(
-            RuleId::DmcaMedia,
-            everyone([tweet(TweetPredicate::HasDmcaMedia)], unspecified()),
-        ),
-        rule(
-            RuleId::GeoRestrictedMedia,
-            everyone(
-                [tweet(TweetPredicate::MediaGeoRestrictedInRequestCountry)],
-                unspecified(),
-            ),
-        ),
-    ]
-    .concat()
-}
+pub(super) const READ_ONLY_VIEWER_LIMITED_ENGAGEMENT: Clause = Clause {
+    id: RuleId::ReadOnlyViewer,
+    when: &[viewer_read_only()],
+    audience: Everyone,
+    action: limit(LimitedEngagementReason::ReadonlyViewer),
+};
 
 #[cfg(test)]
 mod tests {
@@ -1116,8 +1169,8 @@ mod tests {
                         ..Default::default()
                     })
                     .build();
-                post.community_moderation = moderation;
-                post.viewer_is_community_moderator = is_moderator;
+                post.post.community_moderation = moderation;
+                post.post.viewer_is_community_moderator = is_moderator;
                 let verdict = engine
                     .evaluate(SafetyLevel::TimelineHomeHydration, &viewer, &post)
                     .into_verdict();
@@ -1132,17 +1185,31 @@ mod tests {
 
     #[test]
     fn home_hydration_label_blurs_add_the_modern_blur_gate_to_the_timeline_home_conditions() {
-        let home_hydration = home_hydration_nsfw_rules();
-        for home_blur in nsfw_media_interstitials() {
-            let clause = home_hydration
-                .iter()
-                .find(|clause| clause.id == home_blur.id && clause.action == home_blur.action)
-                .unwrap_or_else(|| {
-                    panic!("{} is not wired at TimelineHomeHydration", home_blur.name())
-                });
-            let mut gated = home_blur.when.clone();
-            gated.push(MODERN_BLUR_CLIENT);
-            assert_eq!(clause.when, gated, "{}", home_blur.name());
+        use crate::rules::levels::{TIMELINE_HOME, TIMELINE_HOME_HYDRATION};
+        let label_blurs: Vec<&Clause> = TIMELINE_HOME
+            .iter()
+            .copied()
+            .filter(|clause| {
+                matches!(clause.action.spec(), ActionSpec::MediaRestriction(_))
+                    && clause
+                        .when
+                        .iter()
+                        .any(|condition| !condition.tweet_labels().is_empty())
+            })
+            .collect();
+        assert!(!label_blurs.is_empty());
+        for home in label_blurs {
+            let mut gated = home.when.to_vec();
+            gated.push(client_has_modern_blur());
+            assert!(
+                TIMELINE_HOME_HYDRATION
+                    .iter()
+                    .any(|clause| clause.id == home.id
+                        && clause.action == home.action
+                        && clause.when == gated.as_slice()),
+                "{} has no TimelineHomeHydration clause with its conditions and client_has_modern_blur()",
+                home.name()
+            );
         }
     }
 }

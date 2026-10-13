@@ -370,6 +370,10 @@ class PostMapper:
             profile_image=Image(url=user_metadata.profileImageUrl)
             if user_metadata.profileImageUrl
             else None,
+            profile_banner=Image(url=user_metadata.profileBannerImageUrl)
+            if user_metadata.profileBannerImageUrl
+            else None,
+            blocked_count=user_metadata.blockedCount,
         )
 
     @classmethod

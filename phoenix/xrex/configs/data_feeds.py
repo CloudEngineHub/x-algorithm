@@ -74,6 +74,7 @@ GROUP_IDS: dict[str, str] = {
     "xrecsys_two_tower_immersive_only_gb300": "user_action_sequence_xrecsys_two_tower_immersive_only",
     "xrecsys_two_tower_nano": "user_action_sequence_xrecsys_two_tower_nano",
     "xrecsys_sid_gen_rec": "sid_gen_rec",
+    "reply_two_tower_v2_main": "reply_two_tower_v2_main",
 }
 
 
@@ -136,6 +137,7 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         enable_stale_post=mparams.get("enable_stale_post", False),
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
         search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
     )
 
@@ -164,6 +166,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         enable_stale_post=mparams.get("enable_stale_post", False),
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 
@@ -195,6 +198,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 
@@ -216,6 +220,7 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 
@@ -237,6 +242,7 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 
@@ -262,6 +268,7 @@ def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, conf
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         ads_head_masking=mparams.get("ads_head_masking", False),
+        ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
     )
 
 

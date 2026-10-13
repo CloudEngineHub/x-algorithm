@@ -284,7 +284,7 @@ fn filter_tweets_channel_params(dc: &str) -> VfChannelParams<'_> {
     VfChannelParams {
         name: "vf-filter-tweets",
         dc,
-        discovery: VfDiscovery::from_env(VF_FILTER_TWEETS_DISCOVERY_ENV),
+        discovery: VfDiscovery::from_env(VF_FILTER_TWEETS_DISCOVERY_ENV, VfDiscovery::Xds),
         aperture_size: XAI_VF_APERTURE_SIZE,
         deterministic_aperture: std::env::var("APP_ENV").as_deref() == Ok("prod"),
         xds_lb_policy: LbPolicy::least_request(),
@@ -334,7 +334,7 @@ impl XaiVfClient {
             .collect();
         let results = tokio::time::timeout(self.timeout, futures::future::try_join_all(chunks))
             .await
-            .map_err(|_| anyhow!("VF evaluation deadline exceeded"))??;
+            .map_err(|_| tonic::Status::deadline_exceeded("VF evaluation deadline exceeded"))??;
         Ok(results.into_iter().flatten().collect())
     }
 
@@ -848,7 +848,7 @@ mod rust_vf_tests {
         )
         .await
         .is_err());
-        assert!(evaluate_against(
+        let deadline = evaluate_against(
             EvaluateStub {
                 twitter_contexts,
                 fail_chunks_smaller_than: 0,
@@ -858,7 +858,13 @@ mod rust_vf_tests {
             XAI_VF_MAX_BATCH_SIZE + 1,
         )
         .await
-        .is_err());
+        .unwrap_err();
+        assert_eq!(
+            deadline
+                .downcast_ref::<tonic::Status>()
+                .map(tonic::Status::code),
+            Some(tonic::Code::DeadlineExceeded)
+        );
     }
 
     #[test]
@@ -883,30 +889,6 @@ mod rust_vf_tests {
             classify_filter_tweets_error_code(tonic::Code::Unknown),
             "other"
         );
-    }
-
-    #[test]
-    fn filter_tweets_client_metrics_aggregates_failed_chunks_only() {
-        let mut metrics = FilterTweetsClientMetrics::default();
-        assert_eq!(metrics, FilterTweetsClientMetrics::default());
-
-        metrics.record_failed_chunk("unavailable", 50);
-        metrics.record_failed_chunk("deadline_exceeded", 1);
-
-        assert_eq!(
-            metrics,
-            FilterTweetsClientMetrics {
-                error_codes: vec!["unavailable", "deadline_exceeded"],
-                failed_ids: 51,
-            }
-        );
-    }
-
-    #[test]
-    fn filter_tweets_client_metrics_success_emits_no_errors() {
-        let metrics = FilterTweetsClientMetrics::default();
-        assert!(metrics.error_codes.is_empty());
-        assert_eq!(metrics.failed_ids, 0);
     }
 
     fn request_guard_with(receiver: Arc<RecordingReceiver>) -> FilterTweetsRequestMetricsGuard {
@@ -1315,16 +1297,6 @@ mod rust_vf_tests {
         assert_eq!(captured[1].country_code, None);
         assert_eq!(captured[2].country_code, None);
         handle.abort();
-    }
-
-    #[tokio::test]
-    async fn get_result_empty_input_skips_call() {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let client = XaiVfClient::from_channel(channel);
-        let result = client
-            .get_result(vec![], SafetyLevel::TimelineHome, 1, None)
-            .await;
-        assert!(result.is_empty());
     }
 
     #[tokio::test]

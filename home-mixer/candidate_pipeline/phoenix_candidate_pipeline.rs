@@ -1,5 +1,6 @@
 use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHydrator;
 use crate::candidate_hydrators::ai_trend_feedback_context_hydrator::AiTrendFeedbackContextHydrator;
+use crate::candidate_hydrators::ancestor_video_hydrator::AncestorVideoHydrator;
 use crate::candidate_hydrators::bidirectional_follow_hydrator::BidirectionalFollowHydrator;
 use crate::candidate_hydrators::blocked_by_hydrator::BlockedByHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
@@ -50,6 +51,7 @@ use crate::clients::user_action_aggregation_client::{
 };
 use crate::clients::vm_ranker_client::{MockVMRankerClient, ProdVMRankerClient, VMRankerClient};
 use crate::filters::age_filter::AgeFilter;
+use crate::filters::ancestor_video_filter::AncestorVideoFilter;
 use crate::filters::ancillary_vf_filter::AncillaryVFFilter;
 use crate::filters::author_socialgraph_filter::AuthorSocialgraphFilter;
 use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
@@ -380,7 +382,7 @@ impl PhoenixCandidatePipeline {
                 )
                 .await,
             ),
-            Box::new(MediaInfoHydrator::new(media_info_cache_client).await),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
             Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
             Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
             Box::new(BlockedByHydrator::new(socialgraph_client).await),
@@ -477,11 +479,15 @@ impl PhoenixCandidatePipeline {
                 strato_client: strato_client.clone(),
             }),
             Box::new(VideoAspectRatioHydrator::new(tes_client.clone())),
+            Box::new(AncestorVideoHydrator {
+                media_info_cache_client,
+            }),
         ];
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(VFFilter),
             Box::new(AncillaryVFFilter),
+            Box::new(AncestorVideoFilter),
             Box::new(DedupConversationFilter),
             Box::new(VideoCarouselFilter),
         ];

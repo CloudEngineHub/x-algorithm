@@ -724,11 +724,7 @@ def _make_retrieval_forward_fn(
         mol_side_tables = None
         side_table = by_kind.get("weight")
         if side_table is not None:
-            components = model_config.mol_item_components
-            mol_side_tables = (
-                jax.numpy.transpose(side_table[:, :components]),
-                jax.numpy.transpose(side_table[:, components:]),
-            )
+            mol_side_tables = model_config.mol_side_tables_from_rows(side_table)
         results = model.forward(
             batch,
             recsys_embeddings,

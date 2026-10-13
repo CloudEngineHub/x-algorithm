@@ -14,7 +14,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy import typing as npt
 
+from xrex.data.recsys import reply_features
 from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
+from xrex.data.recsys.ads_pixel_head_masking import build_head_eligible_mask
 from xrex.data.recsys.constants import (
     CONVERSION_DELAY_COLUMNS,
     CONVERSION_DELAY_NONE,
@@ -253,6 +255,7 @@ class PostSeq(TypedDict):
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
     trained_candidate_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    head_eligible_mask: NotRequired[npt.NDArray[np.bool_] | None]
     value_label_valid: NotRequired[npt.NDArray[np.bool_]]
     value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     conversion_delay_ms: NotRequired[npt.NDArray[np.int32]]
@@ -270,6 +273,7 @@ class PostSeq(TypedDict):
 def empty_feature_arrays(
     batch_size: int,
     seq_len: int,
+    post_int64_size: int = POST_INT64_FEATURE_SIZE,
 ) -> dict[str, np.ndarray]:
     return {
         "categorical_features": np.zeros(
@@ -279,18 +283,20 @@ def empty_feature_arrays(
         "float_features": np.zeros(
             (batch_size, seq_len, POST_FLOAT_FEATURE_SIZE), dtype=np.float32
         ),
-        "int64_features": np.zeros((batch_size, seq_len, POST_INT64_FEATURE_SIZE), dtype=np.int64),
+        "int64_features": np.zeros((batch_size, seq_len, post_int64_size), dtype=np.int64),
     }
 
 
-def empty_user_feature_arrays(batch_size: int) -> dict[str, typing.Any]:
+def empty_user_feature_arrays(
+    batch_size: int, user_int64_size: int = USER_INT64_FEATURE_SIZE
+) -> dict[str, typing.Any]:
     return {
         "user_categorical_features": np.zeros(
             (batch_size, USER_CATEGORICAL_FEATURE_SIZE), dtype=np.int16
         ),
         "user_bool_features": np.zeros((batch_size, USER_BOOL_FEATURE_SIZE), dtype=np.bool_),
         "user_float_features": np.zeros((batch_size, USER_FLOAT_FEATURE_SIZE), dtype=np.float32),
-        "user_int64_features": np.zeros((batch_size, USER_INT64_FEATURE_SIZE), dtype=np.int64),
+        "user_int64_features": np.zeros((batch_size, user_int64_size), dtype=np.int64),
     }
 
 
@@ -350,6 +356,7 @@ class RecsysFeaturesBatch(TypedDict):
     num_positive_candidates: npt.NDArray[np.int32] | None
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
     sample_source: NotRequired[npt.NDArray[np.int8] | None]
+    candidate_positions: NotRequired[npt.NDArray[np.int32] | None]
     packing_layout: NotRequired[SequencePackedLayout | None]
 
 
@@ -448,6 +455,15 @@ def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str,
     return labels
 
 
+def _extend_head_eligible_mask(post_seq: PostSeq, num_slots: int) -> dict[str, np.ndarray]:
+    mask = post_seq.get("head_eligible_mask")
+    if mask is None:
+        return {}
+    widened = np.ones((mask.shape[0], num_slots, mask.shape[-1]), dtype=np.bool_)
+    widened[:, : mask.shape[1]] = mask
+    return {"head_eligible_mask": widened}
+
+
 def _extract_feature_columns(
     record_batch: pa.RecordBatch,
     feature_list: list[str],
@@ -499,7 +515,9 @@ def from_record_batch(
     zero_stale_post_14d_candidate_counts: bool = False,
     stale_post_30d: bool = False,
     search_negative_clear_word_match: bool = False,
+    reply_parent_mode: bool = False,
     ads_head_masking: bool = False,
+    ads_pixel_head_masking: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
     batch_size = record_batch.num_rows
@@ -520,6 +538,18 @@ def from_record_batch(
         safety_label_mask = _col(record_batch, "safetyLabelMaskSeq", batch_size, np.int64)
     else:
         safety_label_mask = np.zeros_like(promoted_ids, dtype=np.int64)
+
+    reply_cand_int64_cols: dict[int, np.ndarray] = {}
+    reply_cand_categorical_cols: dict[int, np.ndarray] = {}
+    candidate_positions: np.ndarray | None = None
+    post_int64_size = POST_INT64_FEATURE_SIZE
+    if reply_parent_mode:
+        post_int64_size = reply_features.REPLY_POST_INT64_FEATURE_SIZE
+        reply_cand_int64_cols, reply_cand_categorical_cols = reply_features.read_candidate_columns(
+            record_batch, batch_size
+        )
+        if "tweetPositionSeq" in record_batch.schema.names:
+            candidate_positions = _col(record_batch, "tweetPositionSeq", batch_size, np.int32)
 
     action_col = record_batch.column("actionNameMultiHotSeqSeq")
     assert action_col.type.value_type.list_size == output_vocab_size, (
@@ -566,6 +596,16 @@ def from_record_batch(
         conversion_keep_bits[null_rows] = CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP
     else:
         conversion_keep_bits = None
+    if ads_pixel_head_masking and "conversionEligibleTypesSeq" in record_batch.schema.names:
+        conversion_eligible_types = _col(
+            record_batch, "conversionEligibleTypesSeq", batch_size, np.uint64
+        )
+        null_rows = ~record_batch.column("conversionEligibleTypesSeq").is_valid().to_numpy(
+            zero_copy_only=False
+        )
+        conversion_eligible_types[null_rows] = 0
+    else:
+        conversion_eligible_types = None
     sample_source = (
         record_batch.column("sample_source")
         .fill_null(0)
@@ -735,7 +775,7 @@ def from_record_batch(
         dtype=np.float32,
     )
     hist_int64_features = np.zeros(
-        (batch_size, max_history_post_action_pairs, POST_INT64_FEATURE_SIZE), dtype=np.int64
+        (batch_size, max_history_post_action_pairs, post_int64_size), dtype=np.int64
     )
 
     cand_shape_2d = (batch_size, max_candidate_post_action_pairs)
@@ -750,6 +790,7 @@ def from_record_batch(
     candidate_trained_actions_bits = np.full(
         cand_shape_2d, CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP, dtype=np.uint8
     )
+    candidate_eligible_types = np.zeros(cand_shape_2d, dtype=np.uint64)
     candidate_value_labels: dict[str, np.ndarray] = {
         key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
     }
@@ -787,9 +828,14 @@ def from_record_batch(
         dtype=np.float32,
     )
     cand_int64_features = np.zeros(
-        (batch_size, max_candidate_post_action_pairs, POST_INT64_FEATURE_SIZE),
+        (batch_size, max_candidate_post_action_pairs, post_int64_size),
         dtype=np.int64,
     )
+    cand_positions_aligned: np.ndarray | None = None
+    if candidate_positions is not None or reply_parent_mode:
+        cand_positions_aligned = np.zeros(
+            (batch_size, max_candidate_post_action_pairs), dtype=np.int32
+        )
 
     history_post_sids: np.ndarray | None = (
         np.zeros((batch_size, max_history_post_action_pairs, sid_num_levels), dtype=np.uint16)
@@ -920,6 +966,8 @@ def from_record_batch(
             candidate_client_app_id[*cslice] = client_app_id[*dslice]
             if conversion_keep_bits is not None:
                 candidate_trained_actions_bits[*cslice] = conversion_keep_bits[*dslice]
+            if conversion_eligible_types is not None:
+                candidate_eligible_types[*cslice] = conversion_eligible_types[*dslice]
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
@@ -931,6 +979,8 @@ def from_record_batch(
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
+            if candidate_positions is not None and cand_positions_aligned is not None:
+                cand_positions_aligned[*cslice] = candidate_positions[*dslice]
             if (
                 candidate_search_query_embeddings is not None
                 and search_query_embeddings is not None
@@ -999,6 +1049,10 @@ def from_record_batch(
                 cand_int64_features,
                 cslice,
             )
+            for _slot, _col_arr in reply_cand_int64_cols.items():
+                cand_int64_features[*cslice, _slot] = _col_arr[*dslice]
+            for _slot, _col_arr in reply_cand_categorical_cols.items():
+                cand_categorical_features[*cslice, _slot] = _col_arr[*dslice]
 
     if offline_embedding_table is not None:
         table_embs, found_mask = offline_embedding_table.lookup(candidate_post_ids)
@@ -1027,7 +1081,10 @@ def from_record_batch(
     history_ip_ids = hist_int64_features[:, :, _ip_idx]
     candidate_ip_ids = cand_int64_features[:, :, _ip_idx]
 
-    for _ec_idx in _ENGAGEMENT_COUNT_INT64_INDICES:
+    _saturate_idx = _ENGAGEMENT_COUNT_INT64_INDICES + (
+        reply_features.REPLY_SATURATE_INT64_INDICES if reply_parent_mode else ()
+    )
+    for _ec_idx in _saturate_idx:
         np.clip(
             hist_int64_features[:, :, _ec_idx],
             0,
@@ -1076,6 +1133,23 @@ def from_record_batch(
         if cand_bool_features.shape[2] > BoolFeature.isStalePost14d.value:
             cand_bool_features[:, :, BoolFeature.isStalePost14d.value] = stale_post_14d
 
+    user_features = _extract_user_features(record_batch, batch_size)
+    if reply_parent_mode:
+        user_features["user_int64_features"] = reply_features.read_user_int64(
+            record_batch, batch_size
+        )
+        reply_features.place_focal_post(
+            rb=record_batch,
+            batch_size=batch_size,
+            new_event_mask=new_event_mask,
+            padding_mask=padding_mask,
+            user_ids=user_ids,
+            history_post_ids=history_post_ids,
+            history_auth_ids=history_auth_ids,
+            history_post_sids=history_post_sids,
+            user_int64=user_features["user_int64_features"],
+        )
+
     history_seq = PostSeq(
         impr_ts=history_impr_ts,
         actions=history_actions,
@@ -1104,6 +1178,12 @@ def from_record_batch(
         candidate_trained_actions_bits,
         ads_head_masking=ads_head_masking,
     )
+    candidate_head_eligible: dict[str, np.ndarray] = {}
+    if ads_pixel_head_masking:
+        candidate_head_eligible["head_eligible_mask"] = build_head_eligible_mask(
+            candidate_actions,
+            candidate_eligible_types if conversion_eligible_types is not None else None,
+        )
     candidate_seq = PostSeq(
         impr_ts=candidate_impr_ts,
         actions=candidate_actions,
@@ -1114,6 +1194,7 @@ def from_record_batch(
         client_app_id=candidate_client_app_id,
         post_ids=candidate_post_ids if include_candidate_post_ids else None,
         trained_candidate_mask=candidate_trained_mask,
+        **candidate_head_eligible,
         **candidate_value_labels,
         conversion_delay_ms=candidate_conversion_delays,
         continuous_actions=candidate_continuous_actions,
@@ -1171,7 +1252,7 @@ def from_record_batch(
         user_ip_hashes=hash_table.get_ip_hash(user_ip_ids),
         history_seq=history_seq,
         candidate_seq=candidate_seq_with_negatives,
-        **_extract_user_features(record_batch, batch_size),
+        **user_features,
         user_installed_apps_multihot=user_installed_apps_multihot,
         sample_weights=(
             record_batch.column("sampleWeight")
@@ -1183,6 +1264,8 @@ def from_record_batch(
         ),
         sample_source=sample_source,
     )
+    if cand_positions_aligned is not None:
+        batch["candidate_positions"] = cand_positions_aligned
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
         if candidate_negative_filter is not None
@@ -1510,6 +1593,7 @@ def apply_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_trained_mask,
+        **_extend_head_eligible_mask(post_seq, total_candidate_slots),
         **_extend_value_labels(post_seq, (batch_size, total_candidate_slots)),
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, total_candidate_slots)
@@ -1767,6 +1851,7 @@ def apply_global_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_gn_trained_mask,
+        **_extend_head_eligible_mask(post_seq, expanded_candidate_slots),
         **_extend_value_labels(post_seq, (batch_size, expanded_candidate_slots)),
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, expanded_candidate_slots)

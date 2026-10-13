@@ -162,6 +162,19 @@ impl LimitedEngagementReason {
 }
 
 impl Verdict {
+    pub(crate) fn limited_engagement_reasons(
+        &self,
+    ) -> impl Iterator<Item = LimitedEngagementReason> + '_ {
+        let limit = match self {
+            Self::Shown {
+                engagement: Some(limit),
+                ..
+            } => Some(limit),
+            Self::Shown { .. } | Self::Withheld(_) => None,
+        };
+        limit.into_iter().flat_map(|limit| limit.value.reasons())
+    }
+
     pub const fn not_found() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),

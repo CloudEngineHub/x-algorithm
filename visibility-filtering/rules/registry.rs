@@ -1,27 +1,30 @@
 use crate::hydration::{HydrationPlan, Hydrators};
 use crate::models::{
-    Decided, Evaluation, FosnrReason, HydratedTweetCandidate, LimitedEngagement, Notice,
-    SafetyLabelMap, SafetyLabelType, Verdict, ViewerFeatures, Withholding,
+    Decided, Evaluation, FosnrReason, LimitedEngagement, Notice, PostCandidate, SafetyLabelMap,
+    SafetyLabelType, Verdict, ViewerFeatures, Withholding,
 };
-use crate::params::CountryLists;
-use crate::rules::rule_spec::{ActionSpec, FosnrViolation, RuleClause, RuleId, Truth};
+use crate::params::{CountryList, CountryLists};
+use crate::rules::rule_spec::{
+    ActionSpec, Clause, ClauseAction, Cond, FosnrViolation, RuleId, Truth,
+    viewer_account_or_request_country_in, viewer_blocks_author, viewer_follows_author,
+    viewer_is_blocked_by_author, viewer_mutes_author,
+};
 use crate::rules::{RuleContext, SafetyLevel};
-use crate::rules::{author_rules, tweet_rules};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use strum::VariantArray;
 use xai_x_thrift::action::AppealablePolicy;
 
 pub(super) struct Policy {
-    clauses: Vec<(&'static str, RuleClause)>,
+    clauses: Vec<(&'static str, Clause)>,
     hydrators: Hydrators,
 }
 
 impl Policy {
-    fn new(mut clauses: Vec<(&'static str, RuleClause)>) -> Self {
-        clauses.sort_by_key(|(_, clause)| Reverse(clause.action.severity()));
+    fn new(mut clauses: Vec<(&'static str, Clause)>) -> Self {
+        clauses.sort_by_key(|(_, clause)| Reverse(clause.action.spec().severity()));
         let mut runs: Vec<&'static str> = Vec::new();
-        let mut run: Vec<&RuleClause> = Vec::new();
+        let mut run: Vec<&Clause> = Vec::new();
         for &(name, ref clause) in &clauses {
             if runs.last() != Some(&name) {
                 assert!(!runs.contains(&name), "{name} is wired twice");
@@ -67,7 +70,7 @@ impl Policy {
                 Truth::Unknown { failed, .. } => failed,
                 Truth::True | Truth::False => Hydrators::empty(),
             };
-            match &rule.action {
+            match rule.action.spec() {
                 ActionSpec::Appealable(violations) => {
                     withholding_defaults = withholding_defaults.union(unknown_reads);
                     if truth.resolves_true()
@@ -208,88 +211,6 @@ fn fosnr_reason(
     }
 }
 
-pub(super) fn timeline_home_shared() -> Vec<RuleClause> {
-    [
-        author_rules::author_state_drops(),
-        author_rules::socialgraph_drops(),
-        tweet_rules::tweet_label_drops(),
-        tweet_rules::fosnr_level_3_drops(),
-        tweet_rules::nullcast_drop(),
-        tweet_rules::stale_tweet_drop(),
-        tweet_rules::takedown_drops(),
-        tweet_rules::sensitive_viewer_drops(),
-        tweet_rules::exclusive_tweet_drop(),
-        tweet_rules::trusted_friends_tweet_drop(),
-        tweet_rules::nsfw_media_interstitials(),
-        tweet_rules::nsfw_author_interstitials(),
-    ]
-    .concat()
-}
-
-fn timeline_home_recommendation_only() -> Vec<RuleClause> {
-    [
-        tweet_rules::recs_media_drops(),
-        author_rules::oon_nsfw_author_drops(),
-        tweet_rules::oon_tweet_flag_drops(),
-        tweet_rules::gore_and_violence_high_precision::oon_drop(),
-        tweet_rules::oon_nsfw_media_label_drops(),
-        tweet_rules::oon_low_quality_tweet_label_drops(),
-        tweet_rules::oon_text_label_drops(),
-        author_rules::oon_nsfw_user_label_drops(),
-        author_rules::oon_user_label_drops(),
-    ]
-    .concat()
-}
-
-pub(super) fn timeline_home_recommendations() -> Vec<RuleClause> {
-    [timeline_home_shared(), timeline_home_recommendation_only()].concat()
-}
-
-pub(super) fn timeline_home_hydration() -> Vec<RuleClause> {
-    [
-        author_rules::home_hydration_author_state_drops(),
-        tweet_rules::fosnr_level_3_drops(),
-        tweet_rules::fosnr_level_1_non_follower_drop(),
-        tweet_rules::fosnr_level_1_follower_soft_intervention(),
-        tweet_rules::fosnr_author_appealable(),
-        tweet_rules::fosnr_fallback_drop(),
-        tweet_rules::creator_tweet_nsfw_drop(),
-        tweet_rules::protected_community_tweet_drop(),
-        tweet_rules::hidden_community_tweet_drop(),
-        tweet_rules::author_removed_community_tweet_drop(),
-        tweet_rules::home_hydration_tweet_label_drops(),
-        tweet_rules::exclusive_tweet_drop(),
-        tweet_rules::trusted_friends_tweet_drop(),
-        tweet_rules::takedown_drops(),
-        tweet_rules::article_tweet_content_drop(),
-        tweet_rules::author_blocks_viewer_exclusive_content_drop(),
-        tweet_rules::sensitive_viewer_drops(),
-        tweet_rules::home_hydration_nsfw_rules(),
-        tweet_rules::limited_engagement_rules(),
-    ]
-    .concat()
-}
-
-pub(super) fn immersive_expanded_recommendations() -> Vec<RuleClause> {
-    [
-        author_rules::author_state_drops(),
-        author_rules::socialgraph_drops(),
-        tweet_rules::tweet_label_drops(),
-        tweet_rules::fosnr_level_3_drops(),
-        tweet_rules::stale_tweet_drop(),
-        tweet_rules::takedown_drops(),
-        tweet_rules::sensitive_viewer_drops(),
-        tweet_rules::exclusive_tweet_drop(),
-        tweet_rules::trusted_friends_tweet_drop(),
-        tweet_rules::recs_media_drops(),
-        tweet_rules::gore_and_violence_high_precision::oon_drop(),
-        tweet_rules::oon_low_quality_tweet_label_drops(),
-        author_rules::oon_user_label_drops(),
-        tweet_rules::sensitive_media_opt_out_drops(),
-    ]
-    .concat()
-}
-
 struct Level {
     policy: Policy,
     plan: HydrationPlan,
@@ -305,8 +226,8 @@ pub struct RuleEngine {
     reason = "invalid authored rules fail startup, before the service takes traffic"
 )]
 fn interned_name(
-    names: &mut Vec<(RuleId, ActionSpec, &'static str)>,
-    clause: &RuleClause,
+    names: &mut Vec<(RuleId, ClauseAction, &'static str)>,
+    clause: &Clause,
 ) -> &'static str {
     if let Some(&(_, _, name)) = names
         .iter()
@@ -336,9 +257,11 @@ impl RuleEngine {
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
-                let clauses = (level.spec().rules)()
-                    .into_iter()
-                    .map(|clause| (interned_name(&mut names, &clause), clause))
+                let clauses = level
+                    .spec()
+                    .rules
+                    .iter()
+                    .map(|&clause| (interned_name(&mut names, clause), clause.clone()))
                     .collect();
                 let policy = Policy::new(clauses);
                 let plan = HydrationPlan::new(level, policy.hydrators);
@@ -355,7 +278,7 @@ impl RuleEngine {
         &self,
         level: SafetyLevel,
         viewer: &ViewerFeatures,
-        candidate: &HydratedTweetCandidate,
+        candidate: &PostCandidate,
     ) -> Evaluation {
         let policy = self.policy(level);
         let context = RuleContext::new(viewer, candidate, &self.country_lists);
@@ -393,6 +316,47 @@ impl RuleEngine {
             self.policy(SafetyLevel::TimelineHomeRecommendations).len(),
         )
     }
+
+    pub(crate) fn truth(
+        &self,
+        fact: ExplainedFact,
+        viewer: &ViewerFeatures,
+        candidate: &PostCandidate,
+    ) -> Truth {
+        fact.leaf()
+            .truth(&RuleContext::new(viewer, candidate, &self.country_lists))
+    }
+
+    pub(crate) fn in_nsfw_gating_country(&self, viewer: &ViewerFeatures) -> Truth {
+        viewer_account_or_request_country_in(CountryList::NsfwGating).truth(&RuleContext::new(
+            viewer,
+            &PostCandidate::default(),
+            &self.country_lists,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExplainedFact {
+    Follows,
+    Blocks,
+    Mutes,
+    IsBlockedBy,
+}
+
+impl ExplainedFact {
+    const fn leaf(self) -> Cond {
+        match self {
+            Self::Follows => viewer_follows_author(),
+            Self::Blocks => viewer_blocks_author(),
+            Self::Mutes => viewer_mutes_author(),
+            Self::IsBlockedBy => viewer_is_blocked_by_author(),
+        }
+    }
+
+    pub(crate) const fn reads(self) -> Hydrators {
+        self.leaf().hydrators()
+    }
 }
 
 #[cfg(test)]
@@ -406,9 +370,9 @@ mod tests {
     use crate::rules::fixtures::{
         CandidateBuilder, VIEWER_ID, candidate, viewer, viewer_with_profile,
     };
-    use crate::rules::rule_spec::Condition;
-    use crate::rules::{holds_narrowed, test_context};
-    use std::slice;
+    use crate::rules::rule_spec::Spelled;
+    use crate::rules::{levels, test_context, tweet_rules};
+    use std::fmt::Write;
 
     #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
@@ -465,15 +429,13 @@ country_specific_nsfw_content_gating:
         use std::num::NonZeroU64;
         use xai_visibility_filtering::models::FilteredReason;
 
-        let candidate = HydratedTweetCandidate {
-            failed: Hydrators::of(Hydrator::ArticleLifecycle),
-            ..candidate()
-                .with_tweet_features(TweetFeatures {
-                    article_id: NonZeroU64::new(1),
-                    ..TweetFeatures::default()
-                })
-                .build()
-        };
+        let mut candidate = candidate()
+            .with_tweet_features(TweetFeatures {
+                article_id: NonZeroU64::new(1),
+                ..TweetFeatures::default()
+            })
+            .build();
+        candidate.failed = Hydrators::of(Hydrator::ArticleLifecycle);
         assert_eq!(
             RuleEngine::for_tests().evaluate(
                 SafetyLevel::TimelineHomeHydration,
@@ -555,224 +517,122 @@ country_specific_nsfw_content_gating:
         assert_eq!(withheld_by(labeled(SafetyLabelType::NSFW_CARD_IMAGE)), None);
     }
 
+    const PINNED_POLICIES: [(SafetyLevel, &str); 5] = [
+        (
+            SafetyLevel::FilterAll,
+            include_str!("../../tests/fixtures/policy/filter_all.txt"),
+        ),
+        (
+            SafetyLevel::TimelineHome,
+            include_str!("../../tests/fixtures/policy/timeline_home.txt"),
+        ),
+        (
+            SafetyLevel::TimelineHomeRecommendations,
+            include_str!("../../tests/fixtures/policy/timeline_home_recommendations.txt"),
+        ),
+        (
+            SafetyLevel::TimelineHomeHydration,
+            include_str!("../../tests/fixtures/policy/timeline_home_hydration.txt"),
+        ),
+        (
+            SafetyLevel::ImmersiveExpandedRecommendations,
+            include_str!("../../tests/fixtures/policy/immersive_expanded_recommendations.txt"),
+        ),
+    ];
+
+    fn band(action: &ActionSpec) -> &'static str {
+        match action {
+            ActionSpec::Appealable(_) => "appealable, notice slot",
+            ActionSpec::Drop(_) => "drop, withholding",
+            ActionSpec::Tombstone(_) => "tombstone, withholding",
+            ActionSpec::MediaRestriction(_) => "media restriction, media slot",
+            ActionSpec::SoftIntervention { .. } => "soft intervention, notice slot",
+            ActionSpec::LimitedEngagement(_) => "limited engagement, engagement slot",
+        }
+    }
+
+    fn action_column(action: &ActionSpec) -> String {
+        match action {
+            ActionSpec::Drop(reason) => format!("{reason:?}"),
+            ActionSpec::Tombstone(reason) => format!("{reason:?}"),
+            ActionSpec::MediaRestriction(restriction) => format!("{restriction:?}"),
+            ActionSpec::SoftIntervention {
+                label,
+                policy,
+                level,
+            } => format!("{} {policy:?} level {level}", label.spelled()),
+            ActionSpec::LimitedEngagement(reason) => format!("{reason:?}"),
+            ActionSpec::Appealable(violations) => violations
+                .iter()
+                .map(
+                    |&FosnrViolation {
+                         label,
+                         policy,
+                         level,
+                         limited_actions,
+                     }| {
+                        format!(
+                            "{} {policy:?} level {level} limits {limited_actions:?}",
+                            label.spelled()
+                        )
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    fn policy_table(policy: &Policy) -> String {
+        let mut table = String::new();
+        let mut severity = None;
+        for (name, clause) in &policy.clauses {
+            let action = clause.action.spec();
+            if severity != Some(action.severity()) {
+                severity = Some(action.severity());
+                writeln!(table, "## {}", band(action)).unwrap();
+            }
+            let when: Vec<String> = clause
+                .when
+                .iter()
+                .map(|condition| condition.spelled())
+                .collect();
+            let when = if when.is_empty() {
+                "always".to_owned()
+            } else {
+                when.join(" & ")
+            };
+            writeln!(
+                table,
+                "{name} | {:?} | {when} | {}",
+                clause.audience,
+                action_column(action)
+            )
+            .unwrap();
+        }
+        table
+    }
+
     #[test]
-    fn wired_rule_order_is_pinned() {
+    fn each_level_evaluates_its_pinned_policy() {
         let rule_engine = RuleEngine::for_tests();
-        assert_eq!(
-            rule_engine.wired_rule_names(SafetyLevel::FilterAll),
-            vec!["filter_all/drop/unspecified"]
-        );
-        let home = rule_engine.wired_rule_names(SafetyLevel::TimelineHome);
-        assert_eq!(
-            home,
-            vec![
-                "suspended_author/drop",
-                "deactivated_author/drop",
-                "erased_author/drop/inactive",
-                "offboarded_author/drop/inactive",
-                "protected_author/drop",
-                "viewer_blocks_author/drop",
-                "viewer_mutes_author/drop",
-                "viewer_mutes_retweets/drop/unspecified",
-                "pdna/drop/safety_result",
-                "bounce/drop/bounced",
-                "spam/drop/undesirable",
-                "for_emergency_use_only/drop/unspecified",
-                "fosnr_hateful_conduct/drop/undesirable",
-                "fosnr_violent_speech/drop/undesirable",
-                "fosnr_abuse/drop/undesirable",
-                "fosnr_civic_integrity/drop/undesirable",
-                "nullcasted_tweet/drop",
-                "stale_tweet/drop/unspecified",
-                "legal_takedown/drop/unspecified",
-                "local_laws_takedown/drop/unspecified",
-                "sensitive_viewer_logged_out/drop",
-                "sensitive_viewer_underage/drop",
-                "sensitive_viewer_no_stated_age/drop",
-                "exclusive_tweet/drop",
-                "trusted_friends_tweet/drop/unspecified",
-                "nsfw_high_precision/blur/nudity",
-                "nsfw_high_precision/blur/sensitive",
-                "gore_and_violence_high_precision/blur",
-                "nsfw_card_image/blur/sensitive",
-                "nsfw_admin/blur/sensitive",
-                "nsfw_user/blur/sensitive_user",
-            ]
-        );
-        let (home_drops, home_blurs) = home.split_at(
-            home.iter()
-                .position(|&name| name == "nsfw_high_precision/blur/nudity")
-                .unwrap(),
-        );
-        let mut recs = home_drops.to_vec();
-        recs.extend([
-            "dmca_media/drop/unspecified",
-            "geo_restricted_media/drop/unspecified",
-            "nsfw_user_author/drop/nsfw_media",
-            "nsfw_admin_author/drop/nsfw_media",
-            "nsfw_user_tweet_flag/drop/nsfw_media",
-            "nsfw_admin_tweet_flag/drop/nsfw_media",
-            "gore_and_violence_high_precision/drop/nsfw_media",
-            "nsfw_high_recall/drop/nsfw_media",
-            "nsfw_high_precision/drop/nsfw_media",
-            "nsfw_card_image/drop/nsfw_media",
-            "do_not_amplify/drop/undesirable",
-            "malicious_url/drop/undesirable",
-            "spam_high_recall/drop/undesirable",
-            "brazil_election_legal/drop/undesirable",
-            "fosnr_abuse_insults/drop/undesirable",
-            "nsfw_high_recall_user_label/drop/unspecified",
-            "nsfw_high_precision_user_label/drop/unspecified",
-            "nsfw_avatar_image_user_label/drop/unspecified",
-            "nsfw_banner_image_user_label/drop/unspecified",
-            "nsfw_near_perfect_user_label/drop/unspecified",
-            "spam_high_recall_user_label/drop/unspecified",
-            "compromised_user_label/drop/unspecified",
-            "read_only_user_label/drop/unspecified",
-            "impersonation_high_precision_user_label/drop/unspecified",
-            "abusive_high_recall_user_label/drop/unspecified",
-            "do_not_amplify_user_label/drop/unspecified",
-        ]);
-        recs.extend(home_blurs);
-        assert_eq!(
-            rule_engine.wired_rule_names(SafetyLevel::TimelineHomeRecommendations),
-            recs
-        );
-    }
-
-    #[test]
-    fn home_hydration_wires_only_its_ordered_baseline_rules() {
-        assert_eq!(
-            RuleEngine::for_tests().wired_rule_names(SafetyLevel::TimelineHomeHydration),
-            vec![
-                "fosnr_author/appealable",
-                "erased_author/drop/inactive",
-                "deactivated_author/drop",
-                "suspended_author/drop",
-                "offboarded_author/drop/inactive",
-                "protected_author/drop",
-                "fosnr_hateful_conduct/drop/undesirable",
-                "fosnr_violent_speech/drop/undesirable",
-                "fosnr_abuse/drop/undesirable",
-                "fosnr_civic_integrity/drop/undesirable",
-                "fosnr_abuse_insults_non_follower/drop/undesirable",
-                "fosnr_fallback/drop/undesirable",
-                "creator_tweet_nsfw/drop/nsfw_media",
-                "protected_community_tweet/drop/unspecified",
-                "hidden_community_tweet/drop/unspecified",
-                "author_removed_community_tweet/drop/unspecified",
-                "spam/drop/undesirable",
-                "pdna/drop/safety_result",
-                "bounce/drop/bounced",
-                "for_emergency_use_only/drop/unspecified",
-                "exclusive_tweet/drop",
-                "trusted_friends_tweet/drop/unspecified",
-                "legal_takedown/drop/unspecified",
-                "local_laws_takedown/drop/unspecified",
-                "article_tweet_content/drop/unspecified",
-                "author_blocks_viewer_exclusive_content/drop/unspecified",
-                "sensitive_viewer_logged_out/drop",
-                "sensitive_viewer_underage/drop",
-                "sensitive_viewer_no_stated_age/drop",
-                "nsfw_high_precision/tombstone/local_regulations",
-                "nsfw_high_precision/tombstone/age_verification",
-                "nsfw_high_precision/tombstone/update_app_ios",
-                "nsfw_high_precision/tombstone/update_app_android",
-                "nsfw_account/tombstone/age_verification",
-                "nsfw_account/tombstone/update_app_ios",
-                "nsfw_account/tombstone/update_app_android",
-                "nsfw_reported_heuristics/tombstone/age_verification",
-                "nsfw_reported_heuristics/tombstone/update_app_ios",
-                "nsfw_reported_heuristics/tombstone/update_app_android",
-                "nsfw_card_image/tombstone/age_verification",
-                "nsfw_card_image/tombstone/update_app_ios",
-                "nsfw_card_image/tombstone/update_app_android",
-                "gore_and_violence_high_precision/tombstone/update_app_ios",
-                "gore_and_violence_high_precision/tombstone/update_app_android",
-                "nsfw_high_precision/blur/sensitive/age_prompt",
-                "nsfw_high_precision/blur/sensitive",
-                "nsfw_high_precision/blur/nudity/age_prompt",
-                "nsfw_high_precision/blur/nudity",
-                "nsfw_high_precision/legacy_interstitial",
-                "nsfw_admin/blur/sensitive/age_prompt",
-                "nsfw_admin/blur/sensitive",
-                "nsfw_user/blur/sensitive_user/age_prompt",
-                "nsfw_user/blur/sensitive_user",
-                "nsfw_account/legacy_interstitial",
-                "gore_and_violence_high_precision/blur",
-                "gore_and_violence_ignoring_settings/blur",
-                "gore_and_violence_high_precision/legacy_interstitial",
-                "nsfw_reported_heuristics/blur/sensitive/age_prompt",
-                "nsfw_reported_heuristics/blur/sensitive",
-                "nsfw_reported_heuristics/legacy_interstitial",
-                "gore_and_violence_reported_heuristics/blur/sensitive",
-                "gore_and_violence_reported_heuristics/legacy_interstitial",
-                "nsfw_card_image/blur/sensitive/age_prompt",
-                "nsfw_card_image/blur/sensitive",
-                "nsfw_card_image/legacy_interstitial",
-                "gore_and_violence_high_precision/blur/age_prompt",
-                "fosnr_abuse_insults_follower/soft_intervention/abuse",
-                "blocked_viewer/limited_engagement",
-                "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-                "stale_tweet/limited_engagement",
-                "limit_replies_by_invitation/limited_engagement/conversation_control",
-                "limit_replies_community/limited_engagement/conversation_control",
-                "limit_replies_subscribers/limited_engagement/conversation_control",
-                "limit_replies_verified/limited_engagement/conversation_control",
-                "limit_replies_my_network/limited_engagement/conversation_control",
-                "limit_replies_co/limited_engagement/conversation_control",
-                "community_tweet_viewer_removed/limited_engagement",
-                "local_tweet/limited_engagement",
-                "read_only_viewer/limited_engagement",
-            ]
-        );
-    }
-
-    #[test]
-    fn immersive_expanded_recommendations_wires_only_its_ordered_rules() {
-        assert_eq!(
-            RuleEngine::for_tests().wired_rule_names(SafetyLevel::ImmersiveExpandedRecommendations),
-            vec![
-                "suspended_author/drop",
-                "deactivated_author/drop",
-                "erased_author/drop/inactive",
-                "offboarded_author/drop/inactive",
-                "protected_author/drop",
-                "viewer_blocks_author/drop",
-                "viewer_mutes_author/drop",
-                "viewer_mutes_retweets/drop/unspecified",
-                "pdna/drop/safety_result",
-                "bounce/drop/bounced",
-                "spam/drop/undesirable",
-                "for_emergency_use_only/drop/unspecified",
-                "fosnr_hateful_conduct/drop/undesirable",
-                "fosnr_violent_speech/drop/undesirable",
-                "fosnr_abuse/drop/undesirable",
-                "fosnr_civic_integrity/drop/undesirable",
-                "stale_tweet/drop/unspecified",
-                "legal_takedown/drop/unspecified",
-                "local_laws_takedown/drop/unspecified",
-                "sensitive_viewer_logged_out/drop",
-                "sensitive_viewer_underage/drop",
-                "sensitive_viewer_no_stated_age/drop",
-                "exclusive_tweet/drop",
-                "trusted_friends_tweet/drop/unspecified",
-                "dmca_media/drop/unspecified",
-                "geo_restricted_media/drop/unspecified",
-                "gore_and_violence_high_precision/drop/nsfw_media",
-                "do_not_amplify/drop/undesirable",
-                "malicious_url/drop/undesirable",
-                "spam_high_recall/drop/undesirable",
-                "brazil_election_legal/drop/undesirable",
-                "spam_high_recall_user_label/drop/unspecified",
-                "compromised_user_label/drop/unspecified",
-                "read_only_user_label/drop/unspecified",
-                "impersonation_high_precision_user_label/drop/unspecified",
-                "abusive_high_recall_user_label/drop/unspecified",
-                "do_not_amplify_user_label/drop/unspecified",
-                "nsfw_sensitive_viewer_tweet/drop/nsfw_media",
-                "nsfw_sensitive_viewer_user/drop/nsfw_media",
-            ]
+        let mut stale = Vec::new();
+        for &level in SafetyLevel::VARIANTS {
+            let file = format!("{}.txt", <&str>::from(level));
+            let table = policy_table(rule_engine.policy(level));
+            let pinned = PINNED_POLICIES
+                .iter()
+                .find(|&&(pinned_level, _)| pinned_level == level)
+                .map(|&(_, pinned)| pinned);
+            if pinned != Some(table.as_str()) {
+                if let Ok(dir) = std::env::var("TEST_UNDECLARED_OUTPUTS_DIR") {
+                    std::fs::write(std::path::Path::new(&dir).join(&file), &table).unwrap();
+                }
+                stale.push(file);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "tests/fixtures/policy/{stale:?} differ from the evaluated policies: run scripts/bless-policy and review the diff"
         );
     }
 
@@ -787,20 +647,172 @@ country_specific_nsfw_content_gating:
     }
 
     #[test]
-    fn every_leaf_reads_only_the_hydrators_it_declares() {
-        let viewer = viewer(VIEWER_ID);
-        let candidate = candidate().build();
+    fn each_rule_name_wires_the_same_clauses_at_every_level() {
+        const WIRED_DIFFERENTLY: [&str; 6] = [
+            "nsfw_high_precision/blur/nudity",
+            "nsfw_high_precision/blur/sensitive",
+            "gore_and_violence_high_precision/blur",
+            "nsfw_card_image/blur/sensitive",
+            "nsfw_admin/blur/sensitive",
+            "nsfw_user/blur/sensitive_user",
+        ];
+        let rule_engine = RuleEngine::for_tests();
+        let mut first: Vec<(&str, SafetyLevel, Vec<&Clause>)> = Vec::new();
         for &level in SafetyLevel::VARIANTS {
-            for clause in (level.spec().rules)() {
-                for condition in &clause.when {
-                    let leaves = match condition {
-                        Condition::Holds(leaf) | Condition::Not(leaf) => slice::from_ref(leaf),
-                        Condition::AnyOf(leaves) => leaves,
-                    };
-                    for &leaf in leaves {
-                        holds_narrowed(leaf, &viewer, &candidate);
-                    }
+            for name in rule_engine.policy(level).rule_names() {
+                let clauses: Vec<&Clause> = rule_engine
+                    .policy(level)
+                    .clauses
+                    .iter()
+                    .filter(|&&(other, _)| other == name)
+                    .map(|(_, clause)| clause)
+                    .collect();
+                match first.iter().find(|(other, ..)| *other == name) {
+                    None => first.push((name, level, clauses)),
+                    Some((_, first_level, wired)) => assert!(
+                        *wired == clauses || WIRED_DIFFERENTLY.contains(&name),
+                        "{name} wires other clauses at {level:?} than at {first_level:?}: \
+                         wire the same clauses at every level, or give the {level:?} \
+                         clauses their own RuleId"
+                    ),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn each_clause_of_a_rule_id_names_the_same_labels() {
+        let mut first: Vec<(RuleId, String, Vec<String>)> = Vec::new();
+        for &level in SafetyLevel::VARIANTS {
+            for &clause in level.spec().rules {
+                let mut labels: Vec<String> = clause
+                    .when
+                    .iter()
+                    .filter_map(|condition| condition.own_tweet_label())
+                    .collect();
+                labels.sort_unstable();
+                let name = clause.name();
+                match first.iter().find(|(id, ..)| *id == clause.id) {
+                    None => first.push((clause.id, name, labels)),
+                    Some((_, other, read)) => assert!(
+                        *read == labels,
+                        "{name} names the labels {labels:?} but {other}, a clause of the same \
+                         RuleId, names {read:?}: copy the label conditions of {other}, or give it \
+                         its own RuleId"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_const_a_level_lists_is_named_after_its_clause() {
+        let mut by_name: Vec<(String, Vec<&Clause>)> = Vec::new();
+        for &level in SafetyLevel::VARIANTS {
+            for &clause in level.spec().rules {
+                let name = clause.name();
+                match by_name.iter_mut().find(|(other, _)| *other == name) {
+                    Some((_, clauses)) if !clauses.contains(&clause) => clauses.push(clause),
+                    Some(_) => {}
+                    None => by_name.push((name, vec![clause])),
+                }
+            }
+        }
+        let shared = |name: &str| {
+            by_name
+                .iter()
+                .any(|(other, clauses)| other == name && clauses.len() > 1)
+        };
+        for &level in SafetyLevel::VARIANTS {
+            let level_name = <&str>::from(level).to_uppercase();
+            let &(_, listed) = levels::LISTED
+                .iter()
+                .find(|&&(name, _)| name == level_name)
+                .unwrap_or_else(|| panic!("levels.rs lists no {level_name}"));
+            for (&listed, clause) in listed.iter().zip(level.spec().rules) {
+                let name = clause.name();
+                let prefix = name.replace('/', "_").to_uppercase();
+                let named = match listed.strip_prefix(&prefix) {
+                    Some("") => true,
+                    Some(suffix) => suffix.starts_with('_') && shared(&name),
+                    None => false,
+                };
+                assert!(
+                    named,
+                    "{listed} holds {name}: name it {prefix}{}",
+                    if shared(&name) {
+                        "_<WHAT_SETS_IT_APART>"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_fosnr_violation_has_a_label_drop_and_each_fosnr_label_drop_a_violation() {
+        let rule_engine = RuleEngine::for_tests();
+        let mut dropped = Vec::new();
+        for &level in SafetyLevel::VARIANTS {
+            for (name, clause) in &rule_engine.policy(level).clauses {
+                let id: &str = clause.id.into();
+                let [only] = clause.when[..] else { continue };
+                let [label] = only.tweet_labels()[..] else {
+                    continue;
+                };
+                if !id.starts_with("fosnr") {
+                    continue;
+                }
+                assert!(
+                    tweet_rules::FOSNR_AUTHOR_VIOLATIONS
+                        .iter()
+                        .any(|violation| violation.label == label),
+                    "{name} drops a FOSNR label FOSNR_AUTHOR_VIOLATIONS does not name: add its \
+                     row to FOSNR_AUTHOR_VIOLATIONS in src/rules/tweet_rules.rs"
+                );
+                dropped.push(label);
+            }
+        }
+        for violation in &tweet_rules::FOSNR_AUTHOR_VIOLATIONS {
+            assert!(
+                dropped.contains(&violation.label),
+                "FOSNR_AUTHOR_VIOLATIONS names {:?} but no level drops it: add a `const \
+                 FOSNR_<LABEL>_DROP_UNDESIRABLE: Clause` reading it and list it in the levels",
+                xai_safety_label_store::types::label_meta(violation.label).map(|meta| meta.ident),
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_reads_the_labels_it_names() {
+        let rule_engine = RuleEngine::for_tests();
+        for &level in SafetyLevel::VARIANTS {
+            for (name, clause) in &rule_engine.policy(level).clauses {
+                let mut read: Vec<SafetyLabelType> = clause
+                    .when
+                    .iter()
+                    .flat_map(|condition| condition.tweet_labels())
+                    .collect();
+                let mut named: Vec<SafetyLabelType> = match clause.action.spec() {
+                    ActionSpec::SoftIntervention { label, .. } => vec![*label],
+                    ActionSpec::Appealable(violations) => {
+                        violations.iter().map(|violation| violation.label).collect()
+                    }
+                    ActionSpec::Drop(_)
+                    | ActionSpec::Tombstone(_)
+                    | ActionSpec::MediaRestriction(_)
+                    | ActionSpec::LimitedEngagement(_) => continue,
+                };
+                read.sort_by_key(|label| label.0);
+                named.sort_by_key(|label| label.0);
+                assert!(
+                    read == named,
+                    "{name} names {:?} but its conditions read {:?}: make `when` read exactly the \
+                     labels its action names",
+                    named.into_iter().map(Spelled::spelled).collect::<Vec<_>>(),
+                    read.into_iter().map(Spelled::spelled).collect::<Vec<_>>(),
+                );
             }
         }
     }
@@ -809,41 +821,36 @@ country_specific_nsfw_content_gating:
         use super::super::*;
         use crate::hydration::Hydrator;
         use crate::models::{
-            DropReason, HydratedTweetCandidate, LimitedEngagementReason, MediaInterstitial,
-            MediaRestriction, TombstoneReason, ViewerFeatures,
+            DropReason, LimitedEngagementReason, MediaInterstitial, MediaRestriction,
+            PostCandidate, TombstoneReason, ViewerFeatures,
         };
-        use crate::rules::fixtures::{allow, blurred};
+        use crate::rules::fixtures::{
+            VIEWER_ID, allow, author_viewer, blurred, candidate, logged_out_viewer, viewer,
+        };
+        use crate::rules::rule_spec::Audience::{Everyone, NonAuthors, NonFollowers};
+        use crate::rules::rule_spec::conditions::for_tests::{any, viewer_does_not_follow_author};
         use crate::rules::rule_spec::{
-            ActionSpec, Audience, Condition, Predicate, RelationshipPredicate, TweetPredicate,
-            ViewerPredicate,
+            ActionSpec, Cond, tweet_created_after, viewer_blocks_author, viewer_follows_author,
+            viewer_logged_out,
         };
         use crate::rules::test_context;
         use xai_visibility_filtering::models::FilteredReason;
         use xai_x_thrift::action::InterstitialReason;
 
-        fn clause(when: &[Condition], action: ActionSpec) -> RuleClause {
-            RuleClause {
+        fn clause(when: &[Cond], action: ActionSpec) -> Clause {
+            Clause {
                 id: RuleId::FilterAll,
-                when: when.to_vec(),
-                applies_to: Audience::Everyone,
-                action,
+                when: when.to_vec().leak(),
+                action: action.into(),
+                audience: Everyone,
             }
         }
 
-        fn always(name: &'static str, action: ActionSpec) -> (&'static str, RuleClause) {
+        fn always(name: &'static str, action: ActionSpec) -> (&'static str, Clause) {
             (name, clause(&[], action))
         }
 
-        const NEVER_LEAF: Predicate = Predicate::Tweet(TweetPredicate::CreatedAfter(u64::MAX));
-        const NEVER: Condition = Condition::Holds(NEVER_LEAF);
-
-        const FOLLOWS: Predicate =
-            Predicate::Relationship(RelationshipPredicate::ViewerFollowsAuthor);
-        const BLOCKS: Predicate =
-            Predicate::Relationship(RelationshipPredicate::ViewerBlocksAuthor);
-        const LOGGED_OUT: Predicate = Predicate::Viewer(ViewerPredicate::LoggedOut);
-
-        const UNREACHABLE: Condition = Condition::Holds(FOLLOWS);
+        const NEVER: Cond = tweet_created_after(u64::MAX);
 
         const DROP_SUSPENDED: ActionSpec =
             ActionSpec::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended));
@@ -863,8 +870,8 @@ country_specific_nsfw_content_gating:
         const LIMIT: ActionSpec =
             ActionSpec::LimitedEngagement(LimitedEngagementReason::ConversationControl);
 
-        fn context_inputs() -> (ViewerFeatures, HydratedTweetCandidate) {
-            (ViewerFeatures::default(), HydratedTweetCandidate::default())
+        fn context_inputs() -> (ViewerFeatures, PostCandidate) {
+            (ViewerFeatures::default(), PostCandidate::default())
         }
 
         fn withheld(value: Withholding, by: &'static str) -> Verdict {
@@ -876,15 +883,18 @@ country_specific_nsfw_content_gating:
                 always("tombstone", TOMBSTONE),
                 ("never", clause(&[NEVER], DROP_SUSPENDED)),
                 always("drop", DROP_SUSPENDED),
-                ("after_drop", clause(&[UNREACHABLE], DROP_SUSPENDED)),
+                (
+                    "after_drop",
+                    clause(&[viewer_follows_author()], DROP_SUSPENDED),
+                ),
             ])
         }
 
         fn restrictions() -> Policy {
             Policy::new(vec![
                 always("first_interstitial", INTERSTITIAL_NSFW),
-                always("first_limit", LIMIT),
                 always("second_interstitial", INTERSTITIAL_UNSPECIFIED),
+                always("first_limit", LIMIT),
                 always(
                     "second_limit",
                     ActionSpec::LimitedEngagement(LimitedEngagementReason::BlockedViewer),
@@ -986,10 +996,10 @@ country_specific_nsfw_content_gating:
             );
         }
 
-        fn follows_and_blocks_failed() -> (ViewerFeatures, HydratedTweetCandidate) {
-            let candidate = HydratedTweetCandidate {
+        fn follows_and_blocks_failed() -> (ViewerFeatures, PostCandidate) {
+            let candidate = PostCandidate {
                 failed: Hydrators::of(Hydrator::Follows).with(Hydrator::Blocks),
-                ..HydratedTweetCandidate::default()
+                ..Default::default()
             };
             (ViewerFeatures::default(), candidate)
         }
@@ -1002,28 +1012,24 @@ country_specific_nsfw_content_gating:
                 Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
                 "rule",
             );
-            let rows: [(&[Condition], Verdict, Hydrators); 6] = [
-                (&[Condition::Holds(FOLLOWS)], allow(), follows),
+            let rows: [(&[Cond], Verdict, Hydrators); 6] = [
+                (&[viewer_follows_author()], allow(), follows),
                 (
-                    &[Condition::Holds(FOLLOWS), NEVER],
+                    &[viewer_follows_author(), NEVER],
                     allow(),
                     Hydrators::empty(),
                 ),
-                (&[Condition::Not(FOLLOWS)], dropped.clone(), follows),
+                (&[viewer_does_not_follow_author()], dropped.clone(), follows),
                 (
-                    &[Condition::AnyOf(&[FOLLOWS, LOGGED_OUT])],
+                    &[any(&[viewer_follows_author(), viewer_logged_out()])],
                     dropped,
                     Hydrators::empty(),
                 ),
-                (
-                    &[Condition::AnyOf(&[FOLLOWS, NEVER_LEAF])],
-                    allow(),
-                    follows,
-                ),
+                (&[any(&[viewer_follows_author(), NEVER])], allow(), follows),
                 (
                     &[
-                        Condition::AnyOf(&[BLOCKS, LOGGED_OUT]),
-                        Condition::Holds(FOLLOWS),
+                        any(&[viewer_blocks_author(), viewer_logged_out()]),
+                        viewer_follows_author(),
                     ],
                     allow(),
                     follows,
@@ -1046,7 +1052,7 @@ country_specific_nsfw_content_gating:
         fn fail_open_defaults_are_the_unknown_clauses_that_could_have_changed_the_verdict() {
             let (viewer, candidate) = follows_and_blocks_failed();
             let follows = Hydrators::of(Hydrator::Follows);
-            let unknown = |action| ("unknown", clause(&[Condition::Holds(FOLLOWS)], action));
+            let unknown = |action| ("unknown", clause(&[viewer_follows_author()], action));
             let blur = blurred(InterstitialReason::Sensitive(true), "blur");
             let rows = [
                 (
@@ -1088,6 +1094,75 @@ country_specific_nsfw_content_gating:
                     },
                     "row {index}"
                 );
+            }
+        }
+
+        #[test]
+        fn non_followers_spare_the_author_and_followers_and_fail_closed_on_follows() {
+            let follows = Hydrators::of(Hydrator::Follows);
+            let dropped = withheld(
+                Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
+                "rule",
+            );
+            let followed = candidate().with_edge(Hydrator::Follows).build();
+            let mut follows_failed = candidate().build();
+            follows_failed.failed = follows;
+            let rows = [
+                (
+                    "author",
+                    author_viewer(),
+                    followed.clone(),
+                    Evaluation::Complete { verdict: allow() },
+                ),
+                (
+                    "follower",
+                    viewer(VIEWER_ID),
+                    followed,
+                    Evaluation::Complete { verdict: allow() },
+                ),
+                (
+                    "non-follower",
+                    viewer(VIEWER_ID),
+                    candidate().build(),
+                    Evaluation::Complete {
+                        verdict: dropped.clone(),
+                    },
+                ),
+                (
+                    "logged out",
+                    logged_out_viewer(),
+                    candidate().build(),
+                    Evaluation::Complete {
+                        verdict: dropped.clone(),
+                    },
+                ),
+                (
+                    "follows failed",
+                    viewer(VIEWER_ID),
+                    follows_failed,
+                    Evaluation::Partial {
+                        verdict: dropped,
+                        fail_open_defaults: follows,
+                    },
+                ),
+            ];
+            let non_followers = Clause {
+                audience: NonFollowers,
+                ..clause(&[], DROP_SUSPENDED)
+            };
+            let spelled_out = Clause {
+                audience: NonAuthors,
+                ..clause(&[viewer_does_not_follow_author()], DROP_SUSPENDED)
+            };
+            let policy = Policy::new(vec![("rule", non_followers.clone())]);
+            for (who, viewer, candidate, evaluation) in rows {
+                let context = test_context(&viewer, &candidate).hydrated_by(policy.hydrators);
+                assert_eq!(
+                    non_followers.applies(&context),
+                    spelled_out.applies(&context),
+                    "{who}"
+                );
+                assert_eq!(policy.evaluate(&context), evaluation, "{who}");
             }
         }
     }

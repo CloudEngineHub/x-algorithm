@@ -66,6 +66,7 @@ enum Outcome {
 struct CompiledRule {
     id: String,
     when: Program,
+        when_src: String,
     outcome: Outcome,
 }
 
@@ -73,6 +74,13 @@ struct CompiledRule {
 pub struct CompiledRules {
             entity_type: EntityType,
     rules: Vec<CompiledRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadingSkip<'a> {
+    pub id: &'a str,
+    pub reason: &'a str,
+    pub when: &'a str,
 }
 
 
@@ -128,6 +136,7 @@ impl CompiledRules {
                 Ok(CompiledRule {
                     id: r.id,
                     when,
+                    when_src: r.when,
                     outcome: r.then,
                 })
             })
@@ -140,6 +149,20 @@ impl CompiledRules {
 
     pub fn rule_ids(&self) -> impl Iterator<Item = &str> {
         self.rules.iter().map(|r| r.id.as_str())
+    }
+
+            pub fn leading_skips(&self) -> Vec<LeadingSkip<'_>> {
+        self.rules
+            .iter()
+            .map_while(|r| match &r.outcome {
+                Outcome::Special(SpecialOutcome::Skip { reason }) => Some(LeadingSkip {
+                    id: &r.id,
+                    reason,
+                    when: &r.when_src,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
                 pub fn entity_type(&self) -> EntityType {
@@ -282,6 +305,13 @@ fn project_post(post: &PostFacts) -> PostCel<'_> {
 
 
 pub fn decide_with(rules: &CompiledRules, facts: &Facts) -> Result<Decision, EvalError> {
+    decide_with_id(rules, facts).map(|(decision, _)| decision)
+}
+
+pub fn decide_with_id(
+    rules: &CompiledRules,
+    facts: &Facts,
+) -> Result<(Decision, String), EvalError> {
     let mut ctx = Context::default();
     bind_facts(&mut ctx, facts)?;
 
@@ -291,7 +321,7 @@ pub fn decide_with(rules: &CompiledRules, facts: &Facts) -> Result<Decision, Eva
             source: e,
         })?;
         match value {
-            Value::Bool(true) => return Ok(outcome_to_decision(&rule.outcome)),
+            Value::Bool(true) => return Ok((outcome_to_decision(&rule.outcome), rule.id.clone())),
             Value::Bool(false) => continue,
             other => {
                 return Err(EvalError::NonBoolResult {
@@ -302,6 +332,30 @@ pub fn decide_with(rules: &CompiledRules, facts: &Facts) -> Result<Decision, Eva
         }
     }
     Err(EvalError::NoMatch)
+}
+
+pub(crate) fn first_true(
+    checks: &[(&str, &Program)],
+    facts: &Facts,
+) -> Result<Option<usize>, EvalError> {
+    let mut ctx = Context::default();
+    bind_facts(&mut ctx, facts)?;
+    for (i, (id, program)) in checks.iter().enumerate() {
+        match program.execute(&ctx).map_err(|e| EvalError::Exec {
+            id: (*id).to_owned(),
+            source: e,
+        })? {
+            Value::Bool(true) => return Ok(Some(i)),
+            Value::Bool(false) => {}
+            other => {
+                return Err(EvalError::NonBoolResult {
+                    id: (*id).to_owned(),
+                    value: format!("{other:?}"),
+                });
+            }
+        }
+    }
+    Ok(None)
 }
 
 type CredAliasConfig =
@@ -1305,12 +1359,12 @@ rules:
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("very_high_follower_count".into())
         );
-        f.cred_mut().follower_count = Some(50_000);
+        f.cred_mut().follower_count = Some(5_000);
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("high_follower_count".into())
         );
-        f.cred_mut().follower_count = Some(500);
+        f.cred_mut().follower_count = Some(10);
         assert_ne!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("high_follower_count".into())

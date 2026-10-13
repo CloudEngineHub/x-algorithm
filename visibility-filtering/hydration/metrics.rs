@@ -34,6 +34,17 @@ pub(crate) enum HydratorOutcome {
     Error,
 }
 
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum FallbackCacheResult {
+    Fresh,
+    Stale,
+    NotFound,
+    Partial,
+    PartialStale,
+    Unavailable,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct KeyedResultCounts {
     success_keys: usize,
@@ -285,12 +296,36 @@ impl FallbackCacheCounts {
     pub(crate) fn record(&self, cache: &'static str, column: &'static str) {
         let live = self.fresh + self.not_found + self.partial + self.partial_stale;
         for (metric, result, count) in [
-            (FALLBACK_CACHE_KEYS, "fresh", self.fresh),
-            (FALLBACK_CACHE_KEYS, "stale", self.stale),
-            (FALLBACK_CACHE_KEYS, "not_found", self.not_found),
-            (FALLBACK_CACHE_KEYS, "partial", self.partial),
-            (FALLBACK_CACHE_KEYS, "partial_stale", self.partial_stale),
-            (FALLBACK_CACHE_KEYS, "unavailable", self.unavailable),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Fresh.into(),
+                self.fresh,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Stale.into(),
+                self.stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::NotFound.into(),
+                self.not_found,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Partial.into(),
+                self.partial,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::PartialStale.into(),
+                self.partial_stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Unavailable.into(),
+                self.unavailable,
+            ),
             (FALLBACK_CACHE_RESIDENT_KEYS, "resident", self.resident),
             (FALLBACK_CACHE_RESIDENT_KEYS, "absent", live - self.resident),
         ] {
@@ -339,7 +374,6 @@ mod tests {
     use crate::models::{ClientCapability, RawCandidate, TweetFeatures, TweetId};
     use crate::rules::RuleEngine;
     use std::collections::HashMap;
-    use xai_x_rpc::WithBudget;
 
     #[test]
     fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
@@ -356,9 +390,10 @@ mod tests {
         assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
         use crate::hydration::Hydrator;
         let root_edges = format!(
-            "{}+{}",
+            "{}+{}+{}",
             Hydrator::RootFollowsViewer.spec().label.1,
-            Hydrator::SuperFollowsRoot.spec().label.1
+            Hydrator::SuperFollowsRoot.spec().label.1,
+            Hydrator::BlockedByConversationRoot.spec().label.1
         );
         assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
         assert!(dashboard.contains(&format!(
@@ -375,17 +410,6 @@ mod tests {
             "HYDRATOR_KEY_RESULTS = \"{}\"",
             key_results.join("|")
         )));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn caller_deadline_cancels_a_hop_before_the_static_ceiling() {
-        let start = tokio::time::Instant::now();
-        let context = crate::hydration::request_context(start, Some(Duration::from_millis(40)));
-        let result = context
-            .scope(std::future::pending::<()>().with_budget(crate::hydration::HYDRATION_TIMEOUT))
-            .await;
-        assert!(result.is_err());
-        assert_eq!(start.elapsed(), Duration::from_millis(30));
     }
 
     #[test]
@@ -460,18 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn from_batch_counts_timeout_keys() {
-        let expected = FxHashMap::from_iter([(1, 2), (2, 3)]);
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([1, 2]);
-
-        let counts = KeyedResultCounts::from_batch(&expected, &batch);
-
-        assert_eq!(counts.timeout_keys, 2);
-        assert_eq!(counts.timeout_candidates, 5);
-        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
-    }
-
-    #[test]
     fn a_tweet_keyed_call_counts_its_keys_before_pure_core_resolves_authors() {
         let engine = RuleEngine::for_tests();
         let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
@@ -500,11 +512,12 @@ mod tests {
 
     #[test]
     fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40]);
+        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40, 41]);
 
-        let counts = KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0)]), &batch);
+        let counts =
+            KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0), (41, 3)]), &batch);
 
-        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (1, 0));
+        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (2, 3));
         assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
     }
 }

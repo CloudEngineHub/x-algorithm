@@ -203,6 +203,7 @@ def _make_dataset(
     _sid_num_levels = mparams.get("sid_num_levels", 6)
     _enable_stale_post = mparams.get("enable_stale_post", False)
     _ads_head_masking = mparams.get("ads_head_masking", False)
+    _ads_pixel_head_masking = mparams.get("ads_pixel_head_masking", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -221,6 +222,7 @@ def _make_dataset(
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
+                ads_pixel_head_masking=_ads_pixel_head_masking,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -236,6 +238,7 @@ def _make_dataset(
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
                 ads_head_masking=_ads_head_masking,
+                ads_pixel_head_masking=_ads_pixel_head_masking,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -552,10 +555,7 @@ class _ConfigRegistry(dict[str, RecsysTrainer]):
 CONFIGS: dict[str, RecsysTrainer] = _ConfigRegistry()
 
 
-for config in configs:
-    config_name, mparams = config["config_name__mparams"]
-    assert isinstance(mparams, dict)
-    dataset_type = config["dataset_type"]
+def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTrainer:
     config_name_gen = f"{config_name}_{dataset_type}"
 
     if dataset_type == "grpc_recsys" and mparams.get("enable_stale_post", False):
@@ -633,7 +633,7 @@ for config in configs:
 
     _validate_params(mparams, num_user_prefix_tokens)
 
-    CONFIGS[config_name_gen] = RecsysTrainer(
+    return RecsysTrainer(
         name=config_name_gen,
         precision_level=2,
         reuse_run_id=False,
@@ -668,6 +668,7 @@ for config in configs:
                 "mask_candidate_positive_when_negative_action_present", False
             ),
             ads_head_masking=mparams.get("ads_head_masking", False),
+            ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
@@ -933,6 +934,13 @@ for config in configs:
             checkpoint_disk_every_s=600,
         ),
     )
+
+
+for config in configs:
+    config_name, mparams = config["config_name__mparams"]
+    assert isinstance(mparams, dict)
+    dataset_type = config["dataset_type"]
+    CONFIGS[f"{config_name}_{dataset_type}"] = make_trainer(config_name, mparams, dataset_type)
 
 for _apply_config_overrides in config_registry.RANKING_CONFIG_HOOKS:
     _apply_config_overrides(CONFIGS)
