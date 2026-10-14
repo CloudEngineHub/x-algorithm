@@ -238,6 +238,12 @@ param!(
     "rust_home_mixer_vm_ranker_dpp_enabled",
     true
 );
+param!(
+    TopicDppEnabled,
+    bool,
+    "rust_home_mixer_vm_ranker_topic_dpp_enabled",
+    false
+);
 param!(DppTheta, f64, "rust_home_mixer_vm_ranker_dpp_theta", 0.65);
 param!(
     DppMaxSelectedRank,

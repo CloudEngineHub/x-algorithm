@@ -1,5 +1,7 @@
 use crate::decision::{ActionSpec, Decision};
-use crate::facts::{CredFacts, EntityFacts, EntityType, Facts, GizmoduckFacts, PostFacts};
+use crate::facts::{
+    CredFacts, EntityFacts, EntityType, Facts, GizmoduckFacts, PostFacts, ScoreFacts,
+};
 use cel::{Context, Program, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -249,13 +251,12 @@ struct PostCel<'a> {
     labels: &'a [String],
 }
 
-fn project_score(facts: &Facts) -> ScoreCel<'_> {
+fn project_score(score: &ScoreFacts) -> ScoreCel<'_> {
     ScoreCel {
-        labels: &facts.score.labels,
-        model_version: &facts.score.model_version,
-        skip_author_credibility_prechecks: facts.score.skip_author_credibility_prechecks,
-        requested_actions: facts
-            .score
+        labels: &score.labels,
+        model_version: &score.model_version,
+        skip_author_credibility_prechecks: score.skip_author_credibility_prechecks,
+        requested_actions: score
             .requested_actions
             .iter()
             .map(|a| RequestedActionCel {
@@ -267,7 +268,7 @@ fn project_score(facts: &Facts) -> ScoreCel<'_> {
                 head: &a.head,
             })
             .collect(),
-        policy_version: &facts.score.policy_version,
+        policy_version: &score.policy_version,
     }
 }
 
@@ -332,6 +333,35 @@ pub fn decide_with_id(
         }
     }
     Err(EvalError::NoMatch)
+}
+
+pub fn reachable_decisions(
+    rules: &CompiledRules,
+    score: &ScoreFacts,
+) -> Result<Vec<Decision>, EvalError> {
+    let mut ctx = Context::default();
+    ctx.add_variable("score", project_score(score))
+        .map_err(|e| EvalError::Bind(format!("score: {e}")))?;
+
+    let mut reachable = Vec::new();
+    for rule in &rules.rules {
+        let acts = !matches!(rule.outcome, Outcome::Special(SpecialOutcome::Skip { .. }));
+        match rule.when.execute(&ctx) {
+            Ok(Value::Bool(false)) => {}
+            Ok(Value::Bool(true)) => {
+                if acts {
+                    reachable.push(outcome_to_decision(&rule.outcome));
+                }
+                break;
+            }
+            _ => {
+                if acts {
+                    reachable.push(outcome_to_decision(&rule.outcome));
+                }
+            }
+        }
+    }
+    Ok(reachable)
 }
 
 pub(crate) fn first_true(
@@ -401,7 +431,7 @@ fn bind_cred_aliases(ctx: &mut Context<'_>, cred: &CredFacts) -> Result<(), Eval
 }
 
 fn bind_facts(ctx: &mut Context<'_>, facts: &Facts) -> Result<(), EvalError> {
-    ctx.add_variable("score", project_score(facts))
+    ctx.add_variable("score", project_score(&facts.score))
         .map_err(|e| EvalError::Bind(format!("score: {e}")))?;
     ctx.add_variable("user_allowlist", project_allowlist(facts.user_allowlist()))
         .map_err(|e| EvalError::Bind(format!("user_allowlist: {e}")))?;
@@ -1549,5 +1579,91 @@ rules:
     fn mock_post_catch_all_skips() {
         let f = post_facts(safe_author(), vec![]);
         assert_eq!(d(&f), Decision::Skip("post_no_action".into()));
+    }
+
+
+    fn reachable(f: &Facts) -> Vec<Decision> {
+        reachable_decisions(&mock_rules(f.entity_type), &f.score)
+            .expect("binding the score never fails")
+    }
+
+    fn label_only() -> Decision {
+        Decision::Act(vec![ActionSpec::AddLabelsV2 {
+            labels: vec!["MockLabel".into()],
+            ttl_msec: Some(1000),
+        }])
+    }
+
+    #[test]
+    fn reachable_decisions_pass_over_skips_that_need_fetched_facts() {
+        let mut f = base_facts();
+        f.score.labels = vec!["label_only".into()];
+        if let EntityFacts::User(u) = &mut f.entity {
+            u.user.present = false;
+            u.cred.is_high = Some(true);
+        }
+        assert_eq!(d(&f), Decision::Skip("not_present".into()));
+        assert_eq!(reachable(&f), vec![label_only()]);
+    }
+
+    #[test]
+    fn reachable_decisions_hold_the_hydrated_act() {
+        for labels in [vec!["composite_label"], vec!["label_only"], vec![]] {
+            let mut f = base_facts();
+            f.score.labels = labels.iter().map(|s| s.to_string()).collect();
+            assert_eq!(reachable(&f), vec![d(&f)], "labels {labels:?}");
+        }
+    }
+
+    #[test]
+    fn reachable_decisions_stop_at_a_skip_the_score_settles() {
+        let f = post_facts(safe_author(), vec![]);
+        assert_eq!(
+            reachable(&f),
+            vec![Decision::Act(vec![ActionSpec::AddPostLabelsV2 {
+                labels: vec!["SomeLabel".into()],
+                ttl_msec: None,
+            }])]
+        );
+        let rules = one_rule_pipeline(
+            "rules:\n  - id: s\n    when: \"true\"\n    then: {kind: skip, reason: r}\n  - id: a\n    when: \"true\"\n    then: {kind: act_captcha}\n",
+        );
+        assert!(
+            reachable_decisions(&rules, &base_facts().score)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reachable_decisions_keep_every_act_that_needs_fetched_facts() {
+        let rules = one_rule_pipeline(
+            r#"rules:
+  - id: suspend_if_new
+    when: '"x" in score.labels && user.suspended == false'
+    then: {kind: act_suspend_user, perm: false, policy: P}
+  - id: suspend_if_other
+    when: '"other" in score.labels && user.suspended == false'
+    then: {kind: act_suspend_user, perm: true, policy: P}
+  - id: captcha
+    when: '"x" in score.labels'
+    then: {kind: act_captcha}
+  - id: never
+    when: "true"
+    then: {kind: act_arkose}
+"#,
+        );
+        let mut f = base_facts();
+        f.score.labels = vec!["x".into()];
+        assert_eq!(
+            reachable_decisions(&rules, &f.score).unwrap(),
+            vec![
+                Decision::Act(vec![ActionSpec::SuspendUser {
+                    perm: false,
+                    policy: "P".into(),
+                }]),
+                Decision::Act(vec![ActionSpec::Captcha]),
+            ]
+        );
     }
 }

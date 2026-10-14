@@ -500,6 +500,7 @@ mod replay {
 
         async fn article_media_entities(
             &self,
+            _viewer_id: Option<u64>,
             article_ids: &[u64],
         ) -> Answered<exchange::ArticleMediaEntities, bool> {
             self.batch::<exchange::ArticleMediaEntities>(article_ids.iter().copied())
@@ -507,6 +508,7 @@ mod replay {
 
         async fn article_cover_media(
             &self,
+            _viewer_id: Option<u64>,
             article_ids: &[u64],
         ) -> Answered<exchange::ArticleCoverMedia, bool> {
             self.batch::<exchange::ArticleCoverMedia>(article_ids.iter().copied())
@@ -1378,14 +1380,20 @@ mod tests {
                 Source::ArticleMediaEntities => {
                     let keys = [ARTICLE, MISSING, FAILED];
                     shown(
-                        &sources.article_media_entities(&keys).await.into_inner(),
+                        &sources
+                            .article_media_entities(Some(VIEWER), &keys)
+                            .await
+                            .into_inner(),
                         &keys,
                     )
                 }
                 Source::ArticleCoverMedia => {
                     let keys = [ARTICLE, MISSING, FAILED];
                     shown(
-                        &sources.article_cover_media(&keys).await.into_inner(),
+                        &sources
+                            .article_cover_media(Some(VIEWER), &keys)
+                            .await
+                            .into_inner(),
                         &keys,
                     )
                 }

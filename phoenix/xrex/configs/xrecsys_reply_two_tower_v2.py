@@ -3,12 +3,11 @@
 import dataclasses
 
 from xai_proto import recsys_pb2
+from xrex import settings
 from xrex.configs import xrecsys
 from xrex.models.recsys_model import ContinuousActionLossConfig, NormConfig
 from xrex.models.recsys_reply_two_tower_v2_model import RecsysReplyTwoTowerV2Config
 from xrex.train.trainer_recsys import RecsysTrainer
-
-SID_DECODER_PATH = "sid_codebook.safetensors"
 
 MODEL_CFGS = {
     "reply_two_tower_v2_main": xrecsys._make_cfg(
@@ -35,7 +34,7 @@ MODEL_CFGS = {
             "metric_group": "reply",
             "use_post_sid": True,
             "sid_num_levels": 16,
-            "sid_decoder_path": SID_DECODER_PATH,
+            "sid_decoder_path": settings.SID_DECODER_PATH,
             "dwell_loss_weight": 0.02,
             "negfb_loss_weight": 10.0,
         },

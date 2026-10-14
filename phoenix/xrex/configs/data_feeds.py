@@ -67,6 +67,7 @@ GROUP_IDS: dict[str, str] = {
     "home_direct_packed": "user_action_sequence_home_direct_packed",
     "home_direct_packed_gb300": "user_action_sequence_home_direct_packed",
     "home_direct_packed_nano": "user_action_sequence_home_direct_packed_nano",
+    "immersive_page_rl": "user_action_sequence_immersive_page_rl",
     "xrecsys_two_tower": "user_action_sequence_xrecsys_two_tower",
     "xrecsys_two_tower_combined": "user_action_sequence_xrecsys_two_tower_combined",
     "xrecsys_two_tower_combined_gb300": "user_action_sequence_xrecsys_two_tower_combined",
@@ -114,6 +115,11 @@ def resolve_global_ids_file_path(global_ids_file_path: Path | None) -> Path | No
     return global_ids_file_path
 
 
+def _page_records(mparams) -> bool:
+    page_rl = mparams.get("page_rl")
+    return page_rl is not None and page_rl.enabled
+
+
 def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
     return PhoenixKafkaDataset(
         **phoenix_kafka_kwargs(),
@@ -139,6 +145,7 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
         search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
+        page_records=_page_records(mparams),
     )
 
 
@@ -167,6 +174,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        page_records=_page_records(mparams),
     )
 
 
@@ -199,6 +207,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        page_records=_page_records(mparams),
     )
 
 
@@ -221,6 +230,7 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        page_records=_page_records(mparams),
     )
 
 
@@ -243,6 +253,7 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         enable_stale_post=mparams.get("enable_stale_post", False),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        page_records=_page_records(mparams),
     )
 
 

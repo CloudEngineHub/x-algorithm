@@ -128,7 +128,7 @@ async fn recording_takes_no_dedup_claim_no_ticket_and_no_ais_call() {
         let want_peek = if page_actions {
             "peek(class=2)=None"
         } else {
-            "peek(class=0)=None"
+            "peek(class=3)=None"
         };
         assert_eq!(
             t.dedup_calls,
@@ -176,7 +176,7 @@ async fn producer_dry_run_records_only() {
     for score in [by_field, by_prefix] {
         let t = b.run_fresh(&score).await;
         assert_eq!(t.status, "dry_run", "the rules still route on the label");
-        assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"]);
+        assert_eq!(t.dedup_calls, vec!["peek(class=3)=None"]);
         assert_eq!(t.tickets, 0);
         assert!(t.ais.is_empty());
         let i = info(&t);
@@ -334,22 +334,39 @@ async fn band_records_split_a_two_band_head() {
 }
 
 #[tokio::test]
-async fn global_dry_run_with_a_live_record_stays_as_today() {
+async fn global_dry_run_records_only_like_the_other_two_sources() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let label = suspend_label();
-    let b = bed(vec![live(BB1.0, None, vec![LIVENESS])], true).await;
-    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;
-    assert_eq!(t.status, "dry_run");
-    assert!(t.ais.is_empty());
-    assert_eq!(info(&t)["dry_run_source"], "global");
-    assert_eq!(
-        t.dedup_calls,
-        vec![
-            "try_insert(class=2)=new",
-            "update_skip(class=0,own_claim=true)"
-        ]
-    );
-    assert_eq!(t.tickets, 1);
+    for (records, want_peek) in [
+        (
+            vec![live(BB1.0, None, vec![LIVENESS])],
+            "peek(class=2)=None",
+        ),
+        (vec![], "peek(class=3)=None"),
+    ] {
+        let b = bed(records, true).await;
+        let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;
+        assert_eq!(t.status, "dry_run");
+        assert!(t.ais.is_empty());
+        let i = info(&t);
+        assert_eq!(i["dry_run_source"], "global");
+        assert_eq!(
+            t.dedup_calls,
+            vec![want_peek],
+            "a peek, never a claim or a write"
+        );
+        assert_eq!(t.tickets, 0, "no daily-cap ticket");
+        assert_eq!(i["would_dedup_skip"], "false");
+        assert_eq!(i["would_rate_cap"], "false");
+
+        b.dedup.hold(EntityType::User, Account::Clean.user_id(), 3);
+        let t = b.run(&bb1(&[&label], Account::Clean)).await;
+        assert_eq!(t.status, "dry_run");
+        assert_eq!(t.dedup_calls, vec![want_peek.replace("None", "Some(3)")]);
+        assert_eq!(t.tickets, 0);
+        assert_eq!(info(&t)["would_dedup_skip"], "true");
+        assert_eq!(info(&t)["would_dedup_held_class"], "3");
+    }
 }
 
 const RULES_WITH_UNLISTED_CSE: &str = r#"
@@ -935,7 +952,7 @@ async fn a_recording_decision_never_writes_or_releases_the_slot_on_retry() {
             mode: ControlMode::Recording,
             ..Default::default()
         },
-        would_dedup_held: None,
+        ..Default::default()
     };
     assert!(!decision.claimed());
     let producer = DecisionContext {
@@ -943,8 +960,141 @@ async fn a_recording_decision_never_writes_or_releases_the_slot_on_retry() {
             producer_dry: true,
             ..Default::default()
         },
-        would_dedup_held: None,
+        ..Default::default()
     };
     assert!(!producer.claimed());
+    let global = DecisionContext {
+        global_dry_run: true,
+        ..Default::default()
+    };
+    assert!(!global.claimed());
     assert!(DecisionContext::default().claimed());
+}
+
+#[tokio::test]
+async fn a_decision_pinned_to_global_dry_run_never_acts_after_the_flag_flips() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    let b = bed(vec![], false).await;
+    let ctx = &b.ctx;
+    let score = bb1(&[&label], Account::Clean);
+    let pinned = DecisionContext {
+        global_dry_run: true,
+        ..Default::default()
+    };
+    let tickets = b.tickets.load(std::sync::atomic::Ordering::Relaxed);
+    let out = run_enforcement(ctx, &score, "t", &pinned).await.unwrap();
+    assert_eq!(out.status, "dry_run");
+    assert!(out.dry_run);
+    assert_eq!(out.info["dry_run_source"], "global");
+    assert_eq!(out.info["would_dedup_skip"], "false");
+    assert!(b.ais.take().is_empty(), "no AIS call");
+    assert_eq!(
+        b.tickets.load(std::sync::atomic::Ordering::Relaxed),
+        tickets,
+        "no daily-cap ticket"
+    );
+    let live = run_enforcement(ctx, &score, "t", &DecisionContext::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        live.status, "success",
+        "the same message acts when not pinned"
+    );
+}
+
+const RULES_FACT_GATED_SUSPEND: &str = r#"
+for_entity: user
+rules:
+  - id: user_not_found
+    when: "!user.present"
+    then: { kind: skip, reason: user_not_found }
+  - id: act_suspend_if_labeled
+    when: '"fact_gated_suspend" in score.labels && "SpamHighRecall" in user.labels'
+    then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+  - id: act_liveness_fallback
+    when: '"fact_gated_suspend" in score.labels'
+    then: { kind: act_spam_liveness_check }
+  - id: terminal
+    when: "true"
+    then: { kind: skip, reason: no_match }
+"#;
+
+async fn fact_gated_bed() -> TestBed {
+    bed_with(vec![], base_config(false, None), RULES_FACT_GATED_SUSPEND).await
+}
+
+fn held(b: &TestBed, account: Account) -> Option<(u8, bool, Option<u64>)> {
+    b.dedup
+        .slots
+        .lock()
+        .unwrap()
+        .get(&(EntityType::User.as_str().to_owned(), account.user_id()))
+        .copied()
+}
+
+#[tokio::test]
+async fn a_weaker_fallback_chosen_after_the_fetch_is_deduped_against_an_equal_held_entry() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = fact_gated_bed().await;
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup.hold(
+        EntityType::User,
+        Account::Clean.user_id(),
+        dedup_cache::CLASS_CHALLENGE,
+    );
+    let t = b.run(&bb1(&["fact_gated_suspend"], Account::Clean)).await;
+    assert_eq!(t.status, "dedup_skipped");
+    assert_eq!(
+        t.dedup_calls,
+        vec![
+            "try_insert(class=3)=bypass",
+            "update_skip(class=0,own_claim=true)"
+        ]
+    );
+    assert!(t.ais.is_empty(), "no AIS call: {:?}", t.ais);
+    assert_eq!(t.tickets, 0, "no daily-cap ticket");
+    assert_eq!(info(&t)["matched_rule_id"], "act_liveness_fallback");
+    assert_eq!(info(&t)["dedup_held_class"], "2");
+    assert_eq!(
+        held(&b, Account::Clean),
+        Some((dedup_cache::CLASS_CHALLENGE, false, None)),
+        "the held liveness check is put back"
+    );
+}
+
+#[tokio::test]
+async fn a_fact_gated_suspend_that_fires_acts_over_a_held_liveness_check() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = fact_gated_bed().await;
+    b.dedup.slots.lock().unwrap().clear();
+    b.dedup.hold(
+        EntityType::User,
+        Account::HasSpamHighRecall.user_id(),
+        dedup_cache::CLASS_CHALLENGE,
+    );
+    let t = b
+        .run(&bb1(&["fact_gated_suspend"], Account::HasSpamHighRecall))
+        .await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["suspendUser"]);
+    assert_eq!(t.tickets, 1);
+    assert_eq!(
+        t.dedup_calls,
+        vec![
+            "try_insert(class=3)=bypass",
+            "update(class=3,own_claim=true)"
+        ]
+    );
+    assert_eq!(
+        held(&b, Account::HasSpamHighRecall),
+        Some((dedup_cache::CLASS_SUSPEND, false, None))
+    );
+
+    let t = b
+        .run_fresh(&bb1(&["fact_gated_suspend"], Account::Clean))
+        .await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["bounceViaTemplate"]);
+    assert_eq!(t.tickets, 1);
 }

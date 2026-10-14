@@ -85,7 +85,7 @@ from xrex.models.recsys_model import (
     RecsysAggregatedModelConfig,
 )
 from xrex.models.sharding_context import make_legacy_sharding_context
-from xrex.optimizers.optim import InjectHyperparamsState, apply_updates
+from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partition_grad_norms
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
 from xrex.optimizers.recsys.protocol import AsyncEmbOptimizer
 from xrex.train.misc import (
@@ -1420,6 +1420,8 @@ class RecsysTrainer(Trainer):
             "b1": new_opt_state.hyperparams["b1"],
             "b2": new_opt_state.hyperparams["b2"],
         }
+        if self.optim_config.clip_partitions:
+            metrics.update(partition_grad_norms(gradients, self.optim_config.clip_partitions))
         if self.track_norm_metrics:
             metrics.update(norm_metrics(new_params, new_opt_state, gradients, updates))
 
@@ -1794,6 +1796,8 @@ class RecsysTrainer(Trainer):
             "deferred_emb_grad_norm": deferred_emb_grad_norm,
             "deferred_emb_valid_step": deferred_emb_valid_step,
         }
+        if self.optim_config.clip_partitions:
+            metrics.update(partition_grad_norms(gradients, self.optim_config.clip_partitions))
         metrics.update(emb_optim_metrics)
         if self.track_norm_metrics:
             metrics.update(norm_metrics(new_params, new_opt_state, gradients, updates))
@@ -2217,6 +2221,14 @@ class RecsysTrainer(Trainer):
                     f"tokens, below seqpack_distribution.min_len="
                     f"{self.seqpack_distribution.min_len}"
                 )
+        if (
+            isinstance(self.model_config, RecsysAggregatedModelConfig)
+            and self.model_config.page_rl.enabled
+        ):
+            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):
+                raise ValueError("page_rl needs a dataset with page_records=True")
+            if self.seqpack_drop_empty_candidates:
+                raise ValueError("page_rl does not support seqpack_drop_empty_candidates")
 
         self._init_shmem_write_pool()
         self._free_ports()

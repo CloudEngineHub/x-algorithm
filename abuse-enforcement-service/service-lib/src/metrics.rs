@@ -28,28 +28,28 @@ lazy_static! {
             &["kind", "outcome"])
             .unwrap();
 
-                                                            pub static ref DEDUP_CLASS_BYPASS_TOTAL: IntCounterVec =
+                                                    pub static ref DEDUP_CLASS_BYPASS_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_class_bypass_total",
             "Dedup entries re-claimed by a strictly higher-class incoming row.",
             &["topic", "head", "held_class", "incoming_class"])
             .unwrap();
 
-                                                                            pub static ref DEDUP_WRITE_FENCED_TOTAL: IntCounterVec =
+                                                                    pub static ref DEDUP_WRITE_FENCED_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_write_fenced_total",
             "Dedup terminal writes dropped because a strictly stronger terminal outcome is held.",
             &["op", "held_class", "writer_class"])
             .unwrap();
 
-                                        pub static ref DEDUP_DISPLACED_RESTORED_TOTAL: IntCounterVec =
+                                    pub static ref DEDUP_DISPLACED_RESTORED_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_displaced_restored_total",
             "Displaced dedup holds restored after a bypassing decision resolved without acting.",
             &["op"])
             .unwrap();
 
-                        pub static ref DEDUP_BYPASS_CLAIM_LOST_TOTAL: IntCounter =
+                    pub static ref DEDUP_BYPASS_CLAIM_LOST_TOTAL: IntCounter =
         register_int_counter!(
             "abuse_enforcement_dedup_bypass_claim_lost_total",
             "Bypass claims lost to a concurrent claimant at nonce verification.")

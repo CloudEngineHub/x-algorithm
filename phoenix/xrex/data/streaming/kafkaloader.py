@@ -1092,6 +1092,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             reply_parent_mode=self.reply_parent_mode,
             ads_head_masking=self.ads_head_masking,
             ads_pixel_head_masking=self.ads_pixel_head_masking,
+            page_records=self.page_records,
         )
 
         elapsed = time.time() - t

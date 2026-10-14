@@ -48,6 +48,7 @@ from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
     NUM_USER_INSTALLED_APPS,
+    PAGE_RECORD_COLUMNS,
     POST_INT64_FEATURE_SIZE,
     USER_INT64_FEATURE_SIZE,
     CandidateNegativeFilter,
@@ -58,6 +59,7 @@ from xrex.data.recsys.recsys_batch import (
     RecsysFeaturesBatch,
     empty_conversion_delays,
     empty_feature_arrays,
+    empty_page_record_arrays,
     empty_user_feature_arrays,
     from_record_batch,
 )
@@ -1587,6 +1589,13 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
                 ((0, batch_size - num_rows), (0, 0), (0, 0)),
                 constant_values=CONVERSION_DELAY_NONE,
             )
+        for key, (_, _, fill) in PAGE_RECORD_COLUMNS.items():
+            if (values := post_seq.get(key)) is not None:
+                padded[key] = np.pad(
+                    values, ((0, batch_size - num_rows), (0, 0)), constant_values=fill
+                )
+        if (impressed := post_seq.get("rl_impressed")) is not None:
+            padded["rl_impressed"] = pad_array(impressed)
         return padded
 
     def _pad_post_seq_fields(post_seq: PostSeq) -> PostSeq:
@@ -1701,6 +1710,7 @@ class PhoenixDataset(Dataset):
 
     ads_head_masking: bool = False
     ads_pixel_head_masking: bool = False
+    page_records: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -2134,6 +2144,7 @@ class PhoenixDataset(Dataset):
                         ads_head_masking=self.ads_head_masking,
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
                         reply_parent_mode=self.reply_parent_mode,
+                        page_records=self.page_records,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2376,6 +2387,11 @@ class PhoenixDataset(Dataset):
                 if self.use_post_sid
                 else None,
                 **empty_feature_arrays(batch_size, candidate_seq_len, post_int64_size),
+                **(
+                    empty_page_record_arrays(batch_size, candidate_seq_len)
+                    if self.page_records
+                    else {}
+                ),
             ),
             **empty_user_feature_arrays(batch_size, user_int64_size),
             user_installed_apps_multihot=np.zeros(
@@ -2499,6 +2515,11 @@ class PhoenixToyDataset(PhoenixDataset):
                 search_query_embeddings=None,
                 post_creation_ts_sec=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 **empty_feature_arrays(batch_size, candidate_seq_len),
+                **(
+                    empty_page_record_arrays(batch_size, candidate_seq_len)
+                    if self.page_records
+                    else {}
+                ),
             ),
             **empty_user_feature_arrays(batch_size),
             user_installed_apps_multihot=np.zeros(

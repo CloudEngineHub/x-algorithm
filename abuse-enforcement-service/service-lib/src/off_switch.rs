@@ -29,8 +29,6 @@ const FIRST_LOAD_BACKOFF: Duration = Duration::from_secs(1);
 
 const FIRST_LOAD_ERROR_LOG_EVERY: u64 = 12;
 
-const READY_POLL: Duration = Duration::from_millis(200);
-
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCAN_PAGE: u32 = 1_000;
@@ -611,17 +609,6 @@ impl OffSwitch {
         !enabled || self.first_load_done()
     }
 
-            pub async fn wait_until_ready(&self, enabled: impl Fn() -> bool) {
-        let mut logged = false;
-        while !self.ready(enabled()) {
-            if !logged {
-                warn!("off switch: waiting for the first read of the switch list before deciding");
-                logged = true;
-            }
-            tokio::time::sleep(READY_POLL).await;
-        }
-    }
-
                         pub fn spawn_refresh(self: &Arc<Self>, dynamic_config: DynamicConfig) -> JoinHandle<()> {
         self.spawn_refresh_with(
             move || dynamic_config.off_switch_enabled(),
@@ -1038,6 +1025,16 @@ mod tests {
         .expect("background reads keep retrying");
     }
 
+    async fn until_ready(sw: &OffSwitch, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            while !sw.ready(true) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     #[tokio::test]
     async fn not_ready_until_the_first_read_succeeds() {
         let store = Arc::new(MemStore::default());
@@ -1051,17 +1048,15 @@ mod tests {
         assert!(!sw.first_load_done());
         assert!(sw.snapshot_age_ms().is_none());
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), sw.wait_until_ready(|| true))
-                .await
-                .is_err(),
-            "the wait holds while reads fail"
+            !until_ready(&sw, Duration::from_millis(300)).await,
+            "not ready while reads fail"
         );
 
         store.fail_scan.store(false, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(5), sw.wait_until_ready(|| true))
-            .await
-            .expect("ready once a read succeeds");
-        assert!(sw.ready(true));
+        assert!(
+            until_ready(&sw, Duration::from_secs(5)).await,
+            "ready once a read succeeds"
+        );
         assert!(sw.lookup("H", "c", NOW).is_some());
         task.abort();
     }
@@ -1081,9 +1076,10 @@ mod tests {
         assert!(!sw.ready(true), "each hung read times out and is retried");
 
         store.hang_scan.store(false, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(5), sw.wait_until_ready(|| true))
-            .await
-            .expect("ready once a read answers");
+        assert!(
+            until_ready(&sw, Duration::from_secs(5)).await,
+            "ready once a read answers"
+        );
         assert!(sw.lookup("H", "c", NOW).is_some());
         task.abort();
     }
@@ -1098,36 +1094,10 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(2),
         );
-        assert!(sw.ready(false));
-        tokio::time::timeout(Duration::from_secs(1), sw.wait_until_ready(|| false))
-            .await
-            .expect("no wait with the feature off");
+        assert!(sw.ready(false), "no wait with the feature off");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(store.scans.load(Ordering::Relaxed), 0);
         task.abort();
-    }
-
-    #[tokio::test]
-    async fn turning_the_feature_off_releases_a_waiting_pod() {
-        use std::sync::atomic::AtomicBool;
-        let store = Arc::new(MemStore::default());
-        store.fail_scan.store(true, Ordering::Relaxed);
-        let sw = Arc::new(OffSwitch::new(store, Arc::new(MemStore::default())));
-        let enabled = Arc::new(AtomicBool::new(true));
-        let waiter = {
-            let (sw, enabled) = (sw.clone(), enabled.clone());
-            tokio::spawn(async move {
-                sw.wait_until_ready(|| enabled.load(Ordering::Relaxed))
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(!waiter.is_finished());
-        enabled.store(false, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(2), waiter)
-            .await
-            .expect("released by the GrowthBook kill switch")
-            .unwrap();
     }
 
             fn page_of(

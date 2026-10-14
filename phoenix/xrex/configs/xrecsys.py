@@ -18,6 +18,7 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
+from xrex.models.page_rl import PAGE_PARAM_REGEX, PageRlConfig
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_feature_prep import FeaturePrepConfig
@@ -296,7 +297,7 @@ def _home_direct_packed_base() -> dict:
             enable_user_location=True,
             enable_user_gender=True,
             enable_user_age=True,
-            enable_user_installed_apps=True,
+            enable_user_installed_apps=False,
             enable_product_surface=True,
             enable_post_age=True,
             enable_timezone=True,
@@ -384,6 +385,38 @@ _GB300_OVERRIDES = {
 }
 
 
+def _immersive_page_rl() -> dict:
+    base = {**_home_direct_packed_base(), **_H100_OVERRIDES}
+    return {
+        **base,
+        "bs_per_device": 256,
+        "num_microbatch": 1,
+        "seqpack_drop_empty_candidates": False,
+        "overlap_step_host_work": False,
+        "remat_policy": RematType.WHOLE,
+        "unroll_layer_stack": False,
+        "dwell_tweedie_loss_weight": 0.1,
+        "dwell_mae_loss_weight": 0.1,
+        "dwell_cread_loss_weight": 0.0,
+        "dwell_cread_immersive_loss_weight": 0.0,
+        "ep": 128,
+        "attn_impl": "pallas_ranker_varlen_attn",
+        "attn_logit_cap": 80.0,
+        "click_dwell_loss_weight": 0.0,
+        "compute_post_unexplored_label": False,
+        "feature_prep": replace(
+            base["feature_prep"], enable_click_dwell_time=False, enable_dwell_bucket_table=False
+        ),
+        "optim_config": replace(
+            base["optim_config"], clip_partitions=[PAGE_PARAM_REGEX], muon_ns_shard_group_size=1
+        ),
+        "emb_optim_config": RecsysEmbeddingOptimConfig(
+            rowwise_adagrad=replace(base["emb_optim_config"].rowwise_adagrad, learning_rate=0.198),
+        ),
+        "page_rl": PageRlConfig(enabled=True),
+    }
+
+
 MODEL_CFGS = {
     "xrecsys_seqpack": _make_cfg(
         {
@@ -436,6 +469,13 @@ MODEL_CFGS = {
     ),
     "home_direct_packed_gb300": _make_cfg(
         {**_home_direct_packed_base(), **_GB300_OVERRIDES},
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl": _make_cfg(
+        _immersive_page_rl(),
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -690,6 +730,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             candidate_seq_len=mparams["candidate_seq_len"],
             pad_token=PAD_TOKEN,
             act_l2_weight=5e-7,
+            page_rl=mparams.get("page_rl", PageRlConfig()),
             num_continuous_actions=mparams["num_continuous_actions"],
             continuous_action_losses=[
                 ContinuousActionLossConfig(

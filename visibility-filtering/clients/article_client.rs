@@ -1,8 +1,9 @@
 use anyhow::bail;
 use std::collections::HashMap;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
+use xai_strato::strato_thrift::{strato_decode, StratoResult, AUTHORIZATION_ERROR};
 use xai_strato::StratoGrpc;
+use xai_twittercontext_proto::TwitterContextViewer;
 use xai_x_thrift::api_media::ApiMediaKey;
 
 const LIFECYCLE_COLUMN: &str = "article/fields/lifecycleState.ArticleEntity";
@@ -42,22 +43,35 @@ impl ArticleClient {
 
     pub async fn media_entities(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
-        self.presence(article_ids, MEDIA_ENTITIES_COLUMN, decode_media_entities)
-            .await
+        self.presence(
+            viewer_id,
+            article_ids,
+            MEDIA_ENTITIES_COLUMN,
+            decode_media_entities,
+        )
+        .await
     }
 
     pub async fn cover_media(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
-        self.presence(article_ids, COVER_MEDIA_COLUMN, decode_cover_media)
-            .await
+        self.presence(
+            viewer_id,
+            article_ids,
+            COVER_MEDIA_COLUMN,
+            decode_cover_media,
+        )
+        .await
     }
 
     async fn presence(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
         column: &str,
         decode: fn(&[u8]) -> anyhow::Result<Option<bool>>,
@@ -72,7 +86,11 @@ impl ArticleClient {
                 )
             })
             .collect();
-        let replies = self.grpc.batch_call(calls, None).await;
+        let viewer = viewer_id.map(|user_id| TwitterContextViewer {
+            user_id: user_id.cast_signed(),
+            ..Default::default()
+        });
+        let replies = self.grpc.batch_call(calls, viewer.as_ref()).await;
         article_ids
             .iter()
             .copied()
@@ -91,6 +109,10 @@ fn decode_lifecycle(bytes: &[u8]) -> anyhow::Result<Option<i32>> {
 fn decode_media_entities(bytes: &[u8]) -> anyhow::Result<Option<bool>> {
     match strato_decode::<MediaEntitiesPresence>(bytes)? {
         StratoResult::Ok { value, .. } => Ok(value.map(|presence| presence.0)),
+        StratoResult::Err {
+            code: AUTHORIZATION_ERROR,
+            ..
+        } => Ok(None),
         StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
     }
 }
@@ -98,6 +120,10 @@ fn decode_media_entities(bytes: &[u8]) -> anyhow::Result<Option<bool>> {
 fn decode_cover_media(bytes: &[u8]) -> anyhow::Result<Option<bool>> {
     match strato_decode::<ApiMediaKey>(bytes)? {
         StratoResult::Ok { value, .. } => Ok(value.map(|_| true)),
+        StratoResult::Err {
+            code: AUTHORIZATION_ERROR,
+            ..
+        } => Ok(None),
         StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
     }
 }
@@ -202,6 +228,7 @@ mod tests {
         use Thrift::Set;
         for decode in [decode_media_entities, decode_cover_media] {
             assert!(decode(&strato_error(5, "failed fetch")).is_err());
+            assert!(decode(&strato_error(400, "Missing ArticleMetadata for 1")).is_err());
             assert!(decode(&[0]).is_err());
         }
         for fields in [
@@ -219,6 +246,19 @@ mod tests {
         ));
         truncated.truncate(25);
         assert!(decode_media_entities(&truncated).is_err());
+    }
+
+    #[test]
+    fn an_article_the_viewer_may_not_read_has_no_media() {
+        use crate::clients::strato_answer::strato_error;
+        for decode in [decode_media_entities, decode_cover_media] {
+            for reason in [
+                "Only subscribers have access",
+                "Only article author has access",
+            ] {
+                assert_eq!(decode(&strato_error(202, reason)).unwrap(), None);
+            }
+        }
     }
 
     fn decode_row(lifecycle: Option<i32>) -> thrift::Result<i32> {

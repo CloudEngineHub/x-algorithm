@@ -211,10 +211,11 @@ def _col(
     col: str,
     batch_size: int,
     t: type[_T],
+    fill: float = 0,
 ) -> npt.NDArray[_T]:
     values = _list_values(rb.column(col))
     if values.null_count:
-        values = values.fill_null(False if pa.types.is_boolean(values.type) else 0)
+        values = values.fill_null(False if pa.types.is_boolean(values.type) else fill)
     arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
     return typing.cast(npt.NDArray[_T], arr)
 
@@ -268,6 +269,30 @@ class PostSeq(TypedDict):
     bool_features: npt.NDArray[np.bool_]
     post_creation_ts_sec: npt.NDArray[np.int32]
     post_sids: npt.NDArray[np.uint16] | None
+    rl_served_slot: NotRequired[npt.NDArray[np.int32]]
+    rl_weighted_score: NotRequired[npt.NDArray[np.float32]]
+    rl_final_score: NotRequired[npt.NDArray[np.float32]]
+    rl_rerank_prob: NotRequired[npt.NDArray[np.float32]]
+    rl_decode_prob: NotRequired[npt.NDArray[np.float32]]
+    rl_impressed: NotRequired[npt.NDArray[np.bool_]]
+
+
+PAGE_RECORD_COLUMNS: dict[str, tuple[str, type, float]] = {
+    "rl_served_slot": ("servedSlotSeq", np.int32, -1),
+    "rl_weighted_score": ("weightedScoreSeq", np.float32, 0.0),
+    "rl_final_score": ("finalScoreSeq", np.float32, 0.0),
+    "rl_rerank_prob": ("rewardRerankSlotProbSeq", np.float32, 0.0),
+    "rl_decode_prob": ("pageDecodeSlotProbSeq", np.float32, 0.0),
+}
+
+
+def empty_page_record_arrays(batch_size: int, seq_len: int) -> dict[str, np.ndarray]:
+    arrays = {
+        key: np.full((batch_size, seq_len), fill, dtype=dtype)
+        for key, (_, dtype, fill) in PAGE_RECORD_COLUMNS.items()
+    }
+    arrays["rl_impressed"] = np.zeros((batch_size, seq_len), dtype=np.bool_)
+    return arrays
 
 
 def empty_feature_arrays(
@@ -464,6 +489,15 @@ def _extend_head_eligible_mask(post_seq: PostSeq, num_slots: int) -> dict[str, n
     return {"head_eligible_mask": widened}
 
 
+def _extend_page_record_fields(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    if "rl_served_slot" not in post_seq:
+        return {}
+    fields = empty_page_record_arrays(*shape)
+    for key, values in fields.items():
+        values[:, : post_seq[key].shape[1]] = post_seq[key]
+    return fields
+
+
 def _extract_feature_columns(
     record_batch: pa.RecordBatch,
     feature_list: list[str],
@@ -518,6 +552,7 @@ def from_record_batch(
     reply_parent_mode: bool = False,
     ads_head_masking: bool = False,
     ads_pixel_head_masking: bool = False,
+    page_records: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
     batch_size = record_batch.num_rows
@@ -526,6 +561,23 @@ def from_record_batch(
     tweet_ids = _col(record_batch, "tweetIdSeq", batch_size, np.int64)
     author_ids = _col(record_batch, "authorIdSeq", batch_size, np.int64)
     impression_timestamps_ms = _col(record_batch, "impressedTimeMsSeq", batch_size, np.int64)
+    page_record = np.zeros(batch_size, dtype=np.bool_)
+    page_columns: dict[str, np.ndarray] = {}
+    if page_records:
+        page_record = (
+            record_batch.column("validPageRecord")
+            .fill_null(False)
+            .to_numpy(zero_copy_only=False)
+            .astype(np.bool_)
+        )
+        page_columns = {
+            key: _col(record_batch, column, batch_size, dtype, fill)
+            for key, (column, dtype, fill) in PAGE_RECORD_COLUMNS.items()
+        }
+        page_columns["rl_served_slot"] = np.where(
+            page_record[:, None], page_columns["rl_served_slot"], np.int32(-1)
+        )
+        page_columns["rl_impressed"] = impression_timestamps_ms > 0
     product_surface = _col(record_batch, "productSurfaceSeq", batch_size, np.int32)
     new_event_mask = _col(record_batch, "newEventMask", batch_size, np.bool_)
     padding_mask = _col(record_batch, "paddingMask", batch_size, np.bool_)
@@ -725,7 +777,15 @@ def from_record_batch(
         "timezoneSeq",
         np.zeros((batch_size, impression_timestamps_ms.shape[1]), dtype=np.int16),
     )
-    _local_hour, _local_dow = compute_local_time_features(impression_timestamps_ms, _timezone_enum)
+    feature_timestamps_ms = impression_timestamps_ms
+    if page_records:
+        served_ms = _col(record_batch, "servedTimeMsSeq", batch_size, np.int64)
+        base_rule = np.where(impression_timestamps_ms > 0, impression_timestamps_ms, served_ms)
+        page_rule = np.where(served_ms > 0, served_ms, base_rule)
+        feature_timestamps_ms = np.where(
+            page_record[:, None] & new_event_mask, page_rule, base_rule
+        )
+    _local_hour, _local_dow = compute_local_time_features(feature_timestamps_ms, _timezone_enum)
     hist_raw_categorical["localHourOfDaySeq"] = _local_hour
     hist_raw_categorical["localDayOfWeekSeq"] = _local_dow
     cand_raw_categorical["localHourOfDaySeq"] = _local_hour
@@ -791,6 +851,11 @@ def from_record_batch(
         cand_shape_2d, CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP, dtype=np.uint8
     )
     candidate_eligible_types = np.zeros(cand_shape_2d, dtype=np.uint64)
+    candidate_page = (
+        empty_page_record_arrays(batch_size, max_candidate_post_action_pairs)
+        if page_records
+        else {}
+    )
     candidate_value_labels: dict[str, np.ndarray] = {
         key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
     }
@@ -958,7 +1023,7 @@ def from_record_batch(
                 _src = semantic_ids_full_raw[*dslice]
                 _w = min(_src.shape[-1], candidate_post_sids.shape[-1])
                 candidate_post_sids[*cslice, :_w] = (_src[..., :_w] + 1).astype(np.uint16)
-            ts_values = impression_timestamps_ms[*dslice] / 1000
+            ts_values = feature_timestamps_ms[*dslice] / 1000
             ts_values = np.nan_to_num(ts_values, nan=0.0, posinf=0.0, neginf=0.0)
             ts_values = np.clip(ts_values, -2147483648, 2147483647)
             candidate_impr_ts[*cslice] = ts_values.astype(np.int32)
@@ -968,6 +1033,8 @@ def from_record_batch(
                 candidate_trained_actions_bits[*cslice] = conversion_keep_bits[*dslice]
             if conversion_eligible_types is not None:
                 candidate_eligible_types[*cslice] = conversion_eligible_types[*dslice]
+            for key, values in page_columns.items():
+                candidate_page[key][*cslice] = values[*dslice]
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
@@ -1184,6 +1251,8 @@ def from_record_batch(
             candidate_actions,
             candidate_eligible_types if conversion_eligible_types is not None else None,
         )
+    if page_records:
+        candidate_trained_mask &= candidate_page["rl_impressed"][:, :, None]
     candidate_seq = PostSeq(
         impr_ts=candidate_impr_ts,
         actions=candidate_actions,
@@ -1209,6 +1278,7 @@ def from_record_batch(
         int64_features=cand_int64_features,
         post_creation_ts_sec=candidate_post_creation_ts_sec,
         post_sids=candidate_post_sids,
+        **candidate_page,
     )
 
     candidate_seq_with_negatives = apply_negative_sampling(
@@ -1219,6 +1289,7 @@ def from_record_batch(
         max_candidate_post_action_pairs,
         sample_source=sample_source,
         ads_head_masking=ads_head_masking,
+        negatives_from_trained_rows=page_records,
         clear_negative_word_match=search_negative_clear_word_match,
         lexical_text=candidate_lexical_strings.get(LEXICAL_TEXT_COLUMN),
         lexical_query=candidate_lexical_strings.get(LEXICAL_QUERY_COLUMN),
@@ -1288,6 +1359,7 @@ def apply_negative_sampling(
     lexical_text: np.ndarray | None = None,
     lexical_query: np.ndarray | None = None,
     lexical_author: np.ndarray | None = None,
+    negatives_from_trained_rows: bool = False,
 ) -> PostSeq:
     if num_negatives_per_example == 0:
         return post_seq
@@ -1475,7 +1547,13 @@ def apply_negative_sampling(
     new_lexical_author = np.zeros((batch_size, total_candidate_slots), dtype=object)
 
     def _copy_neg_features(curr_user_idx, start_slot, end_slot, post_src, query_src):
-        new_post_hashes[curr_user_idx, start_slot:end_slot, :] = post_hashes[post_src]
+        src_hashes = post_hashes[post_src]
+        if negatives_from_trained_rows:
+            assert trained_candidate_mask is not None
+            src_hashes = np.where(
+                trained_candidate_mask[post_src].any(-1)[..., None], src_hashes, 0
+            )
+        new_post_hashes[curr_user_idx, start_slot:end_slot, :] = src_hashes
         new_auth_hashes[curr_user_idx, start_slot:end_slot, :] = auth_hashes[post_src]
         new_ip_hashes[curr_user_idx, start_slot:end_slot, :] = ip_hashes[post_src]
         new_impr_ts[curr_user_idx, start_slot:end_slot] = impr_ts[post_src]
@@ -1610,6 +1688,7 @@ def apply_negative_sampling(
         int64_features=new_int64_features,
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_post_sids,
+        **_extend_page_record_fields(post_seq, (batch_size, total_candidate_slots)),
     )
 
 
@@ -1868,6 +1947,7 @@ def apply_global_negative_sampling(
         int64_features=new_int64_features,
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_gn_post_sids,
+        **_extend_page_record_fields(post_seq, (batch_size, expanded_candidate_slots)),
     )
 
 

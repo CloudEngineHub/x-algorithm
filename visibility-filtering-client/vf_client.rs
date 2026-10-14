@@ -327,14 +327,19 @@ impl XaiVfClient {
                         ..request.clone()
                     });
                     *rpc.metadata_mut() = metadata.clone();
-                    let response = client.evaluate_tweets(rpc).await?.into_inner();
+                    rpc.set_timeout(self.timeout);
+                    let response = client
+                        .evaluate_tweets(rpc)
+                        .await
+                        .map_err(timeout_as_deadline_exceeded)?
+                        .into_inner();
                     decode_response(chunk.len(), response)
                 }
             })
             .collect();
         let results = tokio::time::timeout(self.timeout, futures::future::try_join_all(chunks))
             .await
-            .map_err(|_| tonic::Status::deadline_exceeded("VF evaluation deadline exceeded"))??;
+            .map_err(|_| tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED))??;
         Ok(results.into_iter().flatten().collect())
     }
 
@@ -369,6 +374,19 @@ impl XaiVfClient {
         };
         self
     }
+}
+
+const EVALUATION_DEADLINE_EXCEEDED: &str = "VF evaluation deadline exceeded";
+
+fn timeout_as_deadline_exceeded(status: tonic::Status) -> tonic::Status {
+    let mut source = std::error::Error::source(&status);
+    while let Some(err) = source {
+        if err.is::<tonic::TimeoutExpired>() {
+            return tonic::Status::deadline_exceeded(EVALUATION_DEADLINE_EXCEEDED);
+        }
+        source = err.source();
+    }
+    status
 }
 
 fn decode_response(
@@ -717,7 +735,7 @@ mod rust_vf_tests {
     }
 
     struct EvaluateStub {
-        twitter_contexts: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        requests: Arc<std::sync::Mutex<Vec<tonic::metadata::MetadataMap>>>,
         fail_chunks_smaller_than: usize,
         hang: bool,
     }
@@ -728,12 +746,10 @@ mod rust_vf_tests {
             &self,
             request: Request<vf_pb::EvaluateTweetsRequest>,
         ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-            self.twitter_contexts.lock().unwrap().push(
-                request
-                    .metadata()
-                    .get("twittercontext")
-                    .map(|v| v.to_str().unwrap().to_string()),
-            );
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.metadata().clone());
             if self.hang {
                 std::future::pending::<()>().await;
             }
@@ -819,10 +835,10 @@ mod rust_vf_tests {
 
     #[tokio::test]
     async fn evaluate_tweets_chunks_and_fails_whole_call_on_any_chunk_error_or_deadline() {
-        let twitter_contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let results = evaluate_against(
             EvaluateStub {
-                twitter_contexts: twitter_contexts.clone(),
+                requests: requests.clone(),
                 fail_chunks_smaller_than: 0,
                 hang: false,
             },
@@ -832,14 +848,18 @@ mod rust_vf_tests {
         .await
         .unwrap();
         assert_eq!(results.len(), XAI_VF_MAX_BATCH_SIZE + 1);
-        assert_eq!(
-            *twitter_contexts.lock().unwrap(),
-            vec![Some("ctx".to_string()); 2]
-        );
+        {
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            for metadata in captured.iter() {
+                assert_eq!(metadata.get("twittercontext").unwrap(), "ctx");
+                assert_eq!(metadata.get("grpc-timeout").unwrap(), "1000000u");
+            }
+        }
 
         assert!(evaluate_against(
             EvaluateStub {
-                twitter_contexts: twitter_contexts.clone(),
+                requests: requests.clone(),
                 fail_chunks_smaller_than: 2,
                 hang: false,
             },
@@ -850,7 +870,7 @@ mod rust_vf_tests {
         .is_err());
         let deadline = evaluate_against(
             EvaluateStub {
-                twitter_contexts,
+                requests,
                 fail_chunks_smaller_than: 0,
                 hang: true,
             },

@@ -13,6 +13,7 @@ pub(super) enum MissPolicy {
         Unresolves(Subject),
         FailsNode,
         ReadsNoEdge,
+        ReadsNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +423,7 @@ const fn miss_policies_fit_their_nodes() -> bool {
             }
             MissPolicy::FailsNode => true,
             MissPolicy::ReadsNoEdge => node.is_edge(),
+            MissPolicy::ReadsNotFound => !node.is_edge(),
         };
         if !fits {
             return false;

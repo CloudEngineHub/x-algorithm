@@ -317,13 +317,13 @@ impl HydrationPlan {
             }
             Source::ArticleMediaEntities => timed.keyed(
                 call,
-                |call| sources.article_media_entities(&call.keys),
+                |call| sources.article_media_entities(call.viewer_id, &call.keys),
                 identity,
                 Reply::ArticleMediaEntities,
             ),
             Source::ArticleCoverMedia => timed.keyed(
                 call,
-                |call| sources.article_cover_media(&call.keys),
+                |call| sources.article_cover_media(call.viewer_id, &call.keys),
                 identity,
                 Reply::ArticleCoverMedia,
             ),
@@ -1267,6 +1267,9 @@ mod tests {
                     "{viewer_id:?} {source:?}"
                 );
             }
+            for source in [Source::ArticleMediaEntities, Source::ArticleCoverMedia] {
+                assert_eq!(sources.article_viewers(source), [viewer_id], "{source:?}");
+            }
             assert_eq!(
                 hydrated
                     .candidates
@@ -1280,18 +1283,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn article_media_failures_are_per_column_and_per_article() {
+    async fn a_failed_article_column_reads_as_no_media_and_leaves_the_post_complete() {
         use crate::hydration::sources::found_user;
         use crate::models::{Evaluation, NsfwViewerDropReason};
-        use crate::rules::fixtures::nsfw_viewer_dropped;
+        use crate::rules::fixtures::{allow, nsfw_viewer_dropped};
         use xai_core_entities::entities::{ExtendedProfile, GizmoduckUser};
         let mut author = found_user(10);
         author.user.as_mut().unwrap().safety.nsfw_user = true;
-        for (source, node) in [
-            (Source::ArticleMediaEntities, Hydrator::ArticleMediaEntities),
-            (Source::ArticleCoverMedia, Hydrator::ArticleCoverMedia),
+        let dropped = nsfw_viewer_dropped(
+            NsfwViewerDropReason::IsUnderage,
+            "sensitive_viewer_underage/drop",
+        );
+        for (failing, verdict) in [
+            (&[Source::ArticleMediaEntities][..], dropped.clone()),
+            (&[Source::ArticleCoverMedia][..], dropped),
+            (
+                &[Source::ArticleMediaEntities, Source::ArticleCoverMedia][..],
+                allow(),
+            ),
         ] {
-            let world = InMemorySources::default()
+            let mut world = InMemorySources::default()
                 .tweet(1, 10)
                 .tweet(2, 10)
                 .tweet(3, 10)
@@ -1313,8 +1324,10 @@ mod tests {
                 .lifecycle(70, ArticleLifecycle::Published)
                 .lifecycle(80, ArticleLifecycle::Published)
                 .article_media_entities(70, true)
-                .article_cover_media(70, true)
-                .fail_key(source, 70);
+                .article_cover_media(70, true);
+            for &source in failing {
+                world = world.fail_key(source, 70);
+            }
             let scenario = executor(world, SafetyLevel::TimelineHomeHydration, Some(VIEWER));
             let hydrated = scenario
                 .hydrate(&[raw(1, None), raw(2, None), raw(3, None), raw(4, None)])
@@ -1322,24 +1335,19 @@ mod tests {
             assert_eq!(
                 hydrated.failed_nodes,
                 [
-                    Ok(Hydrators::of(node)),
-                    Ok(Hydrators::of(node)),
+                    Ok(Hydrators::empty()),
+                    Ok(Hydrators::empty()),
                     Ok(Hydrators::empty()),
                     Ok(Hydrators::empty())
-                ]
+                ],
+                "{failing:?}"
             );
             let evaluations = scenario
                 .evaluate(&[raw(1, None), raw(2, None)])
                 .await
                 .evaluations();
-            let expected = Evaluation::Partial {
-                verdict: nsfw_viewer_dropped(
-                    NsfwViewerDropReason::IsUnderage,
-                    "sensitive_viewer_underage/drop",
-                ),
-                fail_open_defaults: Hydrators::of(node),
-            };
-            assert_eq!(evaluations, [expected.clone(), expected], "{source:?}");
+            let expected = Evaluation::Complete { verdict };
+            assert_eq!(evaluations, [expected.clone(), expected], "{failing:?}");
         }
     }
 

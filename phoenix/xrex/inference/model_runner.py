@@ -68,6 +68,7 @@ from xrex.inference.int8_post_table import (
 from xrex.inference.metrics import MetricsPublisher, get_metrics_publisher
 from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
+from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.sharding_context import make_legacy_sharding_context
@@ -3345,8 +3346,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                         batch_id=last_batch_id,
                     ):
                         as_np_array_t = Timer()
-                        assert len(last_out) in (3, 4), (
-                            f"model should return (log_probs, cont_preds, has_nan) or "
+                        assert len(last_out) in (3, 4, 6), (
+                            f"model should return (log_probs, cont_preds, [picked_idx, "
+                            f"picked_prob, picked_score,] has_nan) or "
                             f"(top_k_indices, top_k_scores, generated, has_nan), got {len(last_out)}"
                         )
                         *model_out_jax, has_nan_jax = last_out
@@ -3979,6 +3981,11 @@ class RankingModelRunner(
     forward_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
         default_factory=dict, init=False
     )
+    serve_page_decoder: bool = False
+    forward_no_decoder_jit_by_bs: dict[int, JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
+    _zero_page_decode_by_bs: dict[int, PageDecodeInputs] = field(default_factory=dict, init=False)
 
     def _rng_and_init_data(
         self,
@@ -4159,16 +4166,20 @@ class RankingModelRunner(
             "forward_jit/ranking",
             batch_id=batch_id,
         ):
+            if self.serve_page_decoder:
+                return self.forward_no_decoder_jit_by_bs[bs](
+                    params, rng, batch, merged_embeddings, self.zero_page_decode_inputs(bs)
+                )
             return forward_jit(params, rng, batch, merged_embeddings)
 
     def reply_request(
         self,
         request: xai_recsys_engine.PredictRequestBatch,
-        output_array: tuple[np.ndarray, np.ndarray],
+        output_array: tuple[np.ndarray, ...],
         orig_batch_size: int,
         bucket_size: int,
     ) -> None:
-        log_probs, candidate_continuous_predictions = output_array
+        log_probs, candidate_continuous_predictions = output_array[:2]
         if self.using_seqpack:
             log_probs = log_probs.reshape(bucket_size, self.candidate_seq_len, log_probs.shape[-1])
             candidate_continuous_predictions = candidate_continuous_predictions.reshape(
@@ -4268,8 +4279,12 @@ class RankingModelRunner(
 
         self.create_embedding_init_data()
 
+        assert not (self.serve_page_decoder and self.compact_candidate_slots), (
+            "serve_page_decoder does not support compact candidate slots"
+        )
         self.forward_jit_by_bs = {}
         self.forward_jit_by_bs_len = {}
+        self.forward_no_decoder_jit_by_bs = {}
         for bs in self.sorted_buckets:
             lens: tuple[int | None, ...] = (
                 self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
@@ -4280,6 +4295,10 @@ class RankingModelRunner(
                 )
                 self.forward_jit_by_bs_len[(bs, n)] = jit_fn
             self.forward_jit_by_bs[bs] = jit_fn
+            if self.serve_page_decoder:
+                self.forward_no_decoder_jit_by_bs[bs] = self._build_and_register_forward_jit(
+                    bs, compiler_options, run_decoder=False
+                )
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
         if self.compact_candidate_slots:
             logger.info(
@@ -4292,6 +4311,7 @@ class RankingModelRunner(
         bs: int,
         compiler_options: dict[str, Any] | None,
         packed_seq_len: int | None = None,
+        run_decoder: bool = True,
     ) -> JittedOrCompiled:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
@@ -4389,6 +4409,7 @@ class RankingModelRunner(
         def forward_fn(
             batch: RecsysFeaturesBatch,
             merged_embeddings: jax.Array,
+            page_decode: PageDecodeInputs | None = None,
         ):
             assert isinstance(self.model_config, RecsysAggregatedModelConfig)
             sl = embedding_slices
@@ -4414,16 +4435,17 @@ class RankingModelRunner(
                     ),
                 )
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
-            logits, candidate_continuous_predictions = model.forward(batch, recsys_embeddings)
-            log_probs = jax.nn.log_sigmoid(logits).astype(jnp.float32)
-            cont_preds = candidate_continuous_predictions.astype(jnp.float32)
+            outputs = model.forward(batch, recsys_embeddings, page_decode, run_decoder=run_decoder)
+            log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.float32)
+            cont_preds = outputs[1].astype(jnp.float32)
             has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
-            return log_probs, cont_preds, has_nan
+            return log_probs, cont_preds, *outputs[2:], has_nan
 
         self.forward_fn = forward_fn
         nan_sharding = jax.sharding.NamedSharding(
             self.data_sharding.mesh, P(self.data_sharding.spec[0])
         )
+        num_decode_outputs = 3 if self.serve_page_decoder else 0
 
         forward_jit = JittedOrCompiled(
             jax.jit(
@@ -4433,11 +4455,18 @@ class RankingModelRunner(
                     None,
                     self.data_sharding,
                     self.data_sharding,
+                    *((None,) if self.serve_page_decoder else ()),
                 ),
-                out_shardings=(self.data_sharding, self.data_sharding, nan_sharding),
+                out_shardings=(
+                    self.data_sharding,
+                    self.data_sharding,
+                    *((nan_sharding,) * num_decode_outputs),
+                    nan_sharding,
+                ),
             ),
             name=f"forward_fn_bs{bs}"
-            + (f"_len{packed_seq_len}" if packed_seq_len is not None else ""),
+            + (f"_len{packed_seq_len}" if packed_seq_len is not None else "")
+            + ("" if run_decoder else "_no_decoder"),
         )
 
         rng, init_data = self._rng_and_init_data(bs=bs, packed_seq_len=packed_seq_len)
@@ -4463,9 +4492,17 @@ class RankingModelRunner(
             rng,
             init_data,
             merged_embeddings_init,
+            *((self.zero_page_decode_inputs(bs),) if self.serve_page_decoder else ()),
             compiler_options=compiler_options,
         )
         return forward_jit
+
+    def zero_page_decode_inputs(self, bs: int) -> PageDecodeInputs:
+        if bs not in self._zero_page_decode_by_bs:
+            self._zero_page_decode_by_bs[bs] = PageDecodeInputs.no_decode(
+                bs, self.candidate_seq_len
+            )
+        return self._zero_page_decode_by_bs[bs]
 
 
 @final

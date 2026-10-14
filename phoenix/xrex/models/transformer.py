@@ -632,6 +632,7 @@ class Transformer(hk.Module):
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
         subset_index: jax.Array | None = None,
+        act_l2_mask: jax.Array | None = None,
     ) -> TransformerModelOutput:
         config = self.config
 
@@ -777,7 +778,11 @@ class Transformer(hk.Module):
 
         summarize(
             f"{self.summarizer_prefix}act-l2-loss",
-            jnp.mean(jnp.mean(h_final**2, axis=-1) * padding_mask) * regular_layout_token_scale,
+            jnp.mean(
+                jnp.mean(h_final**2, axis=-1)
+                * (padding_mask if act_l2_mask is None else act_l2_mask)
+            )
+            * regular_layout_token_scale,
         )
 
         return TransformerModelOutput(output=h_final)

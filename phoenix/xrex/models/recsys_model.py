@@ -66,6 +66,16 @@ from xrex.models.loss_recsys import (
 )
 from xrex.models.model_utils import Parameter
 from xrex.models.normalization import rms_norm_fn
+from xrex.models.page_rl import (
+    REALIZED_NEGATIVE_ACTIONS,
+    REALIZED_POSITIVE_ACTIONS,
+    PageDecodeInputs,
+    PageRlConfig,
+    page_decode_noop_outputs,
+    page_rl_head_features,
+    page_rl_loss_and_stats,
+    run_page_decode,
+)
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import (
     HashKeys,
@@ -917,6 +927,8 @@ class RecsysAggregatedModelConfig(Config):
     safety_filter_apply_to_candidates: bool = True
     safety_filter_apply_to_history: bool = False
 
+    page_rl: PageRlConfig = PageRlConfig()
+
     @property
     def multimodal_embedding_dim(self) -> int:
         if self.multimodal_embedding_type is None:
@@ -1684,6 +1696,24 @@ def attention_segment_ids(
         jnp.where(valid, jnp.where(is_candidate, -1, 1), 0),
         padding_mask.shape,
     ).astype(jnp.int32)
+
+
+def untrained_candidates_excluded(
+    padding_mask: jax.Array,
+    trained_heads: jax.Array | None,
+    *,
+    candidate_positions: jax.Array | None = None,
+    candidate_start_offset: int = 0,
+) -> jax.Array | None:
+    if trained_heads is None:
+        return None
+    untrained = (~trained_heads.any(-1)).astype(jnp.int8)
+    if candidate_positions is None:
+        drop = jnp.pad(untrained, ((0, 0), (candidate_start_offset, 0)))
+    else:
+        rows = jnp.arange(padding_mask.shape[0])[:, None]
+        drop = jnp.zeros(padding_mask.shape, jnp.int8).at[rows, candidate_positions].max(untrained)
+    return jnp.where(drop > 0, jnp.zeros_like(padding_mask), padding_mask)
 
 
 def build_metric_masks(
@@ -3395,7 +3425,9 @@ class RecsysAggregatedModel(hk.Module):
         candidate_start_offset: int | None = None,
         product_surface: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
-    ) -> tuple[jax.Array, jax.Array, dict[int, jax.Array]]:
+        return_candidate_embeddings: bool = False,
+        act_l2_mask: jax.Array | None = None,
+    ) -> tuple[jax.Array, ...]:
         _debug_dir = self.config.model_config.debug_tensor_dump_output_folder
         dump_to_file(_debug_dir, "input_embeddings", input_embeddings)
 
@@ -3418,6 +3450,7 @@ class RecsysAggregatedModel(hk.Module):
             padding_mask=padding_mask,
             positions=positions,
             seqpack_layout=seqpack_layout,
+            act_l2_mask=act_l2_mask,
         )
 
         out_embeddings = model_out.output
@@ -3444,6 +3477,15 @@ class RecsysAggregatedModel(hk.Module):
 
         assert candidate_start_offset is None or seqpack_layout is None
 
+        if return_candidate_embeddings:
+            if seqpack_layout is not None:
+                user_positions = cast_jax(packed_prefix_positions(seqpack_layout)).astype(jnp.int32)
+                user_embeddings = jnp.take_along_axis(
+                    out_embeddings, user_positions[:, :, None], axis=1
+                )
+            else:
+                user_embeddings = out_embeddings[:, 0, :]
+
         if seqpack_layout is not None:
             out_embeddings = jnp.take_along_axis(
                 out_embeddings, cast_jax(seqpack_layout.candidate_positions)[:, :, None], axis=1
@@ -3464,7 +3506,43 @@ class RecsysAggregatedModel(hk.Module):
             out_embeddings, product_surface
         )
 
-        return logits, continuous_predictions, head_logits_by_index
+        if not return_candidate_embeddings:
+            return logits, continuous_predictions, head_logits_by_index
+        if seqpack_layout is not None:
+            input_candidates = jnp.take_along_axis(
+                input_embeddings, cast_jax(seqpack_layout.candidate_positions)[:, :, None], axis=1
+            )
+        elif candidate_start_offset is not None:
+            input_candidates = input_embeddings[:, candidate_start_offset:, :]
+        else:
+            input_candidates = input_embeddings
+        dwell_norm_scale = max(
+            (
+                lc.norm_config.norm_scale
+                for lc in config.continuous_action_losses
+                if lc.action_index == recsys_pb2.ContinuousActionName.DWELL_TIME
+            ),
+            default=300.0,
+        )
+        candidate_embeddings = jnp.concatenate(
+            [
+                out_embeddings,
+                rms_norm_fn(input_candidates, name="page_rl_input_norm", create_scale=False).astype(
+                    out_embeddings.dtype
+                ),
+                page_rl_head_features(logits, continuous_predictions, dwell_norm_scale).astype(
+                    out_embeddings.dtype
+                ),
+            ],
+            axis=-1,
+        )
+        return (
+            logits,
+            continuous_predictions,
+            head_logits_by_index,
+            candidate_embeddings,
+            user_embeddings,
+        )
 
     @hk.transparent
     def loss_inputs_and_normalizers(
@@ -3574,13 +3652,13 @@ class RecsysAggregatedModel(hk.Module):
                 )
             else:
                 target_padding_mask = cast_jax(batch["candidate_seq"]["post_hashes"])[:, :, 0] != 0
-                trained_candidate_mask = batch["candidate_seq"].get("trained_candidate_mask")
-                if trained_candidate_mask is not None:
-                    trained_heads = cast_jax(trained_candidate_mask)
-                    target_padding_mask = target_padding_mask & trained_heads.any(-1)
                 head_eligible_mask = batch["candidate_seq"].get("head_eligible_mask")
                 if self.config.ads_pixel_head_masking and head_eligible_mask is not None:
                     eligible_heads = cast_jax(head_eligible_mask)
+            trained_candidate_mask = batch["candidate_seq"].get("trained_candidate_mask")
+            if trained_candidate_mask is not None:
+                trained_heads = cast_jax(trained_candidate_mask)
+                target_padding_mask = target_padding_mask & trained_heads.any(-1)
 
             negative_sample_mask = jnp.broadcast_to(negative_sample_mask, target_padding_mask.shape)
 
@@ -3767,8 +3845,17 @@ class RecsysAggregatedModel(hk.Module):
                 axis=1,
             )
 
+            act_l2_mask = (
+                untrained_candidates_excluded(
+                    padding_mask,
+                    c.trained_heads,
+                    candidate_positions=cast_jax(layout.candidate_positions),
+                )
+                if self.config.page_rl.enabled
+                else None
+            )
             with Summary() as summarizer:
-                candidate_logits, candidate_continuous_preds, head_logits_by_index = self(
+                outputs = self(
                     input_embeddings,
                     padding_mask,
                     is_training=is_training,
@@ -3776,6 +3863,8 @@ class RecsysAggregatedModel(hk.Module):
                     segment_ids=segment_ids,
                     seqpack_layout=layout,
                     product_surface=c.product_surface,
+                    return_candidate_embeddings=self.config.page_rl.enabled,
+                    act_l2_mask=act_l2_mask,
                 )
         else:
             assert candidate_start_offset is not None
@@ -3868,8 +3957,15 @@ class RecsysAggregatedModel(hk.Module):
             )
             assert using_ranker_attn
 
+            act_l2_mask = (
+                untrained_candidates_excluded(
+                    padding_mask, c.trained_heads, candidate_start_offset=candidate_start_offset
+                )
+                if self.config.page_rl.enabled
+                else None
+            )
             with Summary() as summarizer:
-                candidate_logits, candidate_continuous_preds, head_logits_by_index = self(
+                outputs = self(
                     input_embeddings,
                     padding_mask,
                     is_training=is_training,
@@ -3877,6 +3973,8 @@ class RecsysAggregatedModel(hk.Module):
                     segment_ids=segment_ids.astype(jnp.int32),
                     candidate_start_offset=candidate_start_offset,
                     product_surface=c.product_surface,
+                    return_candidate_embeddings=self.config.page_rl.enabled,
+                    act_l2_mask=act_l2_mask,
                 )
 
             history_padding = padding_mask[
@@ -3889,6 +3987,7 @@ class RecsysAggregatedModel(hk.Module):
                 :, None
             ]
 
+        candidate_logits, candidate_continuous_preds, head_logits_by_index = outputs[:3]
         targets, negative_sample_mask, trained_heads, eligible_heads = (
             c.targets,
             c.negative_sample_mask,
@@ -4113,6 +4212,17 @@ class RecsysAggregatedModel(hk.Module):
             )
         regularization_loss += continuous_action_loss_total
 
+        if self.config.page_rl.enabled:
+            page_loss, page_stats = self.page_rl_loss(batch, c, *outputs[3:])
+            if loss_normalizers is not None:
+                page_loss = page_loss / loss_normalizers["num_partials"]
+                page_stats = {
+                    k: v / loss_normalizers["num_partials"] for k, v in page_stats.items()
+                }
+            regularization_loss += page_loss
+            stats.update(page_stats)
+            stats["page_rl/total_loss"] = page_loss
+
         embedding_norms: dict[str, tuple[jax.Array, jax.Array]] = {}
         if self.config.multimodal_embedding_type is not None and mm_emb is not None:
             if self.config.use_seqpack:
@@ -4169,6 +4279,64 @@ class RecsysAggregatedModel(hk.Module):
             "embedding_norms": embedding_norms,
         }
         return regularization_loss, (stats, metric_inputs)
+
+    @hk.transparent
+    def page_rl_loss(
+        self,
+        batch: RecsysFeaturesBatch,
+        c: CandidateInputs,
+        candidate_embeddings: jax.Array,
+        user_embeddings: jax.Array,
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        cand = batch["candidate_seq"]
+        num_candidates = c.targets.shape[1]
+        if self.config.use_seqpack:
+            per_user = num_candidates // batch["user_hashes"].shape[1]
+            layout = batch.get("packing_layout")
+            assert layout is not None
+            valid = jnp.take_along_axis(
+                cast_jax(layout.padding_mask), cast_jax(layout.candidate_positions), axis=1
+            )
+        else:
+            valid = cast_jax(cand["post_hashes"])[:, :, 0] != 0
+
+        def rows(x: Any, fill: float | int = 0) -> jax.Array:
+            x = cast_jax(x)
+            if self.config.use_seqpack:
+                return x.reshape(-1, per_user, *x.shape[2:])
+            pad = ((0, 0), (0, num_candidates - x.shape[1])) + ((0, 0),) * (x.ndim - 2)
+            return jnp.pad(x, pad, constant_values=fill)
+
+        def label(name: str) -> jax.Array:
+            return c.targets[..., action_type_map[name]]
+
+        def labels(names: tuple[str, ...]) -> jax.Array:
+            return c.targets[..., [action_type_map[n] for n in names]]
+
+        assert c.continuous_actions is not None
+        return page_rl_loss_and_stats(
+            config=self.config.page_rl,
+            candidate_embeddings=rows(candidate_embeddings),
+            user_embeddings=user_embeddings.reshape(-1, user_embeddings.shape[-1]),
+            rl_served_slot=rows(cand["rl_served_slot"], -1),
+            rl_weighted_score=rows(cand["rl_weighted_score"]),
+            rl_final_score=rows(cand["rl_final_score"]),
+            rl_rerank_prob=rows(cand["rl_rerank_prob"]),
+            rl_decode_prob=rows(cand["rl_decode_prob"]),
+            rl_impressed=rows(cand["rl_impressed"]).astype(jnp.bool_),
+            dwell_s=rows(
+                c.continuous_actions[..., recsys_pb2.ContinuousActionName.DWELL_TIME].astype(
+                    jnp.float32
+                )
+            ),
+            not_dwelled=rows(label("ClientTweetRecapNotDwelled").astype(jnp.bool_)),
+            vqv_observed=rows(label("ClientTweetVideoQualityView").astype(jnp.bool_)),
+            engagement_count=rows(labels(REALIZED_POSITIVE_ACTIONS).astype(jnp.float32).sum(-1)),
+            negative_any=rows(labels(REALIZED_NEGATIVE_ACTIONS).any(-1)),
+            valid_mask=rows(valid, False),
+            post_sids=rows(cand["post_sids"]),
+            auth_hashes=rows(cast_jax(cand["auth_hashes"])[..., 0].astype(jnp.int32)),
+        )
 
     @hk.transparent
     def metrics(
@@ -4370,7 +4538,10 @@ class RecsysAggregatedModel(hk.Module):
         self,
         batch: RecsysFeaturesBatch,
         recsys_embeddings: RecsysEmbeddings,
-    ) -> tuple[jax.Array, jax.Array]:
+        page_decode: PageDecodeInputs | None = None,
+        run_decoder: bool = True,
+    ) -> tuple[jax.Array, ...]:
+        decode = page_decode is not None and run_decoder
         targets = batch["candidate_seq"]["actions"]
         product_surface = batch["candidate_seq"]["product_surface"]
         if targets is not None:
@@ -4398,7 +4569,7 @@ class RecsysAggregatedModel(hk.Module):
             segment_ids = cast_jax(layout.segment_ids)
             positions = cast_jax(layout.positions)
 
-            candidate_logits, candidate_continuous_predictions, _head_logits = self(
+            outputs = self(
                 input_embeddings,
                 padding_mask,
                 is_training=False,
@@ -4406,6 +4577,7 @@ class RecsysAggregatedModel(hk.Module):
                 segment_ids=segment_ids,
                 seqpack_layout=layout,
                 product_surface=product_surface,
+                return_candidate_embeddings=decode,
             )
         else:
             assert candidate_start_offset is not None
@@ -4450,7 +4622,7 @@ class RecsysAggregatedModel(hk.Module):
             )
             assert using_ranker_attn
 
-            candidate_logits, candidate_continuous_predictions, _head_logits = self(
+            outputs = self(
                 input_embeddings,
                 padding_mask,
                 is_training=False,
@@ -4458,12 +4630,42 @@ class RecsysAggregatedModel(hk.Module):
                 segment_ids=segment_ids.astype(jnp.int32),
                 candidate_start_offset=candidate_start_offset,
                 product_surface=product_surface,
+                return_candidate_embeddings=decode,
             )
 
+        candidate_logits = outputs[0]
         candidate_continuous_predictions = _rescale_sigmoid_heads_for_inference(
-            candidate_continuous_predictions,
+            outputs[1],
             self.config.continuous_action_losses,
             product_surface,
         )
 
-        return candidate_logits, candidate_continuous_predictions
+        if page_decode is None:
+            return candidate_logits, candidate_continuous_predictions
+        if not decode:
+            noop = page_decode_noop_outputs(self.config.page_rl, page_decode)
+            return candidate_logits, candidate_continuous_predictions, *noop
+        candidate_embeddings, user_embeddings = outputs[3:]
+        per_user = [
+            candidate_logits,
+            candidate_continuous_predictions,
+            candidate_embeddings,
+            cast_jax(batch["candidate_seq"]["auth_hashes"])[..., 0],
+            cast_jax(batch["candidate_seq"]["post_sids"]),
+        ]
+        if self.config.use_seqpack:
+            per_user_c = candidate_embeddings.shape[1] // user_embeddings.shape[1]
+            per_user = [x.reshape(-1, per_user_c, *x.shape[2:]) for x in per_user]
+            user_embeddings = user_embeddings.reshape(-1, user_embeddings.shape[-1])
+        logits_u, cont_u, emb_u, auth_u, sids_u = per_user
+        decoded = run_page_decode(
+            self.config.page_rl,
+            logits_u,
+            cont_u,
+            emb_u,
+            user_embeddings,
+            page_decode,
+            auth_u,
+            sids_u,
+        )
+        return candidate_logits, candidate_continuous_predictions, *decoded

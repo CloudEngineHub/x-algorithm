@@ -336,10 +336,6 @@ def pack_batch(
             raise ValueError("min_packed_history_len must be an integer >= 1")
         if dist is None:
             raise ValueError("min_packed_history_len requires a training distribution")
-    _tcm = batch["candidate_seq"].get("trained_candidate_mask")
-    assert _tcm is None or bool(np.asarray(_tcm).all()), (
-        "trained_candidate_mask with masked candidates is not supported with sequence packing"
-    )
     _hem = batch["candidate_seq"].get("head_eligible_mask")
     assert _hem is None or bool(np.asarray(_hem).all()), (
         "head_eligible_mask with masked heads is not supported with sequence packing"

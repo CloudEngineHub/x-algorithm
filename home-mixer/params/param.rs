@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-12T16:00:33Z
+// mirrored from config feature-switch defaults; last sync 2026-10-13T16:00:30Z
 use xai_feature_switches::param;
 
 param!(
@@ -317,7 +317,7 @@ param!(
 // navigating to a post (i.e., coordinating via groupchat) has no
 // ranking impact. And users cannot manufacture a post to show up in
 // their Timeline in any consistently reproducible way.
-param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.6);
+param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.66);
 param!(ReplyWeight, f64, "rust_home_mixer_reply_weight", 5.0);
 param!(
     BidirectionalFollowReplyWeightBoost,
@@ -415,7 +415,7 @@ param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",
-    -47.52
+    -52.272
 );
 param!(
     BlockAuthorWeight,

@@ -32,7 +32,7 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
     let params = resolve_params(&req, ctx.config.as_deref());
     let compute_value_model =
         req.compute_value_model || params.as_ref().is_some_and(|p| p.get(ComputeValueModel));
-    let dpp_enabled = params.as_ref().is_none_or(|p| p.get(DppEnabled));
+    let dpp_enabled = dpp_enabled(&req, params.as_ref());
 
     if let (Some(dpp), true) = (ctx.dpp.clone(), dpp_enabled) {
         if req.value_model_id != "dpp" {
@@ -80,6 +80,10 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
         .map(|s| s.unwrap_or(0.0))
         .collect();
     Ok(ranked_candidates(&req, served, value_model.as_ref()))
+}
+
+fn dpp_enabled(req: &RankRequest, params: Option<&Params>) -> bool {
+    params.is_none_or(|p| p.get(DppEnabled) && (!req.topic_request || p.get(TopicDppEnabled)))
 }
 
 fn apply_dpp_overrides(config: &mut DppConfig, overrides: &DppParams) {
@@ -355,6 +359,15 @@ rust_home_mixer_author_exploration:
             assert_eq!(boosted[1].score, base[1].score);
             assert_eq!(boosted[0].weighted_score, base[0].weighted_score);
         }
+    }
+
+    #[test]
+    fn dpp_skipped_for_topic_requests_by_default() {
+        let mut req = request(vec![], "US");
+        let params = resolve_params(&req, Some(&config()));
+        assert!(dpp_enabled(&req, params.as_ref()));
+        req.topic_request = true;
+        assert!(!dpp_enabled(&req, params.as_ref()));
     }
 
     #[test]

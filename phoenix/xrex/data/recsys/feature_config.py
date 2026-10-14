@@ -173,6 +173,13 @@ OPTIONAL_COLUMNS: list[str] = [
     "lexicalTextSeq",
     "lexicalQuerySeq",
     "lexicalAuthorSeq",
+    "validPageRecord",
+    "servedSlotSeq",
+    "weightedScoreSeq",
+    "finalScoreSeq",
+    "rewardRerankSlotProbSeq",
+    "pageDecodeSlotProbSeq",
+    "servedTimeMsSeq",
 ]
 
 

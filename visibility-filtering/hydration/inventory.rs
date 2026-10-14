@@ -101,11 +101,11 @@ sources! {
         batch: Batch::Keys,
     }
     ArticleMediaEntities {
-        miss: MissPolicy::FailsNode,
+        miss: MissPolicy::ReadsNotFound,
         batch: Batch::Keys,
     }
     ArticleCoverMedia {
-        miss: MissPolicy::FailsNode,
+        miss: MissPolicy::ReadsNotFound,
         batch: Batch::Keys,
     }
     TrustedFriends {

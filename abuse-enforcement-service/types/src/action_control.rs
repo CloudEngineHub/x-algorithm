@@ -1,6 +1,76 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 1;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 2;
+pub const BAND_RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    Low,
+    Mid,
+    High,
+}
+
+impl ConfidenceLevel {
+    pub const ALL: [ConfidenceLevel; 3] = [
+        ConfidenceLevel::Low,
+        ConfidenceLevel::Mid,
+        ConfidenceLevel::High,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfidenceLevel::Low => "low",
+            ConfidenceLevel::Mid => "mid",
+            ConfidenceLevel::High => "high",
+        }
+    }
+
+            pub fn floor(self) -> f64 {
+        match self {
+            ConfidenceLevel::Low => 0.70,
+            ConfidenceLevel::Mid => 0.85,
+            ConfidenceLevel::High => 0.95,
+        }
+    }
+
+        pub fn supported_by(lower_bound: f64) -> Option<ConfidenceLevel> {
+        Self::ALL
+            .into_iter()
+            .rev()
+            .find(|l| lower_bound >= l.floor())
+    }
+
+    pub fn parse(s: &str) -> Option<ConfidenceLevel> {
+        Self::ALL.into_iter().find(|l| l.as_str() == s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ConfidenceEvidence {
+            pub precision_lower_bound: f64,
+    pub reads: u32,
+    pub humans: u32,
+        pub read_at_ms: i64,
+        #[serde(default)]
+    pub link: String,
+}
+
+impl Eq for ConfidenceEvidence {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceOverride {
+    pub by: String,
+    pub reason: String,
+    pub expires_at_ms: i64,
+}
+
+pub const EVIDENCE_OVERRIDE_MAX_MS: i64 = 7 * 86_400_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -9,6 +79,7 @@ pub enum ControlMode {
         Rules,
             Recording,
         Live,
+                    ConfidenceDefaults,
 }
 
 impl ControlMode {
@@ -17,6 +88,7 @@ impl ControlMode {
             ControlMode::Rules => "rules",
             ControlMode::Recording => "recording",
             ControlMode::Live => "live",
+            ControlMode::ConfidenceDefaults => "confidence_defaults",
         }
     }
 }
@@ -109,6 +181,26 @@ impl PageAction {
         }
     }
 
+            pub fn confidence_defaults(entity: ControlEntity, level: ConfidenceLevel) -> Vec<PageAction> {
+        match (entity, level) {
+            (ControlEntity::User, ConfidenceLevel::Low) => vec![PageAction::LivenessCheck {}],
+            (ControlEntity::User, ConfidenceLevel::Mid) => vec![
+                PageAction::LivenessCheck {},
+                PageAction::SpamHighRecall {
+                    lifetime: Lifetime::Days7,
+                },
+            ],
+            (ControlEntity::User, ConfidenceLevel::High) => vec![PageAction::Suspend {}],
+            (ControlEntity::Post, ConfidenceLevel::Low) => vec![],
+            (ControlEntity::Post, ConfidenceLevel::Mid) => vec![PageAction::PostSpamHighRecall {
+                lifetime: Lifetime::Days30,
+            }],
+            (ControlEntity::Post, ConfidenceLevel::High) => vec![PageAction::PostSpamHighRecall {
+                lifetime: Lifetime::Permanent,
+            }],
+        }
+    }
+
             pub fn kind(self) -> &'static str {
         match self {
             PageAction::Suspend {} => "suspend",
@@ -144,6 +236,12 @@ pub struct ActionControlRecord {
         pub version: u64,
         #[serde(default)]
     pub write_nonce: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<ConfidenceLevel>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<ConfidenceEvidence>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_override: Option<Box<EvidenceOverride>>,
 }
 
 impl ActionControlRecord {
@@ -161,7 +259,25 @@ impl ActionControlRecord {
         "updated_at_ms",
         "version",
         "write_nonce",
+        "confidence",
+        "evidence",
+        "evidence_override",
     ];
+
+            pub fn uses_confidence(&self) -> bool {
+        self.confidence.is_some()
+            || self.evidence.is_some()
+            || self.evidence_override.is_some()
+            || self.mode == ControlMode::ConfidenceDefaults
+    }
+
+            pub fn schema_version(&self) -> u32 {
+        if self.uses_confidence() {
+            ACTION_CONTROL_RECORD_VERSION
+        } else {
+            BAND_RECORD_VERSION
+        }
+    }
 
             pub fn parse_strict(bytes: &[u8]) -> Result<Self, String> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
@@ -173,12 +289,18 @@ impl ActionControlRecord {
         serde_json::from_value(value).map_err(|e| e.to_string())
     }
 
-        pub fn scope(&self) -> &'static str {
-        match (self.classifier.is_some(), self.band.is_some()) {
-            (false, false) => "head",
-            (true, false) => "classifier",
-            (false, true) => "band",
-            (true, true) => "classifier+band",
+            pub fn scope(&self) -> &'static str {
+        match (
+            self.classifier.is_some(),
+            self.band.is_some(),
+            self.confidence.is_some(),
+        ) {
+            (false, _, true) => "confidence",
+            (true, _, true) => "classifier+confidence",
+            (false, false, false) => "head",
+            (true, false, false) => "classifier",
+            (false, true, false) => "band",
+            (true, true, false) => "classifier+band",
         }
     }
 }
@@ -216,6 +338,12 @@ pub struct ActionControlPutRequest {
     pub confirm: Option<String>,
         #[serde(default)]
     pub updated_by: Option<String>,
+        #[serde(default)]
+    pub confidence: Option<ConfidenceLevel>,
+        #[serde(default)]
+    pub evidence: Option<ConfidenceEvidence>,
+        #[serde(default)]
+    pub evidence_override: Option<EvidenceOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -306,6 +434,34 @@ pub struct ActionControlListResponse {
     pub safety_checks: SafetyChecksByEntity,
     pub allowed_actions: AllowedActions,
     pub cse: CseLists,
+    #[serde(default)]
+    pub confidence: Option<ConfidenceView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ConfidenceLevelView {
+    pub level: ConfidenceLevel,
+        pub floor: f64,
+    pub user_defaults: Vec<PageAction>,
+    pub post_defaults: Vec<PageAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ConfidenceView {
+    pub levels: Vec<ConfidenceLevelView>,
+        pub evidence_max_age_ms: i64,
+        pub label_map: Vec<LabelMapEntry>,
+            #[serde(default)]
+    pub config_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LabelMapEntry {
+    pub pattern: String,
+    pub level: ConfidenceLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -416,9 +572,11 @@ mod tests {
     #[test]
     fn fields_list_matches_the_record_and_the_view_round_trips() {
         let r = ActionControlRecord::parse_strict(
-            br#"{"v":1,"entity_type":"post","head":"H","classifier":"c","band":"b","mode":"live",
+            br#"{"v":2,"entity_type":"post","head":"H","classifier":"c","band":"b","mode":"live",
                 "actions":[{"kind":"suspend_author"}],"reason":"r","updated_by":"u","key_id":"k",
-                "updated_at_ms":5,"version":2,"write_nonce":9}"#,
+                "updated_at_ms":5,"version":2,"write_nonce":9,"confidence":"high",
+                "evidence":{"precision_lower_bound":0.95,"reads":59,"humans":0,"read_at_ms":4,"link":"l"},
+                "evidence_override":{"by":"operator@example.com","reason":"seeded","expires_at_ms":6}}"#,
         )
         .unwrap();
         let keys: Vec<String> = serde_json::to_value(&r)
@@ -470,5 +628,84 @@ mod tests {
         assert_eq!(r.scope(), "classifier+band");
         r.classifier = None;
         assert_eq!(r.scope(), "band");
+        r.band = None;
+        r.confidence = Some(ConfidenceLevel::Mid);
+        assert_eq!(r.scope(), "confidence");
+        r.classifier = Some("c".into());
+        assert_eq!(r.scope(), "classifier+confidence");
+    }
+
+    #[test]
+    fn a_band_record_keeps_the_old_schema_version_and_bytes() {
+        let json = r#"{"v":1,"entity_type":"user","head":"H","mode":"live","actions":[{"kind":"suspend"}],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0}"#;
+        let r: ActionControlRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(r.schema_version(), BAND_RECORD_VERSION);
+        let back = serde_json::to_string(&r).unwrap();
+        assert!(!back.contains("confidence"), "{back}");
+        assert!(!back.contains("evidence"), "{back}");
+        let mut l = r.clone();
+        l.confidence = Some(ConfidenceLevel::High);
+        assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+        let mut d = r;
+        d.mode = ControlMode::ConfidenceDefaults;
+        assert_eq!(d.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+    }
+
+    #[test]
+    fn floors_and_the_level_evidence_supports() {
+        assert_eq!(
+            ConfidenceLevel::supported_by(0.951),
+            Some(ConfidenceLevel::High)
+        );
+        assert_eq!(
+            ConfidenceLevel::supported_by(0.95),
+            Some(ConfidenceLevel::High)
+        );
+        assert_eq!(
+            ConfidenceLevel::supported_by(0.9499),
+            Some(ConfidenceLevel::Mid)
+        );
+        assert_eq!(
+            ConfidenceLevel::supported_by(0.85),
+            Some(ConfidenceLevel::Mid)
+        );
+        assert_eq!(
+            ConfidenceLevel::supported_by(0.70),
+            Some(ConfidenceLevel::Low)
+        );
+        assert_eq!(ConfidenceLevel::supported_by(0.6999), None);
+        assert_eq!(ConfidenceLevel::supported_by(f64::NAN), None);
+    }
+
+    #[test]
+    fn default_table() {
+        use ConfidenceLevel::*;
+        let user = |l| PageAction::confidence_defaults(ControlEntity::User, l);
+        let post = |l| PageAction::confidence_defaults(ControlEntity::Post, l);
+        assert_eq!(user(Low), vec![PageAction::LivenessCheck {}]);
+        assert_eq!(
+            user(Mid),
+            vec![
+                PageAction::LivenessCheck {},
+                PageAction::SpamHighRecall {
+                    lifetime: Lifetime::Days7
+                }
+            ]
+        );
+        assert_eq!(user(High), vec![PageAction::Suspend {}]);
+        assert!(post(Low).is_empty());
+        for l in ConfidenceLevel::ALL {
+            for (e, a) in [
+                (ControlEntity::User, user(l)),
+                (ControlEntity::Post, post(l)),
+            ] {
+                assert!(a.iter().all(|x| x.entity() == e));
+                assert!(a.iter().all(|x| PageAction::menu(e).contains(x)), "{l:?}");
+            }
+        }
+        assert!(
+            !post(High).contains(&PageAction::SuspendAuthor {}),
+            "a post default never suspends the author"
+        );
     }
 }

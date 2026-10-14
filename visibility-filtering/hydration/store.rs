@@ -889,7 +889,7 @@ impl Store {
                     MissPolicy::Unresolves(_) | MissPolicy::FailsNode => {
                         answered_incompletely = answered_incompletely.with(node);
                     }
-                    MissPolicy::ReadsNoEdge => {}
+                    MissPolicy::ReadsNoEdge | MissPolicy::ReadsNotFound => {}
                 }
             }
         }

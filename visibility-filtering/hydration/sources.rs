@@ -153,11 +153,13 @@ pub(crate) trait Sources: Send + Sync {
 
     async fn article_media_entities(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> Answered<exchange::ArticleMediaEntities, bool>;
 
     async fn article_cover_media(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> Answered<exchange::ArticleCoverMedia, bool>;
 
@@ -552,17 +554,27 @@ impl<O: Observer> Sources for ProdSources<O> {
 
     async fn article_media_entities(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> Answered<exchange::ArticleMediaEntities, bool> {
-        let rows = self.backends.articles.media_entities(article_ids).await;
+        let rows = self
+            .backends
+            .articles
+            .media_entities(viewer_id, article_ids)
+            .await;
         self.relay::<exchange::ArticleMediaEntities, _>(article_ids.iter().copied(), rows)
     }
 
     async fn article_cover_media(
         &self,
+        viewer_id: Option<u64>,
         article_ids: &[u64],
     ) -> Answered<exchange::ArticleCoverMedia, bool> {
-        let rows = self.backends.articles.cover_media(article_ids).await;
+        let rows = self
+            .backends
+            .articles
+            .cover_media(viewer_id, article_ids)
+            .await;
         self.relay::<exchange::ArticleCoverMedia, _>(article_ids.iter().copied(), rows)
     }
 
@@ -734,6 +746,7 @@ mod in_memory {
         hung_graphs: HashSet<Graph>,
         missing_graphs: HashSet<Graph>,
         calls: Mutex<Vec<(Source, Vec<u64>)>>,
+        article_viewers: Mutex<Vec<(Source, Option<u64>)>>,
         starts: Mutex<Vec<(Source, Instant)>>,
         selects: Mutex<Vec<Vec<EdgeQuery>>>,
         fields: Mutex<Vec<(Source, Vec<QueryFields>)>>,
@@ -936,6 +949,16 @@ mod in_memory {
                 .iter()
                 .filter(|(called, _)| *called == source)
                 .map(|(_, started)| *started)
+                .collect()
+        }
+
+        pub(crate) fn article_viewers(&self, source: Source) -> Vec<Option<u64>> {
+            self.article_viewers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(called, _)| *called == source)
+                .map(|&(_, viewer_id)| viewer_id)
                 .collect()
         }
 
@@ -1225,8 +1248,13 @@ mod in_memory {
 
         async fn article_media_entities(
             &self,
+            viewer_id: Option<u64>,
             article_ids: &[u64],
         ) -> Answered<exchange::ArticleMediaEntities, bool> {
+            self.article_viewers
+                .lock()
+                .unwrap()
+                .push((Source::ArticleMediaEntities, viewer_id));
             Observed::quiet(
                 self.keyed(
                     Source::ArticleMediaEntities,
@@ -1239,8 +1267,13 @@ mod in_memory {
 
         async fn article_cover_media(
             &self,
+            viewer_id: Option<u64>,
             article_ids: &[u64],
         ) -> Answered<exchange::ArticleCoverMedia, bool> {
+            self.article_viewers
+                .lock()
+                .unwrap()
+                .push((Source::ArticleCoverMedia, viewer_id));
             Observed::quiet(
                 self.keyed(
                     Source::ArticleCoverMedia,

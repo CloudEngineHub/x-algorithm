@@ -4,6 +4,7 @@ pub mod ais_client;
 pub mod allowlist;
 pub mod api_doc;
 pub mod auth;
+pub mod confidence;
 pub mod config;
 pub mod decision;
 pub mod dedup_cache;
@@ -31,6 +32,10 @@ pub mod test_user;
 
 #[cfg(test)]
 mod action_control_path_tests;
+#[cfg(test)]
+mod confidence_adversarial_tests;
+#[cfg(test)]
+mod confidence_path_tests;
 #[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
@@ -146,11 +151,17 @@ struct RetryEntry {
 struct DecisionContext {
     control: action_control::Resolved,
             would_dedup_held: Option<u8>,
+                held_class: u8,
+                global_dry_run: bool,
 }
 
 impl DecisionContext {
+                    fn records_only(&self) -> bool {
+        self.global_dry_run || self.control.record_only()
+    }
+
         fn claimed(&self) -> bool {
-        !self.control.record_only()
+        !self.records_only()
     }
 }
 
@@ -279,6 +290,11 @@ fn decision_outcome(
         fired_heads: summary.map(|s| s.fired_heads.clone()).unwrap_or_default(),
         labels: summary.map(|s| s.labels.clone()).unwrap_or_default(),
         score_id: score.score_id.clone(),
+        confidence: score.confidence,
+        raw_score: score.raw_score,
+        score: score.score,
+        calibration_id: score.calibration_id.clone(),
+        confidence_evidence: score.confidence_evidence.clone(),
     }
 }
 
@@ -332,17 +348,49 @@ fn expand_requested_actions_decision(
     }
 }
 
+fn incoming_dedup_class(
+    dynamic_config: &DynamicConfig,
+    rules_cache: &rules::RulesCache,
+    score: &abuse_proto::ScoreResult,
+) -> u8 {
+    let (entity_type, _) = Facts::resolve_target(score);
+    let rules_override = dynamic_config.enforcement_rules_yaml(entity_type);
+    let compiled = rules_cache.resolve(entity_type, rules_override.as_ref());
+    let score = ScoreFacts::from_score(score);
+    let Ok(reachable) = rules::reachable_decisions(&compiled, &score) else {
+        return dedup_cache::CLASS_NONE;
+    };
+    let allowlist = dynamic_config.generic_action_allowlist(entity_type);
+    reachable
+        .into_iter()
+        .flat_map(|decision| match decision {
+            Decision::Act(specs) => specs,
+            Decision::ActRequestedActions => {
+                match expand_requested_actions_decision(entity_type, &score, &allowlist).0 {
+                    ExpandedDecision::Act(specs) => specs,
+                    ExpandedDecision::Skip(_) => Vec::new(),
+                }
+            }
+            Decision::Skip(_) => Vec::new(),
+        })
+        .map(|spec| spec.dedup_action_class())
+        .max()
+        .unwrap_or(dedup_cache::CLASS_NONE)
+}
+
 #[tracing::instrument(skip_all, fields(dry_run, uas))]
 async fn run_enforcement_inner(
     ctx: &EnforcementCtx,
     score: &abuse_proto::ScoreResult,
     source_topic: &str,
     control: &mut action_control::Resolved,
+    held_class: u8,
+    pinned_global_dry_run: bool,
     extra: &mut BTreeMap<String, String>,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let user_id = score.user_id;
     let (entity_type, entity_id) = Facts::resolve_target(score);
-    let global_dry_run = ctx.dynamic_config.is_dry_run();
+    let global_dry_run = pinned_global_dry_run || ctx.dynamic_config.is_dry_run();
     let mut dry_run = global_dry_run || control.record_only();
     if dry_run && let Some(source) = control.dry_run_source(global_dry_run) {
         extra.insert("dry_run_source".into(), source.into());
@@ -534,6 +582,10 @@ async fn run_enforcement_inner(
         }
         match safety_checks::first_page_stop(facts.entity_type, &facts) {
             Ok(Some(check)) => (Decision::Skip(check.reason.to_owned()), check.id.to_owned()),
+            Ok(None) if control.page_actions.is_empty() => (
+                Decision::Skip(action_control::STATUS_NO_ACTIONS.to_owned()),
+                action_control::PAGE_RULE_ID.to_owned(),
+            ),
             Ok(None) => (
                 Decision::Act(action_control::page_specs(&control.page_actions)),
                 action_control::PAGE_RULE_ID.to_owned(),
@@ -726,6 +778,32 @@ async fn run_enforcement_inner(
                 hold_gate_info = gate.info;
             }
 
+            let chosen_class = specs
+                .iter()
+                .map(decision::ActionSpec::dedup_action_class)
+                .max()
+                .unwrap_or(dedup_cache::CLASS_NONE);
+            if !dry_run && chosen_class <= held_class {
+                info!(
+                    user_id = facts.user_id,
+                    held_class, chosen_class, "dedup: chosen actions do not outrank the held entry"
+                );
+                let mut info = std::mem::take(&mut hold_gate_info);
+                info.insert("dedup_held_class".into(), held_class.to_string());
+                info.insert(
+                    "action_specs".into(),
+                    action_control::action_specs_json(&specs),
+                );
+                return Ok(hold_gate_skip_outcome(
+                    "dedup_skipped",
+                    info,
+                    dry_run,
+                    &facts,
+                    score,
+                    requested_actions_skipped.take(),
+                ));
+            }
+
             if let Some(outcome) = final_checks(
                 &ctx.off_switch,
                 &ctx.dynamic_config,
@@ -734,7 +812,6 @@ async fn run_enforcement_inner(
                 score,
                 source_topic,
                 dry_run,
-                control.record_only(),
                 &mut hold_gate_info,
                 &mut requested_actions_skipped,
             )
@@ -908,7 +985,6 @@ async fn final_checks(
     score: &abuse_proto::ScoreResult,
     source_topic: &str,
     dry_run: bool,
-    record_only: bool,
     hold_gate_info: &mut BTreeMap<String, String>,
     requested_actions_skipped: &mut Option<String>,
 ) -> Option<abuse_proto::DecisionOutcome> {
@@ -955,7 +1031,7 @@ async fn final_checks(
         }
     }
 
-    if record_only {
+    if dry_run {
         if let Some((used, cap, _)) = dynamic_config.rate_limit_stats(facts.entity_type) {
             hold_gate_info.insert("would_rate_cap".into(), (used >= cap).to_string());
         }
@@ -1204,11 +1280,19 @@ async fn run_enforcement(
 ) -> Result<abuse_proto::DecisionOutcome> {
     let mut control = decision.control.clone();
     let mut extra = BTreeMap::new();
-    let mut outcome =
-        run_enforcement_inner(ctx, score, source_topic, &mut control, &mut extra).await?;
+    let mut outcome = run_enforcement_inner(
+        ctx,
+        score,
+        source_topic,
+        &mut control,
+        decision.held_class,
+        decision.global_dry_run,
+        &mut extra,
+    )
+    .await?;
     outcome.info.extend(env_info(ctx));
     outcome.info.extend(control.info_keys());
-    if decision.control.record_only() {
+    if decision.records_only() {
         outcome.info.insert(
             "would_dedup_skip".into(),
             decision.would_dedup_held.is_some().to_string(),
@@ -1220,6 +1304,7 @@ async fn run_enforcement(
         }
     }
     outcome.info.extend(extra);
+    control.stamp_confidence(&mut outcome);
     publish_decision_outcome(ctx, &outcome);
     Ok(outcome)
 }
@@ -1245,9 +1330,12 @@ fn resolve_control(
 ) -> action_control::Resolved {
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     let producer_dry = score.dry_run || action_control::has_dry_run_prefix(labels);
+    let claim =
+        confidence::message_claim(score, &ctx.dynamic_config.confidence_config(), now_millis());
     if !ctx.action_control.has_records() {
         return action_control::Resolved {
             producer_dry,
+            confidence: claim.as_ref().map(confidence::LevelOutcome::routing_label),
             ..Default::default()
         };
     }
@@ -1258,6 +1346,7 @@ fn resolve_control(
         entity: entity_type,
         factory: is_factory_message(score),
         producer_dry,
+        confidence: claim,
     };
     ctx.action_control.resolve(
         &input,
@@ -1365,12 +1454,16 @@ impl ScoreResultProcessor {
         let mut decision = DecisionContext {
             control: resolve_control(&self.ctx, score, entity_type),
             would_dedup_held: None,
+            held_class: dedup_cache::CLASS_NONE,
+            global_dry_run: self.ctx.dynamic_config.is_dry_run(),
         };
 
-        let incoming_class = decision
-            .control
-            .incoming_dedup_class(self.ctx.dynamic_config.dedup_action_class_for_head(head));
-        let claim_nonce = if decision.control.record_only() {
+        let incoming_class = decision.control.incoming_dedup_class(incoming_dedup_class(
+            &self.ctx.dynamic_config,
+            &self.ctx.rules_cache,
+            score,
+        ));
+        let claim_nonce = if decision.records_only() {
             decision.would_dedup_held = self
                 .dedup_cache
                 .peek(entity_type, entity_id, incoming_class)
@@ -1399,6 +1492,7 @@ impl ScoreResultProcessor {
                             &incoming_class.to_string(),
                         ])
                         .inc();
+                    decision.held_class = held_class;
                     claim_nonce
                 }
                 DedupCheck::Duplicate => {
@@ -1925,8 +2019,6 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
             "action control: GrowthBook {}.ignore_store is set; page records are ignored and recording-only heads follow the GrowthBook rules",
             action_control::CONFIG_KEY
         );
-    } else {
-        action_control.load_at_boot().await;
     }
     action_control.spawn_refresh(dynamic_config.clone());
     action_control.spawn_seen_writer();
@@ -2227,12 +2319,46 @@ pub async fn shutdown_kafka(state: &service::AppState, consumers: KafkaConsumers
         .await;
 }
 
-pub fn service_ready(
-    kafka_ready: &AtomicBool,
+pub fn service_ready(state: &service::AppState) -> bool {
+    state.kafka_ready.load(Ordering::Relaxed)
+        && switch_lists_loaded(
+            &state.off_switch,
+            &state.action_control,
+            &state.dynamic_config,
+        )
+}
+
+pub fn switch_lists_loaded(
     off_switch: &off_switch::OffSwitch,
+    action_control: &action_control::ActionControl,
     dynamic_config: &DynamicConfig,
 ) -> bool {
-    kafka_ready.load(Ordering::Relaxed) && off_switch.ready(dynamic_config.off_switch_enabled())
+    off_switch.ready(dynamic_config.off_switch_enabled())
+        && action_control.ready(&dynamic_config.action_control_config())
+}
+
+const SWITCH_LISTS_POLL: Duration = Duration::from_millis(200);
+
+async fn wait_for_switch_lists(
+    off_switch: &off_switch::OffSwitch,
+    action_control: &action_control::ActionControl,
+    dynamic_config: &DynamicConfig,
+) {
+    let mut logged = false;
+    while !switch_lists_loaded(off_switch, action_control, dynamic_config) {
+        if !logged {
+            warn!(
+                off_switch_loaded = off_switch.first_load_done(),
+                action_control_loaded = action_control.is_loaded(),
+                "waiting for the first read of the off-switch and action-control lists before taking Kafka work"
+            );
+            logged = true;
+        }
+        tokio::time::sleep(SWITCH_LISTS_POLL).await;
+    }
+    if logged {
+        info!("off-switch and action-control lists loaded; starting the Kafka consumers");
+    }
 }
 
 pub struct KafkaStartup(JoinHandle<Result<KafkaConsumers>>);
@@ -2280,10 +2406,12 @@ pub async fn start_kafka_consumers(
     state: Arc<service::AppState>,
     cfg: &Config,
 ) -> Result<KafkaConsumers> {
-    state
-        .off_switch
-        .wait_until_ready(|| state.dynamic_config.off_switch_enabled())
-        .await;
+    wait_for_switch_lists(
+        &state.off_switch,
+        &state.action_control,
+        &state.dynamic_config,
+    )
+    .await;
     let cancel = CancellationToken::new();
     if !cfg.kafka_consumer_enabled {
         info!("KAFKA_CONSUMER_ENABLED=false — Kafka consumer disabled");
@@ -3387,6 +3515,286 @@ mod dedup_retention_tests {
 }
 
 #[cfg(test)]
+mod incoming_dedup_class_tests {
+    use super::*;
+    use crate::dedup_cache::{
+        CLASS_CHALLENGE, CLASS_LABEL, CLASS_NONE, CLASS_SUSPEND, held_entry_meta, is_duplicate,
+    };
+    use serde_json::json;
+
+                                const RULES: &str = r#"
+for_entity: user
+rules:
+  - id: user_in_allowlist
+    when: user_allowlist.is_allowlisted
+    then: {kind: skip, reason: user_in_allowlist}
+  - id: user_not_found
+    when: "!user.present"
+    then: {kind: skip, reason: user_not_found}
+  - id: high_follower_count
+    when: cred.follower_count >= 12.34
+    then: {kind: skip, reason: high_follower_count}
+  - id: act_bb1_post_spam_bot_suspend
+    when: '"bb1_post_spam_bot_suspend" in score.labels'
+    then: {kind: act_suspend_user, perm: false, policy: PlatformManipulation}
+  - id: act_bb1_post_spam_bot_bounce
+    when: '"bb1_post_spam_bot_bounce" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - {kind: act_add_labels_v2, labels: [SpamHighRecall], ttl_msec: 2592000000}
+        - {kind: act_spam_liveness_check}
+  - id: act_bb1_user_suspend
+    when: '"bb1_user_suspend" in score.labels'
+    then: {kind: act_suspend_user, perm: false, policy: PlatformManipulation}
+  - id: act_liveness_check_and_spam_high_recall_7d
+    when: '"liveness_check_and_spam_high_recall_7d" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - {kind: act_add_labels_v2, labels: [SpamHighRecall], ttl_msec: 604800000}
+        - {kind: act_spam_liveness_check}
+  - id: act_bb1_user_bounce
+    when: '"bb1_user_bounce" in score.labels'
+    then:
+      kind: act_all
+      actions:
+        - {kind: act_add_labels_v2, labels: [SpamHighRecall], ttl_msec: 2592000000}
+        - {kind: act_spam_liveness_check}
+  - id: already_spam_high_recall_labeled_llm_slop
+    when: '"llm_slop_user" in score.labels && "SpamHighRecall" in user.labels'
+    then: {kind: skip, reason: already_labeled}
+  - id: act_add_llm_slop_label
+    when: '"llm_slop_user" in score.labels'
+    then: {kind: act_add_labels_v2, labels: [SpamHighRecall], ttl_msec: 604800000}
+  - id: already_suspended
+    when: user.suspended
+    then: {kind: skip, reason: already_suspended}
+  - id: act_cusp_liveness
+    when: '"enforcement_cusp_liveness" in score.labels && !("enforcement_threshold_reached" in score.labels)'
+    then: {kind: act_spam_liveness_check}
+  - id: hold_cluster_spam
+    when: score.model_version.startsWith("cluster_spam")
+    then: {kind: skip, reason: hold_cluster_spam}
+  - id: act_requested_actions
+    when: "size(score.requested_actions) > 0"
+    then: {kind: act_requested_actions}
+  - id: act_suspend
+    when: "true"
+    then: {kind: act_suspend_user, perm: false, policy: PlatformManipulation}
+"#;
+
+    const UID: i64 = 1_700_000_042;
+
+    async fn config(config: serde_json::Value) -> DynamicConfig {
+        let dc = DynamicConfig::new(None, None, false, 1_000, 1_000, None, None)
+            .await
+            .unwrap();
+        dc.set_snapshot_for_test(crate::growthbook::ConfigSnapshot {
+            config: Some(config),
+            rules_user: Some(Arc::from(RULES)),
+            rules_post: None,
+        });
+        dc
+    }
+
+    fn row(head: &str, model: &str, labels: &[&str]) -> abuse_proto::ScoreResult {
+        abuse_proto::ScoreResult {
+            user_id: UID,
+            model_version: model.into(),
+            summary: Some(abuse_proto::SummaryCounters {
+                labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+                fired_heads: vec![abuse_proto::FiredHead {
+                    name: head.into(),
+                    score: 0.99,
+                    threshold: 0.9,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn class_of(dc: &DynamicConfig, score: &abuse_proto::ScoreResult) -> u8 {
+        incoming_dedup_class(dc, &rules::RulesCache::new(), score)
+    }
+
+        fn held(status: &str, acted_class: u8) -> Vec<u8> {
+        let entry = json!({"status": status, "acted_class": acted_class, "topic": "t"});
+        zstd::encode_all(entry.to_string().as_bytes(), 3).unwrap()
+    }
+
+        fn claim(class: u8) -> Vec<u8> {
+        json!({"ts": 1, "acted_class": class})
+            .to_string()
+            .into_bytes()
+    }
+
+    fn acts_over(incoming: u8, held: &[u8]) -> bool {
+        !is_duplicate(incoming, &held_entry_meta(held))
+    }
+
+    #[tokio::test]
+    async fn class_is_the_strongest_action_of_the_decision() {
+        let dc = config(json!({})).await;
+        let class = |labels: &[&str]| class_of(&dc, &row("AnyHead", "m", labels));
+        assert_eq!(class(&["bb1_post_spam_bot_suspend"]), CLASS_SUSPEND);
+        assert_eq!(class(&["bb1_post_spam_bot_bounce"]), CLASS_CHALLENGE);
+        assert_eq!(
+            class(&["liveness_check_and_spam_high_recall_7d"]),
+            CLASS_CHALLENGE
+        );
+        assert_eq!(class(&["enforcement_cusp_liveness"]), CLASS_CHALLENGE);
+        assert_eq!(class(&["llm_slop_user"]), CLASS_LABEL);
+        assert_eq!(class(&[]), CLASS_SUSPEND);
+    }
+
+            #[tokio::test]
+    async fn a_decision_that_cannot_act_claims_no_class() {
+        let dc = config(json!({})).await;
+        let score = row("ClusterSpam", "cluster_spam_v3", &["cluster_spam_suspend"]);
+        assert_eq!(class_of(&dc, &score), CLASS_NONE);
+        assert!(!acts_over(
+            CLASS_NONE,
+            &held("high_follower_count", CLASS_NONE)
+        ));
+    }
+
+    #[tokio::test]
+    async fn requested_actions_rank_by_the_allowlisted_actions() {
+        let mut score = row("PlatformHead", "m", &[]);
+        score.requested_actions = vec![
+            abuse_proto::RequestedAction {
+                kind: "label".into(),
+                labels: vec!["SpamHighRecall".into()],
+                head: "PlatformHead".into(),
+                ..Default::default()
+            },
+            abuse_proto::RequestedAction {
+                kind: "spam_liveness_check".into(),
+                head: "PlatformHead".into(),
+                ..Default::default()
+            },
+        ];
+        let allowed = config(json!({"generic_actions": {"user": {
+            "kinds": ["label", "spam_liveness_check"],
+            "labels": ["SpamHighRecall"],
+        }}}))
+        .await;
+        assert_eq!(class_of(&allowed, &score), CLASS_CHALLENGE);
+        let denied = config(json!({})).await;
+        assert_eq!(class_of(&denied, &score), CLASS_NONE);
+    }
+
+                #[tokio::test]
+    async fn heads_without_a_map_entry_get_their_action_class() {
+        let cases = [
+            ("GraphFleetM4", &["bb1_user_suspend"][..], CLASS_SUSPEND),
+            (
+                "GraphNeighbourNetwork",
+                &["bb1_user_suspend"][..],
+                CLASS_SUSPEND,
+            ),
+            ("IsCoordinatedSpammer", &[][..], CLASS_SUSPEND),
+            (
+                "UserEmbeddingOtherSystemBot",
+                &["bb1_user_bounce"][..],
+                CLASS_CHALLENGE,
+            ),
+            (
+                "UserEmbeddingReplyBoostFarm",
+                &["liveness_check_and_spam_high_recall_7d"][..],
+                CLASS_CHALLENGE,
+            ),
+            (
+                "UserEmbeddingLikeSpamBot",
+                &["enforcement_cusp_liveness"][..],
+                CLASS_CHALLENGE,
+            ),
+            ("llm_slop_user", &["llm_slop_user"][..], CLASS_LABEL),
+        ];
+        let empty = config(json!({})).await;
+        let stale_map = config(json!({"dedup_head_action_class": {
+            "GraphFleetM4": 0,
+            "UserEmbeddingOtherSystemBot": "label",
+            "llm_slop_user": "suspend",
+            "UserEmbeddingPostSpamBot": "suspend",
+        }}))
+        .await;
+        for (head, labels, want) in cases {
+            let score = row(head, "m", labels);
+            assert_eq!(class_of(&empty, &score), want, "{head}");
+            assert_eq!(
+                class_of(&stale_map, &score),
+                want,
+                "{head} with a stale map"
+            );
+        }
+        let bounce = row(
+            "UserEmbeddingPostSpamBot",
+            "m",
+            &["bb1_post_spam_bot_bounce"],
+        );
+        assert_eq!(class_of(&stale_map, &bounce), CLASS_CHALLENGE);
+    }
+
+                #[tokio::test]
+    async fn a_suspend_acts_over_an_earlier_liveness_check_and_label_from_any_head() {
+        let dc = config(json!({})).await;
+        let liveness_and_label = held("success", CLASS_CHALLENGE);
+        let label = held("success", CLASS_LABEL);
+        for (head, labels) in [
+            ("GraphFleetM4", &["bb1_user_suspend"][..]),
+            ("ForgedLivenessCompleter", &["bb1_user_suspend"][..]),
+            (
+                "UserEmbeddingPostSpamBot",
+                &["bb1_post_spam_bot_suspend"][..],
+            ),
+            ("ImpersonationScam", &[][..]),
+            ("BrandNewHead", &["bb1_user_suspend"][..]),
+        ] {
+            let suspend = class_of(&dc, &row(head, "m", labels));
+            assert!(
+                acts_over(suspend, &liveness_and_label),
+                "{head} over liveness"
+            );
+            assert!(acts_over(suspend, &label), "{head} over label");
+            assert!(
+                !acts_over(suspend, &held("success", CLASS_SUSPEND)),
+                "{head} repeat"
+            );
+        }
+        let bounce = class_of(
+            &dc,
+            &row("UserEmbeddingOtherSystemBot", "m", &["bb1_user_bounce"]),
+        );
+        assert!(acts_over(bounce, &label));
+        assert!(!acts_over(bounce, &liveness_and_label));
+        let slop = class_of(&dc, &row("llm_slop_user", "m", &["llm_slop_user"]));
+        assert!(!acts_over(slop, &label));
+        let suspend = class_of(&dc, &row("GraphFleetM4", "m", &["bb1_user_suspend"]));
+        assert!(acts_over(suspend, &claim(bounce)));
+        assert!(!acts_over(bounce, &claim(bounce)));
+    }
+
+            #[tokio::test]
+    async fn dry_run_and_skip_entries_hold_no_strength() {
+        let dc = config(json!({})).await;
+        for labels in [&["llm_slop_user"][..], &["bb1_user_bounce"][..], &[][..]] {
+            let incoming = class_of(&dc, &row("AnyHead", "m", labels));
+            assert!(
+                acts_over(incoming, &held("dry_run", CLASS_NONE)),
+                "{labels:?}"
+            );
+            assert!(
+                acts_over(incoming, &held("already_labeled", CLASS_NONE)),
+                "{labels:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod off_switch_hook_tests {
     use super::*;
     use crate::decision::ActionSpec;
@@ -3471,7 +3879,6 @@ mod off_switch_hook_tests {
             score,
             TOPIC,
             dry_run,
-            false,
             &mut hold_gate_info,
             &mut requested_actions_skipped,
         )
@@ -3554,39 +3961,123 @@ mod off_switch_hook_tests {
         );
     }
 
-    #[tokio::test]
-    async fn readiness_waits_for_the_first_switch_read_while_enabled() {
+    fn lists_for_test() -> (
+        off_switch::OffSwitch,
+        Arc<off_switch::test_support::MemStore>,
+        action_control::ActionControl,
+        Arc<action_control::test_support::MemControlStore>,
+    ) {
+        use crate::action_control::test_support::MemControlStore;
         use crate::off_switch::test_support::MemStore;
-        let store = Arc::new(MemStore::default());
-        store.fail_scan.store(true, Ordering::Relaxed);
-        let sw = off_switch::OffSwitch::new(store.clone(), Arc::new(MemStore::default()));
-        let (on, _) = config(json!({})).await;
-        let (killed, _) = config(json!({off_switch::CONFIG_KEY: {"enabled": false}})).await;
-        let kafka = AtomicBool::new(true);
+        let sw_store = Arc::new(MemStore::default());
+        sw_store.fail_scan.store(true, Ordering::Relaxed);
+        let ac_store = Arc::new(MemControlStore::default());
+        ac_store.fail_scan.store(true, Ordering::Relaxed);
+        (
+            off_switch::OffSwitch::new(sw_store.clone(), Arc::new(MemStore::default())),
+            sw_store,
+            action_control::ActionControl::new(ac_store.clone(), "test".into(), String::new()),
+            ac_store,
+        )
+    }
 
-        assert!(!service_ready(&kafka, &sw, &on), "no read yet");
-        assert!(service_ready(&kafka, &sw, &killed), "feature off: no wait");
-        assert!(sw.refresh().await.is_err());
+    #[tokio::test]
+    async fn readiness_waits_for_the_first_read_of_both_lists() {
+        let (sw, sw_store, ac, ac_store) = lists_for_test();
+        let (on, _) = config(json!({})).await;
+        let (sw_off, _) = config(json!({off_switch::CONFIG_KEY: {"enabled": false}})).await;
+        let (ac_ignored, _) =
+            config(json!({action_control::CONFIG_KEY: {"ignore_store": true}})).await;
+        let (both_off, _) = config(json!({
+            off_switch::CONFIG_KEY: {"enabled": false},
+            action_control::CONFIG_KEY: {"ignore_store": true},
+        }))
+        .await;
+
+        assert!(!switch_lists_loaded(&sw, &ac, &on), "no read yet");
         assert!(
-            !service_ready(&kafka, &sw, &on),
+            switch_lists_loaded(&sw, &ac, &both_off),
+            "both features off: no wait"
+        );
+        assert!(
+            !switch_lists_loaded(&sw, &ac, &sw_off),
+            "action control still unread"
+        );
+        assert!(
+            !switch_lists_loaded(&sw, &ac, &ac_ignored),
+            "off switch still unread"
+        );
+        assert!(sw.refresh().await.is_err());
+        assert!(ac.refresh().await.is_err());
+        assert!(
+            !switch_lists_loaded(&sw, &ac, &on),
             "a failed read is not a load"
         );
 
-        store.fail_scan.store(false, Ordering::Relaxed);
+        sw_store.fail_scan.store(false, Ordering::Relaxed);
         sw.refresh().await.unwrap();
-        assert!(service_ready(&kafka, &sw, &on));
-        store.fail_scan.store(true, Ordering::Relaxed);
-        assert!(sw.refresh().await.is_err());
         assert!(
-            service_ready(&kafka, &sw, &on),
-            "later failures keep the last good list and stay ready"
+            !switch_lists_loaded(&sw, &ac, &on),
+            "action control still unread"
         );
+        assert!(switch_lists_loaded(&sw, &ac, &ac_ignored));
 
-        kafka.store(false, Ordering::Relaxed);
+        ac_store.fail_scan.store(false, Ordering::Relaxed);
+        ac.refresh().await.unwrap();
+        assert!(switch_lists_loaded(&sw, &ac, &on));
+        sw_store.fail_scan.store(true, Ordering::Relaxed);
+        ac_store.fail_scan.store(true, Ordering::Relaxed);
+        assert!(sw.refresh().await.is_err());
+        assert!(ac.refresh().await.is_err());
         assert!(
-            !service_ready(&kafka, &sw, &on),
-            "Kafka watchdog still gates"
+            switch_lists_loaded(&sw, &ac, &on),
+            "later failures keep the last good lists and stay ready"
         );
+    }
+
+    #[tokio::test]
+    async fn the_consumer_wait_holds_until_both_lists_load_or_their_features_go_off() {
+        let (sw, sw_store, ac, ac_store) = lists_for_test();
+        let (sw, ac) = (Arc::new(sw), Arc::new(ac));
+        let (dc, _) = config(json!({})).await;
+        let waiter = {
+            let (sw, ac, dc) = (sw.clone(), ac.clone(), dc.clone());
+            tokio::spawn(async move { wait_for_switch_lists(&sw, &ac, &dc).await })
+        };
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished(), "neither list read");
+
+        sw_store.fail_scan.store(false, Ordering::Relaxed);
+        sw.refresh().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(!waiter.is_finished(), "action control still unread");
+
+        ac_store.fail_scan.store(false, Ordering::Relaxed);
+        ac.refresh().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("released once both lists are read")
+            .unwrap();
+
+        let (sw, _, ac, _) = lists_for_test();
+        let (sw, ac) = (Arc::new(sw), Arc::new(ac));
+        let waiter = {
+            let (sw, ac, dc) = (sw.clone(), ac.clone(), dc.clone());
+            tokio::spawn(async move { wait_for_switch_lists(&sw, &ac, &dc).await })
+        };
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished());
+        dc.set_snapshot_for_test(growthbook::ConfigSnapshot {
+            config: Some(json!({
+                off_switch::CONFIG_KEY: {"enabled": false},
+                action_control::CONFIG_KEY: {"ignore_store": true},
+            })),
+            ..Default::default()
+        });
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("released by the GrowthBook kill switches")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4712,6 +5203,8 @@ rules:
             &score("head_v1"),
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await
@@ -4738,6 +5231,8 @@ rules:
             &s,
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await
@@ -4758,6 +5253,8 @@ rules:
             &score("head_v1"),
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await
@@ -4781,6 +5278,8 @@ rules:
             &score("head_v1"),
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await
@@ -4800,6 +5299,8 @@ rules:
             &score("head_v2"),
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await
@@ -4807,6 +5308,10 @@ rules:
         assert_eq!(out.status, "dry_run");
         assert_eq!(out.info["action_kinds"], r#"["addLabelsV2"]"#);
         assert_eq!(out.info[ALREADY_SUSPENDED_STRIPPED], r#"["suspendUser"]"#);
+        assert!(
+            !out.info.contains_key("acted_class"),
+            "a dry run holds no dedup strength"
+        );
         assert_eq!(h.holds.calls(), 0);
     }
 
@@ -4819,6 +5324,8 @@ rules:
             &score("head_v1"),
             "t",
             &mut Default::default(),
+            dedup_cache::CLASS_NONE,
+            false,
             &mut BTreeMap::new(),
         )
         .await

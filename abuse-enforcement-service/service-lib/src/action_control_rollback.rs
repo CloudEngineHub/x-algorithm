@@ -18,10 +18,10 @@ pub fn plan(list: &ActionControlListResponse, updated_by: &str) -> Vec<OffSwitch
     for u in &list.unreadable {
         let parts: Vec<&str> = u.lkey.split('/').collect();
         match parts.as_slice() {
-            [_entity, "h" | "b", head, ..] => {
+            [_entity, "h" | "b" | "l", head, ..] => {
                 scopes.insert(((*head).to_owned(), None));
             }
-            [_entity, "c" | "cb", head, classifier, ..] => {
+            [_entity, "c" | "cb" | "cl", head, classifier, ..] => {
                 scopes.insert(((*head).to_owned(), Some((*classifier).to_owned())));
             }
             _ => {}
@@ -113,6 +113,7 @@ mod tests {
                 heads: vec![],
                 labels: vec![],
             },
+            confidence: None,
         }
     }
 
@@ -179,6 +180,27 @@ mod tests {
         );
         assert!(p.iter().all(|s| s.off && s.reason == REASON));
         assert_eq!(p[0].updated_by.as_deref(), Some("operator@example.com"));
+    }
+
+    #[test]
+    fn plan_switches_off_heads_with_level_records_or_the_defaults() {
+        let mut level = view("Level", None, None, ControlMode::Live);
+        level.record.confidence = Some(crate::confidence::ConfidenceLevel::High);
+        let l = list(
+            vec![
+                level,
+                view("Defaults", None, None, ControlMode::ConfidenceDefaults),
+            ],
+            vec!["user/l/BrokenLevel/high", "post/cl/BrokenClf/c3/mid"],
+        );
+        let keys: Vec<String> = plan(&l, "operator@example.com")
+            .iter()
+            .map(switch_lkey)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/BrokenClf/c3", "h/BrokenLevel", "h/Defaults", "h/Level"]
+        );
     }
 
     #[test]

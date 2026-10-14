@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
             get(move || {
                 let state = ready_state.clone();
                 async move {
-                    if service_ready(&state.kafka_ready, &state.off_switch, &state.dynamic_config) {
+                    if service_ready(&state) {
                         StatusCode::OK
                     } else {
                         StatusCode::SERVICE_UNAVAILABLE
