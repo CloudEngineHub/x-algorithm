@@ -112,9 +112,17 @@ impl<S: Sources + 'static> Scenario<S> {
     }
 
     pub(crate) async fn evaluate(&self, raw: &[RawCandidate]) -> Evaluated {
+        self.evaluate_with(RuleEngine::for_tests(), raw).await
+    }
+
+    pub(crate) async fn evaluate_with(
+        &self,
+        rule_engine: RuleEngine,
+        raw: &[RawCandidate],
+    ) -> Evaluated {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
-        let filter_tweets = FilterTweets::new(sources, RuleEngine::for_tests(), caches);
+        let filter_tweets = FilterTweets::new(sources, rule_engine, caches);
         let (hydrated, outcomes) = hydrate_and_evaluate(&filter_tweets, self.request(raw)).await;
         Evaluated {
             outcomes,

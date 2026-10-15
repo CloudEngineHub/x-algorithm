@@ -1,24 +1,22 @@
-use crate::hydration::{Hydrator, Hydrators};
-use crate::models::region::allows_country;
+use crate::hydration::Hydrators;
 use crate::models::{
-    ArticleLifecycle, AuthorLabel, DropReason, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, NsfwViewerDropReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport,
-    ViewerProfile,
+    AuthorLabel, DropReason, FosnrReason, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
+    TombstoneReason, ViewerProfile, Withholding,
 };
-#[cfg(test)]
-use crate::models::{PostCandidate, ViewerFeatures};
 use crate::params::{CountryList, LimitedActionType};
-#[cfg(test)]
-use crate::rules::test_context;
 use crate::rules::RuleContext;
+use features::{In, TweetSafetyLabels};
+use inputs::Interpreter;
+use rule::{NamedCond, RuleCond};
+use std::fmt::{self, Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::ops::Not;
-use xai_core_entities::entities::ConversationControlArm;
-#[cfg(test)]
 use xai_safety_label_store::types::label_meta;
 use xai_visibility_filtering::models::{FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(super) enum RuleId {
     FilterAll,
@@ -112,105 +110,105 @@ pub(super) enum RuleId {
 }
 
 pub(super) mod conditions;
+pub(super) mod features;
+pub(super) mod inputs;
 #[cfg(test)]
 mod laws;
+pub(super) mod observed;
 mod predicates;
+pub(super) mod rule;
 
+pub(in crate::rules) use features::leaves;
+pub use features::{
+    ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    CommunityViewerRemovedLeaf, CompoundLeaf, EdgeLeaf, PostFactsLeaf, PostModerationLeaf,
+    ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, TweetLeaf, TweetSafetyLabelsLeaf,
+    ViewerAccountLeaf,
+};
+pub use predicates::Predicate;
 pub(in crate::rules) use predicates::*;
 
-#[derive(Clone, PartialEq)]
-pub(super) struct Clause {
-    pub(super) id: RuleId,
-    pub(super) when: &'static [Cond],
-    pub(super) audience: Audience,
-    pub(super) action: ClauseAction,
-}
-
-impl Clause {
-    pub(super) fn name(&self) -> String {
-        let id: &str = self.id.into();
-        let (kind, reason, prompt) = match self.action.spec() {
-            ActionSpec::Drop(DropReason::Legacy(reason)) => {
-                let reason = match reason {
-                    FilteredReason::UnspecifiedReason => "unspecified".to_owned(),
-                    FilteredReason::PossiblyUndesirable => "undesirable".to_owned(),
-                    FilteredReason::ContainNsfwMedia => "nsfw_media".to_owned(),
-                    FilteredReason::AuthorAccountIsInactive => "inactive".to_owned(),
-                    reason @ (FilteredReason::AuthorBlockViewer
-                    | FilteredReason::AuthorIsProtected
-                    | FilteredReason::AuthorIsUnsafe
-                    | FilteredReason::ReportedTweet
-                    | FilteredReason::TweetMatchesViewerMutedKeyword(_)
-                    | FilteredReason::TweetIsBounced
-                    | FilteredReason::SafetyResult(_)
-                    | FilteredReason::AuthorIsDeactivated
-                    | FilteredReason::AuthorIsSuspended
-                    | FilteredReason::ViewerMutesAuthor
-                    | FilteredReason::TweetIsNullcast
-                    | FilteredReason::ExclusiveTweet
-                    | FilteredReason::ViewerBlocksAuthor) => snake(reason),
-                };
-                ("drop", Some(reason), None)
-            }
-            ActionSpec::Drop(DropReason::NsfwViewer(reason)) => {
-                ("drop", Some(<&str>::from(reason).to_owned()), None)
-            }
-            ActionSpec::Tombstone(TombstoneReason::SensitiveViewerAgeVerification) => {
-                ("tombstone", Some("age_verification".to_owned()), None)
-            }
-            ActionSpec::Tombstone(reason) => {
-                ("tombstone", Some(<&str>::from(reason).to_owned()), None)
-            }
-            ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(blur)) => {
-                #[expect(
-                    clippy::wildcard_enum_match_arm,
-                    reason = "InterstitialReason is a generated Thrift union; every variant but PossiblyUndesirable takes its snake-cased name, including any the IDL adds"
-                )]
-                let reason = match &blur.reason {
-                    InterstitialReason::PossiblyUndesirable(_) => "undesirable".to_owned(),
-                    reason => snake(reason),
-                };
-                let prompt = blur.prompt.map(|prompt| match prompt {
-                    InterstitialAction::AGE_VERIFICATION_PROMPT => "age_prompt".to_owned(),
-                    prompt => prompt.0.to_string(),
-                });
-                ("blur", Some(reason), prompt)
-            }
-            ActionSpec::MediaRestriction(MediaRestriction::NsfwInterstitial) => {
-                ("legacy_interstitial", None, None)
-            }
-            ActionSpec::LimitedEngagement(reason) => (
-                "limited_engagement",
-                Some(<&str>::from(reason).to_owned()),
-                None,
-            ),
-            ActionSpec::SoftIntervention { policy, .. } => {
-                let policy = match *policy {
-                    AppealablePolicy::ABUSE => "abuse".to_owned(),
-                    policy => policy.0.to_string(),
-                };
-                ("soft_intervention", Some(policy), None)
-            }
-            ActionSpec::Appealable(_) => ("appealable", None, None),
-        };
-        let keeps_reason = matches!(self.action.spec(), ActionSpec::SoftIntervention { .. });
-        let squashed = |name: &str| name.replace('_', "");
-        let reason = reason
-            .map(|reason| {
-                ["author_is_", "tweet_is_", "is_", "has_"]
-                    .iter()
-                    .find_map(|prefix| reason.strip_prefix(prefix))
-                    .unwrap_or(&reason)
-                    .to_owned()
-            })
-            .filter(|reason| keeps_reason || !squashed(id).contains(&squashed(reason)));
-        let mut name = format!("{id}/{kind}");
-        for part in [reason, prompt].into_iter().flatten() {
-            name.push('/');
-            name.push_str(&part);
+pub(super) fn rule_name(id: RuleId, action: &RuleAction) -> String {
+    let id: &str = id.into();
+    let (kind, reason, prompt) = match action.spec() {
+        ActionSpec::Drop(DropReason::Legacy(reason)) => {
+            let reason = match reason {
+                FilteredReason::UnspecifiedReason => "unspecified".to_owned(),
+                FilteredReason::PossiblyUndesirable => "undesirable".to_owned(),
+                FilteredReason::ContainNsfwMedia => "nsfw_media".to_owned(),
+                FilteredReason::AuthorAccountIsInactive => "inactive".to_owned(),
+                reason @ (FilteredReason::AuthorBlockViewer
+                | FilteredReason::AuthorIsProtected
+                | FilteredReason::AuthorIsUnsafe
+                | FilteredReason::ReportedTweet
+                | FilteredReason::TweetMatchesViewerMutedKeyword(_)
+                | FilteredReason::TweetIsBounced
+                | FilteredReason::SafetyResult(_)
+                | FilteredReason::AuthorIsDeactivated
+                | FilteredReason::AuthorIsSuspended
+                | FilteredReason::ViewerMutesAuthor
+                | FilteredReason::TweetIsNullcast
+                | FilteredReason::ExclusiveTweet
+                | FilteredReason::ViewerBlocksAuthor) => snake(reason),
+            };
+            ("drop", Some(reason), None)
         }
-        name
+        ActionSpec::Drop(DropReason::NsfwViewer(reason)) => {
+            ("drop", Some(<&str>::from(reason).to_owned()), None)
+        }
+        ActionSpec::Tombstone(TombstoneReason::SensitiveViewerAgeVerification) => {
+            ("tombstone", Some("age_verification".to_owned()), None)
+        }
+        ActionSpec::Tombstone(reason) => ("tombstone", Some(<&str>::from(reason).to_owned()), None),
+        ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(blur)) => {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "InterstitialReason is a generated Thrift union; every variant but PossiblyUndesirable takes its snake-cased name, including any the IDL adds"
+            )]
+            let reason = match &blur.reason {
+                InterstitialReason::PossiblyUndesirable(_) => "undesirable".to_owned(),
+                reason => snake(reason),
+            };
+            let prompt = blur.prompt.map(|prompt| match prompt {
+                InterstitialAction::AGE_VERIFICATION_PROMPT => "age_prompt".to_owned(),
+                prompt => prompt.0.to_string(),
+            });
+            ("blur", Some(reason), prompt)
+        }
+        ActionSpec::MediaRestriction(MediaRestriction::NsfwInterstitial) => {
+            ("legacy_interstitial", None, None)
+        }
+        ActionSpec::LimitedEngagement(reason) => (
+            "limited_engagement",
+            Some(<&str>::from(reason).to_owned()),
+            None,
+        ),
+        ActionSpec::SoftIntervention { policy, .. } => {
+            let policy = match *policy {
+                AppealablePolicy::ABUSE => "abuse".to_owned(),
+                policy => policy.0.to_string(),
+            };
+            ("soft_intervention", Some(policy), None)
+        }
+        ActionSpec::Appealable(_) => ("appealable", None, None),
+    };
+    let keeps_reason = matches!(action.spec(), ActionSpec::SoftIntervention { .. });
+    let squashed = |name: &str| name.replace('_', "");
+    let reason = reason
+        .map(|reason| {
+            ["author_is_", "tweet_is_", "is_", "has_"]
+                .iter()
+                .find_map(|prefix| reason.strip_prefix(prefix))
+                .unwrap_or(&reason)
+                .to_owned()
+        })
+        .filter(|reason| keeps_reason || !squashed(id).contains(&squashed(reason)));
+    let mut name = format!("{id}/{kind}");
+    for part in [reason, prompt].into_iter().flatten() {
+        name.push('/');
+        name.push_str(&part);
     }
+    name
 }
 
 fn snake(value: &impl std::fmt::Debug) -> String {
@@ -226,131 +224,6 @@ fn snake_case(variant: &str) -> String {
         snake.push(char.to_ascii_lowercase());
     }
     snake
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(in crate::rules) struct Cond(Condition);
-
-#[derive(Clone, Copy, PartialEq)]
-enum Condition {
-    Is(Predicate),
-    Not(Predicate),
-    Any(&'static [Predicate]),
-}
-
-enum Negation {
-    Not,
-    Forbidden(&'static str),
-}
-
-#[expect(
-    clippy::panic,
-    reason = "an invalid authored clause fails const evaluation, so it never builds"
-)]
-pub(in crate::rules) const fn not(condition: Cond) -> Cond {
-    match condition.0 {
-        Condition::Is(leaf) => match leaf.negation() {
-            Negation::Not => Cond(Condition::Not(leaf)),
-            Negation::Forbidden(write_instead) => panic!("{}", write_instead),
-        },
-        Condition::Not(_) => panic!("not() negates one leaf; write the leaf itself"),
-        Condition::Any(_) => panic!(
-            "not() negates one leaf; negate each leaf of the disjunction as its own condition"
-        ),
-    }
-}
-
-impl Cond {
-    #[expect(
-        clippy::panic,
-        reason = "a disjunction lists only leaves; a non-leaf branch fails const evaluation in conditions.rs, or the test that builds it"
-    )]
-    const fn leaf(self) -> Predicate {
-        match self.0 {
-            Condition::Is(leaf) => leaf,
-            Condition::Not(_) | Condition::Any(_) => {
-                panic!("a disjunction lists leaves; split a negated or nested branch into clauses")
-            }
-        }
-    }
-
-    pub(super) fn truth(self, context: &RuleContext<'_>) -> Truth {
-        self.0.truth(context)
-    }
-
-    pub(super) const fn hydrators(self) -> Hydrators {
-        self.0.hydrators()
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for Cond {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Condition::Is(leaf) => write!(f, "{leaf:?}"),
-            Condition::Not(leaf) => write!(f, "!{leaf:?}"),
-            Condition::Any(set) => write!(f, "any{set:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Cond {
-    pub(in crate::rules) fn tweet_labels(self) -> Vec<SafetyLabelType> {
-        let label = |leaf: &Predicate| {
-            if let Predicate::TweetHasLabel(label) = *leaf {
-                Some(label)
-            } else {
-                None
-            }
-        };
-        match self.0 {
-            Condition::Is(leaf) => label(&leaf).into_iter().collect(),
-            Condition::Not(_) => Vec::new(),
-            Condition::Any(set) => set.iter().filter_map(label).collect(),
-        }
-    }
-
-    pub(in crate::rules) fn own_tweet_label(self) -> Option<String> {
-        match self.0 {
-            Condition::Is(Predicate::TweetHasLabel(label)) => Some(label.spelled()),
-            Condition::Not(Predicate::TweetHasLabel(label)) => {
-                Some(format!("not {}", label.spelled()))
-            }
-            Condition::Is(_) | Condition::Not(_) | Condition::Any(_) => None,
-        }
-    }
-
-    pub(in crate::rules) fn spelled(self) -> String {
-        match self.0 {
-            Condition::Is(leaf) => leaf.spelled(false),
-            Condition::Not(leaf) => leaf.spelled(true),
-            Condition::Any(set) => {
-                let (name, _) = conditions::NAMED
-                    .iter()
-                    .find(|&&(_, named)| named == self)
-                    .expect("conditions.rs names every wired disjunction");
-                let leaves: Vec<String> = set.iter().map(|leaf| leaf.spelled(false)).collect();
-                format!("{name}[{}]", leaves.join(" | "))
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-impl Predicate {
-    fn holds_for(self, viewer: &ViewerFeatures, candidate: &PostCandidate) -> bool {
-        self.holds(&test_context(viewer, candidate).hydrated_by(self.hydrators()))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(test, derive(Debug))]
-pub(super) enum Audience {
-    Everyone,
-    NonAuthors,
-    NonFollowers,
-    OnlyAuthor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -376,26 +249,34 @@ pub(super) enum ActionSpec {
 }
 
 #[derive(Clone, PartialEq)]
-pub(super) struct ClauseAction {
+pub(super) struct RuleAction {
     spec: ActionSpec,
 }
 
-impl ClauseAction {
+impl RuleAction {
     pub(super) const fn spec(&self) -> &ActionSpec {
         &self.spec
     }
 }
 
-impl std::fmt::Debug for ClauseAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for RuleAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.spec.fmt(f)
     }
 }
 
+impl Eq for RuleAction {}
+
+impl Hash for RuleAction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        format!("{:?}", self.spec).hash(state);
+    }
+}
+
 #[cfg(test)]
-impl From<ActionSpec> for ClauseAction {
+impl From<ActionSpec> for RuleAction {
     fn from(spec: ActionSpec) -> Self {
-        ClauseAction { spec }
+        RuleAction { spec }
     }
 }
 
@@ -454,20 +335,20 @@ impl DropAs {
     }
 }
 
-pub(super) const fn drop_post(reason: DropAs) -> ClauseAction {
-    ClauseAction {
+pub(super) const fn drop_post(reason: DropAs) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::Drop(reason.reason()),
     }
 }
 
-pub(super) const fn tombstone(reason: TombstoneReason) -> ClauseAction {
-    ClauseAction {
+pub(super) const fn tombstone(reason: TombstoneReason) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::Tombstone(reason),
     }
 }
 
-pub(super) const fn limit(reason: LimitedEngagementReason) -> ClauseAction {
-    ClauseAction {
+pub(super) const fn limit(reason: LimitedEngagementReason) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::LimitedEngagement(reason),
     }
 }
@@ -476,8 +357,8 @@ pub(super) const fn soft_intervention(
     label: SafetyLabelType,
     policy: AppealablePolicy,
     level: i8,
-) -> ClauseAction {
-    ClauseAction {
+) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::SoftIntervention {
             label,
             policy,
@@ -486,25 +367,25 @@ pub(super) const fn soft_intervention(
     }
 }
 
-pub(super) const fn appealable(violations: &'static [FosnrViolation]) -> ClauseAction {
-    ClauseAction {
+pub(super) const fn appealable(violations: &'static [FosnrViolation]) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::Appealable(violations),
     }
 }
 
-pub(super) const fn blur(reason: InterstitialReason) -> ClauseAction {
+pub(super) const fn blur(reason: InterstitialReason) -> RuleAction {
     media_interstitial(reason, None)
 }
 
-pub(super) const fn blur_with_age_prompt(reason: InterstitialReason) -> ClauseAction {
+pub(super) const fn blur_with_age_prompt(reason: InterstitialReason) -> RuleAction {
     media_interstitial(reason, Some(InterstitialAction::AGE_VERIFICATION_PROMPT))
 }
 
 const fn media_interstitial(
     reason: InterstitialReason,
     prompt: Option<InterstitialAction>,
-) -> ClauseAction {
-    ClauseAction {
+) -> RuleAction {
+    RuleAction {
         spec: ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(
             MediaInterstitial {
                 legacy: FilteredReason::ContainNsfwMedia,
@@ -515,13 +396,101 @@ const fn media_interstitial(
     }
 }
 
-pub(super) const fn legacy_nsfw_interstitial() -> ClauseAction {
-    ClauseAction {
+pub(super) const fn legacy_nsfw_interstitial() -> RuleAction {
+    RuleAction {
         spec: ActionSpec::MediaRestriction(MediaRestriction::NsfwInterstitial),
     }
 }
 
+#[cfg(test)]
 impl ActionSpec {
+    pub(super) const fn kind_and_slot(&self) -> (&'static str, &'static str) {
+        match self {
+            ActionSpec::Appealable(_) => ("appealable", "notice"),
+            ActionSpec::Drop(_) => ("drop", "withholding"),
+            ActionSpec::Tombstone(_) => ("tombstone", "withholding"),
+            ActionSpec::MediaRestriction(_) => ("media restriction", "media"),
+            ActionSpec::SoftIntervention { .. } => ("soft intervention", "notice"),
+            ActionSpec::LimitedEngagement(_) => ("limited engagement", "engagement"),
+        }
+    }
+
+    pub(super) fn spelled(&self) -> String {
+        match self {
+            ActionSpec::Drop(reason) => format!("{reason:?}"),
+            ActionSpec::Tombstone(reason) => format!("{reason:?}"),
+            ActionSpec::MediaRestriction(restriction) => format!("{restriction:?}"),
+            ActionSpec::SoftIntervention {
+                label,
+                policy,
+                level,
+            } => format!("{} {policy:?} level {level}", spelled_label(*label)),
+            ActionSpec::LimitedEngagement(reason) => format!("{reason:?}"),
+            ActionSpec::Appealable(violations) => violations
+                .iter()
+                .map(
+                    |&FosnrViolation {
+                         label,
+                         policy,
+                         level,
+                         limited_actions,
+                     }| {
+                        format!(
+                            "{} {policy:?} level {level} limits {limited_actions:?}",
+                            spelled_label(label)
+                        )
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Contribution {
+    Withholding(Withholding),
+    Media(MediaRestriction),
+    Engagement(LimitedEngagementReason),
+    Notice(Notice),
+}
+
+impl ActionSpec {
+    #[inline]
+    pub(super) fn interpret<'a, I: Interpreter<'a>>(
+        &self,
+        interpreter: &I,
+    ) -> I::Output<Option<Contribution>> {
+        match self {
+            Self::Drop(reason) => interpreter
+                .run(|()| Some(Contribution::Withholding(Withholding::Drop(reason.clone())))),
+            Self::Tombstone(reason) => interpreter
+                .run(|()| Some(Contribution::Withholding(Withholding::Tombstone(*reason)))),
+            Self::MediaRestriction(restriction) => {
+                interpreter.run(|()| Some(Contribution::Media(restriction.clone())))
+            }
+            Self::LimitedEngagement(reason) => {
+                interpreter.run(|()| Some(Contribution::Engagement(*reason)))
+            }
+            Self::SoftIntervention {
+                label,
+                policy,
+                level,
+            } => interpreter.run(|In::<TweetSafetyLabels>(labels)| {
+                Some(Contribution::Notice(Notice::SoftIntervention(
+                    fosnr_reason(*label, *policy, *level, labels),
+                )))
+            }),
+            Self::Appealable(violations) => interpreter.run(|In::<TweetSafetyLabels>(labels)| {
+                appeal(violations, labels).map(Contribution::Notice)
+            }),
+        }
+    }
+
+    pub(super) fn requirements(&self) -> Hydrators {
+        self.interpret(&inputs::Required)
+    }
+
     pub(super) const fn severity(&self) -> u8 {
         match self {
             Self::Appealable(_) => 18,
@@ -534,8 +503,8 @@ impl ActionSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Truth {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Truth {
     True,
     False,
     Unknown { default: bool, failed: Hydrators },
@@ -606,107 +575,27 @@ impl Not for Truth {
     }
 }
 
-impl Clause {
-    pub(super) fn applies(&self, context: &RuleContext<'_>) -> Truth {
-        let mut truth = self.audience.reaches(context);
-        if truth == Truth::False {
-            return truth;
-        }
-        for condition in self.when {
-            truth = truth.and(condition.0.truth(context));
-            if truth == Truth::False {
-                break;
-            }
-        }
-        truth
-    }
-
-    pub(super) fn hydrators(&self) -> Hydrators {
-        self.when
-            .iter()
-            .fold(self.audience.hydrators(), |hydrators, condition| {
-                hydrators.union(condition.0.hydrators())
-            })
-    }
+fn appeal(violations: &[FosnrViolation], labels: &SafetyLabelMap) -> Option<Notice> {
+    let violation = violations
+        .iter()
+        .find(|violation| labels.has_label(violation.label))?;
+    Some(Notice::Appealable {
+        reason: fosnr_reason(violation.label, violation.policy, violation.level, labels),
+        limited_actions: violation.limited_actions,
+    })
 }
 
-impl Condition {
-    const fn hydrators(&self) -> Hydrators {
-        match self {
-            Condition::Is(leaf) | Condition::Not(leaf) => leaf.hydrators(),
-            Condition::Any(set) => {
-                let mut hydrators = Hydrators::empty();
-                let mut rest = *set;
-                while let [leaf, tail @ ..] = rest {
-                    hydrators = hydrators.union(leaf.hydrators());
-                    rest = tail;
-                }
-                hydrators
-            }
-        }
-    }
-}
-
-impl Audience {
-    #[inline]
-    fn reaches(self, context: &RuleContext<'_>) -> Truth {
-        let admitted = match self {
-            Audience::Everyone => true,
-            Audience::NonAuthors | Audience::NonFollowers => !context.is_author_viewer(),
-            Audience::OnlyAuthor => context.is_author_viewer(),
-        };
-        if !admitted {
-            Truth::False
-        } else if self == Audience::NonFollowers {
-            !Predicate::ViewerFollowsAuthor.truth(context)
-        } else {
-            Truth::True
-        }
-    }
-
-    const fn hydrators(self) -> Hydrators {
-        match self {
-            Audience::Everyone | Audience::NonAuthors | Audience::OnlyAuthor => Hydrators::empty(),
-            Audience::NonFollowers => Predicate::ViewerFollowsAuthor.hydrators(),
-        }
-    }
-}
-
-impl Condition {
-    #[inline]
-    fn truth(&self, context: &RuleContext<'_>) -> Truth {
-        match self {
-            Condition::Is(leaf) => leaf.truth(context),
-            Condition::Not(leaf) => !leaf.truth(context),
-            Condition::Any(set) => {
-                let mut truth = Truth::False;
-                for leaf in *set {
-                    truth = truth.or(leaf.truth(context));
-                    if truth == Truth::True {
-                        break;
-                    }
-                }
-                truth
-            }
-        }
-    }
-}
-
-impl Predicate {
-    #[inline]
-    fn truth(self, context: &RuleContext<'_>) -> Truth {
-        let value = self.holds(context);
-        let failed = context.failed();
-        let failed = if failed.is_empty() {
-            failed
-        } else {
-            failed.intersection(self.hydrators())
-        };
-        match (failed.is_empty(), value) {
-            (false, default) => Truth::Unknown { default, failed },
-            (true, true) => Truth::True,
-            (true, false) => Truth::False,
-        }
+fn fosnr_reason(
+    label: SafetyLabelType,
+    policy: AppealablePolicy,
+    level: i8,
+    labels: &SafetyLabelMap,
+) -> FosnrReason {
+    FosnrReason {
+        policy,
+        level,
+        proactive: !labels.is_by_agent(label),
+        appeal_submitted: labels.has_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED),
     }
 }
 
@@ -723,69 +612,21 @@ fn account_or_request_country_in(
 
 #[cfg(test)]
 mod tests {
-    use super::Predicate::*;
+    use super::leaves::*;
     use super::*;
-    use crate::models::{ClientCapability, PostCandidate, Viewer, ViewerFeatures};
+    use crate::hydration::Hydrator;
+    use crate::models::{
+        ClientCapability, PostCandidate, VerifyBlurSupport, Viewer, ViewerFeatures,
+    };
     use crate::rules::fixtures::{
         candidate, logged_out_viewer, viewer, viewer_with_profile, VIEWER_ID,
     };
-    use crate::rules::{test_context, SafetyLevel};
-    use strum::VariantArray;
+    use crate::rules::test_context;
 
-    fn wired_leaves() -> Vec<Predicate> {
-        let mut leaves = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            for clause in level.spec().rules {
-                for condition in clause.when {
-                    match condition.0 {
-                        Condition::Is(leaf) | Condition::Not(leaf) => leaves.push(leaf),
-                        Condition::Any(set) => leaves.extend_from_slice(set),
-                    }
-                }
-            }
+    impl Predicate {
+        fn holds_for(self, viewer: &ViewerFeatures, candidate: &PostCandidate) -> bool {
+            self.holds(&test_context(viewer, candidate).hydrated_by(self.requirements()))
         }
-        leaves
-    }
-
-    #[test]
-    fn every_leaf_reads_only_the_hydrators_it_declares() {
-        let viewer = viewer(VIEWER_ID);
-        let candidate = candidate().build();
-        for leaf in wired_leaves() {
-            leaf.holds_for(&viewer, &candidate);
-        }
-    }
-
-    #[test]
-    fn every_constructor_is_its_variants_snake_case() {
-        for &(constructor, variant) in CONSTRUCTORS {
-            let snake = snake_case(variant);
-            assert_eq!(constructor, snake, "name {variant}'s constructor {snake}");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "write `tweet_created_before(..)`")]
-    fn a_named_negation_is_the_one_spelling_of_its_not() {
-        not(tweet_created_after(0));
-    }
-
-    #[test]
-    #[should_panic(expected = "write `audience: NonFollowers`")]
-    fn not_following_is_spelled_by_the_audience() {
-        not(viewer_follows_author());
-    }
-
-    #[test]
-    #[should_panic(expected = "not() negates one leaf; write the leaf itself")]
-    fn not_does_not_negate_a_negation() {
-        not(not(viewer_logged_out()));
-    }
-
-    #[test]
-    #[should_panic(expected = "negate each leaf of the disjunction")]
-    fn not_does_not_negate_a_disjunction() {
-        not(conditions::is_nsfw_admin());
     }
 
     #[test]
@@ -804,7 +645,7 @@ mod tests {
             candidate.post.tweet_id = tweet_id;
             let context = test_context(&viewer, &candidate);
             assert_eq!(
-                TweetCreatedAfter(CUTOFF_MS).holds(&context),
+                Predicate::PostFacts(TweetCreatedAfter(CUTOFF_MS)).holds(&context),
                 expected,
                 "{tweet_id}"
             );
@@ -833,17 +674,18 @@ mod tests {
             account_country_code: Some("fr".into()),
             ..ViewerProfile::default()
         };
-        let request_country_in = RequestCountryIn(CountryList::AgeVerification);
+        let request_country_in = Predicate::Request(RequestCountryIn(CountryList::AgeVerification));
+        let age_verified = Predicate::Compound(ViewerAgeVerified);
         let candidate = candidate().build();
         for (predicate, viewer, expected) in [
-            (ViewerAgeVerified, labeled, true),
-            (ViewerAgeVerified, in_country(None, idv_premium), true),
+            (age_verified, labeled, true),
+            (age_verified, in_country(None, idv_premium), true),
             (
-                ViewerAgeVerified,
+                age_verified,
                 in_country(None, ViewerProfile::default()),
                 false,
             ),
-            (ViewerAgeVerified, logged_out_viewer(), false),
+            (age_verified, logged_out_viewer(), false),
             (
                 request_country_in,
                 in_country(Some("fr"), ViewerProfile::default()),
@@ -868,7 +710,7 @@ mod tests {
         let viewer = in_country(Some("fr"), ViewerProfile::default());
         let context = test_context(&viewer, &failed);
         assert_eq!(
-            ViewerAgeVerified.truth(&context),
+            age_verified.truth(&context),
             Truth::Unknown {
                 default: false,
                 failed: Hydrators::of(Hydrator::ViewerProfile).with(Hydrator::ViewerLabels),
@@ -896,10 +738,12 @@ mod tests {
         failed.failed = Hydrators::all();
         let context = test_context(&viewer, &failed);
         for (support, expected) in [(IosNeedsUpdate, Truth::True), (Supported, Truth::False)] {
-            let check = ClientVerifyBlurSupportIs(support);
+            let check = Predicate::Request(ClientVerifyBlurSupportIs(support));
             assert_eq!(check.truth(&context), expected, "{support:?}");
         }
-        for check in [ClientHasModernBlur, ClientHasCommunityViewerRemovedLimits] {
+        for check in
+            [ClientHasModernBlur, ClientHasCommunityViewerRemovedLimits].map(Predicate::Request)
+        {
             assert_eq!(check.truth(&context), Truth::True, "{check:?}");
         }
     }

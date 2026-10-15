@@ -795,75 +795,215 @@ mod tests {
             answers
         }
 
-                        macro_rules! failing_tes {
-            ($($method:ident => $value:ty),* $(,)?) => {
-                #[tonic::async_trait]
-                impl TESClient for Failing<MockTESClient> {
-                    $(
-                        async fn $method(
-                            &self,
-                            ids: Vec<u64>,
-                        ) -> HashMap<u64, anyhow::Result<Option<$value>>> {
-                            failing(self.0.$method(ids).await, |id| id)
-                        }
-                    )*
+        #[tonic::async_trait]
+        impl TESClient for Failing<MockTESClient> {
+            async fn get_tweet_core_datas(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<PureCoreData>>> {
+                failing(self.0.get_tweet_core_datas(ids).await, |id| id)
+            }
 
-                    async fn get_core_data_and_api_counts(
-                        &self,
-                        tweet_id: u64,
-                    ) -> (
-                        anyhow::Result<Option<PureCoreData>>,
-                        anyhow::Result<Option<ApiCounts>>,
-                    ) {
-                        self.0.get_core_data_and_api_counts(tweet_id).await
-                    }
+            async fn get_tweet_media_entities(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<MediaEntities>>> {
+                failing(self.0.get_tweet_media_entities(ids).await, |id| id)
+            }
 
-                    async fn get_status_perspectives(
-                        &self,
-                        ids: Vec<u64>,
-                        metadata: Option<&MetadataMap>,
-                    ) -> HashMap<u64, anyhow::Result<Option<ApiPerspective>>> {
-                        failing(self.0.get_status_perspectives(ids, metadata).await, |id| id)
-                    }
+            async fn get_subscription_author_ids(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<u64>>> {
+                failing(self.0.get_subscription_author_ids(ids).await, |id| id)
+            }
 
-                    async fn get_api_media_entities(
-                        &self,
-                        ids: Vec<u64>,
-                        metadata: Option<&MetadataMap>,
-                    ) -> HashMap<u64, anyhow::Result<Option<Vec<ApiMediaEntity>>>> {
-                        failing(self.0.get_api_media_entities(ids, metadata).await, |id| id)
-                    }
-                }
-            };
-        }
+            async fn get_conversation_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ConversationControl>>> {
+                failing(self.0.get_conversation_controls(ids).await, |id| id)
+            }
 
-        failing_tes! {
-            get_tweet_core_datas => PureCoreData,
-            get_tweet_media_entities => MediaEntities,
-            get_subscription_author_ids => u64,
-            get_conversation_controls => ConversationControl,
-            get_quoted_tweets => QuotedTweet,
-            get_reaction_context => ReactionContext,
-            get_min_video_durations => i64,
-            get_media_count => i64,
-            get_nullcast => bool,
-            get_community => i64,
-            get_nsfw_user => bool,
-            get_nsfw_admin => bool,
-            get_has_takedown => bool,
-            get_takedown_country_codes => Vec<String>,
-            get_takedown_reasons => Vec<TakedownReason>,
-            get_language_code => String,
-            get_api_counts => ApiCounts,
-            get_is_article => bool,
-            get_is_premium => bool,
-            get_urls => UrlEntities,
-            get_cashtag_attachments => CashtagAttachments,
-            get_exclusive_controls => ExclusiveTweetControl,
-            get_trusted_friends_controls => TrustedFriendsControl,
-            get_grok_post_ids => String,
-            get_edit_control => EditControl,
-            get_escherbird_entity_annotations => Vec<EscherbirdEntityAnnotation>,
+            async fn get_quoted_tweets(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<QuotedTweet>>> {
+                failing(self.0.get_quoted_tweets(ids).await, |id| id)
+            }
+
+            async fn get_reaction_context(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ReactionContext>>> {
+                failing(self.0.get_reaction_context(ids).await, |id| id)
+            }
+
+            async fn get_min_video_durations(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_min_video_durations(ids).await, |id| id)
+            }
+
+            async fn get_media_count(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_media_count(ids).await, |id| id)
+            }
+
+            async fn get_nullcast(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nullcast(ids).await, |id| id)
+            }
+
+            async fn get_community(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_community(ids).await, |id| id)
+            }
+
+            async fn get_nsfw_user(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nsfw_user(ids).await, |id| id)
+            }
+
+            async fn get_nsfw_admin(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nsfw_admin(ids).await, |id| id)
+            }
+
+            async fn get_has_takedown(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_has_takedown(ids).await, |id| id)
+            }
+
+            async fn get_takedown_country_codes(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<String>>>> {
+                failing(self.0.get_takedown_country_codes(ids).await, |id| id)
+            }
+
+            async fn get_takedown_reasons(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<TakedownReason>>>> {
+                failing(self.0.get_takedown_reasons(ids).await, |id| id)
+            }
+
+            async fn get_language_code(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<String>>> {
+                failing(self.0.get_language_code(ids).await, |id| id)
+            }
+
+            async fn get_api_counts(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ApiCounts>>> {
+                failing(self.0.get_api_counts(ids).await, |id| id)
+            }
+
+            async fn get_is_article(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_is_article(ids).await, |id| id)
+            }
+
+            async fn get_is_premium(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_is_premium(ids).await, |id| id)
+            }
+
+            async fn get_urls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<UrlEntities>>> {
+                failing(self.0.get_urls(ids).await, |id| id)
+            }
+
+            async fn get_cashtag_attachments(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<CashtagAttachments>>> {
+                failing(self.0.get_cashtag_attachments(ids).await, |id| id)
+            }
+
+            async fn get_exclusive_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ExclusiveTweetControl>>> {
+                failing(self.0.get_exclusive_controls(ids).await, |id| id)
+            }
+
+            async fn get_trusted_friends_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<TrustedFriendsControl>>> {
+                failing(self.0.get_trusted_friends_controls(ids).await, |id| id)
+            }
+
+            async fn get_grok_post_ids(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<String>>> {
+                failing(self.0.get_grok_post_ids(ids).await, |id| id)
+            }
+
+            async fn get_edit_control(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<EditControl>>> {
+                failing(self.0.get_edit_control(ids).await, |id| id)
+            }
+
+            async fn get_escherbird_entity_annotations(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<EscherbirdEntityAnnotation>>>> {
+                failing(self.0.get_escherbird_entity_annotations(ids).await, |id| id)
+            }
+
+            async fn get_core_data_and_api_counts(
+                &self,
+                tweet_id: u64,
+            ) -> (
+                anyhow::Result<Option<PureCoreData>>,
+                anyhow::Result<Option<ApiCounts>>,
+            ) {
+                self.0.get_core_data_and_api_counts(tweet_id).await
+            }
+
+            async fn get_status_perspectives(
+                &self,
+                ids: Vec<u64>,
+                metadata: Option<&MetadataMap>,
+            ) -> HashMap<u64, anyhow::Result<Option<ApiPerspective>>> {
+                failing(self.0.get_status_perspectives(ids, metadata).await, |id| id)
+            }
+
+            async fn get_api_media_entities(
+                &self,
+                ids: Vec<u64>,
+                metadata: Option<&MetadataMap>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<ApiMediaEntity>>>> {
+                failing(self.0.get_api_media_entities(ids, metadata).await, |id| id)
+            }
         }
 
         type Users = HashMap<i64, anyhow::Result<Option<GizmoduckUserResult>>>;

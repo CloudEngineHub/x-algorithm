@@ -1,24 +1,28 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, ArticleLifecycle, AuthorFeatures, AuthorLabelSet, ClientCapability,
-    CommunityModeration, PostCandidate, SafetyLabelMap, TweetFeatures, Viewer, ViewerFeatures,
-    ViewerProfile,
+    tweet_timestamp_ms, ClientCapability, PostCandidate, PostEntity, UserEntity, ViewerFeatures,
 };
 use crate::params::{CountryList, CountryLists};
-use xai_core_entities::entities::ConversationControl;
+use crate::rules::rule_spec::features::Feature;
 
 pub(crate) struct RuleContext<'a> {
     facts: CoreFacts<'a>,
+    viewer: &'a ViewerFeatures,
+    candidate: &'a PostCandidate,
     #[cfg(test)]
     hydrated: Hydrators,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct CoreFacts<'a> {
-    viewer: &'a ViewerFeatures,
-    candidate: &'a PostCandidate,
+    viewer_id: Option<u64>,
+    request_country: Option<&'a str>,
+    client_capability: ClientCapability,
     country_lists: &'a CountryLists,
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct PostCoreFacts<'a>(&'a PostCandidate);
 
 impl<'a> RuleContext<'a> {
     pub(super) fn new(
@@ -28,10 +32,13 @@ impl<'a> RuleContext<'a> {
     ) -> Self {
         Self {
             facts: CoreFacts {
-                viewer,
-                candidate,
+                viewer_id: viewer.viewer.user_id(),
+                request_country: viewer.country_code.as_deref(),
+                client_capability: viewer.client_capability,
                 country_lists,
             },
+            viewer,
+            candidate,
             #[cfg(test)]
             hydrated: Hydrators::all(),
         }
@@ -43,15 +50,17 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
-    fn reads(&self, hydrator: Hydrator) -> &'a PostCandidate {
+    fn reads(&self, required: Hydrators) -> &Self {
         #[cfg(test)]
-        assert!(
-            self.hydrated.contains(hydrator),
-            "a rule reads {hydrator:?}, which its policy does not derive"
-        );
+        for hydrator in required.iter() {
+            assert!(
+                self.hydrated.contains(hydrator),
+                "a rule reads {hydrator:?}, which its policy does not derive"
+            );
+        }
         #[cfg(not(test))]
-        let _ = hydrator;
-        self.facts.candidate
+        let _ = required;
+        self
     }
 
     #[inline]
@@ -60,44 +69,49 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
-    pub(super) fn is_author_viewer(&self) -> bool {
-        self.facts.viewer_id() == Some(self.facts.candidate.author.id)
-    }
-
-    #[inline]
     pub(super) fn failed(&self) -> Hydrators {
-        self.facts.candidate.failed
+        self.candidate.failed
     }
 
     #[inline]
-    pub(super) fn source_tweet_id(&self) -> Option<u64> {
-        self.reads(Hydrator::PureCore).post.source_tweet_id
+    pub(super) fn acquire<F: Feature>(&self) -> F::Value<'a> {
+        F::read(At(self.reads(F::REQUIRED)))
     }
 
     #[inline]
-    pub(super) fn tweet_features(&self) -> &'a TweetFeatures {
-        &self.reads(Hydrator::Tweet).post.tweet_features
+    pub(super) fn acquire_edge(&self, node: Hydrator) -> bool {
+        At(self.reads(Hydrators::of(node))).edge(node)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct At<'c, 'a>(&'c RuleContext<'a>);
+
+impl<'a> At<'_, 'a> {
+    #[inline]
+    pub(super) fn post(self) -> &'a PostEntity {
+        &self.0.candidate.post
     }
 
     #[inline]
-    pub(super) fn tweet_safety_labels(&self) -> &'a SafetyLabelMap {
-        &self.reads(Hydrator::TweetSafetyLabels).post.safety_labels
+    pub(super) fn post_facts(self) -> PostCoreFacts<'a> {
+        PostCoreFacts(self.0.candidate)
     }
 
     #[inline]
-    pub(super) fn author_features(&self) -> AuthorFeatures {
-        self.reads(Hydrator::AuthorSafety).author.features()
+    pub(super) fn author(self) -> &'a UserEntity {
+        &self.0.candidate.author
     }
 
     #[inline]
-    pub(super) fn author_labels(&self) -> AuthorLabelSet {
-        self.reads(Hydrator::AuthorLabels).author.labels
+    pub(super) fn viewer(self) -> &'a ViewerFeatures {
+        self.0.viewer
     }
 
     #[inline]
-    pub(super) fn edge(&self, node: Hydrator) -> bool {
+    pub(super) fn edge(self, node: Hydrator) -> bool {
         debug_assert!(node.is_edge(), "{node:?} is not an edge node");
-        let candidate = self.reads(node);
+        let candidate = self.0.candidate;
         debug_assert!(candidate
             .post
             .edges
@@ -108,124 +122,48 @@ impl<'a> RuleContext<'a> {
             .get(node)
             .unwrap_or_else(|| candidate.post.edges.contains(node))
     }
-
-    #[inline]
-    pub(super) fn conversation_control(&self) -> Option<&'a ConversationControl> {
-        let features = self
-            .reads(Hydrator::ConversationControl)
-            .post
-            .conversation_control
-            .as_ref();
-        features.map(|features| &features.control)
-    }
-
-    #[inline]
-    pub(super) fn viewer_country(&self) -> Option<&'a str> {
-        let features = self
-            .reads(Hydrator::ViewerCountry)
-            .post
-            .conversation_control
-            .as_ref();
-        features.and_then(|features| features.viewer_country.as_deref())
-    }
-
-    #[inline]
-    pub(super) fn community_moderation(&self) -> CommunityModeration {
-        self.reads(Hydrator::CommunityModeration)
-            .post
-            .community_moderation
-    }
-
-    #[inline]
-    pub(super) fn viewer_is_community_moderator(&self) -> Option<bool> {
-        self.reads(Hydrator::CommunityModerator)
-            .post
-            .viewer_is_community_moderator
-    }
-
-    #[inline]
-    pub(super) fn viewer_is_removed_from_community(&self) -> bool {
-        self.reads(Hydrator::CommunityViewerRemoved)
-            .post
-            .viewer_is_removed_from_community
-    }
-
-    #[inline]
-    pub(super) fn article_has_media_entities(&self) -> bool {
-        self.reads(Hydrator::ArticleMediaEntities)
-            .post
-            .article_has_media_entities
-    }
-
-    #[inline]
-    pub(super) fn article_has_cover_media(&self) -> bool {
-        self.reads(Hydrator::ArticleCoverMedia)
-            .post
-            .article_has_cover_media
-    }
-
-    #[inline]
-    pub(super) fn article_lifecycle(&self) -> Option<ArticleLifecycle> {
-        self.reads(Hydrator::ArticleLifecycle)
-            .post
-            .article_lifecycle
-    }
-
-    #[inline]
-    pub(super) fn viewer_has_age_verified_18_label(&self) -> bool {
-        self.reads(Hydrator::ViewerLabels);
-        match &self.facts.viewer.viewer {
-            Viewer::LoggedIn {
-                has_age_verified_18_label,
-                ..
-            } => *has_age_verified_18_label,
-            Viewer::LoggedOut => false,
-        }
-    }
-
-    #[inline]
-    pub(super) fn viewer_profile(&self) -> Option<&'a ViewerProfile> {
-        self.reads(Hydrator::ViewerProfile);
-        match &self.facts.viewer.viewer {
-            Viewer::LoggedIn { profile, .. } => Some(profile),
-            Viewer::LoggedOut => None,
-        }
-    }
 }
 
 impl<'a> CoreFacts<'a> {
     #[inline]
-    pub(super) fn tweet_id(self) -> u64 {
-        self.candidate.post.tweet_id
-    }
-
-    #[inline]
     pub(super) fn viewer_id(self) -> Option<u64> {
-        self.viewer.viewer.user_id()
+        self.viewer_id
     }
 
     #[inline]
     pub(super) fn request_country(self) -> Option<&'a str> {
-        self.viewer.country_code.as_deref()
+        self.request_country
     }
 
     #[inline]
     pub(super) fn client_capability(self) -> ClientCapability {
-        self.viewer.client_capability
-    }
-
-    #[inline]
-    pub(super) fn is_reply(self) -> bool {
-        self.candidate.post.is_reply
-    }
-
-    #[inline]
-    pub(super) fn created_after(self, unix_ms: u64) -> bool {
-        tweet_timestamp_ms(self.candidate.post.tweet_id) > unix_ms
+        self.client_capability
     }
 
     #[inline]
     pub(super) fn in_country_list(self, list: CountryList, country_code: &str) -> bool {
         self.country_lists.contains(list, country_code)
+    }
+}
+
+impl PostCoreFacts<'_> {
+    #[inline]
+    pub(super) fn tweet_id(self) -> u64 {
+        self.0.post.tweet_id
+    }
+
+    #[inline]
+    pub(super) fn author_id(self) -> u64 {
+        self.0.author.id
+    }
+
+    #[inline]
+    pub(super) fn is_reply(self) -> bool {
+        self.0.post.is_reply
+    }
+
+    #[inline]
+    pub(super) fn created_after(self, unix_ms: u64) -> bool {
+        tweet_timestamp_ms(self.0.post.tweet_id) > unix_ms
     }
 }

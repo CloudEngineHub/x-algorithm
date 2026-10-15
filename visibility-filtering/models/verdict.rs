@@ -101,10 +101,12 @@ impl LimitedEngagement {
         }
     }
 
-    pub fn add(&mut self, reason: LimitedEngagementReason) {
-        if !self.reasons().any(|held| held == reason) {
+    pub fn add(&mut self, reason: LimitedEngagementReason) -> bool {
+        let added = !self.reasons().any(|held| held == reason);
+        if added {
             self.rest.push(reason);
         }
+        added
     }
 
     pub fn reason(&self) -> LimitedEngagementReason {

@@ -1,6 +1,6 @@
 use crate::rules::levels;
 use crate::rules::metrics::Rpc;
-use crate::rules::rule_spec::Clause;
+use crate::rules::rule_spec::rule::Rule;
 use strum::VariantArray;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
@@ -19,7 +19,7 @@ pub(crate) struct LevelSpec {
     proto: Option<vf_pb::SafetyLevel>,
     thrift: ThriftLevel,
     on_evaluate_tweets: bool,
-    pub(super) rules: &'static [&'static Clause],
+    pub(super) rules: &'static [&'static Rule],
     pub(crate) unspecified_drop_is_exact: bool,
 }
 

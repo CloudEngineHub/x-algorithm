@@ -83,6 +83,7 @@ use crate::query_hydrators::explicit_engagement_signals_query_hydrator::Explicit
 use crate::query_hydrators::followed_grok_topics_query_hydrator::FollowedGrokTopicsQueryHydrator;
 use crate::query_hydrators::followed_starter_packs_query_hydrator::FollowedStarterPacksQueryHydrator;
 use crate::query_hydrators::followed_user_ids_query_hydrator::FollowedUserIdsQueryHydrator;
+use crate::query_hydrators::immersive_scoring_sequence_query_hydrator::ImmersiveScoringSequenceQueryHydrator;
 use crate::query_hydrators::implicit_engagement_signals_query_hydrator::ImplicitEngagementSignalsQueryHydrator;
 use crate::query_hydrators::impressed_posts_query_hydrator::ImpressedPostsQueryHydrator;
 use crate::query_hydrators::impression_bloom_filter_query_hydrator::ImpressionBloomFilterQueryHydrator;
@@ -95,6 +96,7 @@ use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserId
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
+use crate::scorers::immersive_video_scorer::ImmersiveVideoScorer;
 use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::vm_ranker::VMRanker;
 use crate::selectors::TopKScoreSelector;
@@ -258,6 +260,9 @@ impl PhoenixCandidatePipeline {
     ) -> PhoenixCandidatePipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ScoringSequenceQueryHydrator::new(
+                user_action_aggregation_client.clone(),
+            )),
+            Box::new(ImmersiveScoringSequenceQueryHydrator::new(
                 user_action_aggregation_client.clone(),
             )),
             Box::new(RetrievalSequenceQueryHydrator::new(
@@ -454,8 +459,16 @@ impl PhoenixCandidatePipeline {
             xds_client: xds_vm_ranker_client,
             author_cold_start,
         });
+        let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
+            dispatch: crate::util::egress::PredictionDispatch {
+                prod: phoenix_client.clone(),
+                paths: Vec::new(),
+                max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
+            },
+        });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
-            vec![phoenix_scorer, vm_ranker];
+            vec![phoenix_scorer, immersive_video_scorer, vm_ranker];
 
         let selector = TopKScoreSelector;
 

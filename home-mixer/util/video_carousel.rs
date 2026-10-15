@@ -1,6 +1,9 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
-use crate::params::{EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS};
+use crate::params::{
+    EnableVideoCarousel, VideoCarouselImmersiveVqvWeight, VIDEO_CAROUSEL_MAX_VIDEOS,
+    VIDEO_CAROUSEL_MIN_VIDEOS,
+};
 use std::collections::HashSet;
 
 const MAX_VERTICAL_ASPECT_RATIO: f32 = 1.0;
@@ -11,8 +14,16 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
         && query.video_carousel_eligible
 }
 
+pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
+    query.request_type == RequestType::ForYou
+        && query.params.get(EnableVideoCarousel)
+        && query.params.get(VideoCarouselImmersiveVqvWeight) != 0.0
+}
+
 pub(crate) fn select_videos<'a>(
     candidates: impl IntoIterator<Item = &'a PostCandidate>,
+    video_open_weight: f64,
+    immersive_vqv_weight: f64,
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
 ) -> Vec<PostCandidate> {
@@ -20,7 +31,9 @@ pub(crate) fn select_videos<'a>(
         .into_iter()
         .filter(|candidate| is_carousel_video(candidate) && is_vertical(candidate))
         .collect();
-    videos.sort_by(|a, b| video_open_score(b).total_cmp(&video_open_score(a)));
+    let score =
+        |video: &PostCandidate| carousel_score(video, video_open_weight, immersive_vqv_weight);
+    videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
     let videos = take_distinct(videos, dedupe_by_author, semantic_id_dedupe_levels);
     if videos.len() < VIDEO_CAROUSEL_MIN_VIDEOS {
         return Vec::new();
@@ -55,14 +68,18 @@ fn take_distinct(
     kept
 }
 
-pub(crate) fn take_videos_by_video_open(
+pub(crate) fn take_videos_by_carousel_score(
     candidates: &mut Vec<PostCandidate>,
     count: usize,
+    video_open_weight: f64,
+    immersive_vqv_weight: f64,
 ) -> Vec<PostCandidate> {
     let (mut videos, rest): (Vec<_>, Vec<_>) = std::mem::take(candidates)
         .into_iter()
         .partition(is_carousel_video);
-    videos.sort_by(|a, b| video_open_score(b).total_cmp(&video_open_score(a)));
+    let score =
+        |video: &PostCandidate| carousel_score(video, video_open_weight, immersive_vqv_weight);
+    videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
     let overflow = videos.split_off(count.min(videos.len()));
     *candidates = rest;
     candidates.extend(overflow);
@@ -72,7 +89,7 @@ pub(crate) fn take_videos_by_video_open(
     videos
 }
 
-fn is_carousel_video(candidate: &PostCandidate) -> bool {
+pub(crate) fn is_carousel_video(candidate: &PostCandidate) -> bool {
     candidate.has_video == Some(true)
         && candidate.in_reply_to_tweet_id.is_none()
         && candidate.phoenix_scores.video_open_score.is_some()
@@ -84,8 +101,25 @@ fn is_vertical(candidate: &PostCandidate) -> bool {
         .is_some_and(|ratio| ratio < MAX_VERTICAL_ASPECT_RATIO)
 }
 
+fn carousel_score(
+    candidate: &PostCandidate,
+    video_open_weight: f64,
+    immersive_vqv_weight: f64,
+) -> f64 {
+    video_open_weight * video_open_score(candidate)
+        + immersive_vqv_weight * immersive_vqv_score(candidate)
+}
+
 fn video_open_score(candidate: &PostCandidate) -> f64 {
     candidate.phoenix_scores.video_open_score.unwrap_or(0.0)
+}
+
+fn immersive_vqv_score(candidate: &PostCandidate) -> f64 {
+    candidate
+        .immersive_scores
+        .as_ref()
+        .and_then(|scores| scores.vqv_score)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -128,7 +162,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, false, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0)),
             vec![4, 5, 1]
         );
     }
@@ -155,7 +189,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, true, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0)),
             vec![1, 4, 5]
         );
     }
@@ -171,7 +205,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, false, 2)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 2)),
             vec![1, 3, 4, 5]
         );
     }
@@ -190,7 +224,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, true, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0)),
             vec![1, 4, 5, 6, 7]
         );
     }
@@ -203,6 +237,31 @@ mod tests {
             vertical(3, 20, &[], 0.7),
         ];
 
-        assert!(select_videos(&candidates, true, 0).is_empty());
+        assert!(select_videos(&candidates, 1.0, 0.0, true, 0).is_empty());
+    }
+
+    fn with_immersive_vqv(candidate: PostCandidate, vqv: f64) -> PostCandidate {
+        PostCandidate {
+            immersive_scores: Some(PhoenixScores {
+                vqv_score: Some(vqv),
+                ..Default::default()
+            }),
+            ..candidate
+        }
+    }
+
+    #[test]
+    fn ranks_by_weighted_sum_with_missing_immersive_scores_as_zero() {
+        let candidates = vec![
+            with_immersive_vqv(vertical(1, 10, &[], 0.9), 0.1),
+            with_immersive_vqv(vertical(2, 20, &[], 0.2), 0.9),
+            vertical(3, 30, &[], 0.5),
+            with_immersive_vqv(vertical(4, 40, &[], 0.3), 0.95),
+        ];
+
+        assert_eq!(
+            tweet_ids(&select_videos(&candidates, 1.0, 1.0, false, 0)),
+            vec![4, 2, 1, 3]
+        );
     }
 }

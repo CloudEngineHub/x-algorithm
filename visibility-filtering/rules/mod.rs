@@ -1,9 +1,13 @@
 mod author_rules;
+#[cfg(test)]
+mod catalog;
 mod context;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod golden_corpus;
+#[cfg(test)]
+mod legacy_table;
 mod levels;
 pub mod metrics;
 pub mod registry;
@@ -16,9 +20,15 @@ use crate::models::{PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
-pub(crate) use registry::ExplainedFact;
-pub use registry::RuleEngine;
-pub(crate) use rule_spec::Truth;
+pub use registry::{Effect, PolicyTrace, RowTrace, RuleEngine};
+pub(crate) use rule_spec::observed::NoTrace;
+pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
+pub use rule_spec::{
+    ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,
+    PostModerationLeaf, Predicate, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth,
+    TweetLeaf, TweetSafetyLabelsLeaf, ViewerAccountLeaf,
+};
 pub use safety_level::SafetyLevel;
 
 #[cfg(test)]

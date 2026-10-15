@@ -1,21 +1,33 @@
 pub use crate::hydration::{Hydrator, Hydrators, Lookup};
 pub use crate::models::viewer::Client;
-pub use crate::models::{ClientCapability, VerifyBlurSupport, ViewerAge, ViewerProfile};
+pub use crate::models::{
+    AuthorLabel, ClientCapability, Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement,
+    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
+    TombstoneReason, TweetId, Verdict, VerifyBlurSupport, ViewerAge, ViewerProfile, Withholding,
+};
+pub use crate::params::{CountryList, LimitedActionType};
 pub use crate::post_card::{Author, CardMedia, CardMediaKind, PostCard};
+pub use crate::retweet::MergeSelection;
 pub use crate::rules::metrics::Rpc;
-pub use crate::rules::SafetyLevel;
+pub use crate::rules::{
+    ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
+    PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, ReplyControlLeaf, RequestLeaf,
+    RowTrace, SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf, TweetSafetyLabelsLeaf,
+    ViewerAccountLeaf, Witness,
+};
 
-use crate::evaluate_tweets::{evaluate_tweets_request, Sends};
+use crate::evaluate_tweets::{Sends, evaluate_tweets_request};
 use crate::filter::{FilterRequest, FilterTweets, HydratedRequest};
 use crate::hydration::fallback_cache::FallbackCaches;
-use crate::hydration::sources::{test_users_metadata, Sources};
-use crate::hydration::{request_context, Hydration};
+use crate::hydration::sources::{Sources, test_users_metadata};
+use crate::hydration::{HydratedTweet, Hydration, request_context};
 use crate::limited_actions_copy::LimitedActionsCopy;
-use crate::models::{Evaluation, PostCandidate, RawCandidate, TweetId, Viewer};
+use crate::models::{PostCandidate, RawCandidate, Viewer};
 use crate::params::{ClientSwitches, CountryLists};
-use crate::result_label::{label, state_label, Class, NONE};
+use crate::result_label::{Class, NONE, label, state_label};
 use crate::retweet;
-use crate::rules::{ExplainedFact, RuleEngine, Truth};
+use crate::rules::RuleEngine;
 use crate::server_deps::{self, CacheWarming};
 use crate::treatment;
 use futures::future::{join, join_all};
@@ -65,27 +77,37 @@ impl Route {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ask<const N: usize> {
-    pub viewer: Option<NonZeroU64>,
+        pub viewer: Option<NonZeroU64>,
     pub post: u64,
     pub country: Option<String>,
-    pub client: Client,
+        pub client: Client,
     pub routes: [Route; N],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Explanation<const N: usize> {
     pub post: Option<PostCard>,
     pub viewer: ViewerFacts,
-    pub in_nsfw_gating_country: bool,
+            pub in_nsfw_gating_country: FactObservation,
     pub levels: [LevelOutcome; N],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FactObservation {
+        NotRead,
+    Recorded {
+        route: Route,
+                node: usize,
+        truth: Truth,
+    },
 }
 
 impl<const N: usize> Explanation<N> {
     pub fn new(
         post: Option<PostCard>,
         viewer: ViewerFacts,
-        in_nsfw_gating_country: bool,
+        in_nsfw_gating_country: FactObservation,
         levels: [LevelOutcome; N],
     ) -> Self {
         Self {
@@ -97,24 +119,40 @@ impl<const N: usize> Explanation<N> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct LevelOutcome {
     pub route: Route,
-    pub capability: ClientCapability,
+        pub capability: ClientCapability,
     pub judgement: Judgement,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Provenance {
+            pub requested: Option<PolicyTrace>,
+    pub source_tweet_id: Option<TweetId>,
+            pub source: Option<PolicyTrace>,
+    pub selection: MergeSelection,
+        pub evaluation: Evaluation,
 }
 
 impl LevelOutcome {
-    pub fn new(route: Route, capability: ClientCapability, judgement: Judgement) -> Self {
+    pub fn new(
+        route: Route,
+        capability: ClientCapability,
+        judgement: Judgement,
+        provenance: Provenance,
+    ) -> Self {
         Self {
             route,
             capability,
             judgement,
+            provenance,
         }
     }
 
-    pub fn evaluate_tweets_sends(&self) -> Option<Sent<'_>> {
+        pub fn evaluate_tweets_sends(&self) -> Option<Sent<'_>> {
         match self.route.rpc {
             Rpc::FilterTweets => None,
             Rpc::EvaluateTweets => Some(match &self.judgement {
@@ -128,7 +166,7 @@ impl LevelOutcome {
         }
     }
 
-    pub fn label(&self) -> (String, String) {
+            pub fn label(&self) -> (String, String) {
         match (self.route.rpc, &self.judgement) {
             (Rpc::FilterTweets, Judgement::Judged { state, .. }) => state_label(state),
             (Rpc::FilterTweets | Rpc::EvaluateTweets, judgement) => judgement.label(),
@@ -142,16 +180,16 @@ impl LevelOutcome {
     reason = "an explanation holds one per level, and nearly every level judges"
 )]
 pub enum Judgement {
-    #[non_exhaustive]
+            #[non_exhaustive]
     Judged {
         state: TweetFieldsResultState,
-        decided_by: Option<&'static str>,
+                decided_by: Option<&'static str>,
         fail_open: Hydrators,
-        failed: Hydrators,
+                        failed: Hydrators,
         sent: Option<TweetFieldsResultState>,
     },
-    NotFound(Lookup),
-    Failed(Lookup),
+        NotFound(Lookup),
+        Failed(Lookup),
 }
 
 impl Judgement {
@@ -180,7 +218,7 @@ impl Judgement {
         }
     }
 
-    pub fn label(&self) -> (String, String) {
+            pub fn label(&self) -> (String, String) {
         match self {
             Self::Judged {
                 sent: Some(state), ..
@@ -205,29 +243,29 @@ impl Judgement {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sent<'a> {
-    ResultState(&'a TweetFieldsResultState),
+        ResultState(&'a TweetFieldsResultState),
     Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ViewerFacts {
     LoggedOut,
-    NotRead {
+        NotRead {
         id: NonZeroU64,
         relationship: Relationship,
     },
-    ReadFailed {
+        ReadFailed {
         id: NonZeroU64,
         relationship: Relationship,
     },
-    NoUser {
+        NoUser {
         id: NonZeroU64,
         relationship: Relationship,
     },
-    LoggedIn {
+            LoggedIn {
         id: NonZeroU64,
         profile: ViewerProfile,
-        age_verified_18: Seen,
+                age_verified_18: Seen,
         relationship: Relationship,
     },
 }
@@ -245,22 +283,11 @@ pub struct Relationship {
 pub enum Seen {
     Yes,
     No,
-    NotHydrated,
+        NotHydrated,
     Failed,
 }
 
 impl Seen {
-    fn of(planned: Hydrators, fact: ExplainedFact, truth: Truth) -> Self {
-        if planned.intersection(fact.reads()) != fact.reads() {
-            return Self::NotHydrated;
-        }
-        match truth {
-            Truth::Unknown { .. } => Self::Failed,
-            Truth::True => Self::Yes,
-            Truth::False => Self::No,
-        }
-    }
-
     fn read(reads: Hydrators, failed: Hydrators, hydrator: Hydrator, yes: bool) -> Self {
         if !reads.contains(hydrator) {
             Self::NotHydrated
@@ -284,7 +311,7 @@ impl Seen {
 }
 
 impl Explainer {
-    pub async fn connect(datacenter: &str) -> Self {
+                                                pub async fn connect(datacenter: &str) -> Self {
         let metadata = test_users_metadata();
         let serving = server_deps::serving(datacenter, Some(&metadata), CacheWarming::Off).await;
         Self::new(
@@ -296,7 +323,7 @@ impl Explainer {
         )
     }
 
-    pub async fn explain<const N: usize>(&self, ask: &Ask<N>) -> Explanation<N> {
+        pub async fn explain<const N: usize>(&self, ask: &Ask<N>) -> Explanation<N> {
         let post = request_context(Instant::now(), None).scope(self.sources.post_card(ask.post));
         let ((viewer, in_nsfw_gating_country, levels), post) = join(self.judge(ask), post).await;
         Explanation::new(post, viewer, in_nsfw_gating_country, levels)
@@ -309,7 +336,7 @@ struct RouteRun {
     country_code: Option<String>,
     capability: ClientCapability,
     hydrated: HydratedRequest,
-    evaluation: Evaluation,
+    provenance: Provenance,
 }
 
 impl Explainer {
@@ -329,18 +356,21 @@ impl Explainer {
         }
     }
 
-    async fn judge<const N: usize>(&self, ask: &Ask<N>) -> (ViewerFacts, bool, [LevelOutcome; N]) {
+    async fn judge<const N: usize>(
+        &self,
+        ask: &Ask<N>,
+    ) -> (ViewerFacts, FactObservation, [LevelOutcome; N]) {
         let evaluated = join_all(ask.routes.map(|route| self.evaluate(ask, route))).await;
         #[expect(clippy::unreachable, reason = "join_all answers each of the N routes")]
         let Ok(evaluated) = <[RouteRun; N]>::try_from(evaluated) else {
             unreachable!()
         };
-        let viewer = self.viewer_facts(ask, &evaluated);
-        let in_nsfw_gating_country = self.in_nsfw_gating_country(&evaluated);
+        let viewer = Self::viewer_facts(ask, &evaluated);
+        let in_nsfw_gating_country = Self::in_nsfw_gating_country(&evaluated);
         (
             viewer,
             in_nsfw_gating_country,
-            evaluated.each_ref().map(|level| self.outcome(ask, level)),
+            evaluated.map(|level| self.outcome(ask, level)),
         )
     }
 
@@ -378,27 +408,44 @@ impl Explainer {
         let country_code = request.country_code.clone();
         request_context(Instant::now(), None)
             .scope(async {
-                let (hydrated, outcomes) =
-                    retweet::hydrate_and_evaluate(&self.filter_tweets, request).await;
-                RouteRun {
-                    route,
-                    context,
-                    country_code,
-                    capability,
-                    hydrated,
+                let (hydrated, outcomes, mut traced) =
+                    retweet::hydrate_and_trace(&self.filter_tweets, request).await;
+                let post = TweetId(ask.post);
+                let source_tweet_id = hydrated
+                    .hydration()
+                    .tweet(post)
+                    .and_then(HydratedTweet::source_tweet_id);
+                let provenance = Provenance {
+                    requested: traced.policies.remove(&post),
+                    source_tweet_id,
+                    source: source_tweet_id.and_then(|source| traced.policies.remove(&source)),
+                    selection: traced
+                        .selections
+                        .get(&post)
+                        .copied()
+                        .unwrap_or(MergeSelection::RequestedOnly),
                     evaluation: outcomes
                         .into_iter()
                         .next()
                         .map_or(Evaluation::Failed(Lookup::Tweet), |outcome| {
                             outcome.evaluation
                         }),
+                };
+                RouteRun {
+                    route,
+                    context,
+                    country_code,
+                    capability,
+                    hydrated,
+                    provenance,
                 }
             })
             .await
     }
 
-    fn outcome<const N: usize>(&self, ask: &Ask<N>, level: &RouteRun) -> LevelOutcome {
-        let judgement = match &level.evaluation {
+    fn outcome<const N: usize>(&self, ask: &Ask<N>, level: RouteRun) -> LevelOutcome {
+        let evaluation = &level.provenance.evaluation;
+        let judgement = match evaluation {
             Evaluation::Complete { verdict } | Evaluation::Partial { verdict, .. } => {
                 let policies = self.client_switches.limited_actions_policies(
                     level.context.as_ref(),
@@ -409,12 +456,12 @@ impl Explainer {
                     None,
                 );
                 let decided_by = treatment::decided_by(verdict);
-                match Sends::new(&level.evaluation, level.route.level, &policies).result_state() {
+                match Sends::new(evaluation, level.route.level, &policies).result_state() {
                     Some(state) => Judgement::judged(state, decided_by),
                     None => Judgement::judged_partially(
                         treatment::thrift_result_state(verdict, level.route.level, &policies),
                         decided_by,
-                        level.evaluation.fail_open_defaults(),
+                        evaluation.fail_open_defaults(),
                         level.hydrated.hydration().failed_nodes(TweetId(ask.post)),
                     ),
                 }
@@ -422,14 +469,14 @@ impl Explainer {
             Evaluation::NotFound(lookup) => Judgement::NotFound(*lookup),
             Evaluation::Failed(lookup) => Judgement::Failed(*lookup),
         };
-        LevelOutcome::new(level.route, level.capability, judgement)
+        LevelOutcome::new(level.route, level.capability, judgement, level.provenance)
     }
 
-    fn viewer_facts<const N: usize>(&self, ask: &Ask<N>, evaluated: &[RouteRun]) -> ViewerFacts {
+    fn viewer_facts<const N: usize>(ask: &Ask<N>, evaluated: &[RouteRun]) -> ViewerFacts {
         let Some(id) = ask.viewer else {
             return ViewerFacts::LoggedOut;
         };
-        let relationship = self.relationship(id, TweetId(ask.post), evaluated);
+        let relationship = Self::relationship(id, TweetId(ask.post), evaluated);
         let hydrations: Vec<&Hydration> = evaluated
             .iter()
             .map(|level| level.hydrated.hydration())
@@ -484,23 +531,25 @@ impl Explainer {
             })
     }
 
-    fn in_nsfw_gating_country(&self, evaluated: &[RouteRun]) -> bool {
-        Self::profile_hydration(evaluated)
-            .or_else(|| evaluated.first().map(|level| level.hydrated.hydration()))
-            .is_some_and(|hydration| {
-                self.filter_tweets
-                    .rule_engine()
-                    .in_nsfw_gating_country(hydration.viewer())
-                    .resolves_true()
+    fn in_nsfw_gating_country(evaluated: &[RouteRun]) -> FactObservation {
+        let leaf = NodeKind::Leaf(Predicate::ViewerAccount(
+            ViewerAccountLeaf::ViewerAccountOrRequestCountryIn(CountryList::NsfwGating),
+        ));
+        evaluated
+            .iter()
+            .find_map(|level| {
+                let trace = level.provenance.requested.as_ref()?;
+                let node = trace.nodes.iter().find(|node| node.kind == leaf)?;
+                Some(FactObservation::Recorded {
+                    route: level.route,
+                    node: node.node,
+                    truth: node.truth,
+                })
             })
+            .unwrap_or(FactObservation::NotRead)
     }
 
-    fn relationship(
-        &self,
-        viewer: NonZeroU64,
-        post: TweetId,
-        evaluated: &[RouteRun],
-    ) -> Relationship {
+    fn relationship(viewer: NonZeroU64, post: TweetId, evaluated: &[RouteRun]) -> Relationship {
         let posts: Vec<(&Hydration, &PostCandidate)> = evaluated
             .iter()
             .filter_map(|level| {
@@ -508,13 +557,16 @@ impl Explainer {
                 Some((hydration, hydration.tweet(post)?.candidate()?))
             })
             .collect();
-        let rules = self.filter_tweets.rule_engine();
-        let edge = |fact| {
+        let edge = |node| {
             posts
                 .iter()
                 .map(|&(hydration, candidate)| {
-                    let truth = rules.truth(fact, hydration.viewer(), candidate);
-                    Seen::of(hydration.planned(), fact, truth)
+                    Seen::read(
+                        hydration.planned(),
+                        candidate.failed,
+                        node,
+                        candidate.viewer_relationship.get(node).unwrap_or(false),
+                    )
                 })
                 .fold(Seen::NotHydrated, Seen::union)
         };
@@ -522,10 +574,10 @@ impl Explainer {
             is_author: posts
                 .iter()
                 .any(|(_, candidate)| candidate.author.id == viewer.get()),
-            follows: edge(ExplainedFact::Follows),
-            blocks: edge(ExplainedFact::Blocks),
-            mutes: edge(ExplainedFact::Mutes),
-            blocked_by: edge(ExplainedFact::IsBlockedBy),
+            follows: edge(Hydrator::Follows),
+            blocks: edge(Hydrator::Blocks),
+            mutes: edge(Hydrator::Mutes),
+            blocked_by: edge(Hydrator::BlockedByAuthor),
         }
     }
 }
@@ -535,10 +587,11 @@ mod tests {
     use super::*;
     use crate::clients::socialgraph_client::Graph;
     use crate::evaluate_tweets::EvaluateTweetsEndpoint;
-    use crate::hydration::plan::Source;
-    use crate::hydration::sources::{control, Fault, InMemorySources};
     use crate::hydration::HydratedTweet;
+    use crate::hydration::plan::Source;
+    use crate::hydration::sources::{Fault, InMemorySources, control, suspended};
     use crate::limited_actions_copy::tests::BUNDLE;
+    use crate::models::{SafetyLabelType, TweetFeatures};
     use strum::VariantArray;
     use vf_pb::tweet_evaluation::Outcome;
     use xai_core_entities::entities::{
@@ -894,6 +947,13 @@ mod tests {
                 Route::new(rpc, level).unwrap(),
                 ClientCapability::default(),
                 judgement.clone(),
+                Provenance {
+                    requested: None,
+                    source_tweet_id: None,
+                    source: None,
+                    selection: MergeSelection::RequestedOnly,
+                    evaluation: Evaluation::Failed(Lookup::Tweet),
+                },
             )
             .label()
         };
@@ -938,8 +998,34 @@ mod tests {
         );
     }
 
+    fn requested(outcome: &LevelOutcome) -> &PolicyTrace {
+        outcome.provenance.requested.as_ref().unwrap()
+    }
+
+    fn nsfw_gating_reads(outcome: &LevelOutcome) -> Vec<&NodeTrace> {
+        let leaf = NodeKind::Leaf(Predicate::ViewerAccount(
+            ViewerAccountLeaf::ViewerAccountOrRequestCountryIn(CountryList::NsfwGating),
+        ));
+        requested(outcome)
+            .nodes
+            .iter()
+            .filter(|node| node.kind == leaf)
+            .collect()
+    }
+
+        fn assert_first_nsfw_gating_read(fact: FactObservation, outcome: &LevelOutcome) -> Truth {
+        let FactObservation::Recorded { route, node, truth } = fact else {
+            panic!("{fact:?}");
+        };
+        assert_eq!(route, outcome.route);
+        let reads = nsfw_gating_reads(outcome);
+        assert!(reads.len() > 1, "{reads:?}");
+        assert_eq!((node, truth), (reads[0].node, reads[0].truth));
+        truth
+    }
+
     #[tokio::test]
-    async fn nsfw_gating_reads_the_account_country_then_the_request_country() {
+    async fn nsfw_gating_country_is_observed_from_the_first_route_occurrence() {
         let gated = |account: Option<&str>, request: &str| {
             let viewer = GizmoduckUser {
                 account: GizmoduckAccount {
@@ -963,7 +1049,11 @@ mod tests {
                     "{:?}",
                     explanation.viewer
                 );
-                explanation.in_nsfw_gating_country
+                assert_first_nsfw_gating_read(
+                    explanation.in_nsfw_gating_country,
+                    &explanation.levels[0],
+                )
+                .resolves_true()
             }
         };
         assert_eq!(
@@ -975,10 +1065,32 @@ mod tests {
             ],
             [true, false, true, false]
         );
+
+        let filter_all = Route::new(Rpc::FilterTweets, SafetyLevel::FilterAll).unwrap();
+        let level_82 = Route::new(Rpc::EvaluateTweets, SafetyLevel::TimelineHomeHydration).unwrap();
+        let ask = Ask {
+            viewer: NonZeroU64::new(VIEWER),
+            post: 1,
+            country: Some("DE".to_owned()),
+            client: Client::Web,
+            routes: [filter_all, level_82],
+        };
+        let explanation = explainer(
+            InMemorySources::default().tweet(1, 10).authors(&[10]),
+            no_copy(),
+        )
+        .explain(&ask)
+        .await;
+        assert!(nsfw_gating_reads(&explanation.levels[0]).is_empty());
+        let truth = assert_first_nsfw_gating_read(
+            explanation.in_nsfw_gating_country,
+            &explanation.levels[1],
+        );
+        assert!(truth.resolves_true());
     }
 
     #[tokio::test]
-    async fn nsfw_gating_reads_the_request_country_for_every_viewer_without_a_profile() {
+    async fn nsfw_gating_is_recorded_without_a_profile_and_not_read_where_no_rule_reads_it() {
         let world = || InMemorySources::default().tweet(1, 10).authors(&[10]);
         let filter_all = Route::new(Rpc::FilterTweets, SafetyLevel::FilterAll).unwrap();
         let level_82 = Route::new(Rpc::EvaluateTweets, SafetyLevel::TimelineHomeHydration).unwrap();
@@ -1022,10 +1134,15 @@ mod tests {
                 };
                 let explanation = explainer(sources, no_copy()).explain(&ask).await;
                 assert_eq!(arm(&explanation.viewer), expected_arm);
-                assert_eq!(
-                    explanation.in_nsfw_gating_country, gated,
-                    "{expected_arm} in {request}"
+                if route == filter_all {
+                    assert_eq!(explanation.in_nsfw_gating_country, FactObservation::NotRead);
+                    continue;
+                }
+                let truth = assert_first_nsfw_gating_read(
+                    explanation.in_nsfw_gating_country,
+                    &explanation.levels[0],
                 );
+                assert_eq!(truth.resolves_true(), gated, "{expected_arm} in {request}");
             }
         }
     }
@@ -1084,7 +1201,7 @@ mod tests {
         else {
             panic!("a suspended viewer is a Gizmoduck user");
         };
-        assert_eq!(profile.viewer_age, ViewerAge::Unknown);
+        assert_eq!(profile.viewer_age, ViewerAge::NotStated);
         let suspended_aged_30 = GizmoduckUser {
             safety: Safety {
                 suspended: true,
@@ -1244,5 +1361,647 @@ mod tests {
             panic!("{facts:?}");
         };
         assert_eq!(profile.viewer_age, ViewerAge::NotStated);
+    }
+
+    async fn served(world: InMemorySources, route: Route, post: u64) -> Evaluation {
+        let candidates = vec![RawCandidate {
+            tweet_id: TweetId(post),
+            request_author_id: None,
+        }];
+        let request = match route.rpc() {
+            Rpc::FilterTweets => FilterRequest {
+                viewer_id: Some(VIEWER),
+                country_code: Some("us".to_owned()),
+                client_capability: ClientCapability::default(),
+                safety_level: route.level(),
+                candidates,
+                rpc: Rpc::FilterTweets,
+            },
+            Rpc::EvaluateTweets => evaluate_tweets_request(
+                &ClientSwitches::for_tests(),
+                Some(&Client::Web.context(Some(VIEWER), Some("us"))),
+                Some(VIEWER),
+                route.level(),
+                candidates,
+            ),
+        };
+        let filter_tweets =
+            FilterTweets::new(Arc::new(world), RuleEngine::for_tests(), Arc::default());
+        let (_, outcomes) = request_context(Instant::now(), None)
+            .scope(retweet::hydrate_and_evaluate(&filter_tweets, request))
+            .await;
+        outcomes[0].evaluation.clone()
+    }
+
+    #[tokio::test]
+    async fn each_level_keeps_its_requested_source_and_final_evaluations_and_its_merge_branch() {
+        use MergeSelection::*;
+        #[derive(Debug)]
+        enum Answer {
+            Requested,
+            Source,
+            RequestedAsPartial,
+        }
+        fn retweet() -> InMemorySources {
+            InMemorySources::default()
+                .retweet(4, 40, 6, Some(60))
+                .tweet(6, 60)
+                .authors(&[40, 60])
+        }
+        type Case = (
+            &'static str,
+            fn() -> InMemorySources,
+            Option<u64>,
+            MergeSelection,
+            Answer,
+        );
+        let worlds: [Case; 8] = [
+            (
+                "source author suspended",
+                || retweet().user(60, suspended()),
+                Some(6),
+                SourceWithheld,
+                Answer::Source,
+            ),
+            (
+                "requested author suspended",
+                || retweet().user(40, suspended()),
+                Some(6),
+                RequestedWithheld,
+                Answer::Requested,
+            ),
+            (
+                "requested blurred for the media it copies from its source",
+                || {
+                    let mut requested = TweetFeatures::default();
+                    requested.nsfw.admin = true;
+                    let mut source = TweetFeatures::default();
+                    source.media.has_uploaded_media = true;
+                    retweet()
+                        .tweet_features(4, requested)
+                        .tweet_features(6, source)
+                },
+                Some(6),
+                RequestedRestrictions,
+                Answer::Requested,
+            ),
+            (
+                "neither restricted",
+                retweet,
+                Some(6),
+                SourceRestrictions,
+                Answer::Source,
+            ),
+            (
+                "source partial",
+                || retweet().fail_key(Source::SafetyLabels, 6),
+                Some(6),
+                SourceIncomplete,
+                Answer::RequestedAsPartial,
+            ),
+            (
+                "requested partial",
+                || retweet().fail_key(Source::SafetyLabels, 4),
+                Some(6),
+                RequestedIncomplete,
+                Answer::Requested,
+            ),
+            (
+                "requested follow failed",
+                || retweet().fail_edge(Graph::Follows, 40),
+                Some(6),
+                RequestedIncomplete,
+                Answer::Requested,
+            ),
+            (
+                "a partial post that is no retweet",
+                || {
+                    InMemorySources::default()
+                        .tweet(4, 40)
+                        .authors(&[40])
+                        .fail_key(Source::SafetyLabels, 4)
+                },
+                None,
+                RequestedIncomplete,
+                Answer::Requested,
+            ),
+        ];
+        let partial = |evaluation: &Evaluation| matches!(evaluation, Evaluation::Partial { .. });
+        for (name, world, source_tweet_id, selection, answer) in worlds {
+            let ask = ask(VIEWER, 4, Client::Web);
+            let explanation = explainer(world(), no_copy()).explain(&ask).await;
+            for (&route, outcome) in ask.routes.iter().zip(&explanation.levels) {
+                let provenance = &outcome.provenance;
+                let requested = provenance.requested.as_ref().unwrap();
+                assert_eq!(
+                    provenance.evaluation,
+                    served(world(), route, 4).await,
+                    "{name} at {route:?}"
+                );
+                assert_eq!(
+                    provenance.source_tweet_id,
+                    source_tweet_id.map(TweetId),
+                    "{name}"
+                );
+                if route.rpc() == Rpc::FilterTweets {
+                    assert_eq!(provenance.selection, RequestedOnly, "{name} at {route:?}");
+                    assert!(provenance.source.is_none(), "{name} at {route:?}");
+                    assert_eq!(provenance.evaluation, requested.evaluation, "{name}");
+                    continue;
+                }
+                assert_eq!(provenance.selection, selection, "{name}");
+                assert_eq!(
+                    partial(&requested.evaluation),
+                    selection == RequestedIncomplete,
+                    "{name}"
+                );
+                assert_eq!(
+                    provenance.source.is_some(),
+                    source_tweet_id.is_some(),
+                    "{name}"
+                );
+                if let Some(source) = &provenance.source
+                    && selection != RequestedIncomplete
+                {
+                    assert_eq!(
+                        partial(&source.evaluation),
+                        selection == SourceIncomplete,
+                        "{name}"
+                    );
+                }
+                let answered = match answer {
+                    Answer::Requested => requested.evaluation.clone(),
+                    Answer::Source => provenance.source.as_ref().unwrap().evaluation.clone(),
+                    Answer::RequestedAsPartial => Evaluation::Partial {
+                        verdict: requested.evaluation.verdict().clone(),
+                        fail_open_defaults: Hydrators::empty(),
+                    },
+                };
+                assert_eq!(provenance.evaluation, answered, "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_post_or_source_has_no_policy_trace_and_reads_no_country() {
+        let explanation = explainer(InMemorySources::default(), no_copy())
+            .explain(&ask(VIEWER, 4, Client::Web))
+            .await;
+        assert_eq!(explanation.in_nsfw_gating_country, FactObservation::NotRead);
+        for outcome in &explanation.levels {
+            let provenance = &outcome.provenance;
+            assert!(
+                provenance.requested.is_none() && provenance.source.is_none(),
+                "{outcome:?}"
+            );
+            assert!(matches!(
+                outcome.judgement,
+                Judgement::NotFound(_) | Judgement::Failed(_)
+            ));
+        }
+        let [level_8, level_61, level_82] = explainer(
+            InMemorySources::default()
+                .retweet(4, 40, 6, Some(60))
+                .authors(&[40]),
+            no_copy(),
+        )
+        .explain(&ask(VIEWER, 4, Client::Web))
+        .await
+        .levels;
+        for filter_tweets in [level_8, level_61] {
+            let provenance = filter_tweets.provenance;
+            assert!(provenance.requested.is_some() && provenance.source.is_none());
+            assert_eq!(provenance.source_tweet_id, Some(TweetId(6)));
+        }
+        assert!(matches!(
+            level_82.judgement,
+            Judgement::NotFound(Lookup::SharedTweet)
+        ));
+        let provenance = level_82.provenance;
+        assert!(provenance.requested.is_none() && provenance.source.is_none());
+        assert_eq!(provenance.selection, MergeSelection::RequestedOnly);
+    }
+
+    fn labels(types: &[SafetyLabelType]) -> vf_pb::SafetyLabelMap {
+        vf_pb::SafetyLabelMap {
+            labels: types
+                .iter()
+                .map(|label| (label.0, vf_pb::SafetyLabel::default()))
+                .collect(),
+        }
+    }
+
+    fn subtree(trace: &PolicyTrace, root: usize) -> Vec<&NodeTrace> {
+        let within = |node: &NodeTrace| {
+            let mut at = Some(node.node);
+            while let Some(index) = at {
+                if index == root {
+                    return true;
+                }
+                at = trace.nodes[index].parent;
+            }
+            false
+        };
+        trace.nodes.iter().filter(|node| within(node)).collect()
+    }
+
+    fn leaves<'t>(
+        nodes: &[&'t NodeTrace],
+        matches: impl Fn(Predicate) -> bool,
+    ) -> Vec<&'t NodeTrace> {
+        nodes
+            .iter()
+            .copied()
+            .filter(|node| matches!(node.kind, NodeKind::Leaf(leaf) if matches(leaf)))
+            .collect()
+    }
+
+    fn row<'t>(trace: &'t PolicyTrace, by: &str) -> &'t RowTrace {
+        trace.rows.iter().find(|row| row.by == by).unwrap()
+    }
+
+    async fn home_trace(sources: InMemorySources, viewer: u64) -> PolicyTrace {
+        let [level_8, ..] = explainer(sources, no_copy())
+            .explain(&ask(viewer, 4, Client::Web))
+            .await
+            .levels;
+        requested(&level_8).clone()
+    }
+
+    #[tokio::test]
+    async fn the_public_trace_records_later_matches_suppressed_media_and_skipped_failed_reads() {
+        let world = || InMemorySources::default().tweet(4, 40).authors(&[40]);
+        let spam_alone = home_trace(world().labels(4, labels(&[SafetyLabelType::SPAM])), VIEWER)
+            .await
+            .evaluation;
+        let Evaluation::Complete {
+            verdict: Verdict::Withheld(Decided {
+                value: spam_drop, ..
+            }),
+        } = spam_alone
+        else {
+            panic!("{spam_alone:?}");
+        };
+        let trace = home_trace(
+            world().labels(
+                4,
+                labels(&[
+                    SafetyLabelType::SPAM,
+                    SafetyLabelType::BOUNCE,
+                    SafetyLabelType::NSFW_CARD_IMAGE,
+                ]),
+            ),
+            VIEWER,
+        )
+        .await;
+        let decided = trace
+            .rows
+            .iter()
+            .position(|row| row.effect == Effect::Decided)
+            .unwrap();
+        assert_eq!(trace.rows[decided].by, "bounce/drop/bounced");
+        let spam = row(&trace, "spam/drop/undesirable");
+        assert_eq!(
+            spam.completed,
+            Some((
+                Some(Contribution::Withholding(spam_drop)),
+                Hydrators::empty()
+            ))
+        );
+        let card = trace
+            .rows
+            .iter()
+            .find(|row| row.by.starts_with("nsfw_card_image/"))
+            .unwrap();
+        assert!(matches!(
+            card.completed,
+            Some((Some(Contribution::Media(_)), _))
+        ));
+        for later in [spam, card] {
+            assert_eq!(
+                (later.truth, later.effect),
+                (Truth::True, Effect::AfterTerminal),
+                "{}",
+                later.by
+            );
+            assert_eq!(
+                (later.defaults_admitted, later.defaults_retained),
+                (Hydrators::empty(), Hydrators::empty())
+            );
+            assert!(
+                subtree(&trace, later.root)
+                    .iter()
+                    .all(|node| node.skip == Some(Skip::Terminal(decided)))
+            );
+        }
+
+        let trace = home_trace(
+            world().labels(
+                4,
+                labels(&[
+                    SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+                    SafetyLabelType::NSFW_CARD_IMAGE,
+                ]),
+            ),
+            VIEWER,
+        )
+        .await;
+        let card = trace
+            .rows
+            .iter()
+            .find(|row| row.by.starts_with("nsfw_card_image/"))
+            .unwrap();
+        assert_eq!(
+            (card.truth, card.effect),
+            (Truth::True, Effect::KeptEarlierMedia)
+        );
+        assert!(matches!(
+            card.completed,
+            Some((Some(Contribution::Media(_)), _))
+        ));
+        let Verdict::Shown {
+            media: Some(media), ..
+        } = trace.evaluation.verdict()
+        else {
+            panic!("{:?}", trace.evaluation);
+        };
+        assert_ne!(media.by, card.by);
+
+        let trace = home_trace(world().fail_key(Source::SafetyLabels, 4), VIEWER).await;
+        let failed_labels = Hydrators::of(Hydrator::TweetSafetyLabels);
+        let spam = row(&trace, "spam/drop/undesirable");
+        assert_eq!(
+            (spam.truth, spam.defaults_admitted, spam.defaults_retained),
+            (
+                Truth::Unknown {
+                    default: false,
+                    failed: failed_labels
+                },
+                failed_labels,
+                failed_labels
+            )
+        );
+        assert_eq!(trace.evaluation.fail_open_defaults(), failed_labels);
+        let logged_out = row(&trace, "sensitive_viewer_logged_out/drop");
+        assert_eq!(logged_out.truth, Truth::False);
+        assert_eq!(
+            (logged_out.defaults_admitted, logged_out.defaults_retained),
+            (Hydrators::empty(), Hydrators::empty())
+        );
+        let nodes = subtree(&trace, logged_out.root);
+        let [viewer_logged_out] = leaves(&nodes, |leaf| {
+            leaf == Predicate::Request(RequestLeaf::ViewerLoggedOut)
+        })[..] else {
+            panic!("one logged-out leaf");
+        };
+        assert_eq!(viewer_logged_out.truth, Truth::False);
+        let labelled = leaves(&nodes, |leaf| {
+            matches!(leaf, Predicate::TweetSafetyLabels(_))
+        });
+        assert!(!labelled.is_empty());
+        for label in labelled {
+            assert_eq!(
+                label.truth,
+                Truth::Unknown {
+                    default: false,
+                    failed: Hydrators::of(Hydrator::TweetSafetyLabels)
+                }
+            );
+            let Some(Skip::FalseConjunct(cause)) = label.skip else {
+                panic!("{label:?}");
+            };
+            assert_eq!(trace.nodes[cause].truth, Truth::False);
+            assert!(
+                subtree(&trace, cause)
+                    .iter()
+                    .any(|node| node.node == viewer_logged_out.node)
+            );
+        }
+
+        let mut features = TweetFeatures::default();
+        features.media.has_media = true;
+        let trace = home_trace(
+            world().tweet_features(4, features).labels(
+                4,
+                labels(&[
+                    SafetyLabelType::NSFW_HIGH_PRECISION,
+                    SafetyLabelType::NSFW_HIGH_RECALL,
+                ]),
+            ),
+            0,
+        )
+        .await;
+        let logged_out = row(&trace, "sensitive_viewer_logged_out/drop");
+        assert_eq!(logged_out.truth, Truth::True);
+        let nodes = subtree(&trace, logged_out.root);
+        let labelled = leaves(&nodes, |leaf| {
+            matches!(leaf, Predicate::TweetSafetyLabels(_))
+        });
+        let [first, second, third] = labelled[..] else {
+            panic!("{labelled:?}");
+        };
+        assert_eq!(
+            [first.truth, second.truth, third.truth],
+            [Truth::True, Truth::True, Truth::False]
+        );
+        assert_eq!(first.skip, None);
+        assert_eq!(second.skip, Some(Skip::TrueDisjunct(first.node)));
+        assert_eq!(third.skip, Some(Skip::TrueDisjunct(first.node)));
+        let any = &trace.nodes[first.parent.unwrap()];
+        assert_eq!(any.kind, NodeKind::Any);
+        assert_eq!(
+            any.witnesses,
+            [first, second].map(|node| Witness {
+                node: node.node,
+                truth: Truth::True,
+                negated: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_author_reads_a_failed_follow_as_neutral_in_the_audience() {
+        let explanation = explainer(
+            InMemorySources::default()
+                .tweet(4, 40)
+                .authors(&[40])
+                .fail_edge(Graph::Follows, 40),
+            no_copy(),
+        )
+        .explain(&ask(40, 4, Client::Web))
+        .await;
+        let trace = requested(&explanation.levels[0]);
+        let failed_follow = Truth::Unknown {
+            default: false,
+            failed: Hydrators::of(Hydrator::Follows),
+        };
+        let mut rows = 0;
+        for row in &trace.rows {
+            let nodes = subtree(trace, row.root);
+            let [follows] = leaves(&nodes, |leaf| {
+                leaf == Predicate::Edge(EdgeLeaf::ViewerFollowsAuthor)
+            })[..] else {
+                continue;
+            };
+            rows += 1;
+            assert_eq!(row.truth, Truth::False, "{}", row.by);
+            assert_eq!(
+                (row.defaults_admitted, row.defaults_retained),
+                (Hydrators::empty(), Hydrators::empty())
+            );
+            assert_eq!(follows.truth, failed_follow);
+            assert!(matches!(follows.skip, Some(Skip::FalseConjunct(_))));
+            let not = &trace.nodes[follows.parent.unwrap()];
+            assert_eq!(not.kind, NodeKind::Not);
+            assert_eq!(
+                not.truth,
+                Truth::Unknown {
+                    default: true,
+                    failed: Hydrators::of(Hydrator::Follows)
+                }
+            );
+            let negated = |truth| Witness {
+                node: follows.node,
+                truth,
+                negated: true,
+            };
+            assert_eq!(not.witnesses, [negated(failed_follow)]);
+            assert_eq!(not.default_witnesses, [negated(Truth::False)]);
+        }
+        assert!(rows > 0);
+        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {
+            panic!("{:?}", explanation.viewer);
+        };
+        assert!(relationship.is_author);
+        assert_eq!(relationship.follows, Seen::Failed);
+    }
+
+    #[tokio::test]
+    async fn each_use_of_a_named_condition_is_its_own_observed_occurrence() {
+        let [.., level_82] = explainer(
+            InMemorySources::default().tweet(4, 40).authors(&[40]),
+            no_copy(),
+        )
+        .explain(&ask(VIEWER, 4, Client::Web))
+        .await
+        .levels;
+        let trace = requested(&level_82);
+        for name in [
+            "viewer_is_not_age_verified_in_age_verification_countries",
+            "viewer_is_not_age_verified_in_tombstone_countries",
+            "viewer_is_neither_root_author_nor_invited",
+        ] {
+            let uses: Vec<&NodeTrace> = trace
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Named(name))
+                .collect();
+            assert!(uses.len() > 1, "{name}");
+            for named in &uses {
+                let rows = trace
+                    .rows
+                    .iter()
+                    .filter(|row| subtree(trace, row.root).contains(named))
+                    .count();
+                assert_eq!(rows, 1, "{name}");
+                let [body] = trace
+                    .nodes
+                    .iter()
+                    .filter(|node| node.parent == Some(named.node))
+                    .collect::<Vec<_>>()[..]
+                else {
+                    panic!("{name} has one body");
+                };
+                assert_eq!(body.truth, named.truth, "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn leaf_wording_keeps_the_label_and_follower_sentences_and_every_payload() {
+        let world = || InMemorySources::default().tweet(4, 40).authors(&[40]);
+        let bounce = Predicate::TweetSafetyLabels(TweetSafetyLabelsLeaf::TweetHasLabel(
+            SafetyLabelType::BOUNCE,
+        ));
+        let mut observed = Vec::new();
+        for (sources, label, follower) in [
+            (
+                world().labels(4, labels(&[SafetyLabelType::BOUNCE])).edge(
+                    Graph::Follows,
+                    VIEWER,
+                    40,
+                ),
+                "The post has the BOUNCE safety label.",
+                "The viewer follows the author.",
+            ),
+            (
+                world(),
+                "The post does not have the BOUNCE safety label.",
+                "The viewer does not follow the author.",
+            ),
+            (
+                world()
+                    .fail_key(Source::SafetyLabels, 4)
+                    .fail_edge(Graph::Follows, 40),
+                "Whether the post has the BOUNCE safety label.",
+                "Whether the viewer follows the author.",
+            ),
+        ] {
+            let levels = explainer(sources, no_copy())
+                .explain(&ask(VIEWER, 4, Client::Web))
+                .await
+                .levels;
+            let nodes: Vec<&NodeTrace> = requested(&levels[0]).nodes.iter().collect();
+            let rendered = |predicate: Predicate| {
+                let leaf = leaves(&nodes, |leaf| leaf == predicate)[0];
+                predicate.render(leaf.truth)
+            };
+            assert_eq!(rendered(bounce), label);
+            assert_eq!(
+                rendered(Predicate::Edge(EdgeLeaf::ViewerFollowsAuthor)),
+                follower
+            );
+            for level in &levels {
+                observed.extend(
+                    requested(level)
+                        .nodes
+                        .iter()
+                        .filter_map(|node| match node.kind {
+                            NodeKind::Leaf(leaf) => Some(leaf),
+                            NodeKind::Rule
+                            | NodeKind::All
+                            | NodeKind::Any
+                            | NodeKind::Not
+                            | NodeKind::Named(_) => None,
+                        }),
+                );
+            }
+        }
+        observed.sort_by_key(|leaf| format!("{leaf:?}"));
+        observed.dedup();
+        let artificial = [
+            Truth::True,
+            Truth::False,
+            Truth::Unknown {
+                default: false,
+                failed: Hydrators::empty(),
+            },
+        ];
+        for truth in artificial {
+            let mut rendered: Vec<String> =
+                observed.iter().map(|leaf| leaf.render(truth)).collect();
+            assert!(rendered.iter().all(|text| !text.is_empty()));
+            rendered.sort();
+            rendered.dedup();
+            assert_eq!(rendered.len(), observed.len(), "{truth:?}");
+        }
+        for leaf in &observed {
+            let mut rendered = artificial.map(|truth| leaf.render(truth));
+            rendered.sort();
+            assert!(
+                rendered[0] != rendered[1] && rendered[1] != rendered[2],
+                "{leaf:?}"
+            );
+        }
     }
 }

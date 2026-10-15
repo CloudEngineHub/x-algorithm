@@ -32,6 +32,8 @@ pub struct PostCandidate {
     pub reranker_head_tag: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backbone_scores: Option<PhoenixScores>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immersive_scores: Option<PhoenixScores>,
     #[serde(
         serialize_with = "serialize_served_type",
         deserialize_with = "deserialize_served_type"

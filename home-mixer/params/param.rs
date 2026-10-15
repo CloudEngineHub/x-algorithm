@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-13T16:00:30Z
+// mirrored from config feature-switch defaults; last sync 2026-10-14T16:00:44Z
 use xai_feature_switches::param;
 
 param!(
@@ -808,7 +808,7 @@ param!(
     EnableAdsAuthorBrandSafetyFallback,
     bool,
     "rust_home_mixer_ads_bs_author_fallback_enabled",
-    false
+    true
 );
 param!(
     AdsTimeGapTSec,
@@ -1079,6 +1079,30 @@ param!(
     u32,
     "rust_home_mixer_video_carousel_semantic_id_dedupe_levels",
     0
+);
+param!(
+    VideoCarouselVideoOpenWeight,
+    f64,
+    "rust_home_mixer_video_carousel_video_open_weight",
+    1.0
+);
+param!(
+    VideoCarouselImmersiveVqvWeight,
+    f64,
+    "rust_home_mixer_video_carousel_immersive_vqv_weight",
+    0.0
+);
+param!(
+    VideoCarouselImmersiveClusterId,
+    String,
+    "rust_home_mixer_video_carousel_immersive_cluster_id",
+    "Experiment3Fou"
+);
+param!(
+    VideoCarouselImmersiveAggregationType,
+    String,
+    "rust_home_mixer_video_carousel_immersive_aggregation_type",
+    "IMMERSIVE_LONG_DWELL"
 );
 
 param!(

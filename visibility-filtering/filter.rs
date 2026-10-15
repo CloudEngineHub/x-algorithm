@@ -3,12 +3,14 @@ use crate::hydration::sources::Sources;
 use crate::hydration::{
     Cause, HydratedTweet, Hydration, HydrationRequest, Hydrators, Lookup, Unresolved,
 };
-use crate::models::{ClientCapability, Evaluation, PostCandidate, RawCandidate, TweetId};
+use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
 use crate::rules::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
-use crate::rules::{RuleEngine, SafetyLevel};
+use crate::rules::registry::AdmittedPosts;
+use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::warn;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct FilterRequest {
@@ -72,14 +74,10 @@ impl FilterTweets {
         }
     }
 
-    pub(crate) fn rule_engine(&self) -> &RuleEngine {
-        &self.rule_engine
-    }
-
     pub async fn run(&self, request: FilterRequest) -> FilterResponse {
         let hydrated = self.hydrate(request).await;
         FilterResponse {
-            outcomes: self.evaluate_in_request_order(&hydrated),
+            outcomes: self.evaluate_in_request_order(&hydrated, &mut NoTrace),
         }
     }
 
@@ -141,14 +139,16 @@ impl FilterTweets {
         }
     }
 
-    pub(crate) fn evaluate_in_request_order(
+    pub(crate) fn evaluate_in_request_order<O: PostObserver>(
         &self,
         hydrated: &HydratedRequest,
+        observer: &mut O,
     ) -> Vec<FilterOutcome> {
         let evaluating = Instant::now();
+        let admitted = self.admit(hydrated);
         let outcomes = hydrated
             .requested_ids()
-            .map(|tweet_id| self.outcome(hydrated, tweet_id, None))
+            .map(|tweet_id| Self::outcome(hydrated, admitted.as_ref(), tweet_id, false, observer))
             .collect();
         ft_metrics::record_phase(
             hydrated.rpc,
@@ -159,17 +159,25 @@ impl FilterTweets {
         outcomes
     }
 
-    pub(crate) fn evaluate(
+    pub(crate) fn evaluate<O: PostObserver>(
         &self,
         hydrated: &HydratedRequest,
         ids: impl IntoIterator<Item = TweetId>,
-        copied_retweets: &HashMap<TweetId, PostCandidate>,
+        copied: impl Fn(TweetId) -> bool,
+        observer: &mut O,
     ) -> HashMap<TweetId, FilterOutcome> {
         let evaluating = Instant::now();
+        let admitted = self.admit(hydrated);
         let mut outcomes = HashMap::new();
         for tweet_id in ids {
             outcomes.entry(tweet_id).or_insert_with(|| {
-                self.outcome(hydrated, tweet_id, copied_retweets.get(&tweet_id))
+                Self::outcome(
+                    hydrated,
+                    admitted.as_ref(),
+                    tweet_id,
+                    copied(tweet_id),
+                    observer,
+                )
             });
         }
         ft_metrics::record_phase(
@@ -181,25 +189,50 @@ impl FilterTweets {
         outcomes
     }
 
-    fn outcome(
+    pub(crate) fn trace(
         &self,
         hydrated: &HydratedRequest,
+        ids: impl IntoIterator<Item = TweetId>,
+        traces: &mut HashMap<TweetId, PolicyTrace>,
+    ) {
+        let admitted = self.admit(hydrated);
+        for tweet_id in ids {
+            if !traces.contains_key(&tweet_id) {
+                Self::outcome(hydrated, admitted.as_ref(), tweet_id, false, traces);
+            }
+        }
+    }
+
+    fn admit<'a>(&'a self, hydrated: &'a HydratedRequest) -> Option<AdmittedPosts<'a>> {
+        self.rule_engine
+            .admit(hydrated.safety_level, &hydrated.hydration)
+            .inspect_err(|error| {
+                warn!(
+                    ?error,
+                    level = ?hydrated.safety_level,
+                    "hydration not admitted by its level's policy; failing its candidates"
+                );
+            })
+            .ok()
+    }
+
+    fn outcome<O: PostObserver>(
+        hydrated: &HydratedRequest,
+        admitted: Option<&AdmittedPosts<'_>>,
         tweet_id: TweetId,
-        copied_retweet: Option<&PostCandidate>,
+        copied: bool,
+        observer: &mut O,
     ) -> FilterOutcome {
         let tweet = hydrated.hydration.tweet(tweet_id);
-        let evaluation = match tweet {
-            Some(HydratedTweet::Resolved {
-                candidate,
-                has_failed_node,
-                ..
-            }) => {
-                let evaluation = self.rule_engine.evaluate(
-                    hydrated.safety_level,
-                    hydrated.hydration.viewer(),
-                    copied_retweet.unwrap_or(candidate),
-                );
-                match evaluation {
+        let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied));
+        let evaluation = match (tweet, post) {
+            (
+                Some(HydratedTweet::Resolved {
+                    has_failed_node, ..
+                }),
+                Some(post),
+            ) => 'post: {
+                let settle = |evaluation| match evaluation {
                     Evaluation::Complete { verdict } if *has_failed_node => Evaluation::Partial {
                         verdict,
                         fail_open_defaults: Hydrators::empty(),
@@ -208,16 +241,28 @@ impl FilterTweets {
                     | Evaluation::Partial { .. }
                     | Evaluation::NotFound(_)
                     | Evaluation::Failed(_) => evaluation,
+                };
+                if O::TOTAL {
+                    let mut trace = post.trace();
+                    trace.evaluation = settle(trace.evaluation);
+                    let evaluation = trace.evaluation.clone();
+                    observer.record(tweet_id, trace);
+                    break 'post evaluation;
                 }
+                settle(post.evaluate())
             }
-            Some(HydratedTweet::Unresolved {
-                reason: Unresolved { lookup, cause },
-                ..
-            }) => match cause {
+            (
+                Some(HydratedTweet::Unresolved {
+                    reason: Unresolved { lookup, cause },
+                    ..
+                }),
+                _,
+            ) => match cause {
                 Cause::NotFound => Evaluation::NotFound(*lookup),
                 Cause::Failed => Evaluation::Failed(*lookup),
             },
-            None => Evaluation::Failed(Lookup::Tweet),
+            (Some(HydratedTweet::Resolved { .. }), None) => Evaluation::Failed(Lookup::Tweet),
+            (None, _) => Evaluation::Failed(Lookup::Tweet),
         };
         FilterOutcome {
             tweet_id,
@@ -227,6 +272,27 @@ impl FilterTweets {
                 .and_then(HydratedTweet::safety_labels)
                 .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
         }
+    }
+}
+
+pub(crate) trait PostObserver {
+    const TOTAL: bool;
+
+    fn record(&mut self, tweet_id: TweetId, trace: PolicyTrace);
+}
+
+impl PostObserver for NoTrace {
+    const TOTAL: bool = false;
+
+    #[inline]
+    fn record(&mut self, _: TweetId, _: PolicyTrace) {}
+}
+
+impl PostObserver for HashMap<TweetId, PolicyTrace> {
+    const TOTAL: bool = true;
+
+    fn record(&mut self, tweet_id: TweetId, trace: PolicyTrace) {
+        self.insert(tweet_id, trace);
     }
 }
 

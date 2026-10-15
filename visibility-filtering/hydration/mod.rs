@@ -11,12 +11,16 @@ pub(crate) mod sources;
 mod store;
 pub mod tweet_source;
 
-use crate::models::{ClientCapability, PostCandidate, RawCandidate, TweetId, ViewerFeatures};
+use crate::models::{
+    ClientCapability, PostCandidate, RawCandidate, TweetFeatures, TweetId, ViewerFeatures,
+};
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
+use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
 pub(crate) use plan::HydrationPlan;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,6 +113,10 @@ impl Hydrators {
         self.0 & Self::of(hydrator).0 != 0
     }
 
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub const fn intersection(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
@@ -164,7 +172,7 @@ pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
 
 pub(crate) struct Hydration {
     viewer: ViewerFeatures,
-    viewer_found: bool,
+    viewer_state: Option<ViewerState>,
     planned: Hydrators,
     incomplete: Hydrators,
     tweets: FxHashMap<TweetId, HydratedTweet>,
@@ -177,7 +185,7 @@ impl Hydration {
     }
 
             pub(crate) fn viewer_found(&self) -> bool {
-        self.viewer_found
+        self.viewer_state.is_some()
     }
 
     pub(crate) fn planned(&self) -> Hydrators {
@@ -190,6 +198,24 @@ impl Hydration {
 
     pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {
         self.tweets.get(&id)
+    }
+
+            pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {
+        let tweet = self.tweet(id)?;
+        let candidate = tweet.candidate()?;
+        let copy = copied
+            .then(|| self.tweet(tweet.source_tweet_id()?)?.candidate())
+            .flatten()
+            .map(|source| CopiedFromSource::of(&source.post.tweet_features))
+            .filter(|copy| !copy.is_on(&candidate.post.tweet_features));
+        Some(match copy {
+            None => Cow::Borrowed(candidate),
+            Some(copy) => {
+                let mut candidate = candidate.clone();
+                copy.copy_onto(&mut candidate.post.tweet_features);
+                Cow::Owned(candidate)
+            }
+        })
     }
 
     pub(crate) fn failed_nodes(&self, post: TweetId) -> Hydrators {
@@ -209,6 +235,27 @@ impl Hydration {
 
     pub(crate) fn has_fetched_sources(&self) -> bool {
         self.has_fetched_sources
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CopiedFromSource {
+    has_media: bool,
+}
+
+impl CopiedFromSource {
+    fn of(source: &TweetFeatures) -> Self {
+        Self {
+            has_media: source.media.has_uploaded_media,
+        }
+    }
+
+    fn is_on(self, retweet: &TweetFeatures) -> bool {
+        retweet.media.has_media == self.has_media
+    }
+
+    fn copy_onto(self, retweet: &mut TweetFeatures) {
+        retweet.media.has_media = self.has_media;
     }
 }
 

@@ -14,106 +14,153 @@ pub(super) enum Batch {
     Requested,
 }
 
-macro_rules! sources {
-    ($($source:ident { $($field:ident: $value:expr),* $(,)? })*) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
-        pub(crate) enum Source {
-            $($source,)*
-        }
-
-        impl Source {
-            pub(super) const fn row(self) -> Row {
-                match self {
-                    $(Source::$source => Row { $($field: $value),* },)*
-                }
-            }
-
-            pub(super) const fn scope(self) -> Scope {
-                match self {
-                    $(Source::$source => <exchange::$source as Exchange>::SCOPE,)*
-                }
-            }
-
-            pub(crate) fn visit(self, visitor: &mut impl Visit) {
-                match self {
-                    $(Source::$source => visitor.exchange::<exchange::$source>(),)*
-                }
-            }
-        }
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
+pub(crate) enum Source {
+    TesPureCoreData,
+    TesConversationRoot,
+    TesTweet,
+    TesConversationControl,
+    SafetyLabels,
+    GizmoduckViewer,
+    GizmoduckAuthor,
+    Flock,
+    ViewerCountry,
+    Wingman,
+    CommunityModeration,
+    CommunityModerator,
+    CommunityViewerRemoved,
+    ArticleLifecycle,
+    ArticleMediaEntities,
+    ArticleCoverMedia,
+    TrustedFriends,
+    UserLocation,
 }
 
-sources! {
-    TesPureCoreData {
-        miss: MissPolicy::Unresolves(Subject::Tweet),
-        batch: Batch::Keys,
+impl Source {
+    pub(super) const fn row(self) -> Row {
+        match self {
+            Source::TesPureCoreData => Row {
+                miss: MissPolicy::Unresolves(Subject::Tweet),
+                batch: Batch::Keys,
+            },
+            Source::TesConversationRoot => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::TesTweet => Row {
+                miss: MissPolicy::Unresolves(Subject::Tweet),
+                batch: Batch::Unrecorded,
+            },
+            Source::TesConversationControl => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::SafetyLabels => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Requested,
+            },
+            Source::GizmoduckViewer => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Unrecorded,
+            },
+            Source::GizmoduckAuthor => Row {
+                miss: MissPolicy::Unresolves(Subject::Author),
+                batch: Batch::Keys,
+            },
+            Source::Flock => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Requested,
+            },
+            Source::ViewerCountry => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Unrecorded,
+            },
+            Source::Wingman => Row {
+                miss: MissPolicy::ReadsNoEdge,
+                batch: Batch::Requested,
+            },
+            Source::CommunityModeration => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::CommunityModerator => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::CommunityViewerRemoved => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::ArticleLifecycle => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
+            Source::ArticleMediaEntities => Row {
+                miss: MissPolicy::ReadsNotFound,
+                batch: Batch::Keys,
+            },
+            Source::ArticleCoverMedia => Row {
+                miss: MissPolicy::ReadsNotFound,
+                batch: Batch::Keys,
+            },
+            Source::TrustedFriends => Row {
+                miss: MissPolicy::ReadsNoEdge,
+                batch: Batch::Keys,
+            },
+            Source::UserLocation => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Unrecorded,
+            },
+        }
     }
-    TesConversationRoot {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
+
+    pub(super) const fn scope(self) -> Scope {
+        match self {
+            Source::TesPureCoreData => <exchange::TesPureCoreData as Exchange>::SCOPE,
+            Source::TesConversationRoot => <exchange::TesConversationRoot as Exchange>::SCOPE,
+            Source::TesTweet => <exchange::TesTweet as Exchange>::SCOPE,
+            Source::TesConversationControl => <exchange::TesConversationControl as Exchange>::SCOPE,
+            Source::SafetyLabels => <exchange::SafetyLabels as Exchange>::SCOPE,
+            Source::GizmoduckViewer => <exchange::GizmoduckViewer as Exchange>::SCOPE,
+            Source::GizmoduckAuthor => <exchange::GizmoduckAuthor as Exchange>::SCOPE,
+            Source::Flock => <exchange::Flock as Exchange>::SCOPE,
+            Source::ViewerCountry => <exchange::ViewerCountry as Exchange>::SCOPE,
+            Source::Wingman => <exchange::Wingman as Exchange>::SCOPE,
+            Source::CommunityModeration => <exchange::CommunityModeration as Exchange>::SCOPE,
+            Source::CommunityModerator => <exchange::CommunityModerator as Exchange>::SCOPE,
+            Source::CommunityViewerRemoved => <exchange::CommunityViewerRemoved as Exchange>::SCOPE,
+            Source::ArticleLifecycle => <exchange::ArticleLifecycle as Exchange>::SCOPE,
+            Source::ArticleMediaEntities => <exchange::ArticleMediaEntities as Exchange>::SCOPE,
+            Source::ArticleCoverMedia => <exchange::ArticleCoverMedia as Exchange>::SCOPE,
+            Source::TrustedFriends => <exchange::TrustedFriends as Exchange>::SCOPE,
+            Source::UserLocation => <exchange::UserLocation as Exchange>::SCOPE,
+        }
     }
-    TesTweet {
-        miss: MissPolicy::Unresolves(Subject::Tweet),
-        batch: Batch::Unrecorded,
-    }
-    TesConversationControl {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
-    }
-    SafetyLabels {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Requested,
-    }
-    GizmoduckViewer {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Unrecorded,
-    }
-    GizmoduckAuthor {
-        miss: MissPolicy::Unresolves(Subject::Author),
-        batch: Batch::Keys,
-    }
-    Flock {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Requested,
-    }
-    ViewerCountry {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Unrecorded,
-    }
-    Wingman {
-        miss: MissPolicy::ReadsNoEdge,
-        batch: Batch::Requested,
-    }
-    CommunityModeration {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
-    }
-    CommunityModerator {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
-    }
-    CommunityViewerRemoved {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
-    }
-    ArticleLifecycle {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Keys,
-    }
-    ArticleMediaEntities {
-        miss: MissPolicy::ReadsNotFound,
-        batch: Batch::Keys,
-    }
-    ArticleCoverMedia {
-        miss: MissPolicy::ReadsNotFound,
-        batch: Batch::Keys,
-    }
-    TrustedFriends {
-        miss: MissPolicy::ReadsNoEdge,
-        batch: Batch::Keys,
-    }
-    UserLocation {
-        miss: MissPolicy::FailsNode,
-        batch: Batch::Unrecorded,
+
+    pub(crate) fn visit(self, visitor: &mut impl Visit) {
+        match self {
+            Source::TesPureCoreData => visitor.exchange::<exchange::TesPureCoreData>(),
+            Source::TesConversationRoot => visitor.exchange::<exchange::TesConversationRoot>(),
+            Source::TesTweet => visitor.exchange::<exchange::TesTweet>(),
+            Source::TesConversationControl => {
+                visitor.exchange::<exchange::TesConversationControl>()
+            }
+            Source::SafetyLabels => visitor.exchange::<exchange::SafetyLabels>(),
+            Source::GizmoduckViewer => visitor.exchange::<exchange::GizmoduckViewer>(),
+            Source::GizmoduckAuthor => visitor.exchange::<exchange::GizmoduckAuthor>(),
+            Source::Flock => visitor.exchange::<exchange::Flock>(),
+            Source::ViewerCountry => visitor.exchange::<exchange::ViewerCountry>(),
+            Source::Wingman => visitor.exchange::<exchange::Wingman>(),
+            Source::CommunityModeration => visitor.exchange::<exchange::CommunityModeration>(),
+            Source::CommunityModerator => visitor.exchange::<exchange::CommunityModerator>(),
+            Source::CommunityViewerRemoved => {
+                visitor.exchange::<exchange::CommunityViewerRemoved>()
+            }
+            Source::ArticleLifecycle => visitor.exchange::<exchange::ArticleLifecycle>(),
+            Source::ArticleMediaEntities => visitor.exchange::<exchange::ArticleMediaEntities>(),
+            Source::ArticleCoverMedia => visitor.exchange::<exchange::ArticleCoverMedia>(),
+            Source::TrustedFriends => visitor.exchange::<exchange::TrustedFriends>(),
+            Source::UserLocation => visitor.exchange::<exchange::UserLocation>(),
+        }
     }
 }

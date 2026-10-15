@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_evaluated_candidates_and_unresolved_tweets_metrics() {
+    fn dashboard_generator_pins_the_evaluated_candidates_unresolved_tweets_and_deadline_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if Path::new(cargo).exists() { cargo } else { ws };
@@ -337,6 +337,12 @@ mod tests {
         assert!(dashboard.contains(&format!(
             "UNRESOLVED_TWEETS_METRIC = \"{UNRESOLVED_TWEETS}\""
         )));
+        assert!(dashboard.contains(&format!("FT_DEADLINE_METRIC = \"{DEADLINE}\"")));
+        assert!(dashboard.contains(&format!(
+            "FT_DEADLINE_REMAINING_METRIC = \"{DEADLINE_REMAINING_MS}\""
+        )));
+        let overrun: &str = DeadlineOutcome::Overrun.into();
+        assert!(dashboard.contains(&format!("outcome=\"{overrun}\"")));
     }
 
     #[test]

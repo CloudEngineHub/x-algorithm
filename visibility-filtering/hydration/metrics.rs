@@ -6,6 +6,7 @@ use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
+use crate::params::CountryList;
 use crate::rules::SafetyLevel;
 
 const HYDRATOR_REQUESTS: &str = "vf_hydrator_requests";
@@ -19,10 +20,9 @@ const HYDRATOR_UNASKED_KEYS: &str = "vf_hydrator_unasked_keys";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
 const FALLBACK_CACHE_RESIDENT_KEYS: &str = "vf_fallback_cache_resident_keys";
-const AUTHOR_LABELS: &str = "vf_author_labels";
 const VIEWER_COUNTRY: &str = "vf_viewer_country";
-const WINGMAN_SECOND_DEGREE: &str = "vf_wingman_second_degree";
-const TRUSTED_FRIENDS_ANSWERS: &str = "vf_trusted_friends_answers";
+const VIEWER_STATE: &str = "vf_viewer_state";
+const VIEWER_AGE: &str = "vf_viewer_age";
 const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -196,12 +196,6 @@ pub(crate) fn record_tes_join_latency(safety_level: SafetyLevel, elapsed: Durati
     );
 }
 
-pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
-    for (result, count) in [("mapped", mapped), ("unmapped", unmapped)] {
-        incr_nonzero(AUTHOR_LABELS, &[("result", result)], count as u64);
-    }
-}
-
 pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLevel) {
     incr(
         VIEWER_COUNTRY,
@@ -210,35 +204,39 @@ pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLe
     );
 }
 
-pub(crate) fn record_wingman_second_degree(
-    in_network: usize,
-    not_in_network: usize,
-    safety_level: SafetyLevel,
-) {
-    for (result, count) in [
-        ("in_network", in_network),
-        ("not_in_network", not_in_network),
-    ] {
-        incr_nonzero(
-            WINGMAN_SECOND_DEGREE,
-            &[("result", result), ("safety_level", safety_level.into())],
-            count as u64,
-        );
-    }
+pub(crate) fn record_viewer_state(state: &'static str, safety_level: SafetyLevel) {
+    incr(
+        VIEWER_STATE,
+        &[("state", state), ("safety_level", safety_level.into())],
+        1,
+    );
 }
 
-pub(crate) fn record_trusted_friends_answers(
-    member_or_owner: usize,
-    neither: usize,
+const VIEWER_AGE_EXTRA_COUNTRIES: [&str; 2] = ["us", "jp"];
+
+pub(crate) fn record_viewer_age(
+    age: &'static str,
+    request_country: Option<&str>,
     safety_level: SafetyLevel,
 ) {
-    for (result, count) in [("true", member_or_owner), ("false", neither)] {
-        incr_nonzero(
-            TRUSTED_FRIENDS_ANSWERS,
-            &[("result", result), ("safety_level", safety_level.into())],
-            count as u64,
-        );
-    }
+    let country = request_country
+        .and_then(|code| {
+            CountryList::listed_by_default(code).or_else(|| {
+                VIEWER_AGE_EXTRA_COUNTRIES
+                    .into_iter()
+                    .find(|&extra| extra == code)
+            })
+        })
+        .unwrap_or("other");
+    incr(
+        VIEWER_AGE,
+        &[
+            ("age", age),
+            ("country", country),
+            ("safety_level", safety_level.into()),
+        ],
+        1,
+    );
 }
 
 pub(crate) fn record_flock_missing_keys(
@@ -376,8 +374,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
-    {
+    fn dashboard_generator_pins_the_key_results_fallback_cache_results_and_viewer_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -387,21 +384,23 @@ mod tests {
         };
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
-        use crate::hydration::Hydrator;
-        let root_edges = format!(
-            "{}+{}+{}",
-            Hydrator::RootFollowsViewer.spec().label.1,
-            Hydrator::SuperFollowsRoot.spec().label.1,
-            Hydrator::BlockedByConversationRoot.spec().label.1
-        );
-        assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
         assert!(dashboard.contains(&format!(
-            "WINGMAN_SECOND_DEGREE_METRIC = \"{WINGMAN_SECOND_DEGREE}\""
+            "FALLBACK_CACHE_KEYS_METRIC = \"{FALLBACK_CACHE_KEYS}\""
         )));
-        assert!(dashboard.contains(&format!(
-            "TRUSTED_FRIENDS_ANSWERS_METRIC = \"{TRUSTED_FRIENDS_ANSWERS}\""
-        )));
+        assert!(dashboard.contains(&format!("VIEWER_STATE_METRIC = \"{VIEWER_STATE}\"")));
+        assert!(dashboard.contains(&format!("VIEWER_AGE_METRIC = \"{VIEWER_AGE}\"")));
+        for result in [
+            FallbackCacheResult::Stale,
+            FallbackCacheResult::Unavailable,
+            FallbackCacheResult::PartialStale,
+            FallbackCacheResult::Partial,
+        ] {
+            let result: &str = result.into();
+            assert!(
+                dashboard.contains(&format!("    \"{result}\": ")),
+                "{result}"
+            );
+        }
         let key_results: Vec<&str> = <HydratorOutcome as strum::VariantArray>::VARIANTS
             .iter()
             .map(|&result| result.into())

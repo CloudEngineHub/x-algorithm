@@ -1,7 +1,16 @@
+use super::conditions::{
+    VIEWER_IS_NEITHER_ROOT_AUTHOR_NOR_INVITED,
+    VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES,
+    VIEWER_IS_NOT_AGE_VERIFIED_IN_TOMBSTONE_COUNTRIES,
+};
+use super::features::{CompoundLeaf, ReplyControlLeaf, RequestLeaf};
+use super::rule::{Rule, RuleCond};
 use super::*;
-use crate::models::{ClientCapability, ViewerFeatures};
+use crate::hydration::Hydrator;
+use crate::models::{ClientCapability, VerifyBlurSupport, ViewerFeatures};
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 use crate::rules::golden_corpus::pairs;
+use crate::rules::test_context;
 use crate::rules::SafetyLevel;
 use std::iter::once;
 use strum::VariantArray;
@@ -18,30 +27,27 @@ fn truths() -> Vec<Truth> {
     truths
 }
 
-fn wired_clauses() -> Vec<&'static Clause> {
-    let mut clauses: Vec<&'static Clause> = Vec::new();
+fn wired_rules() -> Vec<&'static Rule> {
+    let mut rules: Vec<&'static Rule> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for &clause in level.spec().rules {
-            if !clauses.contains(&clause) {
-                clauses.push(clause);
+        for &rule in level.spec().rules {
+            if !rules.contains(&rule) {
+                rules.push(rule);
             }
         }
     }
-    clauses
+    rules
 }
 
 fn wired_leaves() -> Vec<Predicate> {
     let mut leaves = Vec::new();
-    for clause in wired_clauses() {
-        for condition in clause.when {
-            let read = match &condition.0 {
-                Condition::Is(leaf) | Condition::Not(leaf) => std::slice::from_ref(leaf),
-                Condition::Any(set) => set,
-            };
-            for &leaf in read {
-                if !leaves.contains(&leaf) {
-                    leaves.push(leaf);
-                }
+    for rule in wired_rules() {
+        let mut read = Vec::new();
+        rule.audience.condition().leaves(&mut read);
+        rule.when.leaves(&mut read);
+        for leaf in read {
+            if !leaves.contains(&leaf) {
+                leaves.push(leaf);
             }
         }
     }
@@ -90,7 +96,7 @@ fn a_failed_read_is_local() {
         for &hydrator in Hydrator::VARIANTS {
             let mut failed = fetched.clone();
             failed.failed = Hydrators::of(hydrator);
-            let expected = if leaf.hydrators().contains(hydrator) {
+            let expected = if leaf.requirements().contains(hydrator) {
                 Truth::Unknown {
                     default: clean.resolves_true(),
                     failed: Hydrators::of(hydrator),
@@ -107,33 +113,19 @@ fn a_failed_read_is_local() {
     }
 }
 
-fn folded_without_break(clause: &Clause, context: &RuleContext<'_>) -> Truth {
-    let mut truth = clause.audience.reaches(context);
-    for condition in clause.when {
-        truth = truth.and(condition.truth(context));
+fn holds(condition: RuleCond, context: &RuleContext<'_>) -> bool {
+    match condition {
+        RuleCond::Leaf(leaf) => leaf.holds(context),
+        RuleCond::All(children) => children.iter().all(|&child| holds(child, context)),
+        RuleCond::Any(children) => children.iter().any(|&child| holds(child, context)),
+        RuleCond::Not(child) => !holds(*child, context),
+        RuleCond::Named(named) => holds(named.condition, context),
     }
-    truth
-}
-
-fn holds(clause: &Clause, context: &RuleContext<'_>) -> bool {
-    let author = context.is_author_viewer();
-    let reached = match clause.audience {
-        Audience::Everyone => true,
-        Audience::NonAuthors => !author,
-        Audience::NonFollowers => !author && !Predicate::ViewerFollowsAuthor.holds(context),
-        Audience::OnlyAuthor => author,
-    };
-    reached
-        && clause.when.iter().all(|condition| match condition.0 {
-            Condition::Is(leaf) => leaf.holds(context),
-            Condition::Not(leaf) => !leaf.holds(context),
-            Condition::Any(set) => set.iter().any(|leaf| leaf.holds(context)),
-        })
 }
 
 #[test]
-fn the_clause_fold_is_faithful() {
-    let clauses = wired_clauses();
+fn the_rule_evaluator_is_faithful() {
+    let rules = wired_rules();
     let failures: Vec<Hydrators> = once(Hydrators::empty())
         .chain(
             Hydrator::VARIANTS
@@ -146,50 +138,117 @@ fn the_clause_fold_is_faithful() {
             let mut candidate = fetched.clone();
             candidate.failed = failed;
             let context = test_context(&viewer, &candidate);
-            for &clause in &clauses {
-                if clause.hydrators().intersection(failed) != failed {
+            for &rule in &rules {
+                if rule.requirements().intersection(failed) != failed {
                     continue;
                 }
-                let truth = clause.applies(&context);
-                assert_eq!(
-                    truth,
-                    folded_without_break(clause, &context),
-                    "{} with {failed:?} failed",
-                    clause.name()
+                let (truth, ()) =
+                    observed::evaluate_rule(rule, &context, &mut observed::NoTrace, None);
+                let (total, _) = observed::evaluate_rule(
+                    rule,
+                    &context,
+                    &mut observed::NodeTracer::default(),
+                    None,
                 );
+                assert_eq!(truth, total, "{} with {failed:?} failed", rule.name());
                 assert_eq!(
                     truth.resolves_true(),
-                    holds(clause, &context),
+                    holds(rule.audience.condition(), &context) && holds(rule.when, &context),
                     "{} with {failed:?} failed",
-                    clause.name()
+                    rule.name()
                 );
             }
         }
     }
 }
 
+fn readers_through(definitions: &[RuleCond], leaves: &[Predicate]) -> usize {
+    fn walk(
+        condition: RuleCond,
+        definitions: &[RuleCond],
+        negated: bool,
+        outside: &mut Vec<Predicate>,
+        uses: &mut Vec<bool>,
+    ) {
+        match condition {
+            condition if definitions.contains(&condition) => uses.push(negated),
+            RuleCond::Leaf(leaf) => outside.push(leaf),
+            RuleCond::All(children) | RuleCond::Any(children) => {
+                for &child in children {
+                    walk(child, definitions, negated, outside, uses);
+                }
+            }
+            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),
+            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),
+        }
+    }
+    let mut readers = 0;
+    for rule in wired_rules() {
+        let (mut outside, mut uses) = (Vec::new(), Vec::new());
+        for root in [rule.audience.condition(), rule.when] {
+            walk(root, definitions, false, &mut outside, &mut uses);
+        }
+        for leaf in leaves {
+            assert!(
+                !outside.contains(leaf),
+                "{} reads {leaf:?} outside its named definition",
+                rule.name()
+            );
+        }
+        if !uses.is_empty() {
+            assert_eq!(
+                uses,
+                [false],
+                "{} must read one definition once, positively",
+                rule.name()
+            );
+            readers += 1;
+        }
+    }
+    readers
+}
+
 #[test]
 fn the_age_gate_is_whole() {
-    let unverified = not(viewer_age_verified());
-    let age_gated = [
-        request_country_in(CountryList::AgeVerification),
-        request_country_in(CountryList::Tombstone),
-    ];
-    let mut gates = 0;
-    for clause in wired_clauses() {
-        let gated = clause
-            .when
-            .iter()
-            .any(|condition| age_gated.contains(condition));
-        assert_eq!(
-            clause.when.contains(&unverified),
-            gated,
-            "{}: an age gate reads both not(viewer_age_verified()) and its country list",
-            clause.name()
-        );
-        gates += usize::from(gated);
-    }
-    assert!(gates > 0, "no wired clause is age gated");
+    let in_list = |list| Predicate::Request(RequestLeaf::RequestCountryIn(list));
+    assert_ne!(
+        readers_through(
+            &[VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES],
+            &[in_list(CountryList::AgeVerification)]
+        ),
+        0
+    );
+    assert_ne!(
+        readers_through(
+            &[VIEWER_IS_NOT_AGE_VERIFIED_IN_TOMBSTONE_COUNTRIES],
+            &[in_list(CountryList::Tombstone)]
+        ),
+        0
+    );
+    assert_ne!(
+        readers_through(
+            &[
+                VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES,
+                VIEWER_IS_NOT_AGE_VERIFIED_IN_TOMBSTONE_COUNTRIES
+            ],
+            &[Predicate::Compound(CompoundLeaf::ViewerAgeVerified)]
+        ),
+        0
+    );
+}
+
+#[test]
+fn the_conversation_root_exemption_is_whole() {
+    assert_ne!(
+        readers_through(
+            &[VIEWER_IS_NEITHER_ROOT_AUTHOR_NOR_INVITED],
+            &[
+                Predicate::ReplyControl(ReplyControlLeaf::ViewerIsConversationRootAuthor),
+                Predicate::ReplyControl(ReplyControlLeaf::ViewerIsInvitedToConversation),
+            ],
+        ),
+        0
+    );
 }
 
 #[test]

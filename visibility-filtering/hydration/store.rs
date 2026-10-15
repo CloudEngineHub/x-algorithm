@@ -721,20 +721,20 @@ impl Store {
                 HydratedTweet::Unresolved { .. } => {}
             }
         }
-        let (viewer, viewer_found) = match request.viewer_id {
-            None => (Viewer::LoggedOut, false),
+        let (viewer, viewer_state) = match request.viewer_id {
+            None => (Viewer::LoggedOut, None),
             Some(id) => {
                 let DecodedViewer {
                     profile,
                     has_age_verified_18_label,
-                    found,
+                    state,
                 } = self.viewer.take(id).unwrap_or_default();
                 let viewer = Viewer::LoggedIn {
                     id,
                     profile,
                     has_age_verified_18_label,
                 };
-                (viewer, found)
+                (viewer, state)
             }
         };
         Hydration {
@@ -743,7 +743,7 @@ impl Store {
                 request.country_code,
                 request.client_capability,
             ),
-            viewer_found,
+            viewer_state,
             planned: self.callable,
             incomplete,
             tweets,

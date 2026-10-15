@@ -974,7 +974,6 @@ class RecsysAggregatedModelConfig(Config):
             )
         if self.use_seqpack:
             attn_config = self.model_config.attn_config
-            assert self.right_anchored_rope
             assert (
                 isinstance(attn_config, RecsysAttentionConfig)
                 and attn_config.num_user_prefix_tokens == self.num_user_prefix_tokens

@@ -386,7 +386,7 @@ impl Hydrator {
         self.edge().is_some()
     }
 
-    pub(super) const fn needs_viewer(self) -> bool {
+    pub(crate) const fn needs_viewer(self) -> bool {
         self.is_edge()
             || matches!(
                 self.spec().key,
@@ -568,6 +568,10 @@ impl HydrationPlan {
 
     pub(crate) fn level(&self) -> SafetyLevel {
         self.level
+    }
+
+    pub(super) fn reads_viewer_profile(&self) -> bool {
+        self.nodes.contains(Hydrator::ViewerProfile)
     }
 
     pub(super) fn callable(&self, viewer_id: Option<u64>) -> Hydrators {

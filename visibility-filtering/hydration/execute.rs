@@ -5,14 +5,16 @@ use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::fallback_cache::{Column, FallbackCache, FallbackCaches};
 use crate::hydration::metrics::{
     self, record_batch_size, record_expanded_batch, record_flock_missing_keys,
-    record_keyed_hydrator_request, record_trusted_friends_answers, record_viewer_country,
-    record_wingman_second_degree,
+    record_keyed_hydrator_request, record_viewer_age, record_viewer_country, record_viewer_state,
 };
 use crate::hydration::plan::{Edge, Group, Source};
 use crate::hydration::sources::{Answered, Sources};
 use crate::hydration::store::{CallRequest, Landing, Store};
-use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, HYDRATION_TIMEOUT};
-use crate::models::{ArticleLifecycle, AuthorId, CommunityModeration, PureCore, TweetFeatures};
+use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator, HYDRATION_TIMEOUT};
+use crate::models::{
+    ArticleLifecycle, AuthorId, CommunityModeration, PureCore, TweetFeatures, Viewer, ViewerAge,
+    ViewerProfile,
+};
 use crate::rules::SafetyLevel;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -34,6 +36,60 @@ enum ViewerCountry {
     Found,
     NoRow,
     Failed,
+}
+
+#[derive(Debug, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum NoViewerState {
+    LoggedOut,
+    NotFound,
+    Failed,
+}
+
+#[derive(Debug, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum ViewerAgeGroup {
+    LoggedOut,
+    Adult,
+    Underage,
+    NotStated,
+    Unknown,
+}
+
+impl ViewerAgeGroup {
+    fn of(profile: &ViewerProfile) -> Self {
+        match profile.viewer_age {
+            ViewerAge::Known(_) if profile.is_underage() => Self::Underage,
+            ViewerAge::Known(_) => Self::Adult,
+            ViewerAge::NotStated => Self::NotStated,
+            ViewerAge::Unknown => Self::Unknown,
+        }
+    }
+}
+
+fn record_viewer(plan: &HydrationPlan, hydration: &Hydration) {
+    if !plan.reads_viewer_profile() {
+        return;
+    }
+    let (state, age) = match &hydration.viewer.viewer {
+        Viewer::LoggedOut => (NoViewerState::LoggedOut.into(), ViewerAgeGroup::LoggedOut),
+        Viewer::LoggedIn { profile, .. } => {
+            let state = if hydration.incomplete.contains(Hydrator::ViewerProfile) {
+                NoViewerState::Failed.into()
+            } else {
+                hydration
+                    .viewer_state
+                    .map_or(NoViewerState::NotFound.into(), <&str>::from)
+            };
+            (state, ViewerAgeGroup::of(profile))
+        }
+    };
+    record_viewer_state(state, plan.level());
+    record_viewer_age(
+        age.into(),
+        hydration.viewer.country_code.as_deref(),
+        plan.level(),
+    );
 }
 
 pub(super) enum Reply {
@@ -150,7 +206,9 @@ impl HydrationPlan {
                 .tweets_elapsed
                 .map_or(store.core_elapsed, |tweets| tweets.max(store.core_elapsed)),
         );
-        store.assemble(request)
+        let hydration = store.assemble(request);
+        record_viewer(self, &hydration);
+        hydration
     }
 
     fn send<'p>(
@@ -261,11 +319,7 @@ impl HydrationPlan {
                 timed.keyed(
                     call,
                     move |call| sources.second_degree(viewer_id, &call.keys),
-                    move |answers| {
-                        record_holds(answers, |in_network, not_in_network| {
-                            record_wingman_second_degree(in_network, not_in_network, level);
-                        })
-                    },
+                    identity,
                     |answers| Reply::Edge(Edge::SecondDegree, answers),
                 )
             }
@@ -274,11 +328,7 @@ impl HydrationPlan {
                 timed.keyed(
                     call,
                     move |call| sources.trusted_friends(viewer_id, &call.keys),
-                    move |answers| {
-                        record_holds(answers, |member_or_owner, neither| {
-                            record_trusted_friends_answers(member_or_owner, neither, level);
-                        })
-                    },
+                    identity,
                     |answers| Reply::Edge(Edge::TrustedFriends, answers),
                 )
             }
@@ -366,21 +416,6 @@ fn missing_sets_read_no_edge(
         })
         .collect();
     (edges, missing.len())
-}
-
-fn record_holds(
-    answers: RawHydrationBatch<bool>,
-    record: impl FnOnce(usize, usize),
-) -> RawHydrationBatch<bool> {
-    let answers = answers.into_hydrated();
-    let answered = |holds: bool| {
-        answers
-            .values()
-            .filter(|answer| answer.value() == Some(&holds))
-            .count()
-    };
-    record(answered(true), answered(false));
-    HydrationBatch::from_hydrated(answers)
 }
 
 #[cfg(test)]

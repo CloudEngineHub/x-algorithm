@@ -1,154 +1,156 @@
 use crate::models::AuthorLabel;
-use crate::rules::rule_spec::Audience::{Everyone, NonAuthors, NonFollowers};
+use crate::rules::rule_spec::leaves::*;
+use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors, NonFollowers};
+use crate::rules::rule_spec::rule::{all, Rule};
 use crate::rules::rule_spec::*;
 
-pub(super) const SUSPENDED_AUTHOR_DROP: Clause = Clause {
+pub(super) const SUSPENDED_AUTHOR_DROP: Rule = Rule {
     id: RuleId::SuspendedAuthor,
-    when: &[author_is_suspended()],
     audience: NonAuthors,
+    when: all![AuthorIsSuspended],
     action: drop_post(DropAs::AuthorIsSuspended),
 };
 
-pub(super) const DEACTIVATED_AUTHOR_DROP: Clause = Clause {
+pub(super) const DEACTIVATED_AUTHOR_DROP: Rule = Rule {
     id: RuleId::DeactivatedAuthor,
-    when: &[author_is_deactivated()],
     audience: NonAuthors,
+    when: all![AuthorIsDeactivated],
     action: drop_post(DropAs::AuthorIsDeactivated),
 };
 
-pub(super) const ERASED_AUTHOR_DROP_INACTIVE: Clause = Clause {
+pub(super) const ERASED_AUTHOR_DROP_INACTIVE: Rule = Rule {
     id: RuleId::ErasedAuthor,
-    when: &[author_is_erased()],
     audience: NonAuthors,
+    when: all![AuthorIsErased],
     action: drop_post(DropAs::AuthorAccountIsInactive),
 };
 
-pub(super) const OFFBOARDED_AUTHOR_DROP_INACTIVE: Clause = Clause {
+pub(super) const OFFBOARDED_AUTHOR_DROP_INACTIVE: Rule = Rule {
     id: RuleId::OffboardedAuthor,
-    when: &[author_is_offboarded()],
     audience: NonAuthors,
+    when: all![AuthorIsOffboarded],
     action: drop_post(DropAs::AuthorAccountIsInactive),
 };
 
-pub(super) const PROTECTED_AUTHOR_DROP: Clause = Clause {
+pub(super) const PROTECTED_AUTHOR_DROP: Rule = Rule {
     id: RuleId::ProtectedAuthor,
-    when: &[author_is_protected()],
     audience: NonFollowers,
+    when: all![AuthorIsProtected],
     action: drop_post(DropAs::AuthorIsProtected),
 };
 
-pub(super) const VIEWER_BLOCKS_AUTHOR_DROP: Clause = Clause {
+pub(super) const VIEWER_BLOCKS_AUTHOR_DROP: Rule = Rule {
     id: RuleId::ViewerBlocksAuthor,
-    when: &[not(viewer_logged_out()), viewer_blocks_author()],
     audience: Everyone,
+    when: all![!ViewerLoggedOut, ViewerBlocksAuthor],
     action: drop_post(DropAs::ViewerBlocksAuthor),
 };
 
-pub(super) const VIEWER_MUTES_AUTHOR_DROP: Clause = Clause {
+pub(super) const VIEWER_MUTES_AUTHOR_DROP: Rule = Rule {
     id: RuleId::ViewerMutesAuthor,
-    when: &[not(viewer_logged_out()), viewer_mutes_author()],
     audience: Everyone,
+    when: all![!ViewerLoggedOut, ViewerMutesAuthor],
     action: drop_post(DropAs::ViewerMutesAuthor),
 };
 
-pub(super) const VIEWER_MUTES_RETWEETS_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const VIEWER_MUTES_RETWEETS_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::ViewerMutesRetweets,
-    when: &[
-        not(viewer_logged_out()),
-        tweet_is_retweet(),
-        viewer_mutes_retweets_from_author(),
-    ],
     audience: Everyone,
+    when: all![
+        !ViewerLoggedOut,
+        TweetIsRetweet,
+        ViewerMutesRetweetsFromAuthor
+    ],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_USER_AUTHOR_DROP_NSFW_MEDIA: Clause = Clause {
+pub(super) const NSFW_USER_AUTHOR_DROP_NSFW_MEDIA: Rule = Rule {
     id: RuleId::NsfwUserAuthor,
-    when: &[author_is_nsfw_user()],
     audience: NonAuthors,
+    when: all![AuthorIsNsfwUser],
     action: drop_post(DropAs::ContainNsfwMedia),
 };
 
-pub(super) const NSFW_ADMIN_AUTHOR_DROP_NSFW_MEDIA: Clause = Clause {
+pub(super) const NSFW_ADMIN_AUTHOR_DROP_NSFW_MEDIA: Rule = Rule {
     id: RuleId::NsfwAdminAuthor,
-    when: &[author_is_nsfw_admin()],
     audience: NonAuthors,
+    when: all![AuthorIsNsfwAdmin],
     action: drop_post(DropAs::ContainNsfwMedia),
 };
 
-pub(super) const NSFW_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const NSFW_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::NsfwHighRecallUserLabel,
-    when: &[author_has_label(AuthorLabel::NsfwHighRecall)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwHighRecall)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const NSFW_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::NsfwHighPrecisionUserLabel,
-    when: &[author_has_label(AuthorLabel::NsfwHighPrecision)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwHighPrecision)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_AVATAR_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const NSFW_AVATAR_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::NsfwAvatarImageUserLabel,
-    when: &[author_has_label(AuthorLabel::NsfwAvatarImage)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwAvatarImage)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_BANNER_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const NSFW_BANNER_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::NsfwBannerImageUserLabel,
-    when: &[author_has_label(AuthorLabel::NsfwBannerImage)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwBannerImage)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_NEAR_PERFECT_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const NSFW_NEAR_PERFECT_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::NsfwNearPerfectUserLabel,
-    when: &[author_has_label(AuthorLabel::NsfwNearPerfect)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwNearPerfect)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const SPAM_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const SPAM_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::SpamHighRecallUserLabel,
-    when: &[author_has_label(AuthorLabel::SpamHighRecall)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::SpamHighRecall)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const COMPROMISED_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const COMPROMISED_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::CompromisedUserLabel,
-    when: &[author_has_label(AuthorLabel::Compromised)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::Compromised)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const READ_ONLY_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const READ_ONLY_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::ReadOnlyUserLabel,
-    when: &[author_has_label(AuthorLabel::ReadOnly)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::ReadOnly)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const IMPERSONATION_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const IMPERSONATION_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::ImpersonationHighPrecisionUserLabel,
-    when: &[author_has_label(AuthorLabel::ImpersonationHighPrecision)],
     audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::ImpersonationHighPrecision)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const ABUSIVE_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const ABUSIVE_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::AbusiveHighRecallUserLabel,
-    when: &[author_has_label(AuthorLabel::AbusiveHighRecall)],
     audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::AbusiveHighRecall)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const DO_NOT_AMPLIFY_USER_LABEL_DROP_UNSPECIFIED: Clause = Clause {
+pub(super) const DO_NOT_AMPLIFY_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::DoNotAmplifyUserLabel,
-    when: &[author_has_label(AuthorLabel::DoNotAmplify)],
     audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::DoNotAmplify)],
     action: drop_post(DropAs::UnspecifiedReason),
 };
