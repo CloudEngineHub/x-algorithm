@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-14T16:00:44Z
+// mirrored from config feature-switch defaults; last sync 2026-10-15T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -1079,6 +1079,18 @@ param!(
     u32,
     "rust_home_mixer_video_carousel_semantic_id_dedupe_levels",
     0
+);
+param!(
+    EnableVideoCarouselEmbeddingDedupe,
+    bool,
+    "rust_home_mixer_enable_video_carousel_embedding_dedupe",
+    false
+);
+param!(
+    VideoCarouselEmbeddingDedupeThreshold,
+    f64,
+    "rust_home_mixer_video_carousel_embedding_dedupe_threshold",
+    0.72
 );
 param!(
     VideoCarouselVideoOpenWeight,

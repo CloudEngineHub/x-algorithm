@@ -43,8 +43,8 @@ impl FilterTweetsEndpoint {
         request: Request<vf_pb::VisibilityFilterRequest>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
         let entered = tokio::time::Instant::now();
-        let request_metrics = RequestMetricsGuard::new();
         let grpc_timeout = parse_grpc_timeout(request.metadata());
+        let request_metrics = RequestMetricsGuard::new(grpc_timeout);
         let caller = caller_identity::record(Endpoint::FilterTweets, &request);
         let context = crate::hydration::request_context(entered, grpc_timeout);
         let req = request.into_inner();
@@ -78,7 +78,7 @@ impl FilterTweetsEndpoint {
         let response = context
             .scope(self.filter_tweets.run(FilterRequest {
                 viewer_id,
-                country_code: req.country_code,
+                country_code: req.country_code.filter(|code| !code.is_empty()),
                 client_capability: ClientCapability::default(),
                 safety_level,
                 candidates,
@@ -117,7 +117,6 @@ impl FilterTweetsEndpoint {
             .map(to_visibility_result)
             .collect();
 
-        request_metrics.record_deadline(grpc_timeout);
         request_metrics.mark_success();
         caller.mark_success();
         Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))

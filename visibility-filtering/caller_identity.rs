@@ -1,14 +1,14 @@
-use crate::filter_tweets::parse_grpc_timeout;
 use std::cell::Cell;
+use std::time::Instant;
 use tonic::Request;
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
-use xai_stats_receiver::global_stats_receiver;
+use xai_stats_receiver::{global_stats_receiver, StatsReceiverExt};
 
 const REQUESTS_BY_CALLER: &str = "vf_requests_by_caller";
+const LATENCY_BY_CALLER_MS: &str = "vf_request_latency_by_caller_ms";
 const S2S_IDENTITY_PREFIX: &str = "twtr:svc:";
 const UNKNOWN_IDENTITY: &str = "unknown";
-const NO_DEADLINE: &str = "absent";
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -29,8 +29,8 @@ pub(crate) enum Outcome {
 pub(crate) struct CallerRequest {
     identity: Option<String>,
     endpoint: Endpoint,
-    deadline: &'static str,
     outcome: Cell<Outcome>,
+    start: Instant,
 }
 
 impl CallerRequest {
@@ -41,24 +41,36 @@ impl CallerRequest {
     pub(crate) fn mark_failure(&self) {
         self.outcome.set(Outcome::Failure);
     }
+
+    fn emit(&self, sr: &dyn StatsReceiverExt) {
+        let caller_identity = self.identity.as_deref().unwrap_or(UNKNOWN_IDENTITY);
+        let outcome = self.outcome.get();
+        sr.incr(
+            REQUESTS_BY_CALLER,
+            &[
+                ("caller_identity", caller_identity),
+                ("rpc", self.endpoint.into()),
+                ("outcome", outcome.into()),
+            ],
+            1,
+        );
+        if matches!(outcome, Outcome::Success) {
+            sr.observe_vm(
+                LATENCY_BY_CALLER_MS,
+                &[
+                    ("caller_identity", caller_identity),
+                    ("rpc", self.endpoint.into()),
+                ],
+                self.start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+    }
 }
 
 impl Drop for CallerRequest {
     fn drop(&mut self) {
         if let Some(sr) = global_stats_receiver() {
-            sr.incr(
-                REQUESTS_BY_CALLER,
-                &[
-                    (
-                        "caller_identity",
-                        self.identity.as_deref().unwrap_or(UNKNOWN_IDENTITY),
-                    ),
-                    ("rpc", self.endpoint.into()),
-                    ("deadline", self.deadline),
-                    ("outcome", self.outcome.get().into()),
-                ],
-                1,
-            );
+            self.emit(&*sr);
         }
     }
 }
@@ -68,16 +80,11 @@ pub(crate) fn record<T>(endpoint: Endpoint, request: &Request<T>) -> CallerReque
     let identity = request
         .peer_certs()
         .and_then(|certs| identity_from_der(certs.first()?.as_ref()));
-    let deadline = if parse_grpc_timeout(request.metadata()).is_some() {
-        "present"
-    } else {
-        NO_DEADLINE
-    };
     CallerRequest {
         identity,
         endpoint,
-        deadline,
         outcome: Cell::new(Outcome::Cancelled),
+        start: Instant::now(),
     }
 }
 
@@ -110,6 +117,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
+    use xai_stats_receiver::HistogramBuckets;
 
     const S2S_IDENTITY: &str = "twtr:svc:example-caller:example-caller:prod:atla";
 
@@ -182,7 +191,7 @@ tMYHDu0CIG/uxg3z7cGl6/7g6seBJJ7qqxJNLaQBRlMu1Ntki9Q7
             "REQUESTS_BY_CALLER_METRIC = \"{REQUESTS_BY_CALLER}\""
         )));
         assert!(dashboard.contains(&format!(
-            "REQUESTS_BY_CALLER_NO_DEADLINE_FILTER = 'deadline=\"{NO_DEADLINE}\"'"
+            "VF_LATENCY_BY_CALLER_METRIC = \"{LATENCY_BY_CALLER_MS}\""
         )));
         let [success, failure, cancelled] =
             [Outcome::Success, Outcome::Failure, Outcome::Cancelled].map(<&str>::from);
@@ -198,10 +207,46 @@ tMYHDu0CIG/uxg3z7cGl6/7g6seBJJ7qqxJNLaQBRlMu1Ntki9Q7
     fn caller_request_defaults_to_cancelled_until_marked() {
         let request = record(Endpoint::GetSafetyLabels, &Request::new(()));
         assert!(matches!(request.outcome.get(), Outcome::Cancelled));
-        assert_eq!(request.deadline, NO_DEADLINE);
         request.mark_failure();
         assert!(matches!(request.outcome.get(), Outcome::Failure));
         request.mark_success();
         assert!(matches!(request.outcome.get(), Outcome::Success));
+    }
+
+    #[derive(Default)]
+    struct Latencies(Mutex<Vec<(String, String)>>);
+
+    impl StatsReceiverExt for Latencies {
+        fn incr(&self, _: &str, _: &[(&str, &str)], _: u64) {}
+        fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
+        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+        fn observe_vm(&self, name: &str, scopes: &[(&str, &str)], _: f64) {
+            let labels = scopes
+                .iter()
+                .map(|(label, tag)| format!("{label}={tag}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.0.lock().unwrap().push((name.to_string(), labels));
+        }
+        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    }
+
+    #[test]
+    fn only_a_successful_request_observes_its_latency_by_caller() {
+        let latencies = Latencies::default();
+        let request = record(Endpoint::GetSafetyLabels, &Request::new(()));
+        request.emit(&latencies);
+        request.mark_failure();
+        request.emit(&latencies);
+        assert!(latencies.0.lock().unwrap().is_empty());
+        request.mark_success();
+        request.emit(&latencies);
+        assert_eq!(
+            *latencies.0.lock().unwrap(),
+            [(
+                LATENCY_BY_CALLER_MS.to_string(),
+                "caller_identity=unknown,rpc=get_safety_labels".to_string()
+            )]
+        );
     }
 }

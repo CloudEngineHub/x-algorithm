@@ -278,7 +278,8 @@ def build1FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRe
   val object = {
     postId = candidate.postId,
     authorId = candidate.authorId,
-    indexName = "1fav_reply"
+    indexName = "1fav_reply",
+    inReplyToPostId = candidate.tweetMedadata.flatMap { tweet => eventProcessing.inReplyToPostId(tweet) }
   }
   #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
   stats.counter("1fav_reply_indexing_event_created").incr(1)
@@ -289,7 +290,8 @@ def build32FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsR
     val object = {
       postId = candidate.postId,
       authorId = candidate.authorId,
-      indexName = "32fav_reply"
+      indexName = "32fav_reply",
+      inReplyToPostId = candidate.tweetMedadata.flatMap { tweet => eventProcessing.inReplyToPostId(tweet) }
     }
     #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
     stats.counter("32fav_reply_indexing_event_created").incr(1)

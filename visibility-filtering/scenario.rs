@@ -158,13 +158,9 @@ impl InRequestOrder {
                 .collect(),
             failed_ids: tweets()
                 .filter(|(_, tweet)| {
-                    matches!(
-                        tweet,
-                        HydratedTweet::Resolved {
-                            has_failed_node: true,
-                            ..
-                        }
-                    )
+                    tweet
+                        .candidate()
+                        .is_some_and(|candidate| !candidate.failed.is_empty())
                 })
                 .map(|(id, _)| id)
                 .collect(),

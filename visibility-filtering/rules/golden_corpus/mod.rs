@@ -21,7 +21,7 @@ mod tweet_label;
 mod tweet_state;
 
 use crate::hydration::Hydrators;
-use crate::models::{PostCandidate, Verdict, ViewerFeatures};
+use crate::models::{Evaluation, PostCandidate, Verdict, ViewerFeatures};
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
 use crate::rules::{RuleEngine, SafetyLevel};
 use crate::treatment::proto_action;
@@ -173,14 +173,21 @@ fn bench_corpus_evaluation() {
 }
 
 #[test]
-fn every_node_failing_changes_no_corpus_verdict() {
+fn every_node_failing_changes_no_corpus_verdict_and_only_a_must_have_one_makes_it_partial() {
     let rule_engine = RuleEngine::for_tests();
+    let best_effort = Hydrators::all().difference(Hydrators::all().must_have());
     for mut case in corpus() {
-        case.candidate.failed = Hydrators::all();
-        let verdict = rule_engine
-            .evaluate(case.level, &case.viewer, &case.candidate)
-            .into_verdict();
-        assert_eq!(verdict, case.expected, "{}", case.name);
+        for (failed, is_partial) in [(best_effort, false), (Hydrators::all(), true)] {
+            case.candidate.failed = failed;
+            let evaluation = rule_engine.evaluate(case.level, &case.viewer, &case.candidate);
+            assert_eq!(
+                matches!(evaluation, Evaluation::Partial { .. }),
+                is_partial,
+                "{} with {failed:?} failed",
+                case.name
+            );
+            assert_eq!(evaluation.into_verdict(), case.expected, "{}", case.name);
+        }
     }
 }
 
@@ -212,10 +219,17 @@ fn corpus() -> Vec<CorpusCase> {
     rows().into_iter().flat_map(Row::expand).collect()
 }
 
-pub(super) fn pairs() -> Vec<(ViewerFeatures, PostCandidate)> {
+pub(super) fn cases() -> Vec<(SafetyLevel, ViewerFeatures, PostCandidate)> {
     corpus()
         .into_iter()
-        .map(|case| (case.viewer, case.candidate))
+        .map(|case| (case.level, case.viewer, case.candidate))
+        .collect()
+}
+
+pub(super) fn pairs() -> Vec<(ViewerFeatures, PostCandidate)> {
+    cases()
+        .into_iter()
+        .map(|(_, viewer, candidate)| (viewer, candidate))
         .collect()
 }
 

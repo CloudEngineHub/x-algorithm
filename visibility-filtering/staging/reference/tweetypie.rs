@@ -51,6 +51,7 @@ const BATCHES: &str = "vf_tweetypie_reference_batches";
 const RECORD_LINE_MARKER: &str = "vf_tweetypie_reference_record";
 pub(crate) const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
 const RECORD_CAP_PER_MINUTE: u32 = 20;
+const BEST_EFFORT_DEFAULTS: &str = "best_effort_defaults";
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 enum BatchOutcome {
@@ -196,7 +197,10 @@ impl TweetypieReference {
         let tweet_ids: Vec<TweetId> = outcomes
             .iter()
             .filter(|outcome| match &outcome.evaluation {
-                Evaluation::Complete { verdict } => !matches!(verdict, Verdict::Withheld(_)),
+                Evaluation::Complete {
+                    verdict,
+                    fail_open_defaults,
+                } => !matches!(verdict, Verdict::Withheld(_)) && fail_open_defaults.is_empty(),
                 Evaluation::NotFound(_) => true,
                 Evaluation::Partial { .. } | Evaluation::Failed(_) => false,
             })
@@ -354,10 +358,17 @@ struct Compared<'a> {
 
 impl Compared<'_> {
     fn bucket(&self) -> Bucket {
-        let vf = self.vf.map_or_else(
-            || label(Class::Missing, NONE),
-            |outcome| vf_label(outcome, SAFETY_LEVEL),
-        );
+        let vf = match self.vf {
+            None => label(Class::Missing, NONE),
+            Some(FilterOutcome {
+                evaluation:
+                    Evaluation::Complete {
+                        fail_open_defaults, ..
+                    },
+                ..
+            }) if !fail_open_defaults.is_empty() => label(Class::Failed, BEST_EFFORT_DEFAULTS),
+            Some(outcome) => vf_label(outcome, SAFETY_LEVEL),
+        };
         let allow: &str = Class::Allow.into();
         let (tp, vf) = if self.tp.label.0 == allow && vf.0 == allow {
             (label(Class::Allow, NONE), label(Class::Allow, NONE))
@@ -471,7 +482,7 @@ mod tests {
         FilterOutcome {
             tweet_id: TweetId(1),
             source_tweet_id: None,
-            evaluation: Evaluation::Complete { verdict },
+            evaluation: Evaluation::complete(verdict),
             safety_labels: None,
         }
     }
@@ -499,10 +510,31 @@ mod tests {
     }
 
     #[test]
+    fn a_post_resting_on_best_effort_defaults_is_labelled_uncomparable() {
+        use crate::hydration::Hydrator;
+        let tp = TpResult {
+            label: pair("allow", NONE),
+            result: None,
+            strato_error: None,
+        };
+        let vf = FilterOutcome {
+            evaluation: Evaluation::Complete {
+                verdict: shown(),
+                fail_open_defaults: Hydrators::of(Hydrator::Follows),
+            },
+            ..outcome(shown())
+        };
+        assert_eq!(
+            compared(&tp, Some(&vf)).bucket().vf,
+            pair("failed", "best_effort_defaults")
+        );
+    }
+
+    #[test]
     fn the_record_names_each_evaluation() {
         assert_eq!(
             [
-                Evaluation::Complete { verdict: shown() },
+                Evaluation::complete(shown()),
                 Evaluation::Partial {
                     verdict: shown(),
                     fail_open_defaults: Hydrators::empty(),

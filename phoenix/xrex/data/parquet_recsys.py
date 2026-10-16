@@ -44,6 +44,7 @@ from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
 from xrex.data.recsys import reply_features
+from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
@@ -1697,6 +1698,9 @@ class PhoenixDataset(Dataset):
     global_author_ids: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_post_creation_datetimes: np.ndarray | None = dataclasses.field(init=False, default=None)
     global_post_sids: np.ndarray | None = dataclasses.field(init=False, default=None)
+    _alloc: ArrayAllocator = dataclasses.field(
+        init=False, default_factory=ArrayAllocator, repr=False, compare=False
+    )
     global_ids_file_path: Path = (
         PHOENIX_INDEX_BASE / "post_creation_snapshots/post_creation_1day.parquet"
     )
@@ -2145,6 +2149,7 @@ class PhoenixDataset(Dataset):
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
+                        alloc=self._alloc,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:

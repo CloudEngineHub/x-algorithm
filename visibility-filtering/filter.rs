@@ -1,8 +1,6 @@
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
-use crate::hydration::{
-    Cause, HydratedTweet, Hydration, HydrationRequest, Hydrators, Lookup, Unresolved,
-};
+use crate::hydration::{Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, Unresolved};
 use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
 use crate::rules::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
 use crate::rules::registry::AdmittedPosts;
@@ -226,30 +224,15 @@ impl FilterTweets {
         let tweet = hydrated.hydration.tweet(tweet_id);
         let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied));
         let evaluation = match (tweet, post) {
-            (
-                Some(HydratedTweet::Resolved {
-                    has_failed_node, ..
-                }),
-                Some(post),
-            ) => 'post: {
-                let settle = |evaluation| match evaluation {
-                    Evaluation::Complete { verdict } if *has_failed_node => Evaluation::Partial {
-                        verdict,
-                        fail_open_defaults: Hydrators::empty(),
-                    },
-                    Evaluation::Complete { .. }
-                    | Evaluation::Partial { .. }
-                    | Evaluation::NotFound(_)
-                    | Evaluation::Failed(_) => evaluation,
-                };
+            (Some(HydratedTweet::Resolved { .. }), Some(post)) => {
                 if O::TOTAL {
-                    let mut trace = post.trace();
-                    trace.evaluation = settle(trace.evaluation);
+                    let trace = post.trace();
                     let evaluation = trace.evaluation.clone();
                     observer.record(tweet_id, trace);
-                    break 'post evaluation;
+                    evaluation
+                } else {
+                    post.evaluate()
                 }
-                settle(post.evaluate())
             }
             (
                 Some(HydratedTweet::Unresolved {
@@ -261,8 +244,9 @@ impl FilterTweets {
                 Cause::NotFound => Evaluation::NotFound(*lookup),
                 Cause::Failed => Evaluation::Failed(*lookup),
             },
-            (Some(HydratedTweet::Resolved { .. }), None) => Evaluation::Failed(Lookup::Tweet),
-            (None, _) => Evaluation::Failed(Lookup::Tweet),
+            (Some(HydratedTweet::Resolved { .. }), None) | (None, _) => {
+                Evaluation::Failed(Lookup::Tweet)
+            }
         };
         FilterOutcome {
             tweet_id,
@@ -325,7 +309,7 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeQuery, Graph};
     use crate::hydration::plan::Source;
     use crate::hydration::sources::{control, found_user, Fault, InMemorySources};
-    use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator};
+    use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator, Hydrators};
     use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};
     use crate::rules::fixtures::{allow, dropped, limited, limited_for};
     use crate::scenario::{raw, Scenario};
@@ -367,11 +351,11 @@ mod tests {
                 in_reply_to_user_id: Some(in_reply_to_user_id),
                 ..Default::default()
             };
-        let root_author_blocked = || Evaluation::Complete {
-            verdict: limited(
+        let root_author_blocked = || {
+            Evaluation::complete(limited(
                 LimitedEngagementReason::RootAuthorBlockedViewer,
                 "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-            ),
+            ))
         };
         let raw = [1, 3, 100, 2, 201, 4, 7, 8].map(|id| raw(id, None));
         for delayed in [Source::TesPureCoreData, Source::TesConversationControl] {
@@ -398,13 +382,11 @@ mod tests {
                 logged_in.evaluate(&raw).await.evaluations(),
                 vec![
                     root_author_blocked(),
-                    Evaluation::Complete { verdict: allow() },
-                    Evaluation::Complete {
-                        verdict: limited(
-                            LimitedEngagementReason::BlockedViewer,
-                            "blocked_viewer/limited_engagement",
-                        ),
-                    },
+                    Evaluation::complete(allow()),
+                    Evaluation::complete(limited(
+                        LimitedEngagementReason::BlockedViewer,
+                        "blocked_viewer/limited_engagement",
+                    )),
                     root_author_blocked(),
                     root_author_blocked(),
                     root_author_blocked(),
@@ -416,7 +398,7 @@ mod tests {
             let logged_out = home(None);
             assert_eq!(
                 logged_out.evaluate(&raw).await.evaluations(),
-                vec![Evaluation::Complete { verdict: allow() }; 8],
+                vec![Evaluation::complete(allow()); 8],
                 "{delayed:?}"
             );
             assert!(logged_out.sources().selects().is_empty(), "{delayed:?}");
@@ -440,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_nested_reply_fails_only_when_its_request_tweet_roots_pure_core_failed() {
+    async fn a_nested_reply_fails_a_node_only_when_its_request_tweet_roots_pure_core_failed() {
         let nested = |author_id, conversation_id| PureCoreData {
             author_id,
             conversation_id: Some(conversation_id),
@@ -459,9 +441,9 @@ mod tests {
         assert_eq!(
             scenario.evaluate(&raw).await.evaluations(),
             [
-                Evaluation::Complete { verdict: allow() },
+                Evaluation::complete(allow()),
                 Evaluation::NotFound(Lookup::Tweet),
-                Evaluation::Partial {
+                Evaluation::Complete {
                     verdict: allow(),
                     fail_open_defaults: Hydrators::of(Hydrator::BlockedByReplyRoot),
                 },
@@ -608,7 +590,7 @@ mod tests {
             let started = tokio::time::Instant::now();
             let evaluations = scenario.evaluate(&[raw(2, None)]).await.evaluations();
             let sources = scenario.sources();
-            assert_eq!(evaluations, [Evaluation::Complete { verdict }], "{name}");
+            assert_eq!(evaluations, [Evaluation::complete(verdict)], "{name}");
             assert_eq!(sources.selects(), selects, "{name}");
             assert_eq!(
                 sources.keys(Source::TesConversationRoot),
@@ -652,12 +634,12 @@ mod tests {
                 .authors(&[10, 11, 12, 13])
                 .trusted_friend(7, 50)
         };
-        let shown = || Evaluation::Complete { verdict: allow() };
-        let trusted_friends_drop = || Evaluation::Complete {
-            verdict: dropped(
+        let shown = || Evaluation::complete(allow());
+        let trusted_friends_drop = || {
+            Evaluation::complete(dropped(
                 FilteredReason::UnspecifiedReason,
                 "trusted_friends_tweet/drop/unspecified",
-            ),
+            ))
         };
 
         let home = |sources: InMemorySources, viewer_id| {
@@ -707,12 +689,12 @@ mod tests {
                 .tweet(3, 12)
                 .authors(&[10, 11, 12])
         };
-        let shown = || Evaluation::Complete { verdict: allow() };
-        let local_limit = || Evaluation::Complete {
-            verdict: limited(
+        let shown = || Evaluation::complete(allow());
+        let local_limit = || {
+            Evaluation::complete(limited(
                 LimitedEngagementReason::LocalTweet,
                 "local_tweet/limited_engagement",
-            ),
+            ))
         };
 
         let home = |sources: InMemorySources| {
@@ -738,7 +720,7 @@ mod tests {
         assert_eq!(
             home(failed).evaluate(&[raw[0], raw[2]]).await.evaluations(),
             [
-                Evaluation::Partial {
+                Evaluation::Complete {
                     verdict: allow(),
                     fail_open_defaults: Hydrators::of(Hydrator::OutsideNarrowcastPlace),
                 },
@@ -771,13 +753,11 @@ mod tests {
             scenario.evaluate(&raw).await.evaluations()
         };
         let expected = [
-            Evaluation::Complete { verdict: allow() },
-            Evaluation::Complete {
-                verdict: dropped(
-                    FilteredReason::UnspecifiedReason,
-                    "trusted_friends_tweet/drop/unspecified",
-                ),
-            },
+            Evaluation::complete(allow()),
+            Evaluation::complete(dropped(
+                FilteredReason::UnspecifiedReason,
+                "trusted_friends_tweet/drop/unspecified",
+            )),
         ];
 
         assert_eq!(judged().await, expected);
@@ -805,13 +785,11 @@ mod tests {
         assert_eq!(
             evaluated.evaluations(),
             vec![
-                Evaluation::Complete {
-                    verdict: dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "viewer_mutes_retweets/drop/unspecified",
-                    ),
-                },
-                Evaluation::Complete { verdict: allow() },
+                Evaluation::complete(dropped(
+                    FilteredReason::UnspecifiedReason,
+                    "viewer_mutes_retweets/drop/unspecified",
+                )),
+                Evaluation::complete(allow()),
             ]
         );
     }
@@ -897,9 +875,7 @@ mod tests {
     #[tokio::test]
     async fn a_post_is_judged_only_when_its_tweet_and_author_lookups_answer() {
         let nullcast_drop = dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop");
-        let judged = Evaluation::Complete {
-            verdict: nullcast_drop.clone(),
-        };
+        let judged = Evaluation::complete(nullcast_drop.clone());
         let not_found = Evaluation::NotFound;
         let failed = Evaluation::Failed;
         let rows = [
@@ -1094,9 +1070,9 @@ mod tests {
                 .map(|outcome| outcome.evaluation.clone())
                 .collect::<Vec<_>>(),
             vec![
-                Evaluation::Complete { verdict: allow() },
+                Evaluation::complete(allow()),
                 Evaluation::Failed(Lookup::Tweet),
-                Evaluation::Complete { verdict: allow() },
+                Evaluation::complete(allow()),
             ]
         );
         assert_eq!(

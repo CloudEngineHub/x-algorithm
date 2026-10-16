@@ -24,3 +24,4 @@ pub mod tweet_type_metrics_hydrator;
 pub mod vf_candidate_hydrator;
 pub mod vf_following_candidate_hydrator;
 pub mod video_aspect_ratio_hydrator;
+pub mod video_embedding_hydrator;

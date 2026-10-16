@@ -27,6 +27,7 @@ use std::time::Duration;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(300);
 pub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);
 
 pub(crate) fn request_context(
@@ -266,7 +267,6 @@ impl CopiedFromSource {
 pub(crate) enum HydratedTweet {
     Resolved {
         candidate: PostCandidate,
-        has_failed_node: bool,
         source_tweet_id: Option<TweetId>,
         safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
     },
@@ -318,15 +318,11 @@ impl HydratedTweet {
     pub(crate) fn source_to_merge(&self) -> Option<TweetId> {
         match self {
             Self::Resolved {
-                has_failed_node: false,
+                candidate,
                 source_tweet_id,
                 ..
-            } => *source_tweet_id,
-            Self::Resolved {
-                has_failed_node: true,
-                ..
-            }
-            | Self::Unresolved { .. } => None,
+            } if !candidate.failed.has_must_have() => *source_tweet_id,
+            Self::Resolved { .. } | Self::Unresolved { .. } => None,
         }
     }
 

@@ -8,6 +8,7 @@ mod pb {
 
 pub use pb::*;
 
+pub mod brand_engagement;
 pub mod grok_topics;
 pub mod installed_apps;
 pub mod purchase_value;

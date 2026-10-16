@@ -81,12 +81,6 @@ impl Predicate {
     }
 }
 
-impl Hash for Predicate {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        format!("{self:?}").hash(state);
-    }
-}
-
 struct Spelled;
 
 impl PredicateVisitor for Spelled {

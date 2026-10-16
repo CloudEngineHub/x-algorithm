@@ -5,16 +5,17 @@ use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::fallback_cache::{Column, FallbackCache, FallbackCaches};
 use crate::hydration::metrics::{
     self, record_batch_size, record_expanded_batch, record_flock_missing_keys,
-    record_keyed_hydrator_request, record_viewer_age, record_viewer_country, record_viewer_state,
+    record_keyed_hydrator_request, record_request_country, record_viewer_country,
+    record_viewer_not_age_verified, record_viewer_state,
 };
 use crate::hydration::plan::{Edge, Group, Source};
 use crate::hydration::sources::{Answered, Sources};
 use crate::hydration::store::{CallRequest, Landing, Store};
-use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator, HYDRATION_TIMEOUT};
+use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator};
 use crate::models::{
     ArticleLifecycle, AuthorId, CommunityModeration, PureCore, TweetFeatures, Viewer, ViewerAge,
-    ViewerProfile,
 };
+use crate::params::CountryList;
 use crate::rules::SafetyLevel;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -24,7 +25,7 @@ use std::future::Future;
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use xai_core_entities::entities::ConversationControl;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_rpc::WithBudget;
@@ -46,50 +47,71 @@ enum NoViewerState {
     Failed,
 }
 
-#[derive(Debug, strum::IntoStaticStr)]
+#[derive(Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-enum ViewerAgeGroup {
-    LoggedOut,
+enum UnverifiedAge {
     Adult,
-    Underage,
     NotStated,
-    Unknown,
 }
 
-impl ViewerAgeGroup {
-    fn of(profile: &ViewerProfile) -> Self {
-        match profile.viewer_age {
-            ViewerAge::Known(_) if profile.is_underage() => Self::Underage,
-            ViewerAge::Known(_) => Self::Adult,
-            ViewerAge::NotStated => Self::NotStated,
-            ViewerAge::Unknown => Self::Unknown,
-        }
+fn age_verification_prompted(
+    viewer: &Viewer,
+    request_country: Option<&str>,
+) -> Option<(&'static str, UnverifiedAge)> {
+    let Viewer::LoggedIn {
+        profile,
+        has_age_verified_18_label,
+        ..
+    } = viewer
+    else {
+        return None;
+    };
+    if *has_age_verified_18_label || profile.has_idv_premium {
+        return None;
+    }
+    let age = match profile.viewer_age {
+        ViewerAge::Known(_) if profile.is_underage() => return None,
+        ViewerAge::Known(_) => UnverifiedAge::Adult,
+        ViewerAge::NotStated => UnverifiedAge::NotStated,
+        ViewerAge::Unknown => return None,
+    };
+    let code = request_country?;
+    let country = [CountryList::AgeVerification, CountryList::Tombstone]
+        .into_iter()
+        .find_map(|list| list.names_by_default(code))?;
+    Some((country, age))
+}
+
+fn record_age_verification_prompted(plan: &HydrationPlan, hydration: &Hydration) {
+    let answered = !hydration.incomplete.contains(Hydrator::ViewerLabels)
+        && !hydration.incomplete.contains(Hydrator::ViewerProfile);
+    if plan.reads_viewer_labels()
+        && answered
+        && let Some((country, age)) = age_verification_prompted(
+            &hydration.viewer.viewer,
+            hydration.viewer.country_code.as_deref(),
+        )
+    {
+        record_viewer_not_age_verified(country, age.into());
     }
 }
 
 fn record_viewer(plan: &HydrationPlan, hydration: &Hydration) {
+    record_age_verification_prompted(plan, hydration);
     if !plan.reads_viewer_profile() {
         return;
     }
-    let (state, age) = match &hydration.viewer.viewer {
-        Viewer::LoggedOut => (NoViewerState::LoggedOut.into(), ViewerAgeGroup::LoggedOut),
-        Viewer::LoggedIn { profile, .. } => {
-            let state = if hydration.incomplete.contains(Hydrator::ViewerProfile) {
-                NoViewerState::Failed.into()
-            } else {
-                hydration
-                    .viewer_state
-                    .map_or(NoViewerState::NotFound.into(), <&str>::from)
-            };
-            (state, ViewerAgeGroup::of(profile))
+    let state = match &hydration.viewer.viewer {
+        Viewer::LoggedOut => NoViewerState::LoggedOut.into(),
+        Viewer::LoggedIn { .. } if hydration.incomplete.contains(Hydrator::ViewerProfile) => {
+            NoViewerState::Failed.into()
         }
+        Viewer::LoggedIn { .. } => hydration
+            .viewer_state
+            .map_or(NoViewerState::NotFound.into(), <&str>::from),
     };
     record_viewer_state(state, plan.level());
-    record_viewer_age(
-        age.into(),
-        hydration.viewer.country_code.as_deref(),
-        plan.level(),
-    );
+    record_request_country(hydration.viewer.country_code.as_deref());
 }
 
 pub(super) enum Reply {
@@ -117,6 +139,7 @@ struct Timed {
     client: String,
     method: String,
     level: SafetyLevel,
+    ceiling: Duration,
     candidate_count_by_claimed_key: FxHashMap<u64, usize>,
 }
 
@@ -127,13 +150,10 @@ impl Timed {
         timed_out: impl FnOnce(RawHydrationBatch<V>) -> A,
     ) -> A {
         let start = Instant::now();
-        let answer = call
-            .with_budget(HYDRATION_TIMEOUT)
-            .await
-            .unwrap_or_else(|_| {
-                let claimed = self.candidate_count_by_claimed_key.keys().copied();
-                timed_out(HydrationBatch::timed_out(claimed))
-            });
+        let answer = call.with_budget(self.ceiling).await.unwrap_or_else(|_| {
+            let claimed = self.candidate_count_by_claimed_key.keys().copied();
+            timed_out(HydrationBatch::timed_out(claimed))
+        });
         record_keyed_hydrator_request(
             &self.client,
             &self.method,
@@ -232,6 +252,7 @@ impl HydrationPlan {
             client,
             method,
             level,
+            ceiling: group.ceiling(),
             candidate_count_by_claimed_key: mem::take(&mut call.candidate_count_by_claimed_key),
         };
         let in_flight: InFlight<'p> = match group.source {
@@ -424,12 +445,17 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeDirection, EdgeQuery, Graph};
     use crate::hydration::decode::author::fallback_cache;
     use crate::hydration::decode::tweet::tweet_fallback_cache;
-    use crate::hydration::sources::{control, suspended, Fault, InMemorySources};
-    use crate::hydration::{Cause, Hydrator, Hydrators, Lookup, Unresolved};
-    use crate::models::{ArticleLifecycle, ClientCapability, TweetId, Viewer, ViewerProfile};
+    use crate::hydration::sources::{Fault, InMemorySources, control, suspended};
+    use crate::hydration::{
+        BEST_EFFORT_HYDRATION_TIMEOUT, Cause, HYDRATION_TIMEOUT, Hydrator, Hydrators, Lookup,
+        Unresolved,
+    };
+    use crate::models::{
+        ArticleLifecycle, ClientCapability, Evaluation, TweetId, Viewer, ViewerProfile,
+    };
     use crate::rules::metrics::Rpc;
     use crate::rules::{RuleEngine, SafetyLevel};
-    use crate::scenario::{raw, InRequestOrder, Scenario};
+    use crate::scenario::{InRequestOrder, Scenario, raw};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fmt::Write;
@@ -706,6 +732,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_best_effort_call_ends_at_its_ceiling_or_the_callers_budget_whichever_comes_first() {
+        let ms = Duration::from_millis;
+        for (remaining, ends_at) in [(ms(500), BEST_EFFORT_HYDRATION_TIMEOUT), (ms(200), ms(200))] {
+            let sources = InMemorySources::default()
+                .tweet(1, 10)
+                .authors(&[10])
+                .fault(Source::Flock, Fault::Hangs);
+            let scenario = executor(sources, SafetyLevel::TimelineHomeHydration, Some(VIEWER));
+            let started = tokio::time::Instant::now();
+            let hydrated = xai_x_rpc::CallContext {
+                deadline: Some(started + remaining),
+            }
+            .scope(scenario.hydrate(&[raw(1, None)]))
+            .await;
+            assert_eq!(started.elapsed(), ends_at, "{remaining:?}");
+            assert!(hydrated.candidates[0].failed.contains(Hydrator::Follows));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn author_calls_do_not_wait_for_tweets() {
         let sources = InMemorySources::default()
             .tweet(1, 10)
@@ -806,6 +852,45 @@ mod tests {
         let originals = scenario.sources();
         scenario.hydrate(&[raw(2, None)]).await;
         assert_eq!(originals.selects(), [relationships(&[30], &[])]);
+    }
+
+    #[test]
+    fn only_an_unverified_adult_or_no_stated_age_viewer_in_a_gated_country_is_prompted() {
+        let viewer = |age, label, idv| Viewer::LoggedIn {
+            id: VIEWER,
+            profile: ViewerProfile {
+                viewer_age: age,
+                has_idv_premium: idv,
+                ..ViewerProfile::default()
+            },
+            has_age_verified_18_label: label,
+        };
+        let adult = ViewerAge::Known(30);
+        for (viewer, country, prompted) in [
+            (
+                viewer(adult, false, false),
+                Some("gb"),
+                Some(("gb", UnverifiedAge::Adult)),
+            ),
+            (
+                viewer(ViewerAge::NotStated, false, false),
+                Some("gb"),
+                Some(("gb", UnverifiedAge::NotStated)),
+            ),
+            (viewer(ViewerAge::Known(15), false, false), Some("gb"), None),
+            (viewer(ViewerAge::Unknown, false, false), Some("gb"), None),
+            (Viewer::LoggedOut, Some("gb"), None),
+            (viewer(adult, true, false), Some("gb"), None),
+            (viewer(adult, false, true), Some("gb"), None),
+            (viewer(adult, false, false), Some("ca"), None),
+            (viewer(adult, false, false), None, None),
+        ] {
+            assert_eq!(
+                age_verification_prompted(&viewer, country),
+                prompted,
+                "{viewer:?} {country:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1144,7 +1229,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_timed_out_root_edge_call_fails_its_candidate_whichever_input_lands_first() {
+    async fn a_timed_out_root_edge_call_fails_its_nodes_but_leaves_the_post_complete_whichever_input_lands_first()
+     {
         let level = SafetyLevel::TimelineHomeHydration;
         for delayed in [Source::TesConversationControl, Source::TesPureCoreData] {
             let sources = InMemorySources::default()
@@ -1152,7 +1238,7 @@ mod tests {
                 .authors(&[10])
                 .control(1, control(ConversationControlArm::Subscribers, 40, &[]))
                 .edge(Graph::SuperFollows, VIEWER, 40)
-                .fault(delayed, Fault::Delays(HYDRATION_TIMEOUT / 2))
+                .fault(delayed, Fault::Delays(BEST_EFFORT_HYDRATION_TIMEOUT / 2))
                 .hang_graph(Graph::SuperFollows);
             let hydrated = executor(sources, level, Some(VIEWER))
                 .hydrate(&[raw(1, None)])
@@ -1165,9 +1251,7 @@ mod tests {
             let engine = RuleEngine::for_tests();
             let evaluation =
                 engine.evaluate(level, &hydrated.viewer_features, &hydrated.candidates[0]);
-            assert!(evaluation
-                .fail_open_defaults()
-                .contains(Hydrator::SuperFollowsRoot));
+            assert!(matches!(evaluation, Evaluation::Complete { .. }));
         }
     }
 
@@ -1320,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_article_column_reads_as_no_media_and_leaves_the_post_complete() {
         use crate::hydration::sources::found_user;
-        use crate::models::{Evaluation, NsfwViewerDropReason};
+        use crate::models::NsfwViewerDropReason;
         use crate::rules::fixtures::{allow, nsfw_viewer_dropped};
         use xai_core_entities::entities::{ExtendedProfile, GizmoduckUser};
         let mut author = found_user(10);
@@ -1381,7 +1465,7 @@ mod tests {
                 .evaluate(&[raw(1, None), raw(2, None)])
                 .await
                 .evaluations();
-            let expected = Evaluation::Complete { verdict };
+            let expected = Evaluation::complete(verdict);
             assert_eq!(evaluations, [expected.clone(), expected], "{failing:?}");
         }
     }
@@ -1685,7 +1769,8 @@ mod tests {
                 let sources = scenario.sources();
                 let hydration = scenario.hydrate(&raw);
                 tokio::pin!(hydration);
-                let early = tokio::time::timeout(HYDRATION_TIMEOUT / 2, &mut hydration).await;
+                let early =
+                    tokio::time::timeout(BEST_EFFORT_HYDRATION_TIMEOUT / 2, &mut hydration).await;
                 assert!(early.is_err(), "{level:?} {hung:?}");
                 let sent = call_labels(sources);
                 let waiting: Vec<&str> = every_call
@@ -1700,7 +1785,12 @@ mod tests {
                     .collect();
                 assert_eq!(sent, expected, "{level:?} {hung:?}");
                 let hydrated = hydration.await;
-                assert_eq!(started.elapsed(), HYDRATION_TIMEOUT, "{level:?} {hung:?}");
+                let ceiling = plan
+                    .groups()
+                    .filter(|group| group.source == hung)
+                    .map(|group| group.ceiling())
+                    .max();
+                assert_eq!(Some(started.elapsed()), ceiling, "{level:?} {hung:?}");
                 if hung == Source::TesConversationRoot {
                     let root_failed = Hydrators::of(Hydrator::ConversationRootPost)
                         .with(Hydrator::BlockedByConversationRootPost);
@@ -1733,7 +1823,7 @@ mod tests {
         static BATCH_SIZES: RefCell<Option<Vec<(String, usize)>>> = const { RefCell::new(None) };
     }
 
-    struct ThreadBatchSizes;
+            struct ThreadBatchSizes;
 
     impl StatsReceiverExt for ThreadBatchSizes {
         fn incr(&self, _: &str, _: &[(&str, &str)], _: u64) {}

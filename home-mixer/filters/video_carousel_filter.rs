@@ -1,7 +1,8 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnableVideoCarouselAuthorDedupe, VideoCarouselImmersiveVqvWeight,
+    EnableVideoCarouselAuthorDedupe, EnableVideoCarouselEmbeddingDedupe,
+    VideoCarouselEmbeddingDedupeThreshold, VideoCarouselImmersiveVqvWeight,
     VideoCarouselSemanticIdDedupeLevels, VideoCarouselVideoOpenWeight, RESULT_SIZE,
 };
 use crate::util::video_carousel;
@@ -28,6 +29,10 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
             query.params.get(VideoCarouselImmersiveVqvWeight),
             query.params.get(EnableVideoCarouselAuthorDedupe),
             query.params.get(VideoCarouselSemanticIdDedupeLevels) as usize,
+            query
+                .params
+                .get(EnableVideoCarouselEmbeddingDedupe)
+                .then(|| query.params.get(VideoCarouselEmbeddingDedupeThreshold)),
         ));
         FilterResult { kept, removed }
     }

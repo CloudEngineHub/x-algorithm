@@ -764,7 +764,6 @@ impl Store {
             Ok(author_id) => {
                 let candidate = self.candidate(request_tweet, author_id, incomplete, unclaimed);
                 HydratedTweet::Resolved {
-                    has_failed_node: !candidate.failed.is_empty(),
                     candidate,
                     source_tweet_id: self.source_tweet_id(id),
                     safety_labels,

@@ -232,6 +232,7 @@ def _make_dataset(
                 history_seq_len=mparams["history_seq_len"],
                 candidate_seq_len=mparams["candidate_seq_len"],
                 input_vocab_size=mparams["input_vocab_size"],
+                output_vocab_size=mparams["output_vocab_size"],
                 num_continuous_actions=mparams["num_continuous_actions"],
                 num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
                 multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
@@ -712,6 +713,9 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
+            concat_history_web_conv_time_on_site=mparams.get(
+                "concat_history_web_conv_time_on_site", False
+            ),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
@@ -930,6 +934,8 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
         bs_per_device=mparams["bs_per_device"],
         num_microbatch=mparams.get("num_microbatch", 1),
         use_async_emb=mparams.get("use_async_emb", False),
+        use_row_emb=mparams.get("use_row_emb", False),
+        row_emb_recv_factor=mparams.get("row_emb_recv_factor", 2.0),
         overlap_step_host_work=mparams.get("overlap_step_host_work", False),
         seqpack_drop_empty_candidates=mparams.get("seqpack_drop_empty_candidates", False),
         seqpack_distribution=seqpack_distribution,

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
 use crate::model_config::ModelConfig;
-use arrow::array::{
-    Array, AsArray, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
-};
+use arrow::array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array};
 use arrow::ipc::reader::StreamReader;
 use half::f16;
 use lazy_static::lazy_static;
@@ -25,6 +23,13 @@ lazy_static! {
         "recsys_sid_coverage_total",
         "Per-post SID coverage at inference by sequence (history/candidate) and status (present/missing).",
         &["sequence", "status"]
+    )
+    .unwrap();
+
+    static ref COLUMNAR_COLUMN_MISTYPED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "recsys_columnar_column_mistyped_total",
+        "Columnar request columns skipped because they had an unexpected Arrow type.",
+        &["column"]
     )
     .unwrap();
 }
@@ -105,6 +110,19 @@ pub fn record_sid_coverage(sequence: &str, present: u64, count: u64) {
     SID_COVERAGE_TOTAL
         .with_label_values(&[sequence, "missing"])
         .inc_by(count.saturating_sub(present));
+}
+
+fn typed_column<'a, T: 'static>(
+    batch: &'a arrow::record_batch::RecordBatch,
+    name: &str,
+) -> Option<&'a T> {
+    let typed = batch.column_by_name(name)?.as_any().downcast_ref::<T>();
+    if typed.is_none() {
+        COLUMNAR_COLUMN_MISTYPED_TOTAL
+            .with_label_values(&[name])
+            .inc();
+    }
+    typed
 }
 
 pub fn stamp_semantic_ids(dst: &mut [u16], entry_idx: usize, sid_num_levels: usize, codes: &[i32]) {
@@ -288,7 +306,25 @@ pub(crate) fn snowflake_to_creation_ts_sec(tweet_id: i64) -> i32 {
     (created_ms / 1000) as i32
 }
 
+thread_local! {
+    static FIXED_NOW_SEC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn with_fixed_now_sec<R>(now: i32, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIXED_NOW_SEC.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FIXED_NOW_SEC.with(|c| c.replace(Some(now))));
+    f()
+}
+
 fn now_epoch_sec() -> i32 {
+    if let Some(ts) = FIXED_NOW_SEC.with(std::cell::Cell::get) {
+        return ts;
+    }
     static FIXED: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         std::env::var("RECSYS_FIXED_NOW_SEC")
@@ -1333,65 +1369,39 @@ impl InputBuffer {
 
         let num_rows = batch.num_rows();
 
-        let tweet_ids = batch
-            .column_by_name("tweetId")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let author_ids = batch
-            .column_by_name("authorId")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let product_surfaces = batch
-            .column_by_name(PRODUCT_SURFACE_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
-        let action_multi_hot = batch.column_by_name("actionNameMultiHot");
-        let continuous_actions = batch.column_by_name("continuousActionValuesSeq");
+        let tweet_ids = typed_column::<Int64Array>(&batch, "tweetId");
+        let author_ids = typed_column::<Int64Array>(&batch, "authorId");
+        let product_surfaces = typed_column::<Int32Array>(&batch, PRODUCT_SURFACE_SEQ_COLUMN);
+        let action_multi_hot = typed_column::<FixedSizeListArray>(&batch, "actionNameMultiHot");
+        let continuous_actions =
+            typed_column::<FixedSizeListArray>(&batch, "continuousActionValuesSeq");
 
-        let col_impressed_time_ms = batch
-            .column_by_name("impressedTimeMs")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_timezone_id = batch
-            .column_by_name("timezoneId")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let col_impressed_time_ms = typed_column::<Int64Array>(&batch, "impressedTimeMs");
+        let col_timezone_id = typed_column::<Int32Array>(&batch, "timezoneId");
 
-        let col_semantic_id = batch.column_by_name("semanticId");
+        let col_semantic_id = typed_column::<FixedSizeListArray>(&batch, "semanticId");
 
-        let col_fav_count = batch
-            .column_by_name(FAV_COUNT_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_reply_count = batch
-            .column_by_name(REPLY_COUNT_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_repost_count = batch
-            .column_by_name(REPOST_COUNT_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_quote_count = batch
-            .column_by_name(QUOTE_COUNT_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_view_count = batch
-            .column_by_name(VIEW_COUNT_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let col_web_conv_tracking_integration = batch
-            .column_by_name(WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let col_fav_count = typed_column::<Int64Array>(&batch, FAV_COUNT_SEQ_COLUMN);
+        let col_reply_count = typed_column::<Int64Array>(&batch, REPLY_COUNT_SEQ_COLUMN);
+        let col_repost_count = typed_column::<Int64Array>(&batch, REPOST_COUNT_SEQ_COLUMN);
+        let col_quote_count = typed_column::<Int64Array>(&batch, QUOTE_COUNT_SEQ_COLUMN);
+        let col_view_count = typed_column::<Int64Array>(&batch, VIEW_COUNT_SEQ_COLUMN);
+        let col_web_conv_tracking_integration =
+            typed_column::<Int32Array>(&batch, WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN);
         let col_web_conv_time_on_site = [
             (
                 WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ,
-                batch
-                    .column_by_name(WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN)
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN),
             ),
             (
                 WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ,
-                batch
-                    .column_by_name(WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN)
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>()),
+                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN),
             ),
         ];
-        let col_is_author_followed_by_viewer = batch
-            .column_by_name(IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
-        let col_is_author_following_viewer = batch
-            .column_by_name(IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN)
-            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+        let col_is_author_followed_by_viewer =
+            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN);
+        let col_is_author_following_viewer =
+            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN);
 
         let start_row = num_rows.saturating_sub(history_seq_len);
         let mut valid_entry_count = 0;
@@ -1419,18 +1429,17 @@ impl InputBuffer {
 
             history_post_ids[valid_entry_count] = tweet_id;
 
-            if let Some(sid_col) = col_semantic_id {
-                let fsl = sid_col.as_fixed_size_list();
-                if !fsl.is_null(row_idx) {
-                    let inner = fsl.value(row_idx);
-                    if let Some(codes) = inner.as_any().downcast_ref::<Int32Array>() {
-                        stamp_semantic_ids(
-                            &mut history_semantic_ids,
-                            valid_entry_count,
-                            sid_num_levels,
-                            codes.values(),
-                        );
-                    }
+            if let Some(fsl) = col_semantic_id
+                && !fsl.is_null(row_idx)
+            {
+                let inner = fsl.value(row_idx);
+                if let Some(codes) = inner.as_any().downcast_ref::<Int32Array>() {
+                    stamp_semantic_ids(
+                        &mut history_semantic_ids,
+                        valid_entry_count,
+                        sid_num_levels,
+                        codes.values(),
+                    );
                 }
             }
 
@@ -1438,8 +1447,7 @@ impl InputBuffer {
                 history_product_surfaces[valid_entry_count] = ps.value(row_idx);
             }
 
-            if let Some(action_col) = action_multi_hot {
-                let fsl = action_col.as_fixed_size_list();
+            if let Some(fsl) = action_multi_hot {
                 let inner_bools = fsl.value(row_idx);
                 if let Some(bools) = inner_bools.as_any().downcast_ref::<BooleanArray>() {
                     let base_idx = valid_entry_count * output_vocab_size;
@@ -1450,8 +1458,7 @@ impl InputBuffer {
                 }
             }
 
-            if let Some(cont_col) = continuous_actions {
-                let fsl = cont_col.as_fixed_size_list();
+            if let Some(fsl) = continuous_actions {
                 let inner_floats = fsl.value(row_idx);
                 if let Some(floats) = inner_floats.as_any().downcast_ref::<Float32Array>() {
                     let continuous_base_idx = valid_entry_count * num_continuous_actions;
@@ -2246,6 +2253,64 @@ mod tests {
     }
 
     #[test]
+    fn columnar_mistyped_columns_are_skipped_and_counted() {
+        use arrow::array::{Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        for name in [
+            "actionNameMultiHot",
+            "continuousActionValuesSeq",
+            "semanticId",
+            "impressedTimeMs",
+        ] {
+            let schema = Schema::new(vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+                Field::new(name, DataType::Int32, false),
+            ]);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![11i64])),
+                    Arc::new(Int64Array::from(vec![21i64])),
+                    Arc::new(Int32Array::from(vec![7])),
+                ],
+            )
+            .unwrap();
+            let mut bytes = Vec::new();
+            {
+                let mut writer =
+                    StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+
+            let mut model_config = test_history_model_config();
+            model_config.sid_num_levels = 3;
+            let mistyped = COLUMNAR_COLUMN_MISTYPED_TOTAL.with_label_values(&[name]);
+            let before = mistyped.get();
+            let buf = InputBuffer::compute_from_columnar_bytes(
+                &model_config,
+                &bytes,
+                &pb::CandidateSet::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(mistyped.get(), before + 1, "{name}");
+            assert_eq!(buf.history_post_ids, vec![11, 0, 0, 0], "{name}");
+            assert!(buf.history_actions.iter().all(|&a| !a), "{name}");
+            assert!(buf.history_semantic_ids.iter().all(|&s| s == 0), "{name}");
+        }
+    }
+
+    #[test]
     fn columnar_history_web_conv_columns_fill_their_feature_slots() {
         use arrow::array::{Int32Array, Int64Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -2603,6 +2668,33 @@ mod tests {
         let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
         assert_eq!(7, cand.int64_features[FAV_COUNT_SEQ]);
         assert!(!cand.bool_features[IS_STALE_POST14D]);
+    }
+
+    #[test]
+    fn fixed_now_sec_applies_to_this_thread_only_and_is_restored() {
+        let fixed = 1_700_000_000;
+        let candidates = pb::CandidateSet {
+            candidates: vec![pb::TweetInfo {
+                tweet_id: 11,
+                author_id: 21,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (cand, nested, other_thread) = with_fixed_now_sec(fixed, || {
+            let nested = with_fixed_now_sec(42, now_epoch_sec);
+            let other_thread = std::thread::spawn(now_epoch_sec).join().unwrap();
+            let cand = InputBuffer::new_with_candidates(&test_model_config(0), &candidates, None);
+            (cand, nested, other_thread)
+        });
+        assert_eq!(cand.impr_ts[0], fixed);
+        assert_eq!(nested, 42);
+        assert_ne!(other_thread, fixed);
+        assert_ne!(now_epoch_sec(), fixed);
+
+        let unwound = std::panic::catch_unwind(|| with_fixed_now_sec(7, || panic!("unwind")));
+        assert!(unwound.is_err());
+        assert_ne!(now_epoch_sec(), 7);
     }
 
     #[test]

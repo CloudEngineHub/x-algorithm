@@ -55,12 +55,17 @@ impl CountryList {
         }
     }
 
+    pub(crate) fn names_by_default(self, code: &str) -> Option<&'static str> {
+        self.default_codes()
+            .iter()
+            .find(|&&listed| listed == code)
+            .copied()
+    }
+
     pub(crate) fn listed_by_default(code: &str) -> Option<&'static str> {
         Self::VARIANTS
             .iter()
-            .flat_map(|list| list.default_codes())
-            .find(|&&listed| listed == code)
-            .copied()
+            .find_map(|list| list.names_by_default(code))
     }
 
     const fn default_codes(self) -> &'static [&'static str] {

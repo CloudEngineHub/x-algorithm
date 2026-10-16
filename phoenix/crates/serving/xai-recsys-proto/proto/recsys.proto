@@ -194,6 +194,24 @@ message PageDecodeParams {
   uint32 steps = 2;
 
   float temperature = 3;
+
+  RankingScoreWeights rankingScoreWeights = 4;
+}
+
+message RankingScoreWeights {
+  float favoriteWeight = 1;
+  float replyWeight = 2;
+  float retweetWeight = 3;
+  float clickWeight = 4;
+  float profileClickWeight = 5;
+  float vqvWeight = 6;
+  float shareWeight = 7;
+  float quoteWeight = 8;
+  float contDwellTimeWeight = 9;
+  float notInterestedWeight = 10;
+  float reportWeight = 11;
+  float notDwelledWeight = 12;
+  float minVideoDurationMs = 13;
 }
 
 message PageDecodeResult {

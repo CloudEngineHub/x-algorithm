@@ -193,31 +193,6 @@ pub enum Judgement {
 }
 
 impl Judgement {
-    pub fn judged(state: TweetFieldsResultState, decided_by: Option<&'static str>) -> Self {
-        Self::Judged {
-            sent: Some(state.clone()),
-            state,
-            decided_by,
-            fail_open: Hydrators::empty(),
-            failed: Hydrators::empty(),
-        }
-    }
-
-    pub fn judged_partially(
-        state: TweetFieldsResultState,
-        decided_by: Option<&'static str>,
-        fail_open: Hydrators,
-        failed: Hydrators,
-    ) -> Self {
-        Self::Judged {
-            state,
-            decided_by,
-            fail_open,
-            failed,
-            sent: None,
-        }
-    }
-
             pub fn label(&self) -> (String, String) {
         match self {
             Self::Judged {
@@ -446,7 +421,7 @@ impl Explainer {
     fn outcome<const N: usize>(&self, ask: &Ask<N>, level: RouteRun) -> LevelOutcome {
         let evaluation = &level.provenance.evaluation;
         let judgement = match evaluation {
-            Evaluation::Complete { verdict } | Evaluation::Partial { verdict, .. } => {
+            Evaluation::Complete { verdict, .. } | Evaluation::Partial { verdict, .. } => {
                 let policies = self.client_switches.limited_actions_policies(
                     level.context.as_ref(),
                     ask.viewer.map(NonZeroU64::get),
@@ -455,15 +430,12 @@ impl Explainer {
                     &self.copy,
                     None,
                 );
-                let decided_by = treatment::decided_by(verdict);
-                match Sends::new(evaluation, level.route.level, &policies).result_state() {
-                    Some(state) => Judgement::judged(state, decided_by),
-                    None => Judgement::judged_partially(
-                        treatment::thrift_result_state(verdict, level.route.level, &policies),
-                        decided_by,
-                        evaluation.fail_open_defaults(),
-                        level.hydrated.hydration().failed_nodes(TweetId(ask.post)),
-                    ),
+                Judgement::Judged {
+                    state: treatment::thrift_result_state(verdict, level.route.level, &policies),
+                    decided_by: treatment::decided_by(verdict),
+                    fail_open: evaluation.fail_open_defaults(),
+                    failed: level.hydrated.hydration().failed_nodes(TweetId(ask.post)),
+                    sent: Sends::new(evaluation, level.route.level, &policies).result_state(),
                 }
             }
             Evaluation::NotFound(lookup) => Judgement::NotFound(*lookup),
@@ -601,8 +573,6 @@ mod tests {
     };
     use xai_visibility_filtering_proto as vf_pb;
     use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
-    use xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;
-    use xai_x_thrift::tweet_service::TweetFieldsResultFiltered;
     use xai_x_thrift::user_labels::LabelValue;
 
     const VIEWER: u64 = 50;
@@ -788,7 +758,7 @@ mod tests {
                     },
                 )
                 .authors(&[40, 60])
-                .fail_edge(Graph::Blocks, 60)
+                .fail_key(Source::SafetyLabels, 6)
         };
         let outcomes = explainer(world(), no_copy())
             .explain(&ask(VIEWER, 4, Client::Web))
@@ -798,10 +768,43 @@ mod tests {
         let Judgement::Judged { failed, .. } = &outcomes[2].judgement else {
             panic!("{:?}", outcomes[2]);
         };
+        assert_eq!(*failed, Hydrators::of(Hydrator::TweetSafetyLabels));
+        assert_eq!(
+            evaluate_tweets(world(), 4).await,
+            [on_the_wire(&outcomes[2])]
+        );
+    }
+
+    #[tokio::test]
+    async fn level_82_serves_a_post_whose_best_effort_node_failed_and_shows_its_defaults() {
+        let world = || {
+            InMemorySources::default()
+                .tweet(4, 40)
+                .authors(&[40])
+                .fail_edge(Graph::Blocks, 40)
+        };
+        let outcomes = explainer(world(), no_copy())
+            .explain(&ask(VIEWER, 4, Client::Web))
+            .await
+            .levels;
+        let Judgement::Judged {
+            fail_open, failed, ..
+        } = &outcomes[2].judgement
+        else {
+            panic!("{:?}", outcomes[2]);
+        };
         assert_eq!(
             *failed,
             Hydrators::of(Hydrator::Follows).with(Hydrator::BlockedByAuthor)
         );
+        assert!(
+            fail_open.contains(Hydrator::BlockedByAuthor),
+            "{fail_open:?}"
+        );
+        assert!(matches!(
+            outcomes[2].evaluate_tweets_sends(),
+            Some(Sent::ResultState(_))
+        ));
         assert_eq!(
             evaluate_tweets(world(), 4).await,
             [on_the_wire(&outcomes[2])]
@@ -931,17 +934,22 @@ mod tests {
         assert!(relationship.is_author);
     }
 
-    #[test]
-    fn a_level_labels_a_judgement_as_its_route_sends_it() {
-        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
-            ThriftFilteredReason::AuthorIsSuspended(true),
-        ));
-        let partial = Judgement::judged_partially(
-            suspended.clone(),
-            None,
-            Hydrators::of(Hydrator::Follows),
-            Hydrators::of(Hydrator::Follows),
-        );
+    #[tokio::test]
+    async fn a_level_labels_a_judgement_as_its_route_sends_it() {
+        let world = || {
+            InMemorySources::default()
+                .tweet(4, 40)
+                .user(40, suspended())
+        };
+        let judgement = |world| async move {
+            let levels = explainer(world, no_copy())
+                .explain(&ask(VIEWER, 4, Client::Web))
+                .await
+                .levels;
+            levels[2].judgement.clone()
+        };
+        let partial = judgement(world().fail_key(Source::SafetyLabels, 4)).await;
+        let judged = judgement(world()).await;
         let label_at = |rpc, level, judgement: &Judgement| {
             LevelOutcome::new(
                 Route::new(rpc, level).unwrap(),
@@ -973,7 +981,7 @@ mod tests {
                 label_at(
                     Rpc::EvaluateTweets,
                     SafetyLevel::TimelineHomeHydration,
-                    &Judgement::judged(suspended, None)
+                    &judged
                 ),
                 label_at(
                     Rpc::FilterTweets,
@@ -1470,8 +1478,8 @@ mod tests {
                 "requested follow failed",
                 || retweet().fail_edge(Graph::Follows, 40),
                 Some(6),
-                RequestedIncomplete,
-                Answer::Requested,
+                SourceRestrictions,
+                Answer::Source,
             ),
             (
                 "a partial post that is no retweet",
@@ -1534,7 +1542,14 @@ mod tests {
                     Answer::Source => provenance.source.as_ref().unwrap().evaluation.clone(),
                     Answer::RequestedAsPartial => Evaluation::Partial {
                         verdict: requested.evaluation.verdict().clone(),
-                        fail_open_defaults: Hydrators::empty(),
+                        fail_open_defaults: requested.evaluation.fail_open_defaults().union(
+                            provenance
+                                .source
+                                .as_ref()
+                                .unwrap()
+                                .evaluation
+                                .fail_open_defaults(),
+                        ),
                     },
                 };
                 assert_eq!(provenance.evaluation, answered, "{name}");
@@ -1638,6 +1653,7 @@ mod tests {
             verdict: Verdict::Withheld(Decided {
                 value: spam_drop, ..
             }),
+            ..
         } = spam_alone
         else {
             panic!("{spam_alone:?}");

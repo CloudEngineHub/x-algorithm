@@ -1,9 +1,10 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
 pub(crate) use crate::hydration::inventory::Source;
 use crate::hydration::sources::Scope;
-use crate::hydration::{Hydrator, Hydrators};
+use crate::hydration::{BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT, Hydrator, Hydrators};
 use crate::rules::SafetyLevel;
 use std::fmt;
+use std::time::Duration;
 use strum::VariantArray;
 use xai_core_entities::entities::ConversationControlArm;
 use xai_core_entities::gizmoduck_client::QueryFields;
@@ -371,6 +372,42 @@ impl Hydrator {
         }
     }
 
+    pub(crate) const fn is_best_effort(self) -> bool {
+        use Hydrator as H;
+        match self {
+            H::ConversationControl
+            | H::ConversationRootPost
+            | H::Follows
+            | H::BlockedByAuthor
+            | H::BlockedByReplyRoot
+            | H::BlockedByConversationRoot
+            | H::BlockedByConversationRootPost
+            | H::RootFollowsViewer
+            | H::RootFollowsViewerSecondDegree
+            | H::SuperFollowsRoot
+            | H::ViewerCountry
+            | H::CommunityViewerRemoved
+            | H::OutsideNarrowcastPlace => true,
+            H::PureCore
+            | H::Tweet
+            | H::TweetSafetyLabels
+            | H::ViewerProfile
+            | H::ViewerLabels
+            | H::AuthorSafety
+            | H::AuthorLabels
+            | H::Blocks
+            | H::Mutes
+            | H::MuteRetweets
+            | H::SuperFollowsExclusive
+            | H::CommunityModeration
+            | H::CommunityModerator
+            | H::ArticleLifecycle
+            | H::ArticleMediaEntities
+            | H::ArticleCoverMedia
+            | H::TrustedFriends => false,
+        }
+    }
+
     pub(super) const fn input(self) -> Option<Hydrator> {
         self.spec().key.input()
     }
@@ -399,11 +436,47 @@ impl Hydrator {
     }
 }
 
+const MUST_HAVE: Hydrators = {
+    let mut must_have = Hydrators::empty();
+    let mut rest = Hydrator::VARIANTS;
+    while let [node, tail @ ..] = rest {
+        if !node.is_best_effort() {
+            must_have = must_have.with(*node);
+        }
+        rest = tail;
+    }
+    must_have
+};
+
+impl Hydrators {
+    pub(crate) const fn must_have(self) -> Self {
+        self.intersection(MUST_HAVE)
+    }
+
+    pub(crate) const fn has_must_have(self) -> bool {
+        !self.must_have().is_empty()
+    }
+}
+
 const fn inputs_precede_nodes() -> bool {
     let mut rest = Hydrator::VARIANTS;
     while let [node, tail @ ..] = rest {
         if let Some(input) = node.input()
             && input as u8 >= *node as u8
+        {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+const fn best_effort_inputs_key_only_best_effort_nodes() -> bool {
+    let mut rest = Hydrator::VARIANTS;
+    while let [node, tail @ ..] = rest {
+        if let Some(input) = node.input()
+            && input.is_best_effort()
+            && !node.is_best_effort()
         {
             return false;
         }
@@ -451,6 +524,7 @@ const fn viewer_scopes_fit_their_nodes() -> bool {
 }
 
 const _: () = assert!(inputs_precede_nodes());
+const _: () = assert!(best_effort_inputs_key_only_best_effort_nodes());
 const _: () = assert!(miss_policies_fit_their_nodes());
 const _: () = assert!(viewer_scopes_fit_their_nodes());
 const _: () = assert!(Hydrator::VARIANTS.len() <= u32::BITS as usize);
@@ -574,6 +648,10 @@ impl HydrationPlan {
         self.nodes.contains(Hydrator::ViewerProfile)
     }
 
+    pub(super) fn reads_viewer_labels(&self) -> bool {
+        self.nodes.contains(Hydrator::ViewerLabels)
+    }
+
     pub(super) fn callable(&self, viewer_id: Option<u64>) -> Hydrators {
         match viewer_id {
             Some(_) => self.nodes,
@@ -594,6 +672,14 @@ impl HydrationPlan {
 }
 
 impl Group {
+    pub(super) fn ceiling(&self) -> Duration {
+        if self.nodes.has_must_have() {
+            HYDRATION_TIMEOUT
+        } else {
+            BEST_EFFORT_HYDRATION_TIMEOUT
+        }
+    }
+
     pub(super) fn label(&self) -> (String, String) {
         (self.clients.join("+"), self.methods.join("+"))
     }
@@ -733,6 +819,9 @@ impl fmt::Display for HydrationPlan {
             if group.nodes.iter().all(Hydrator::needs_viewer) {
                 f.write_str(" (skipped logged out)")?;
             }
+            if group.ceiling() != HYDRATION_TIMEOUT {
+                write!(f, " timeout: {:?}", group.ceiling())?;
+            }
             writeln!(f)?;
         }
         Ok(())
@@ -772,25 +861,25 @@ trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped 
 timeline_home_hydration: 21 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet
-conversation_control/get_conversation_controls after: - nodes: conversation_control
+conversation_control/get_conversation_controls after: - nodes: conversation_control timeout: 300ms
 safety_labels/get after: - nodes: tweet_safety_labels
 gizmoduck/get_viewer_data after: - nodes: viewer_profile,viewer_labels fields: ACCOUNT|EXTENDED_PROFILE|SAFETY|LABELS (skipped logged out)
 gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph+blocked_by/batch_check_relationships+batch_check_blocked_by after: pure_core nodes: follows,blocked_by_author,blocked_by_reply_root follows-fwd[author] blocks-rev[author,reply_root] (skipped logged out)
+socialgraph+blocked_by/batch_check_relationships+batch_check_blocked_by after: pure_core nodes: follows,blocked_by_author,blocked_by_reply_root follows-fwd[author] blocks-rev[author,reply_root] (skipped logged out) timeout: 300ms
 exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-conversation_control/batch_check_followed_by+batch_check_super_follows+batch_check_blocked_by after: conversation_control nodes: root_follows_viewer,super_follows_root,blocked_by_conversation_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] blocks-rev[control_root_author] (skipped logged out)
-conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out)
-conversation_root/get_tweet_core_datas after: pure_core nodes: conversation_root_post (skipped logged out)
-conversation_root/batch_check_blocked_by after: conversation_root_post nodes: blocked_by_conversation_root_post blocks-rev[conversation_root_post_author] (skipped logged out)
-conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out)
+conversation_control/batch_check_followed_by+batch_check_super_follows+batch_check_blocked_by after: conversation_control nodes: root_follows_viewer,super_follows_root,blocked_by_conversation_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] blocks-rev[control_root_author] (skipped logged out) timeout: 300ms
+conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out) timeout: 300ms
+conversation_root/get_tweet_core_datas after: pure_core nodes: conversation_root_post (skipped logged out) timeout: 300ms
+conversation_root/batch_check_blocked_by after: conversation_root_post nodes: blocked_by_conversation_root_post blocks-rev[conversation_root_post_author] (skipped logged out) timeout: 300ms
+conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out) timeout: 300ms
 communities/moderation_state after: tweet nodes: community_moderation
 communities/visibility_features after: community_moderation nodes: community_moderator (skipped logged out)
-communities/is_removed after: tweet nodes: community_viewer_removed (skipped logged out)
+communities/is_removed after: tweet nodes: community_viewer_removed (skipped logged out) timeout: 300ms
 article/get_lifecycles after: tweet nodes: article_lifecycle
 article/get_media_entities after: tweet nodes: article_media_entities
 article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-geoduck/user_location after: tweet nodes: outside_narrowcast_place (skipped logged out)
+geoduck/user_location after: tweet nodes: outside_narrowcast_place (skipped logged out) timeout: 300ms
 immersive_expanded_recommendations: 10 calls
 tes/get_tweet_core_datas after: - nodes: pure_core
 tes/get_tweets after: - nodes: tweet

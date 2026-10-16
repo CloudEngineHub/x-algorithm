@@ -1,8 +1,8 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
-    EnableVideoCarousel, VideoCarouselImmersiveVqvWeight, VIDEO_CAROUSEL_MAX_VIDEOS,
-    VIDEO_CAROUSEL_MIN_VIDEOS,
+    EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
+    VideoCarouselImmersiveVqvWeight,
 };
 use std::collections::HashSet;
 
@@ -26,6 +26,7 @@ pub(crate) fn select_videos<'a>(
     immersive_vqv_weight: f64,
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
+    embedding_dedupe_threshold: Option<f64>,
 ) -> Vec<PostCandidate> {
     let mut videos: Vec<&PostCandidate> = candidates
         .into_iter()
@@ -34,7 +35,12 @@ pub(crate) fn select_videos<'a>(
     let score =
         |video: &PostCandidate| carousel_score(video, video_open_weight, immersive_vqv_weight);
     videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
-    let videos = take_distinct(videos, dedupe_by_author, semantic_id_dedupe_levels);
+    let videos = take_distinct(
+        videos,
+        dedupe_by_author,
+        semantic_id_dedupe_levels,
+        embedding_dedupe_threshold,
+    );
     if videos.len() < VIDEO_CAROUSEL_MIN_VIDEOS {
         return Vec::new();
     }
@@ -45,9 +51,11 @@ fn take_distinct(
     ranked: Vec<&PostCandidate>,
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
+    embedding_dedupe_threshold: Option<f64>,
 ) -> Vec<&PostCandidate> {
     let mut authors = HashSet::new();
     let mut prefixes: HashSet<&[i32]> = HashSet::new();
+    let mut embeddings: Vec<&[f32]> = Vec::new();
     let mut kept = Vec::with_capacity(VIDEO_CAROUSEL_MAX_VIDEOS);
     for video in ranked {
         if kept.len() == VIDEO_CAROUSEL_MAX_VIDEOS {
@@ -61,11 +69,39 @@ fn take_distinct(
         if prefix.is_some_and(|prefix| prefixes.contains(prefix)) {
             continue;
         }
+        let embedding = match (embedding_dedupe_threshold, &video.video_embedding) {
+            (Some(_), Some(embedding)) if video.quoted_tweet_id.is_none() => {
+                Some(embedding.as_slice())
+            }
+            _ => None,
+        };
+        if let (Some(threshold), Some(embedding)) = (embedding_dedupe_threshold, embedding)
+            && embeddings
+                .iter()
+                .any(|picked| cosine_similarity(picked, embedding) >= threshold)
+        {
+            continue;
+        }
         authors.insert(author);
         prefixes.extend(prefix);
+        embeddings.extend(embedding);
         kept.push(video);
     }
     kept
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    let (dot, norm_a, norm_b) = a
+        .iter()
+        .zip(b)
+        .fold((0.0, 0.0, 0.0), |(d, na, nb), (&x, &y)| {
+            let (x, y) = (f64::from(x), f64::from(y));
+            (d + x * y, na + x * x, nb + y * y)
+        });
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 pub(crate) fn take_videos_by_carousel_score(
@@ -162,7 +198,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0, None)),
             vec![4, 5, 1]
         );
     }
@@ -189,7 +225,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0, None)),
             vec![1, 4, 5]
         );
     }
@@ -205,7 +241,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 2)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 2, None)),
             vec![1, 3, 4, 5]
         );
     }
@@ -224,7 +260,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0, None)),
             vec![1, 4, 5, 6, 7]
         );
     }
@@ -237,7 +273,7 @@ mod tests {
             vertical(3, 20, &[], 0.7),
         ];
 
-        assert!(select_videos(&candidates, 1.0, 0.0, true, 0).is_empty());
+        assert!(select_videos(&candidates, 1.0, 0.0, true, 0, None).is_empty());
     }
 
     fn with_immersive_vqv(candidate: PostCandidate, vqv: f64) -> PostCandidate {
@@ -260,8 +296,32 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 1.0, false, 0)),
+            tweet_ids(&select_videos(&candidates, 1.0, 1.0, false, 0, None)),
             vec![4, 2, 1, 3]
+        );
+    }
+
+    fn with_embedding(mut candidate: PostCandidate, embedding: &[f32]) -> PostCandidate {
+        candidate.video_embedding = Some(embedding.to_vec());
+        candidate
+    }
+
+    #[test]
+    fn embedding_dedupe_skips_near_duplicates_except_quotes() {
+        let candidates = vec![
+            with_embedding(vertical(1, 10, &[], 0.9), &[1.0, 0.0]),
+            with_embedding(vertical(2, 20, &[], 0.8), &[0.99, 0.1]),
+            with_embedding(vertical(3, 30, &[], 0.7), &[0.0, 1.0]),
+            PostCandidate {
+                quoted_tweet_id: Some(99),
+                ..with_embedding(vertical(4, 40, &[], 0.6), &[1.0, 0.0])
+            },
+            vertical(5, 50, &[], 0.5),
+        ];
+
+        assert_eq!(
+            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0, Some(0.72))),
+            vec![1, 3, 4, 5]
         );
     }
 }

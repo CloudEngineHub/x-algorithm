@@ -380,6 +380,9 @@ ads_slim_engagement_to_action_types = {
     "IsMmpClick": [
         "AdsMmpClick",
     ],
+    "IsBrandEngagement": [
+        "BrandEngagement",
+    ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",
     ],

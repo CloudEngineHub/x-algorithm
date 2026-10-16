@@ -11,7 +11,7 @@ use std::ptr;
 #[cfg(test)]
 use std::slice;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::rules) struct Rule {
     pub(in crate::rules) id: RuleId,
     pub(in crate::rules) audience: Audience,
@@ -19,7 +19,7 @@ pub(in crate::rules) struct Rule {
     pub(in crate::rules) action: RuleAction,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rules) enum RuleCond {
     Leaf(Predicate),
     All(&'static [RuleCond]),
@@ -87,13 +87,13 @@ macro_rules! conds {
 
 pub(in crate::rules) use {all, any, conds};
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq)]
 pub(in crate::rules) struct NamedCond {
     pub(in crate::rules) name: &'static str,
     pub(in crate::rules) condition: RuleCond,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rules) enum Audience {
     Everyone,
     NonAuthors,

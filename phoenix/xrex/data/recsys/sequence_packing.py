@@ -8,6 +8,7 @@ import jax
 import numpy as np
 
 from xai_configlib import Config, configclass
+from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 
 
@@ -321,6 +322,8 @@ def pack_batch(
     candidate_tokens_per_user: int | None = None,
     min_packed_history_len: int | None = None,
     empty_history_min_slot: bool = False,
+    *,
+    alloc: ArrayAllocator,
 ) -> RecsysFeaturesBatch:
     if empty_history_min_slot and dist is not None:
         if not isinstance(dist, BetaLengthDistribution) or dist.block_size != block_size:
@@ -375,22 +378,22 @@ def pack_batch(
             dst_idx,
             np.arange(total_packed, dtype=np.intp),
         )
-        full_src: np.ndarray | None = None
+        if use_dense_gather:
+            full_src, pad_rows = src_idx, None
+        else:
+            full_src = np.zeros(total_packed, dtype=np.intp)
+            full_src[dst_idx] = src_idx
+            padding = np.ones(total_packed, dtype=np.bool_)
+            padding[dst_idx] = False
+            pad_rows = np.flatnonzero(padding)
         for k, v in seq.items():
             if isinstance(v, np.ndarray) and v.ndim >= 2 and v.shape[1] == seq_len:
                 flat = v.reshape(read_bsz_per_process * seq_len, *v.shape[2:])
-                if use_dense_gather:
-                    out[k] = flat[src_idx].reshape(
-                        num_devices_per_process, packed_len, *v.shape[2:]
-                    )
-                else:
-                    if full_src is None:
-                        full_src = np.full(total_packed, flat.shape[0], dtype=np.intp)
-                        full_src[dst_idx] = src_idx
-                    flatz = np.concatenate([flat, np.zeros((1, *v.shape[2:]), dtype=v.dtype)])
-                    out[k] = flatz[full_src].reshape(
-                        num_devices_per_process, packed_len, *v.shape[2:]
-                    )
+                packed = alloc.empty((total_packed, *v.shape[2:]), v.dtype)
+                np.take(flat, full_src, axis=0, mode="clip", out=packed)
+                if pad_rows is not None:
+                    packed[pad_rows] = 0
+                out[k] = packed.reshape(num_devices_per_process, packed_len, *v.shape[2:])
             else:
                 out[k] = v
         return cast(PostSeq, out)
@@ -559,7 +562,7 @@ def pack_batch(
             f"of {block_size=}"
         )
         packed_candidate_seq, dropped_candidate_slots = _drop_candidates_over_budget(
-            packed_candidate_seq, candidate_seq_len, candidate_region_len - 1
+            packed_candidate_seq, candidate_seq_len, candidate_region_len - 1, alloc=alloc
         )
 
     packed_seq_len = (
@@ -654,7 +657,7 @@ def _aligned_candidate_tokens(counts: np.ndarray) -> np.ndarray:
 
 
 def _drop_candidates_over_budget(
-    seq: PostSeq, slots_per_user: int, budget: int
+    seq: PostSeq, slots_per_user: int, budget: int, *, alloc: ArrayAllocator
 ) -> tuple[PostSeq, np.ndarray]:
     post_hashes = seq["post_hashes"]
     assert post_hashes is not None
@@ -696,7 +699,7 @@ def _drop_candidates_over_budget(
     kept_seq = {}
     for key, value in seq.items():
         if isinstance(value, np.ndarray) and value.ndim >= 2 and value.shape[1] == num_slots:
-            value = value.copy()
+            value = alloc.copy(value, value.dtype)
             value[drop] = 0
         kept_seq[key] = value
     return cast(PostSeq, kept_seq), dropped

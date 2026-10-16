@@ -66,8 +66,8 @@ class PageServeScoreConfig(Config):
     retweet_weight: float = 1.0
     click_weight: float = 0.4
     profile_click_weight: float = 0.5
-    vqv_weight: float = 0.5
-    share_weight: float = 40.0
+    vqv_weight: float = 1.0
+    share_weight: float = 4.0
     quote_weight: float = 5.0
     cont_dwell_time_weight: float = 0.1
     not_interested_weight: float = -500.0
@@ -75,6 +75,23 @@ class PageServeScoreConfig(Config):
     not_dwelled_weight: float = -1.2
     min_video_duration_ms: float = 10_000.0
     negative_offset: float = 0.001
+
+
+RANKING_SCORE_WEIGHT_FIELDS: tuple[str, ...] = (
+    "favorite_weight",
+    "reply_weight",
+    "retweet_weight",
+    "click_weight",
+    "profile_click_weight",
+    "vqv_weight",
+    "share_weight",
+    "quote_weight",
+    "cont_dwell_time_weight",
+    "not_interested_weight",
+    "report_weight",
+    "not_dwelled_weight",
+    "min_video_duration_ms",
+)
 
 
 @configclass
@@ -246,6 +263,7 @@ class PageDecodeInputs(NamedTuple):
     pool_n: jax.Array
     steps: jax.Array
     temperature: jax.Array
+    ranking_score_weights: jax.Array
 
     @classmethod
     def no_decode(cls, n_users: int, n_candidates: int) -> PageDecodeInputs:
@@ -255,6 +273,9 @@ class PageDecodeInputs(NamedTuple):
             pool_n=jnp.zeros((n_users,), dtype=jnp.int32),
             steps=jnp.zeros((n_users,), dtype=jnp.int32),
             temperature=jnp.zeros((n_users,), dtype=jnp.float32),
+            ranking_score_weights=jnp.full(
+                (n_users, len(RANKING_SCORE_WEIGHT_FIELDS)), jnp.nan, dtype=jnp.float32
+            ),
         )
 
 
@@ -288,47 +309,66 @@ def page_serve_weighted_score(
     logits: jax.Array,
     cont_preds: jax.Array,
     video_duration_ms: jax.Array,
+    request_weights: jax.Array | None = None,
 ) -> jax.Array:
     an = recsys_pb2.ActionName
 
     def head(idx: int) -> jax.Array:
         return jax.nn.sigmoid(logits[..., idx].astype(jnp.float32))
 
+    def weight(name: str) -> jax.Array | float:
+        default = getattr(cfg, name)
+        if request_weights is None:
+            return default
+        w = request_weights[:, RANKING_SCORE_WEIGHT_FIELDS.index(name), None].astype(jnp.float32)
+        return jnp.where(jnp.isnan(w), default, w)
+
+    favorite = weight("favorite_weight")
+    reply = weight("reply_weight")
+    retweet = weight("retweet_weight")
+    click = weight("click_weight")
+    profile_click = weight("profile_click_weight")
+    vqv = weight("vqv_weight")
+    share = weight("share_weight")
+    quote = weight("quote_weight")
+    cont_dwell_time = weight("cont_dwell_time_weight")
+    not_interested = weight("not_interested_weight")
+    report = weight("report_weight")
+    not_dwelled = weight("not_dwelled_weight")
+
     vqv_w = jnp.where(
-        video_duration_ms.astype(jnp.float32) > cfg.min_video_duration_ms, cfg.vqv_weight, 0.0
+        video_duration_ms.astype(jnp.float32) > weight("min_video_duration_ms"), vqv, 0.0
     )
     raw = (
-        cfg.favorite_weight * head(an.SERVER_TWEET_FAV)
-        + cfg.reply_weight * head(an.SERVER_TWEET_REPLY)
-        + cfg.retweet_weight * head(an.SERVER_TWEET_RETWEET)
-        + cfg.click_weight * head(an.CLIENT_TWEET_CLICK)
-        + cfg.profile_click_weight * head(an.CLIENT_TWEET_CLICK_PROFILE)
+        favorite * head(an.SERVER_TWEET_FAV)
+        + reply * head(an.SERVER_TWEET_REPLY)
+        + retweet * head(an.SERVER_TWEET_RETWEET)
+        + click * head(an.CLIENT_TWEET_CLICK)
+        + profile_click * head(an.CLIENT_TWEET_CLICK_PROFILE)
         + vqv_w * head(an.CLIENT_TWEET_VIDEO_QUALITY_VIEW)
-        + cfg.share_weight * head(an.CLIENT_TWEET_SHARE)
-        + cfg.quote_weight * head(an.SERVER_TWEET_QUOTE)
-        + cfg.not_interested_weight * head(an.CLIENT_TWEET_NOT_INTERESTED_IN)
-        + cfg.report_weight * head(an.CLIENT_TWEET_REPORT)
+        + share * head(an.CLIENT_TWEET_SHARE)
+        + quote * head(an.SERVER_TWEET_QUOTE)
+        + not_interested * head(an.CLIENT_TWEET_NOT_INTERESTED_IN)
+        + report * head(an.CLIENT_TWEET_REPORT)
     )
     raw = (
         raw
-        + cfg.cont_dwell_time_weight
+        + cont_dwell_time
         * cont_preds[..., recsys_pb2.ContinuousActionName.DWELL_TIME].astype(jnp.float32)
-        + cfg.not_dwelled_weight * head(an.CLIENT_TWEET_RECAP_NOT_DWELLED)
+        + not_dwelled * head(an.CLIENT_TWEET_RECAP_NOT_DWELLED)
     )
     positive_sum = (
-        cfg.favorite_weight
-        + cfg.reply_weight
-        + cfg.retweet_weight
-        + cfg.click_weight
-        + cfg.profile_click_weight
-        + cfg.vqv_weight
-        + cfg.share_weight
-        + cfg.quote_weight
-        + max(cfg.not_dwelled_weight, 0.0)
+        favorite
+        + reply
+        + retweet
+        + click
+        + profile_click
+        + vqv
+        + share
+        + quote
+        + jnp.maximum(not_dwelled, 0.0)
     )
-    negative_sum = -(
-        cfg.not_interested_weight + cfg.report_weight + min(cfg.not_dwelled_weight, 0.0)
-    )
+    negative_sum = -(not_interested + report + jnp.minimum(not_dwelled, 0.0))
     total_sum = positive_sum + negative_sum
     return jnp.where(
         raw < 0.0,
@@ -349,7 +389,11 @@ def run_page_decode(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     n_cand = request.video_duration_ms.shape[1]
     wscore = page_serve_weighted_score(
-        config.serve_score, logits[:, :n_cand], cont_preds[:, :n_cand], request.video_duration_ms
+        config.serve_score,
+        logits[:, :n_cand],
+        cont_preds[:, :n_cand],
+        request.video_duration_ms,
+        request.ranking_score_weights,
     )
     valid = jnp.arange(n_cand)[None, :] < request.n_candidates[:, None]
     pool_k = min(config.decoder.max_steps, n_cand)

@@ -34,6 +34,8 @@ pub struct PostCandidate {
     pub backbone_scores: Option<PhoenixScores>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immersive_scores: Option<PhoenixScores>,
+    #[serde(skip)]
+    pub video_embedding: Option<Vec<f32>>,
     #[serde(
         serialize_with = "serialize_served_type",
         deserialize_with = "deserialize_served_type"

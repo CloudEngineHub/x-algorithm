@@ -164,14 +164,21 @@ fn fold<O: PolicyObserver>(
         Some((_, verdict)) => verdict,
         None => decision.finish(),
     };
-    if context.failed().is_empty() {
-        debug_assert!(
-            fail_open_defaults.is_empty(),
-            "a verdict over no failed node relies on no default"
-        );
-        Evaluation::Complete { verdict }
-    } else {
+    debug_assert!(
+        !context.failed().is_empty() || fail_open_defaults.is_empty(),
+        "a verdict over no failed node relies on no default"
+    );
+    if context.failed().has_must_have() {
         Evaluation::Partial {
+            verdict,
+            fail_open_defaults,
+        }
+    } else {
+        debug_assert!(
+            !fail_open_defaults.has_must_have(),
+            "a complete verdict relies only on best-effort defaults"
+        );
+        Evaluation::Complete {
             verdict,
             fail_open_defaults,
         }
@@ -1194,35 +1201,31 @@ country_specific_nsfw_content_gating:
                     "author",
                     author_viewer(),
                     followed.clone(),
-                    Evaluation::Complete { verdict: allow() },
+                    Evaluation::complete(allow()),
                 ),
                 (
                     "follower",
                     viewer(VIEWER_ID),
                     followed,
-                    Evaluation::Complete { verdict: allow() },
+                    Evaluation::complete(allow()),
                 ),
                 (
                     "non-follower",
                     viewer(VIEWER_ID),
                     candidate().build(),
-                    Evaluation::Complete {
-                        verdict: dropped.clone(),
-                    },
+                    Evaluation::complete(dropped.clone()),
                 ),
                 (
                     "logged out",
                     logged_out_viewer(),
                     candidate().build(),
-                    Evaluation::Complete {
-                        verdict: dropped.clone(),
-                    },
+                    Evaluation::complete(dropped.clone()),
                 ),
                 (
                     "follows failed",
                     viewer(VIEWER_ID),
                     follows_failed,
-                    Evaluation::Partial {
+                    Evaluation::Complete {
                         verdict: dropped,
                         fail_open_defaults: follows,
                     },
@@ -1252,7 +1255,7 @@ country_specific_nsfw_content_gating:
         use crate::models::{ClientCapability, RawCandidate, SafetyLabelType, TweetId};
         use crate::models::{LimitedEngagementReason, Notice};
         use crate::rules::fixtures::{candidate, dropped, viewer, VIEWER_ID};
-        use crate::rules::golden_corpus::pairs;
+        use crate::rules::golden_corpus::cases;
         use crate::rules::rule_spec::conditions::VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES;
         use crate::rules::rule_spec::leaves::*;
         use crate::rules::rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
@@ -1266,7 +1269,7 @@ country_specific_nsfw_content_gating:
         use crate::rules::test_context;
         use crate::rules::tweet_rules;
         use crate::scenario::{raw, Scenario};
-        use std::hash::{DefaultHasher, Hash, Hasher};
+        use std::iter::once;
         use xai_core_entities::entities::{GizmoduckUser, Label, Labels};
         use xai_visibility_filtering::models::FilteredReason;
         use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
@@ -1299,36 +1302,44 @@ country_specific_nsfw_content_gating:
         }
 
         #[test]
-        fn total_observation_keeps_every_golden_evaluation_at_every_level() {
+        fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {
             let rule_engine = RuleEngine::for_tests();
             let mut seen = (0, 0);
-            for (viewer, healthy) in pairs() {
-                let mut failed = healthy.clone();
-                failed.failed = Hydrators::all();
-                for (candidate, &level) in [healthy, failed].iter().flat_map(|candidate| {
-                    SafetyLevel::VARIANTS
-                        .iter()
-                        .map(move |level| (candidate, level))
-                }) {
-                    let served = rule_engine.evaluate(level, &viewer, candidate);
-                    let observed = rule_engine.trace(level, &viewer, candidate);
-                    assert_eq!(
-                        observed.evaluation, served,
-                        "{level:?} {viewer:?} {candidate:?}"
-                    );
-                    match served {
-                        Evaluation::Partial {
-                            fail_open_defaults, ..
-                        } if !fail_open_defaults.is_empty() => {
-                            seen.0 += 1;
+            for (own_level, viewer, fetched) in cases() {
+                for &level in SafetyLevel::VARIANTS {
+                    let failed_alone = if level == own_level {
+                        rule_engine.policy(level).hydrators
+                    } else {
+                        Hydrators::empty()
+                    };
+                    for failed in once(Hydrators::empty())
+                        .chain(failed_alone.iter().map(Hydrators::of))
+                        .chain(once(Hydrators::all()))
+                    {
+                        let mut candidate = fetched.clone();
+                        candidate.failed = candidate.failed.union(failed);
+                        let served = rule_engine.evaluate(level, &viewer, &candidate);
+                        let observed = rule_engine.trace(level, &viewer, &candidate);
+                        assert_eq!(
+                            observed.evaluation, served,
+                            "{level:?} {viewer:?} {candidate:?}"
+                        );
+                        match served {
+                            Evaluation::Partial {
+                                fail_open_defaults, ..
+                            } if !fail_open_defaults.is_empty() => {
+                                seen.0 += 1;
+                            }
+                            Evaluation::Complete {
+                                verdict:
+                                    Verdict::Withheld(_) | Verdict::Shown { media: Some(_), .. },
+                                ..
+                            } => seen.1 += 1,
+                            Evaluation::Complete { .. }
+                            | Evaluation::Partial { .. }
+                            | Evaluation::NotFound(_)
+                            | Evaluation::Failed(_) => {}
                         }
-                        Evaluation::Complete {
-                            verdict: Verdict::Withheld(_) | Verdict::Shown { media: Some(_), .. },
-                        } => seen.1 += 1,
-                        Evaluation::Complete { .. }
-                        | Evaluation::Partial { .. }
-                        | Evaluation::NotFound(_)
-                        | Evaluation::Failed(_) => {}
                     }
                 }
             }
@@ -1414,13 +1425,11 @@ country_specific_nsfw_content_gating:
             assert_eq!(mutes.truth, Truth::False);
             assert_eq!(
                 trace.evaluation,
-                Evaluation::Complete {
-                    verdict: Verdict::Shown {
-                        notice: None,
-                        media: None,
-                        engagement: None
-                    }
-                }
+                Evaluation::complete(Verdict::Shown {
+                    notice: None,
+                    media: None,
+                    engagement: None
+                })
             );
 
             let unfollowed = candidate().build();
@@ -1480,7 +1489,7 @@ country_specific_nsfw_content_gating:
             assert_eq!(trace.rows[0].defaults_retained, unknown.failed);
             assert_eq!(
                 trace.evaluation,
-                Evaluation::Partial {
+                Evaluation::Complete {
                     verdict: dropped(FilteredReason::UnspecifiedReason, "nested"),
                     fail_open_defaults: unknown.failed,
                 }
@@ -1622,9 +1631,7 @@ country_specific_nsfw_content_gating:
                         .evaluate_with(engine, &[raw(1, None)])
                         .await
                         .evaluations(),
-                    [Evaluation::Complete {
-                        verdict: dropped(decided.1, decided.0)
-                    }],
+                    [Evaluation::complete(dropped(decided.1, decided.0))],
                     "viewer {viewer_id}"
                 );
             }
@@ -2016,13 +2023,7 @@ country_specific_nsfw_content_gating:
                 );
                 assert_eq!(leaf.skip, Some(skip));
             }
-            let Evaluation::Partial {
-                fail_open_defaults, ..
-            } = trace.evaluation
-            else {
-                panic!("a failed node makes the evaluation partial");
-            };
-            assert_eq!(fail_open_defaults, Hydrators::empty());
+            assert_eq!(trace.evaluation.fail_open_defaults(), Hydrators::empty());
         }
 
         #[test]
@@ -2058,20 +2059,12 @@ country_specific_nsfw_content_gating:
             assert_eq!(trace.rows[1].effect, Effect::Decided);
             assert_eq!(
                 trace.evaluation,
-                Evaluation::Complete {
-                    verdict: dropped(FilteredReason::UnspecifiedReason, "decides")
-                }
+                Evaluation::complete(dropped(FilteredReason::UnspecifiedReason, "decides"))
             );
         }
 
-        fn hashed(rule: &Rule) -> u64 {
-            let mut hasher = DefaultHasher::new();
-            rule.hash(&mut hasher);
-            hasher.finish()
-        }
-
         #[test]
-        fn rules_compare_hash_and_print_their_structure_payload_and_names() {
+        fn rules_compare_and_print_their_structure_payload_and_names() {
             use crate::rules::rule_spec::leaves::TweetHasLabel;
             static FOLLOWED: NamedCond = NamedCond {
                 name: "followed",
@@ -2131,14 +2124,12 @@ country_specific_nsfw_content_gating:
                 ),
             ];
             assert_eq!(base, base.clone());
-            assert_eq!(hashed(&base), hashed(&base.clone()));
             for (change, when) in changes {
                 let changed = Rule {
                     when,
                     ..base.clone()
                 };
                 assert_ne!(changed, base, "{change}");
-                assert_ne!(hashed(&changed), hashed(&base), "{change}");
                 assert_ne!(format!("{changed:?}"), format!("{base:?}"), "{change}");
                 assert_ne!(changed.authored(), base.authored(), "{change}");
             }

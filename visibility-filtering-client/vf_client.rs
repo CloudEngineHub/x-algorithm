@@ -24,6 +24,8 @@ use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
 
+pub const FILTER_TWEETS_LATENCY_VM_METRIC: &str = "vf_client_filter_tweets_latency_ms_vm";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Hash, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SafetyLevel {
@@ -532,16 +534,12 @@ impl Drop for FilterTweetsRequestMetricsGuard {
     }
 }
 
-fn emit_filter_tweets_client_metrics(latency_ms: f64, metrics: &FilterTweetsClientMetrics) {
-    let Some(sr) = global_stats_receiver() else {
-        return;
-    };
-    sr.observe(
-        "vf_client_filter_tweets_latency_ms",
-        &[],
-        latency_ms,
-        xai_stats_receiver::HistogramBuckets::Bucket50To500,
-    );
+fn emit_filter_tweets_client_metrics(
+    sr: &dyn xai_stats_receiver::StatsReceiverExt,
+    latency_ms: f64,
+    metrics: &FilterTweetsClientMetrics,
+) {
+    sr.observe_vm(FILTER_TWEETS_LATENCY_VM_METRIC, &[], latency_ms);
     for code in &metrics.error_codes {
         sr.incr("vf_client_filter_tweets_error", &[("code", *code)], 1);
     }
@@ -623,7 +621,10 @@ impl VfClient for XaiVfClient {
         }
 
         request_guard.mark_completed(&metrics);
-        emit_filter_tweets_client_metrics(start.elapsed().as_secs_f64() * 1000.0, &metrics);
+        if let Some(sr) = global_stats_receiver() {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            emit_filter_tweets_client_metrics(sr.as_ref(), latency_ms, &metrics);
+        }
         out
     }
 }
@@ -934,6 +935,13 @@ mod rust_vf_tests {
         assert_eq!(sr.counter("vf_client_filter_tweets|requests=completed"), 1);
         assert_eq!(sr.counter("vf_client_filter_tweets|requests=degraded"), 1);
         assert_eq!(sr.counter("vf_client_filter_tweets|requests=cancelled"), 0);
+    }
+
+    #[test]
+    fn client_metrics_record_latency_as_vm_histogram() {
+        let sr = RecordingReceiver::default();
+        emit_filter_tweets_client_metrics(&sr, 12.0, &FilterTweetsClientMetrics::default());
+        assert_eq!(sr.vm_observations(FILTER_TWEETS_LATENCY_VM_METRIC), 1);
     }
 
     #[tokio::test]

@@ -592,13 +592,8 @@ mod tests {
         use crate::rules::fixtures::allow;
         let suspended = dropped(FilteredReason::AuthorIsSuspended);
         for (evaluation, rule) in [
-            (Evaluation::Complete { verdict: allow() }, None),
-            (
-                Evaluation::Complete {
-                    verdict: suspended.clone(),
-                },
-                Some("rule"),
-            ),
+            (Evaluation::complete(allow()), None),
+            (Evaluation::complete(suspended.clone()), Some("rule")),
             (
                 Evaluation::Partial {
                     verdict: suspended,

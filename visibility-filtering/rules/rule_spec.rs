@@ -10,13 +10,12 @@ use features::{In, TweetSafetyLabels};
 use inputs::Interpreter;
 use rule::{NamedCond, RuleCond};
 use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
 use std::ops::Not;
 use xai_safety_label_store::types::label_meta;
 use xai_visibility_filtering::models::{FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(super) enum RuleId {
     FilterAll,
@@ -266,12 +265,6 @@ impl Debug for RuleAction {
 }
 
 impl Eq for RuleAction {}
-
-impl Hash for RuleAction {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        format!("{:?}", self.spec).hash(state);
-    }
-}
 
 #[cfg(test)]
 impl From<ActionSpec> for RuleAction {

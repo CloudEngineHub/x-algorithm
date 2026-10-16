@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
-use crate::hydration::{Cause, Hydrators, Lookup};
+use crate::hydration::{Cause, Hydrators, Lookup, INBOUND_ALLOWANCE};
 use crate::models::{Evaluation, Verdict};
 use crate::rules::SafetyLevel;
 use crate::treatment;
@@ -40,12 +40,42 @@ pub(crate) enum RequestOutcome {
     Failure,
 }
 
-#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-enum DeadlineOutcome {
+pub(crate) enum DeadlineOutcome {
     Absent,
-    Within,
-    Overrun,
+    Within(Duration),
+    Overrun(Duration),
+    CancelledEarly,
+    CancelledAtDeadline,
+    CancelledNoDeadline,
+}
+
+impl DeadlineOutcome {
+    pub(crate) fn of(
+        outcome: RequestOutcome,
+        grpc_timeout: Option<Duration>,
+        elapsed: Duration,
+    ) -> Option<Self> {
+        match (outcome, grpc_timeout) {
+            (RequestOutcome::Started | RequestOutcome::Failure, _) => None,
+            (RequestOutcome::Success, None) => Some(Self::Absent),
+            (RequestOutcome::Cancelled, None) => Some(Self::CancelledNoDeadline),
+            (RequestOutcome::Success, Some(deadline)) => {
+                Some(match deadline.checked_sub(elapsed) {
+                    Some(remaining) => Self::Within(remaining),
+                    None => Self::Overrun(elapsed - deadline),
+                })
+            }
+            (RequestOutcome::Cancelled, Some(deadline)) => {
+                Some(if elapsed + INBOUND_ALLOWANCE < deadline {
+                    Self::CancelledEarly
+                } else {
+                    Self::CancelledAtDeadline
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
@@ -182,23 +212,34 @@ pub(crate) fn record_fail_open_defaults(
     }
 }
 
+enum DeadlineCount {
+    Skip,
+    Count { grpc_timeout: Option<Duration> },
+}
+
 pub(crate) struct RequestMetricsGuard {
     requests: &'static str,
     latency_ms: &'static str,
+    deadline: DeadlineCount,
     start: Instant,
     outcome: Cell<RequestOutcome>,
 }
 
 impl RequestMetricsGuard {
-    pub(crate) fn new() -> Self {
-        Self::named(REQUESTS, LATENCY_MS)
+    pub(crate) fn new(grpc_timeout: Option<Duration>) -> Self {
+        Self::start(REQUESTS, LATENCY_MS, DeadlineCount::Count { grpc_timeout })
     }
 
     pub(crate) fn named(requests: &'static str, latency_ms: &'static str) -> Self {
+        Self::start(requests, latency_ms, DeadlineCount::Skip)
+    }
+
+    fn start(requests: &'static str, latency_ms: &'static str, deadline: DeadlineCount) -> Self {
         incr(requests, &[("outcome", RequestOutcome::Started.into())], 1);
         Self {
             requests,
             latency_ms,
+            deadline,
             start: Instant::now(),
             outcome: Cell::new(RequestOutcome::Cancelled),
         }
@@ -210,21 +251,6 @@ impl RequestMetricsGuard {
 
     pub(crate) fn mark_failure(&self) {
         self.outcome.set(RequestOutcome::Failure);
-    }
-
-    pub(crate) fn record_deadline(&self, grpc_timeout: Option<Duration>) {
-        let Some(deadline) = grpc_timeout else {
-            incr(DEADLINE, &[("outcome", DeadlineOutcome::Absent.into())], 1);
-            return;
-        };
-        let elapsed = self.start.elapsed();
-        if elapsed <= deadline {
-            incr(DEADLINE, &[("outcome", DeadlineOutcome::Within.into())], 1);
-            observe_vm(DEADLINE_REMAINING_MS, &[], millis(deadline - elapsed));
-        } else {
-            incr(DEADLINE, &[("outcome", DeadlineOutcome::Overrun.into())], 1);
-            observe_vm(DEADLINE_OVERRUN_MS, &[], millis(elapsed - deadline));
-        }
     }
 }
 
@@ -255,8 +281,29 @@ fn millis(d: Duration) -> f64 {
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        incr(self.requests, &[("outcome", self.outcome.get().into())], 1);
-        observe_vm(self.latency_ms, &[], millis(self.start.elapsed()));
+        let elapsed = self.start.elapsed();
+        let outcome = self.outcome.get();
+        incr(self.requests, &[("outcome", outcome.into())], 1);
+        observe_vm(self.latency_ms, &[], millis(elapsed));
+        let DeadlineCount::Count { grpc_timeout } = self.deadline else {
+            return;
+        };
+        let Some(deadline_outcome) = DeadlineOutcome::of(outcome, grpc_timeout, elapsed) else {
+            return;
+        };
+        incr(DEADLINE, &[("outcome", deadline_outcome.into())], 1);
+        match deadline_outcome {
+            DeadlineOutcome::Within(remaining) => {
+                observe_vm(DEADLINE_REMAINING_MS, &[], millis(remaining));
+            }
+            DeadlineOutcome::Overrun(overrun) => {
+                observe_vm(DEADLINE_OVERRUN_MS, &[], millis(overrun));
+            }
+            DeadlineOutcome::Absent
+            | DeadlineOutcome::CancelledEarly
+            | DeadlineOutcome::CancelledAtDeadline
+            | DeadlineOutcome::CancelledNoDeadline => {}
+        }
     }
 }
 
@@ -298,6 +345,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use xai_visibility_filtering::models::FilteredReason;
+    use xai_visibility_filtering::vf_client::FILTER_TWEETS_LATENCY_VM_METRIC;
     use xai_x_thrift::action::InterstitialReason;
 
     fn allow() -> Verdict {
@@ -341,8 +389,53 @@ mod tests {
         assert!(dashboard.contains(&format!(
             "FT_DEADLINE_REMAINING_METRIC = \"{DEADLINE_REMAINING_MS}\""
         )));
-        let overrun: &str = DeadlineOutcome::Overrun.into();
-        assert!(dashboard.contains(&format!("outcome=\"{overrun}\"")));
+        assert!(dashboard.contains(&format!(
+            "VF_CLIENT_FT_LATENCY_VM_METRIC = \"{FILTER_TWEETS_LATENCY_VM_METRIC}\""
+        )));
+        for outcome in [
+            DeadlineOutcome::CancelledEarly,
+            DeadlineOutcome::CancelledAtDeadline,
+            DeadlineOutcome::CancelledNoDeadline,
+            DeadlineOutcome::Overrun(Duration::ZERO),
+        ] {
+            let outcome: &str = outcome.into();
+            assert!(dashboard.contains(&format!("'outcome=\"{outcome}\"'")));
+        }
+    }
+
+    #[test]
+    fn a_cancel_counts_whether_the_caller_hung_up_before_its_deadline() {
+        let deadline = Some(Duration::from_millis(400));
+        let of = |outcome, ms| DeadlineOutcome::of(outcome, deadline, Duration::from_millis(ms));
+        assert_eq!(
+            of(RequestOutcome::Cancelled, 389),
+            Some(DeadlineOutcome::CancelledEarly)
+        );
+        assert_eq!(
+            of(RequestOutcome::Cancelled, 390),
+            Some(DeadlineOutcome::CancelledAtDeadline)
+        );
+        assert_eq!(
+            of(RequestOutcome::Cancelled, 401),
+            Some(DeadlineOutcome::CancelledAtDeadline)
+        );
+        assert_eq!(
+            DeadlineOutcome::of(RequestOutcome::Cancelled, None, Duration::ZERO),
+            Some(DeadlineOutcome::CancelledNoDeadline)
+        );
+        assert_eq!(
+            DeadlineOutcome::of(RequestOutcome::Success, None, Duration::ZERO),
+            Some(DeadlineOutcome::Absent)
+        );
+        assert_eq!(
+            of(RequestOutcome::Success, 400),
+            Some(DeadlineOutcome::Within(Duration::ZERO))
+        );
+        assert_eq!(
+            of(RequestOutcome::Success, 401),
+            Some(DeadlineOutcome::Overrun(Duration::from_millis(1)))
+        );
+        assert_eq!(of(RequestOutcome::Failure, 5), None);
     }
 
     #[test]

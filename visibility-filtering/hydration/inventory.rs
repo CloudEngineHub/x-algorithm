@@ -164,3 +164,31 @@ impl Source {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::type_name;
+
+    struct Visited(Vec<(&'static str, Scope)>);
+
+    impl Visit for Visited {
+        fn exchange<X: Exchange>(&mut self) {
+            self.0.push((type_name::<X>(), X::SCOPE));
+        }
+    }
+
+    #[test]
+    fn each_source_visits_the_exchange_named_after_it() {
+        let (module, _) = type_name::<exchange::TesTweet>().rsplit_once("::").unwrap();
+        for &source in Source::VARIANTS {
+            let mut visited = Visited(Vec::new());
+            source.visit(&mut visited);
+            let [(exchange, scope)] = visited.0[..] else {
+                panic!("{source:?} visits {:?}", visited.0);
+            };
+            assert_eq!(exchange, format!("{module}::{source:?}"));
+            assert_eq!(source.scope(), scope, "{source:?}");
+        }
+    }
+}

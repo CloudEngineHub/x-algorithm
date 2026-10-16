@@ -162,6 +162,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         history_seq_len=mparams["history_seq_len"],
         candidate_seq_len=mparams["candidate_seq_len"],
         input_vocab_size=mparams["input_vocab_size"],
+        output_vocab_size=mparams["output_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         pad_token=PAD_TOKEN,
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
@@ -174,6 +175,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
         ads_head_masking=mparams.get("ads_head_masking", False),
         ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
+        max_redistribution_bytes=mparams.get("max_redistribution_bytes", 256 << 20),
         page_records=_page_records(mparams),
     )
 
@@ -189,6 +191,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         history_seq_len=mparams["history_seq_len"],
         candidate_seq_len=mparams["candidate_seq_len"],
         input_vocab_size=mparams["input_vocab_size"],
+        output_vocab_size=mparams["output_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         pad_token=PAD_TOKEN,
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),

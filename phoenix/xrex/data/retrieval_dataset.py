@@ -324,9 +324,13 @@ class RetrievalDataset(Enum):
         return None
 
     def load(
-        self, *, read_post_sid: bool = False, sid_num_levels: int = 6
+        self,
+        *,
+        read_post_sid: bool = False,
+        sid_num_levels: int = 6,
+        path: str | Path | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
-        load_path = self._get_valid_path()
+        load_path = str(path) if path is not None else self._get_valid_path()
         if load_path is None:
             logger.warning(f"Skipping {self.name}: path not found")
             return None
@@ -397,11 +401,20 @@ class RetrievalDataset(Enum):
         sid_num_levels: int = 6,
         cold_pool_metadata_path: str | Path | None = None,
         cold_start_max_age_seconds: float = 0.0,
+        paths: dict[RetrievalDataset, str | Path] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         start = time.time()
         post_ids_list, author_ids_list, types_list, sids_list = [], [], [], []
         any_sid_loaded = False
         home_source: tuple[np.ndarray, np.ndarray, np.ndarray | None] | None | bool = False
+        home_paths = {
+            str(path)
+            for dataset, path in (paths or {}).items()
+            if dataset in (cls.HOME, *cls.home_slices())
+        }
+        if len(home_paths) > 1:
+            raise ValueError("HOME, HOME_COLD and HOME_HOT must pin the same source file")
+        home_path = next(iter(home_paths), None)
 
         def _append(
             pids: np.ndarray,
@@ -424,7 +437,9 @@ class RetrievalDataset(Enum):
             nonlocal home_source
             if home_source is False:
                 home_source = cls.HOME.load(
-                    read_post_sid=read_post_sid, sid_num_levels=sid_num_levels
+                    read_post_sid=read_post_sid,
+                    sid_num_levels=sid_num_levels,
+                    **({"path": home_path} if home_path is not None else {}),
                 )
             return None if home_source is False else home_source
 
@@ -468,7 +483,11 @@ class RetrievalDataset(Enum):
                 continue
 
             if (
-                result := ds.load(read_post_sid=read_post_sid, sid_num_levels=sid_num_levels)
+                result := ds.load(
+                    read_post_sid=read_post_sid,
+                    sid_num_levels=sid_num_levels,
+                    **({"path": paths[ds]} if paths and ds in paths else {}),
+                )
             ) is None:
                 continue
             pids, aids, sids = result

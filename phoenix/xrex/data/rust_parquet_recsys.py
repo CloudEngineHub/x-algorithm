@@ -411,6 +411,7 @@ class RustParquetDataset(PhoenixDataset):
                 ads_pixel_head_masking=dataset.ads_pixel_head_masking,
                 reply_parent_mode=dataset.reply_parent_mode,
                 page_records=dataset.page_records,
+                alloc=dataset._alloc,
             )
 
             if record_batch.num_rows < batch_size:

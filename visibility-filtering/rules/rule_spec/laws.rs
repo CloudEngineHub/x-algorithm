@@ -113,6 +113,70 @@ fn a_failed_read_is_local() {
     }
 }
 
+const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
+    (
+        "protected_author/drop",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "abusive_high_recall_user_label/drop/unspecified",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "do_not_amplify_user_label/drop/unspecified",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "fosnr_abuse_insults_non_follower/drop/undesirable",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "fosnr_abuse_insults_follower/soft_intervention/abuse",
+        Hydrator::Follows,
+        "the non-follower drop on the same label fires instead",
+    ),
+    (
+        "author_blocks_viewer_exclusive_content/drop/unspecified",
+        Hydrator::BlockedByAuthor,
+        "only a subscriber the author blocked sees the exclusive post",
+    ),
+];
+
+#[test]
+fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
+    let mut unaccepted = Vec::new();
+    let mut accepted = Vec::new();
+    for rule in wired_rules() {
+        let name = rule.name();
+        let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
+        for node in rule
+            .requirements()
+            .iter()
+            .filter(|node| node.is_best_effort())
+        {
+            match ACCEPTED_BEST_EFFORT_READS
+                .iter()
+                .find(|&&(by, accepted, _)| by == name && accepted == node)
+            {
+                Some(&(by, node, _)) => accepted.push((by, node)),
+                None if limits => {}
+                None => unaccepted.push((name.clone(), node)),
+            }
+        }
+    }
+    assert!(unaccepted.is_empty(), "{unaccepted:?}");
+    for &(by, node, _) in ACCEPTED_BEST_EFFORT_READS {
+        assert!(
+            accepted.contains(&(by, node)),
+            "{by} no longer reads {node:?}"
+        );
+    }
+}
+
 fn holds(condition: RuleCond, context: &RuleContext<'_>) -> bool {
     match condition {
         RuleCond::Leaf(leaf) => leaf.holds(context),

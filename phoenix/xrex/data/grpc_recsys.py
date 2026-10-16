@@ -144,6 +144,7 @@ class PhoenixGrpcDataset(PhoenixDataset):
                         self.num_negatives_per_example,
                         actual_batch_size,
                         self.candidate_seq_len,
+                        alloc=self._alloc,
                     )
                     neg_sampling_duration = time.perf_counter() - neg_sampling_start
 

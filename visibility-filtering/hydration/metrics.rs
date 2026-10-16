@@ -22,7 +22,8 @@ const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
 const FALLBACK_CACHE_RESIDENT_KEYS: &str = "vf_fallback_cache_resident_keys";
 const VIEWER_COUNTRY: &str = "vf_viewer_country";
 const VIEWER_STATE: &str = "vf_viewer_state";
-const VIEWER_AGE: &str = "vf_viewer_age";
+const REQUEST_COUNTRY: &str = "vf_request_country";
+const VIEWER_NOT_AGE_VERIFIED: &str = "vf_viewer_not_age_verified";
 const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -212,29 +213,36 @@ pub(crate) fn record_viewer_state(state: &'static str, safety_level: SafetyLevel
     );
 }
 
-const VIEWER_AGE_EXTRA_COUNTRIES: [&str; 2] = ["us", "jp"];
+const REQUEST_COUNTRY_EXTRA: [&str; 28] = [
+    "ae", "ch", "cl", "co", "ec", "eg", "gh", "hk", "il", "iq", "jp", "ke", "kw", "my", "ng", "om",
+    "pe", "pk", "sa", "sg", "tr", "tw", "ua", "us", "ve", "vn", "ye", "za",
+];
 
-pub(crate) fn record_viewer_age(
-    age: &'static str,
-    request_country: Option<&str>,
-    safety_level: SafetyLevel,
-) {
-    let country = request_country
-        .and_then(|code| {
-            CountryList::listed_by_default(code).or_else(|| {
-                VIEWER_AGE_EXTRA_COUNTRIES
-                    .into_iter()
-                    .find(|&extra| extra == code)
-            })
+fn request_country_label(request_country: Option<&str>) -> &'static str {
+    let Some(code) = request_country else {
+        return "none";
+    };
+    CountryList::listed_by_default(code)
+        .or_else(|| {
+            REQUEST_COUNTRY_EXTRA
+                .into_iter()
+                .find(|&extra| extra == code)
         })
-        .unwrap_or("other");
+        .unwrap_or("other")
+}
+
+pub(crate) fn record_request_country(request_country: Option<&str>) {
     incr(
-        VIEWER_AGE,
-        &[
-            ("age", age),
-            ("country", country),
-            ("safety_level", safety_level.into()),
-        ],
+        REQUEST_COUNTRY,
+        &[("country", request_country_label(request_country))],
+        1,
+    );
+}
+
+pub(crate) fn record_viewer_not_age_verified(country: &'static str, age: &'static str) {
+    incr(
+        VIEWER_NOT_AGE_VERIFIED,
+        &[("country", country), ("age", age)],
         1,
     );
 }
@@ -374,6 +382,25 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn a_request_country_reads_its_listed_code_other_or_none() {
+        for (country, label) in [
+            (Some("de"), "de"),
+            (Some("us"), "us"),
+            (Some("zz"), "other"),
+            (None, "none"),
+        ] {
+            assert_eq!(request_country_label(country), label, "{country:?}");
+        }
+        for extra in REQUEST_COUNTRY_EXTRA {
+            assert_eq!(
+                CountryList::listed_by_default(extra),
+                None,
+                "{extra} is listed"
+            );
+        }
+    }
+
+    #[test]
     fn dashboard_generator_pins_the_key_results_fallback_cache_results_and_viewer_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
@@ -388,7 +415,10 @@ mod tests {
             "FALLBACK_CACHE_KEYS_METRIC = \"{FALLBACK_CACHE_KEYS}\""
         )));
         assert!(dashboard.contains(&format!("VIEWER_STATE_METRIC = \"{VIEWER_STATE}\"")));
-        assert!(dashboard.contains(&format!("VIEWER_AGE_METRIC = \"{VIEWER_AGE}\"")));
+        assert!(dashboard.contains(&format!("REQUEST_COUNTRY_METRIC = \"{REQUEST_COUNTRY}\"")));
+        assert!(dashboard.contains(&format!(
+            "VIEWER_NOT_AGE_VERIFIED_METRIC = \"{VIEWER_NOT_AGE_VERIFIED}\""
+        )));
         for result in [
             FallbackCacheResult::Stale,
             FallbackCacheResult::Unavailable,

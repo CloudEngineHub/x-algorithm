@@ -198,7 +198,7 @@ impl<'a> Sends<'a> {
 
     pub(crate) fn result_state(self) -> Option<TweetFieldsResultState> {
         match self.evaluation {
-            Evaluation::Complete { verdict } => Some(treatment::thrift_result_state(
+            Evaluation::Complete { verdict, .. } => Some(treatment::thrift_result_state(
                 verdict,
                 self.level,
                 self.policies,
@@ -209,7 +209,7 @@ impl<'a> Sends<'a> {
 
     pub(crate) fn label(self) -> Label {
         match self.evaluation {
-            Evaluation::Complete { verdict } => state_label(&treatment::thrift_result_state(
+            Evaluation::Complete { verdict, .. } => state_label(&treatment::thrift_result_state(
                 verdict,
                 self.level,
                 self.policies,
@@ -403,8 +403,7 @@ mod tests {
             None,
             Action::Drop(action::Drop::new(None, None)),
         )));
-        let failed = Outcome::Failed(vf_pb::Failed {});
-        for (fault, outcome) in [(None, dropped), (Some(Fault::Fails), failed)] {
+        for (fault, outcome) in [(None, dropped), (Some(Fault::Fails), failed())] {
             let mut world = InMemorySources::default()
                 .pure_core(
                     4,
@@ -464,6 +463,192 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [outcome.clone(), outcome],
                 "{fault:?}"
+            );
+        }
+    }
+
+    const VIEWER: u64 = 50;
+
+    async fn evaluate_tweets(
+        world: InMemorySources,
+        level: ThriftLevel,
+        tweet_ids: &[u64],
+    ) -> Vec<Outcome> {
+        let endpoint = EvaluateTweetsEndpoint::new(
+            Arc::new(FilterTweets::new(
+                Arc::new(world),
+                RuleEngine::for_tests(),
+                Arc::default(),
+            )),
+            ClientSwitches::for_tests(),
+            LimitedActionsCopy::from_json("[]"),
+        );
+        let request = Request::new(vf_pb::EvaluateTweetsRequest {
+            safety_level: level.0,
+            viewer_id: Some(VIEWER),
+            tweets: tweet_ids
+                .iter()
+                .map(|&tweet_id| vf_pb::TweetData {
+                    tweet_id,
+                    quote_context: None,
+                })
+                .collect(),
+        });
+        let response = endpoint.handle(request).await.unwrap().into_inner();
+        response
+            .results
+            .into_iter()
+            .map(|result| result.outcome.unwrap())
+            .collect()
+    }
+
+    fn shown() -> Outcome {
+        encoded(&TweetFieldsResultState::Found(TweetFieldsResultFound::new(
+            None,
+        )))
+    }
+
+    fn failed() -> Outcome {
+        Outcome::Failed(vf_pb::Failed {})
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_flock_call_fails_a_post_only_through_a_must_have_node_it_carries() {
+        use crate::hydration::{
+            Hydrator, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT, INBOUND_ALLOWANCE,
+        };
+        use crate::models::{ClientCapability, SafetyLabelType};
+        use crate::rules::fixtures::{allow, dropped};
+        use xai_visibility_filtering::models::FilteredReason;
+        let protected = GizmoduckUserResult {
+            user: Some(GizmoduckUser {
+                safety: Safety {
+                    is_protected: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            response_state: Some(UserResponseState::Found),
+        };
+        let spam = vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(SafetyLabelType::SPAM.0, vf_pb::SafetyLabel::default())]),
+        };
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .tweet(2, 20)
+                .tweet(3, 30)
+                .labels(3, spam.clone())
+                .authors(&[10, 30])
+                .user(20, protected.clone())
+                .fault(Source::Flock, Fault::Hangs)
+        };
+        let verdicts = [
+            allow(),
+            dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+            dropped(FilteredReason::PossiblyUndesirable, "spam/drop/undesirable"),
+        ];
+        let served = vec![
+            shown(),
+            filtered(ThriftFilteredReason::AuthorIsProtected(true)),
+            filtered(ThriftFilteredReason::SafetyResult(SafetyResult::new(
+                None,
+                Action::Drop(action::Drop::new(None, None)),
+            ))),
+        ];
+        for (level, thrift, is_partial, outcomes, answered_at) in [
+            (
+                SafetyLevel::TimelineHomeHydration,
+                ThriftLevel::TIMELINE_HOME_HYDRATION,
+                false,
+                served,
+                BEST_EFFORT_HYDRATION_TIMEOUT,
+            ),
+            (
+                SafetyLevel::TimelineHomeRecommendations,
+                ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS,
+                true,
+                vec![failed(); 3],
+                HYDRATION_TIMEOUT - INBOUND_ALLOWANCE,
+            ),
+            (
+                SafetyLevel::TimelineHome,
+                ThriftLevel::TIMELINE_HOME,
+                true,
+                vec![failed(); 3],
+                HYDRATION_TIMEOUT - INBOUND_ALLOWANCE,
+            ),
+        ] {
+            let filter_tweets =
+                FilterTweets::new(Arc::new(world()), RuleEngine::for_tests(), Arc::default());
+            let request = |rpc| FilterRequest {
+                viewer_id: Some(VIEWER),
+                country_code: None,
+                client_capability: ClientCapability::default(),
+                safety_level: level,
+                candidates: [1, 2, 3]
+                    .map(|tweet_id| RawCandidate {
+                        tweet_id: TweetId(tweet_id),
+                        request_author_id: None,
+                    })
+                    .to_vec(),
+                rpc,
+            };
+            let counted = [
+                filter_tweets.run(request(Rpc::FilterTweets)).await.outcomes,
+                retweet::evaluate_merging_sources(&filter_tweets, request(Rpc::EvaluateTweets))
+                    .await,
+            ];
+            for outcomes in counted {
+                assert!(
+                    outcomes[1]
+                        .evaluation
+                        .fail_open_defaults()
+                        .contains(Hydrator::Follows),
+                    "{level:?}"
+                );
+                for (outcome, verdict) in outcomes.into_iter().zip(&verdicts) {
+                    assert_eq!(
+                        matches!(outcome.evaluation, Evaluation::Partial { .. }),
+                        is_partial,
+                        "{level:?} {:?}",
+                        outcome.evaluation
+                    );
+                    assert_eq!(&outcome.evaluation.into_verdict(), verdict, "{level:?}");
+                }
+            }
+            let started = tokio::time::Instant::now();
+            assert_eq!(
+                evaluate_tweets(world(), thrift, &[1, 2, 3]).await,
+                outcomes,
+                "{level:?}"
+            );
+            assert_eq!(started.elapsed(), answered_at, "{level:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_must_have_lookup_fails_exactly_the_posts_it_failed_for() {
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .tweet(2, 20)
+                .tweet(3, 30)
+                .authors(&[10, 20, 30])
+        };
+        for (world, outcomes) in [
+            (
+                world().fail_key(Source::SafetyLabels, 2),
+                vec![shown(), failed(), shown()],
+            ),
+            (
+                world().fault(Source::GizmoduckViewer, Fault::Fails),
+                vec![failed(); 3],
+            ),
+        ] {
+            assert_eq!(
+                evaluate_tweets(world, ThriftLevel::TIMELINE_HOME_HYDRATION, &[1, 2, 3]).await,
+                outcomes
             );
         }
     }
@@ -541,9 +726,7 @@ mod tests {
                     }),
                 ),
             ] {
-                let evaluation = Evaluation::Complete {
-                    verdict: verdict.clone(),
-                };
+                let evaluation = Evaluation::complete(verdict.clone());
                 assert_eq!(
                     evaluated_outcome(Sends::new(
                         &evaluation,
@@ -568,14 +751,12 @@ mod tests {
         ));
         let cases = [
             (
-                Evaluation::Complete { verdict: allow() },
+                Evaluation::complete(allow()),
                 Some(&shown),
                 ("allow", "none"),
             ),
             (
-                Evaluation::Complete {
-                    verdict: dropped(FilteredReason::AuthorIsSuspended, "rule"),
-                },
+                Evaluation::complete(dropped(FilteredReason::AuthorIsSuspended, "rule")),
                 Some(&suspended),
                 ("drop", "author_is_suspended"),
             ),

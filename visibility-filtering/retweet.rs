@@ -170,30 +170,51 @@ fn merge_source(
     sources: &HashMap<TweetId, Evaluation>,
 ) -> (FilterOutcome, MergeSelection) {
     let (evaluation, selection) = match (outcome.evaluation, outcome.source_tweet_id) {
-        (Evaluation::Complete { verdict }, Some(source_id)) => match sources.get(&source_id) {
-            Some(Evaluation::Complete { verdict: source }) => {
-                let selection = merge_selection(&verdict, source);
-                let verdict = match selection {
-                    MergeSelection::SourceWithheld | MergeSelection::SourceRestrictions => {
-                        source.clone()
-                    }
-                    MergeSelection::RequestedOnly
-                    | MergeSelection::RequestedIncomplete
-                    | MergeSelection::SourceIncomplete
-                    | MergeSelection::RequestedWithheld
-                    | MergeSelection::RequestedRestrictions => verdict,
-                };
-                (Evaluation::Complete { verdict }, selection)
+        (
+            Evaluation::Complete {
+                verdict,
+                fail_open_defaults,
+            },
+            Some(source_id),
+        ) => {
+            let source = sources.get(&source_id);
+            let fail_open_defaults = fail_open_defaults
+                .union(source.map_or(Hydrators::empty(), Evaluation::fail_open_defaults));
+            match source {
+                Some(Evaluation::Complete {
+                    verdict: source, ..
+                }) => {
+                    let selection = merge_selection(&verdict, source);
+                    let verdict = match selection {
+                        MergeSelection::SourceWithheld | MergeSelection::SourceRestrictions => {
+                            source.clone()
+                        }
+                        MergeSelection::RequestedOnly
+                        | MergeSelection::RequestedIncomplete
+                        | MergeSelection::SourceIncomplete
+                        | MergeSelection::RequestedWithheld
+                        | MergeSelection::RequestedRestrictions => verdict,
+                    };
+                    (
+                        Evaluation::Complete {
+                            verdict,
+                            fail_open_defaults,
+                        },
+                        selection,
+                    )
+                }
+                Some(
+                    Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_),
+                )
+                | None => (
+                    Evaluation::Partial {
+                        verdict,
+                        fail_open_defaults,
+                    },
+                    MergeSelection::SourceIncomplete,
+                ),
             }
-            Some(Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_))
-            | None => (
-                Evaluation::Partial {
-                    verdict,
-                    fail_open_defaults: Hydrators::empty(),
-                },
-                MergeSelection::SourceIncomplete,
-            ),
-        },
+        }
         (evaluation, _) => {
             let selection = requested_selection(&evaluation);
             (evaluation, selection)
@@ -264,7 +285,7 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeDirection, Graph};
     use crate::hydration::plan::Source;
     use crate::hydration::sources::{control, suspended, InMemorySources};
-    use crate::hydration::Lookup;
+    use crate::hydration::{Hydrator, Lookup};
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
         MediaInterstitial, MediaRestriction, NsfwFeature, RawCandidate, SafetyLabelType,
@@ -334,24 +355,12 @@ mod tests {
             let retweet = FilterOutcome {
                 tweet_id: TweetId(1),
                 source_tweet_id: Some(TweetId(5)),
-                evaluation: Evaluation::Complete {
-                    verdict: retweet.clone(),
-                },
+                evaluation: Evaluation::complete(retweet.clone()),
                 safety_labels: None,
             };
-            let sources = HashMap::from([(
-                TweetId(5),
-                Evaluation::Complete {
-                    verdict: source.clone(),
-                },
-            )]);
+            let sources = HashMap::from([(TweetId(5), Evaluation::complete(source.clone()))]);
             let (outcome, _) = merge_source(retweet, &sources);
-            assert_eq!(
-                outcome.evaluation,
-                Evaluation::Complete {
-                    verdict: merged.clone()
-                }
-            );
+            assert_eq!(outcome.evaluation, Evaluation::complete(merged.clone()));
         }
     }
 
@@ -382,10 +391,8 @@ mod tests {
                 .tweet_features(6, features(false, media(true, true)))
                 .tweet_features(7, features(false, media(true, false))),
         );
-        let blurred = Evaluation::Complete {
-            verdict: legacy_interstitial("nsfw_account/legacy_interstitial"),
-        };
-        let allowed = Evaluation::Complete { verdict: allow() };
+        let blurred = Evaluation::complete(legacy_interstitial("nsfw_account/legacy_interstitial"));
+        let allowed = Evaluation::complete(allow());
         for tweet_ids in [&[4, 5, 6, 7][..], &[4, 5]] {
             let evaluations = scenario.evaluate(&requested(tweet_ids)).await.evaluations();
             assert_eq!(evaluations[0], blurred, "{tweet_ids:?}");
@@ -463,9 +470,7 @@ mod tests {
                     let evaluations = scenario.evaluate(&requested(tweet_ids)).await.evaluations();
                     assert_eq!(
                         evaluations[0],
-                        Evaluation::Complete {
-                            verdict: expected.clone()
-                        },
+                        Evaluation::complete(expected.clone()),
                         "{age:?} {cover} {tweet_ids:?}"
                     );
                 }
@@ -754,7 +759,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
 
     #[tokio::test(start_paused = true)]
     async fn a_source_failure_fails_only_its_retweets() {
-        use crate::hydration::HYDRATION_TIMEOUT;
+        use crate::hydration::{BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
         use Arm::{Complete, Partial};
         let rows = [
             (
@@ -804,7 +809,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
             (
                 "source reply-root select",
                 retweet_world(true).fail_edge(Graph::Blocks, 70),
-                [Complete, Complete, Complete, Partial],
+                [Complete; 4],
                 Duration::ZERO,
             ),
             (
@@ -812,14 +817,14 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
                 retweet_world(true)
                     .control(2, control(ConversationControlArm::Subscribers, 80, &[]))
                     .fail_edge(Graph::Follows, 80),
-                [Partial, Complete, Partial, Complete],
+                [Complete; 4],
                 Duration::ZERO,
             ),
             (
                 "timed-out source root select",
                 retweet_world(true).key_latency(Source::Flock, 80, HYDRATION_TIMEOUT * 2),
-                [Partial, Complete, Partial, Complete],
-                HYDRATION_TIMEOUT,
+                [Complete; 4],
+                BEST_EFFORT_HYDRATION_TIMEOUT,
             ),
             (
                 "timed-out source controls",
@@ -828,8 +833,14 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
                     5,
                     HYDRATION_TIMEOUT * 2,
                 ),
-                [Partial, Complete, Partial, Partial],
-                HYDRATION_TIMEOUT,
+                [Complete; 4],
+                BEST_EFFORT_HYDRATION_TIMEOUT,
+            ),
+            (
+                "source safety labels",
+                retweet_world(true).fail_key(Source::SafetyLabels, 6),
+                [Complete, Complete, Complete, Partial],
+                Duration::ZERO,
             ),
         ];
         for (name, world, expected, elapsed) in rows {
@@ -840,6 +851,26 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
             assert_eq!(t0.elapsed(), elapsed, "{name}");
             assert_eq!(arms(&evaluated.outcomes), expected, "{name}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retweet_whose_only_failure_is_best_effort_still_takes_its_sources_drop() {
+        use crate::rules::fixtures::dropped;
+        let world = || {
+            retweet_world(true)
+                .user(60, suspended())
+                .fail_edge(Graph::Follows, 40)
+        };
+        assert_eq!(
+            evaluate_tweets(world())
+                .evaluate(&requested(&[4]))
+                .await
+                .evaluations(),
+            [Evaluation::Complete {
+                verdict: dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+                fail_open_defaults: Hydrators::of(Hydrator::BlockedByAuthor),
+            }]
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -882,7 +913,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
     #[tokio::test]
     async fn a_retweet_resolves_only_when_its_shared_tweet_and_shared_author_answer() {
         use Answer::{Failed, Found, NotFound};
-        let judged = Evaluation::Complete { verdict: allow() };
+        let judged = Evaluation::complete(allow());
         let both = |expected: Evaluation| [expected.clone(), expected];
         let rows = [
             (Found, Found, Found, both(judged.clone())),
@@ -1002,24 +1033,29 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
 
     #[tokio::test(start_paused = true)]
     async fn a_requested_key_asked_by_a_source_batch_shares_its_fate() {
-        use Arm::{Complete, Partial};
         let ms = Duration::from_millis;
-        let world = || {
-            retweet_world(true)
+        let world = |root_fails: bool| {
+            let world = retweet_world(true)
                 .control(5, control(ConversationControlArm::Community, 90, &[]))
-                .key_latency(Source::TesConversationControl, 2, ms(30))
+                .key_latency(Source::TesConversationControl, 2, ms(30));
+            if root_fails {
+                world.fail_edge(Graph::Follows, 90)
+            } else {
+                world
+            }
         };
-        for (world, expected) in [
-            (world(), [Complete; 4]),
-            (
-                world().fail_edge(Graph::Follows, 90),
-                [Partial, Partial, Partial, Complete],
-            ),
-        ] {
-            let scenario = evaluate_tweets(world);
+        for (root_fails, failed_ids) in [(false, &[][..]), (true, &[2])] {
+            let hydrated = evaluate_tweets(world(root_fails))
+                .hydrate(&requested(&[1, 2, 3, 4]))
+                .await;
+            assert_eq!(
+                hydrated.failed_ids,
+                failed_ids.iter().map(|&id| TweetId(id)).collect()
+            );
+            let scenario = evaluate_tweets(world(root_fails));
             let t0 = tokio::time::Instant::now();
             let evaluated = scenario.evaluate(&requested(&[1, 2, 3, 4])).await;
-            assert_eq!(arms(&evaluated.outcomes), expected);
+            assert_eq!(arms(&evaluated.outcomes), [Arm::Complete; 4]);
             let sources = scenario.sources();
             let root_selects: Vec<(Duration, Vec<u64>)> = sources
                 .selects()
@@ -1080,13 +1116,11 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         let evaluated = evaluate_tweets(sources).evaluate(&requested(&[1])).await;
         assert_eq!(
             evaluated.evaluations(),
-            [Evaluation::Complete {
-                verdict: noticed(
-                    true,
-                    false,
-                    "fosnr_abuse_insults_follower/soft_intervention/abuse"
-                ),
-            }]
+            [Evaluation::complete(noticed(
+                true,
+                false,
+                "fosnr_abuse_insults_follower/soft_intervention/abuse"
+            ))]
         );
     }
 
@@ -1108,12 +1142,10 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
             .client(limits)
             .evaluate(&requested(&[1, 5]))
             .await;
-        let removed_limit = Evaluation::Complete {
-            verdict: limited(
-                LimitedEngagementReason::CommunityTweetViewerRemoved,
-                "community_tweet_viewer_removed/limited_engagement",
-            ),
-        };
+        let removed_limit = Evaluation::complete(limited(
+            LimitedEngagementReason::CommunityTweetViewerRemoved,
+            "community_tweet_viewer_removed/limited_engagement",
+        ));
         assert_eq!(
             evaluated.evaluations(),
             [removed_limit.clone(), removed_limit]
@@ -1182,12 +1214,10 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         let evaluated = scenario.evaluate(&requested(&[5])).await;
         assert_eq!(
             evaluated.evaluations(),
-            [Evaluation::Complete {
-                verdict: limited(
-                    LimitedEngagementReason::RootAuthorBlockedViewer,
-                    "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-                ),
-            }]
+            [Evaluation::complete(limited(
+                LimitedEngagementReason::RootAuthorBlockedViewer,
+                "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+            ))]
         );
         let sources = scenario.sources();
         assert_eq!(

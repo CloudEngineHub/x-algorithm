@@ -132,6 +132,14 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
         rng=None,
         **kwargs,
     ):
+        _eval_bs = kwargs.get("eval_bs_per_device", 0)
+        try:
+            eval_bs_per_device = int(_eval_bs)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("eval_bs_per_device must be an integer") from None
+        if eval_bs_per_device != _eval_bs:
+            raise ValueError("eval_bs_per_device must be an integer")
+        _eval_bs = eval_bs_per_device
         self.metric_groups = kwargs.get("metric_groups", self.metric_groups)
         candidate_tower_forward_fn = kwargs.get("candidate_tower_forward_fn", None)
         assert candidate_tower_forward_fn is not None
@@ -285,7 +293,6 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                     _user_local, _cand_flat, self.query_head_weights
                 )
 
-                _eval_bs = kwargs.get("eval_bs_per_device", 0)
                 global_top_large_k_indices, _ = forward_fn(
                     jax_batch,
                     all_post_embeddings,
@@ -306,7 +313,6 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                     ]
 
                 global_top_large_k_ids = all_post_ids[global_top_large_k_indices]
-                _eval_bs = kwargs.get("eval_bs_per_device", 0)
                 _gr_n = global_top_large_k_ids.shape[0]
                 if _eval_bs > 0 and _gr_n < target_post_ids.shape[0]:
                     _local_experts = _gr_n // _eval_bs

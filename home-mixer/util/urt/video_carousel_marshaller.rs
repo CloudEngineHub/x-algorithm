@@ -4,6 +4,7 @@ use super::client_event::{
 use super::post_marshaller::{make_tweet, make_tweet_item, ENTRY_NAMESPACE_TWEET};
 use xai_home_mixer_proto::{ScoredPost, VideoCarouselModule};
 use xai_urt_thrift::entry::{TimelineEntry, TimelineEntryContent};
+use xai_urt_thrift::icon::HorizonIcon;
 use xai_urt_thrift::timeline_module::{
     ModuleDisplayType, ModuleHeader, ModuleHeaderDisplayType, ModuleItem, TimelineModule,
 };
@@ -85,7 +86,7 @@ fn header(text: Option<String>) -> Option<ModuleHeader> {
         sticky: Some(false),
         context: None,
         social_context: None,
-        icon: None,
+        icon: Some(HorizonIcon::VIDEO_PLAYER_LIST),
         button: None,
         custom_icon: None,
         display_type: Some(ModuleHeaderDisplayType::CLASSIC),
@@ -179,5 +180,6 @@ mod tests {
         assert_eq!(injection_type(module_event), Some("VideoCarousel"));
         let header = header(Some("Videos for you".to_string())).unwrap();
         assert!(header.landing_url.is_none());
+        assert_eq!(header.icon, Some(HorizonIcon::VIDEO_PLAYER_LIST));
     }
 }

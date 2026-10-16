@@ -513,6 +513,7 @@ def _batch_template(
             dist=None,
             rng=None,
             block_size=export_cfg._seqpack_block_size,
+            alloc=export_cfg._alloc,
         )
         layout = batch["packing_layout"]
         if packed_seq_len is not None and packed_seq_len != int(layout.segment_ids.shape[1]):
@@ -1477,6 +1478,9 @@ def _prep_spec(
         "num_post_int64_features": _leaf_width(hist, "int64_features", 2),
         "enable_stale_post": bool(
             getattr(getattr(features, "feature_prep", None), "enable_stale_post", False)
+        ),
+        "enable_stale_post_30d": bool(
+            getattr(getattr(features, "feature_prep", None), "enable_stale_post_30d", False)
         ),
         "history_seq_len": history_seq_len,
         "candidate_seq_len": candidate_seq_len,

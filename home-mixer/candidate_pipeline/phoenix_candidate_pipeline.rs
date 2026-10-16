@@ -20,6 +20,7 @@ use crate::candidate_hydrators::topic_feedback_context_hydrator::TopicFeedbackCo
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
 use crate::candidate_hydrators::vf_candidate_hydrator::VFCandidateHydrator;
 use crate::candidate_hydrators::video_aspect_ratio_hydrator::VideoAspectRatioHydrator;
+use crate::candidate_hydrators::video_embedding_hydrator::VideoEmbeddingHydrator;
 use crate::clients::author_brand_safety_client::{
     AuthorBrandSafetyClient, MockAuthorBrandSafetyClient,
 };
@@ -30,6 +31,10 @@ use crate::clients::engagement_signals_client::{
     EngagementSignalsClient, MockEngagementSignalsClient, ProdEngagementSignalsClient,
 };
 use crate::clients::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient};
+use crate::clients::post_v8_search_embedding_client::{
+    ManhattanPostV8SearchEmbeddingClient, NoopPostV8SearchEmbeddingClient,
+    PostV8SearchEmbeddingClient,
+};
 
 use crate::clients::impressed_posts_client::ImpressedPostsClient;
 use crate::clients::popular_authors_store_client::{
@@ -257,6 +262,7 @@ impl PhoenixCandidatePipeline {
         popular_authors: Arc<PopularAuthorsCache>,
         popular_posts: Arc<PopularPostsCache>,
         author_brand_safety_client: Arc<dyn AuthorBrandSafetyClient>,
+        post_v8_search_embedding_client: Arc<dyn PostV8SearchEmbeddingClient>,
     ) -> PhoenixCandidatePipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ScoringSequenceQueryHydrator::new(
@@ -492,6 +498,7 @@ impl PhoenixCandidatePipeline {
                 strato_client: strato_client.clone(),
             }),
             Box::new(VideoAspectRatioHydrator::new(tes_client.clone())),
+            Box::new(VideoEmbeddingHydrator::new(post_v8_search_embedding_client)),
             Box::new(AncestorVideoHydrator {
                 media_info_cache_client,
             }),
@@ -921,6 +928,17 @@ impl PhoenixCandidatePipeline {
                 }
             };
         let popular_posts = Arc::new(PopularPostsCache::new(popular_posts_store));
+        let post_v8_search_embedding_client: Arc<dyn PostV8SearchEmbeddingClient> =
+            match ManhattanPostV8SearchEmbeddingClient::new(datacenter).await {
+                Ok(client) => Arc::new(client),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "post v8_search Manhattan client unavailable; carousel embedding dedupe is a no-op"
+                    );
+                    Arc::new(NoopPostV8SearchEmbeddingClient)
+                }
+            };
 
         PhoenixCandidatePipeline::build_with_clients(
             user_action_aggregation_client,
@@ -966,6 +984,7 @@ impl PhoenixCandidatePipeline {
             popular_authors,
             popular_posts,
             author_brand_safety_client,
+            post_v8_search_embedding_client,
         )
         .await
     }
@@ -1074,6 +1093,7 @@ impl PhoenixCandidatePipeline {
                 InMemoryPopularPostsStore::default(),
             ))),
             Arc::new(MockAuthorBrandSafetyClient::default()) as Arc<dyn AuthorBrandSafetyClient>,
+            Arc::new(NoopPostV8SearchEmbeddingClient) as Arc<dyn PostV8SearchEmbeddingClient>,
         )
         .await
     }

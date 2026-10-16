@@ -199,6 +199,7 @@ static LOOKUP_FAILED: Verdict = Verdict::lookup_failed();
 pub enum Evaluation {
     Complete {
         verdict: Verdict,
+        fail_open_defaults: Hydrators,
     },
     Partial {
         verdict: Verdict,
@@ -211,7 +212,7 @@ pub enum Evaluation {
 impl Evaluation {
     pub fn verdict(&self) -> &Verdict {
         match self {
-            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
             Self::NotFound(_) => &NOT_FOUND,
             Self::Failed(_) => &LOOKUP_FAILED,
         }
@@ -219,18 +220,28 @@ impl Evaluation {
 
     pub fn into_verdict(self) -> Verdict {
         match self {
-            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,
             Self::NotFound(_) => Verdict::not_found(),
             Self::Failed(_) => Verdict::lookup_failed(),
         }
     }
 
+    pub const fn complete(verdict: Verdict) -> Self {
+        Self::Complete {
+            verdict,
+            fail_open_defaults: Hydrators::empty(),
+        }
+    }
+
     pub fn fail_open_defaults(&self) -> Hydrators {
         match self {
-            Self::Partial {
+            Self::Complete {
+                fail_open_defaults, ..
+            }
+            | Self::Partial {
                 fail_open_defaults, ..
             } => *fail_open_defaults,
-            Self::Complete { .. } | Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
+            Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
         }
     }
 }

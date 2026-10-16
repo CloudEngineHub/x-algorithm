@@ -2663,6 +2663,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             dist=None,
             rng=None,
             block_size=self._seqpack_block_size,
+            alloc=self._alloc,
         )
         if packed_seq_len is not None:
             layout = batch.get("packing_layout")
@@ -3094,6 +3095,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                     dist=None,
                     rng=None,
                     block_size=self._seqpack_block_size,
+                    alloc=self._alloc,
                 )
                 if self.using_fa4:
                     batch = self.add_block_sparse_layout(batch)
