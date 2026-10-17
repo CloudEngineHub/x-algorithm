@@ -62,7 +62,7 @@ pub trait SocialgraphClient: Send + Sync {
         &self,
         viewer_id: u64,
         queries: &[EdgeQuery],
-    ) -> Option<Vec<Option<HashSet<u64>>>>;
+    ) -> Result<Vec<Option<HashSet<u64>>>, tonic::Status>;
 }
 
 fn decode_packed_ids(packed: &[u8]) -> HashSet<u64> {
@@ -188,7 +188,7 @@ impl SocialgraphClient for ProdSocialgraphClient {
         &self,
         viewer_id: u64,
         queries: &[EdgeQuery],
-    ) -> Option<Vec<Option<HashSet<u64>>>> {
+    ) -> Result<Vec<Option<HashSet<u64>>>, tonic::Status> {
         let (request, counts) = select_request(viewer_id, queries);
         let mut request = tonic::Request::new(request);
         if let Some(metadata) = &self.metadata {
@@ -196,11 +196,11 @@ impl SocialgraphClient for ProdSocialgraphClient {
         }
         xai_x_rpc::apply_call_deadline(&mut request);
         match self.flock_client.inner().clone().select(request).await {
-            Ok(resp) => Some(decode_edge_sets(&counts, resp.into_inner().results)),
+            Ok(resp) => Ok(decode_edge_sets(&counts, resp.into_inner().results)),
             Err(e) => {
                 let graphs: Vec<Graph> = queries.iter().map(|query| query.graph).collect();
                 warn!(error = %e, ?graphs, "FlockDB select failed");
-                None
+                Err(e)
             }
         }
     }

@@ -1,6 +1,19 @@
-use crate::hydration::plan::{MissPolicy, Subject};
 use crate::hydration::sources::{exchange, Exchange, Scope, Visit};
 use strum::VariantArray;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MissPolicy {
+    Unresolves(Subject),
+    FailsNode,
+    ReadsNoEdge,
+    ReadsNotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Subject {
+    Tweet,
+    Author,
+}
 
 pub(super) struct Row {
     pub(super) miss: MissPolicy,
@@ -112,6 +125,10 @@ impl Source {
                 batch: Batch::Unrecorded,
             },
         }
+    }
+
+    pub(super) const fn miss_policy(self) -> MissPolicy {
+        self.row().miss
     }
 
     pub(super) const fn scope(self) -> Scope {

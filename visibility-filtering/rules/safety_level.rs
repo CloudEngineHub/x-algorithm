@@ -1,5 +1,5 @@
+use crate::metrics::Rpc;
 use crate::rules::levels;
-use crate::rules::metrics::Rpc;
 use crate::rules::rule_spec::rule::Rule;
 use strum::VariantArray;
 use xai_visibility_filtering_proto as vf_pb;

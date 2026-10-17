@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-15T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-10-16T16:00:32Z
 use xai_feature_switches::param;
 
 param!(
@@ -225,6 +225,24 @@ param!(
     AuthorIsTreatment,
     bool,
     "rust_home_mixer_author_is_treatment",
+    false
+);
+param!(
+    ViewerZeroFavCodivertIsTreatment,
+    bool,
+    "rust_home_mixer_viewer_zero_fav_codivert_is_treatment",
+    false
+);
+param!(
+    AuthorZeroFavCodivertIsTreatment,
+    bool,
+    "rust_home_mixer_author_zero_fav_codivert_is_treatment",
+    false
+);
+param!(
+    AuthorZeroFavCodivertIsControl,
+    bool,
+    "rust_home_mixer_author_zero_fav_codivert_is_control",
     false
 );
 
@@ -765,6 +783,12 @@ param!(
     true
 );
 param!(
+    EnablePostEngagers,
+    bool,
+    "rust_home_mixer_enable_post_engagers",
+    false
+);
+param!(
     EnableSemanticIdHydration,
     bool,
     "rust_home_mixer_enable_semantic_id_hydration",
@@ -1072,19 +1096,19 @@ param!(
     EnableVideoCarouselAuthorDedupe,
     bool,
     "rust_home_mixer_enable_video_carousel_author_dedupe",
-    false
+    true
 );
 param!(
     VideoCarouselSemanticIdDedupeLevels,
     u32,
     "rust_home_mixer_video_carousel_semantic_id_dedupe_levels",
-    0
+    3
 );
 param!(
     EnableVideoCarouselEmbeddingDedupe,
     bool,
     "rust_home_mixer_enable_video_carousel_embedding_dedupe",
-    false
+    true
 );
 param!(
     VideoCarouselEmbeddingDedupeThreshold,

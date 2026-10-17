@@ -7,6 +7,7 @@ use crate::params::{
 };
 use crate::util::egress::PredictionDispatch;
 use crate::util::phoenix_request::build_prediction_request;
+use crate::util::post_engagers::record_sent_post_engagers;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
     PhoenixCluster, PredictNextActions,
@@ -93,7 +94,9 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
         };
 
         let cluster = Self::resolve_cluster(query);
-        let request = build_prediction_request(query, candidates, product_surface);
+        let serve_time_ms = last_scored_at_ms.map_or(query.request_time_ms, |ms| ms as i64);
+        let request = build_prediction_request(query, candidates, product_surface, serve_time_ms);
+        record_sent_post_engagers(candidates, &request.candidate_sets[0].candidates);
 
         let predictions = self
             .dispatch

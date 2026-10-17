@@ -1,20 +1,21 @@
-use crate::config::{parse_env_flag, ENV_APP_ENV, ENV_REFERENCE};
-use crate::filter::FilterTweets;
+use crate::config::{ENV_APP_ENV, ENV_REFERENCE, parse_env_flag};
 use crate::filter_tweets::{Comparator, FinishComparison};
 use crate::params::ClientSwitches;
+use crate::post_evaluator::PostEvaluator;
 use crate::rules::SafetyLevel;
 use crate::server_deps::{init_client_with_retry, with_metadata};
-use crate::staging::reference_compare::{ReferenceCompareHarness, TweetVerdict};
 use std::env;
 use std::sync::Arc;
 use strum::VariantNames;
 use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
+use vf_service::{ReferenceCompareHarness, TweetVerdict};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
 
 pub(crate) mod tweetypie;
+pub(crate) mod vf_service;
 
 const ENV_DUAL_CALL_HARNESS_ENABLED: &str = "VF_DUAL_CALL_HARNESS_ENABLED";
 pub const ENV_IMAGE: &str = "VF_IMAGE";
@@ -26,12 +27,12 @@ pub const ENV_TWEETYPIE_CLIENT_ID: &str = "VF_TWEETYPIE_CLIENT_ID";
 #[strum(serialize_all = "snake_case")]
 pub enum Reference {
     None,
-    VfService,
-    Tweetypie,
+        VfService,
+        Tweetypie,
 }
 
 impl Reference {
-    pub fn resolve(
+        pub fn resolve(
         configured: Option<&str>,
         legacy_harness_flag: bool,
         app_env: Option<&str>,
@@ -72,7 +73,7 @@ fn reference() -> Reference {
 pub(crate) async fn build(
     datacenter: &str,
     init_deadline: Instant,
-    filter_tweets: &Arc<FilterTweets>,
+    post_evaluator: &Arc<PostEvaluator>,
     client_switches: &ClientSwitches,
     metadata: Option<&MetadataMap>,
 ) -> Option<Box<dyn Comparator>> {
@@ -84,7 +85,7 @@ pub(crate) async fn build(
         Reference::Tweetypie => Some(Box::new(
             tweetypie::build(
                 init_deadline,
-                filter_tweets,
+                post_evaluator,
                 client_switches.clone(),
                 metadata,
             )

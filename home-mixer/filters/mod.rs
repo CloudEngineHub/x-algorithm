@@ -30,3 +30,4 @@ pub mod vf_filter;
 pub mod video_carousel_filter;
 pub mod video_filter;
 pub mod viewer_muted_keyword_filter;
+pub mod zero_fav_codivert_filter;

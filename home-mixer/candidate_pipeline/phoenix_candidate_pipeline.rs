@@ -13,6 +13,7 @@ use crate::candidate_hydrators::language_code_hydrator::LanguageCodeHydrator;
 use crate::candidate_hydrators::media_info_hydrator::MediaInfoHydrator;
 use crate::candidate_hydrators::mutual_follow_jaccard_hydrator::MutualFollowJaccardHydrator;
 use crate::candidate_hydrators::phoenix_reply_ancestors_hydrator::PhoenixReplyAncestorsHydrator;
+use crate::candidate_hydrators::post_engagers_hydrator::PostEngagersHydrator;
 use crate::candidate_hydrators::quote_hydrator::QuoteHydrator;
 use crate::candidate_hydrators::semantic_id_hydrator::SemanticIdHydrator;
 use crate::candidate_hydrators::subscription_hydrator::SubscriptionHydrator;
@@ -39,6 +40,9 @@ use crate::clients::post_v8_search_embedding_client::{
 use crate::clients::impressed_posts_client::ImpressedPostsClient;
 use crate::clients::popular_authors_store_client::{
     ManhattanPopularAuthorsStore, ManhattanPopularPostsStore,
+};
+use crate::clients::post_engagers_client::{
+    MockPostEngagersClient, PostEngagersClient, ProdPostEngagersClient,
 };
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::sid_retrieval_client::{
@@ -79,6 +83,7 @@ use crate::filters::vf_filter::VFFilter;
 use crate::filters::video_carousel_filter::VideoCarouselFilter;
 use crate::filters::video_filter::VideoFilter;
 use crate::filters::viewer_muted_keyword_filter::ViewerMutedKeywordFilter;
+use crate::filters::zero_fav_codivert_filter::ZeroFavCodivertFilter;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params;
@@ -250,6 +255,7 @@ impl PhoenixCandidatePipeline {
         user_inferred_gender_grpc_client: Arc<dyn GenderPredictionGrpcClient>,
         impressed_posts_client: Arc<dyn ImpressedPostsClient>,
         engagement_counts_client: Arc<dyn EngagementCountsClient>,
+        post_engagers_client: Arc<dyn PostEngagersClient>,
         followed_grok_topics_client: Arc<dyn FollowedGrokTopicsStoreClient>,
         followed_starter_packs_client: Arc<dyn FollowedStarterPacksStoreClient>,
         user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient>,
@@ -402,11 +408,19 @@ impl PhoenixCandidatePipeline {
             }),
             Box::new(LanguageCodeHydrator::new(tes_client.clone()).await),
             Box::new(EngagementCountsHydrator::new(engagement_counts_client).await),
+            Box::new(PostEngagersHydrator::new(post_engagers_client)),
             Box::new(SemanticIdHydrator::new(sid_client)),
         ];
 
+        let author_rules = Arc::new(xai_feature_switches::AuthorRulesEvaluator::new(
+            feature_switches,
+        ));
+
         let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(DropDuplicatesFilter),
+            Box::new(ZeroFavCodivertFilter {
+                author_rules: author_rules.clone(),
+            }),
             Box::new(CoreDataHydrationFilter),
             Box::new(AgeFilter::new(Duration::from_secs(params::MAX_POST_AGE))),
             Box::new(SelfTweetFilter),
@@ -454,9 +468,6 @@ impl PhoenixCandidatePipeline {
                 enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
             },
         });
-        let author_rules = Arc::new(xai_feature_switches::AuthorRulesEvaluator::new(
-            feature_switches,
-        ));
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
 
         let xds_vm_ranker_client = super::build_vm_ranker_xds_client(vm_ranker_xds).await;
@@ -595,6 +606,7 @@ impl PhoenixCandidatePipeline {
             user_installed_apps_client,
             engagement_signals_client,
             engagement_counts_client_impl,
+            post_engagers_client,
             sid_client,
             thunder_capi_client,
             author_brand_safety_client,
@@ -894,6 +906,13 @@ impl PhoenixCandidatePipeline {
                         .expect("Failed to create EngagementCounts client"),
                 )
             },
+            async {
+                Arc::new(
+                    ProdPostEngagersClient::new(datacenter)
+                        .await
+                        .expect("Failed to create PostEngagers client"),
+                ) as Arc<dyn PostEngagersClient>
+            },
             async { Arc::new(ProdSidClient::new()) as Arc<dyn SidClient> },
             async {
                 match ProdThunderCapiClient::new(datacenter).await {
@@ -972,6 +991,7 @@ impl PhoenixCandidatePipeline {
             user_inferred_gender_grpc_client,
             impressed_posts_client,
             engagement_counts_client,
+            post_engagers_client,
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
@@ -1036,6 +1056,8 @@ impl PhoenixCandidatePipeline {
         let engagement_counts_client: Arc<dyn EngagementCountsClient> = Arc::new(
             crate::clients::engagement_counts_client::MockEngagementCountsClient::default(),
         );
+        let post_engagers_client: Arc<dyn PostEngagersClient> =
+            Arc::new(MockPostEngagersClient::default());
         let followed_grok_topics_client: Arc<dyn FollowedGrokTopicsStoreClient> =
             Arc::new(MockFollowedGrokTopicsStoreClient);
         let followed_starter_packs_client: Arc<dyn FollowedStarterPacksStoreClient> =
@@ -1077,6 +1099,7 @@ impl PhoenixCandidatePipeline {
             user_inferred_gender_grpc_client,
             impressed_posts_client,
             engagement_counts_client,
+            post_engagers_client,
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,

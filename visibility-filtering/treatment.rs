@@ -1,9 +1,9 @@
-use crate::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::models::{
     Decided, DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason,
     MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
     Withholding,
 };
+use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::params::{LimitedActionType, LimitedActionsPolicies};
 use crate::rules::SafetyLevel;
 use xai_visibility_filtering::models::FilteredReason;
@@ -556,8 +556,8 @@ pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Rpc;
     use crate::rules::fixtures::{appealed, limited_for, noticed};
-    use crate::rules::metrics::Rpc;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::graphql_results::resolve_blurred_image_interstitial;
     use xai_visibility_filtering::models::{KeywordMatch, SafetyResult};

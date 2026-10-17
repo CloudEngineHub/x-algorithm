@@ -369,7 +369,7 @@ async fn global_dry_run_records_only_like_the_other_two_sources() {
     }
 }
 
-const RULES_WITH_UNLISTED_CSE: &str = r#"
+const RULES_WITH_A_CSE_SUSPEND: &str = r#"
 for_entity: user
 rules:
   - id: user_in_allowlist
@@ -387,8 +387,8 @@ rules:
   - id: pagerank_skipped
     when: cred.is_high || cred.score >= 50.0
     then: { kind: skip, reason: pagerank_skipped }
-  - id: act_unlisted_cse
-    when: '"unlisted_cse_label" in score.labels'
+  - id: act_cse_label
+    when: '"cse_label" in score.labels'
     then: { kind: act_suspend_user, perm: true, policy: "Cse" }
   - id: terminal
     when: "true"
@@ -396,43 +396,37 @@ rules:
 "#;
 
 #[tokio::test]
-async fn a_cse_action_found_by_the_rules_locks_a_live_record() {
+async fn a_cse_action_chosen_by_the_rules_leaves_a_live_page_setting_acting() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let b = bed_with(
-        vec![live("UnlistedHead", None, vec![SUSPEND])],
+        vec![live("SomeHead", None, vec![SUSPEND])],
         on_config(false, None),
-        RULES_WITH_UNLISTED_CSE,
+        RULES_WITH_A_CSE_SUSPEND,
     )
     .await;
     let t = b
-        .run(&message(
+        .run_fresh(&message(
             EntityType::User,
-            "UnlistedHead",
+            "SomeHead",
             "clf",
-            &["unlisted_cse_label"],
+            &["cse_label"],
             Account::Clean,
         ))
         .await;
-    assert_eq!(t.status, "dry_run");
-    assert!(t.ais.is_empty());
-    assert_eq!(t.tickets, 0);
+    assert_eq!(t.status, "success");
+    assert!(!t.ais.is_empty());
     let i = info(&t);
-    assert_eq!(i["action_control_forced_recording"], "cse_lock");
-    assert_eq!(i["dry_run_source"], "page");
-    assert_eq!(t.dedup_calls.len(), 2, "{:?}", t.dedup_calls);
-    assert!(
-        t.dedup_calls[1].starts_with("invalidate"),
-        "the claim taken before the lock is released, not written: {:?}",
-        t.dedup_calls
-    );
-    assert!(b.dedup.slots.lock().unwrap().is_empty(), "nothing held");
+    assert_eq!(i["matched_rule_id"], "page");
+    assert_eq!(i["rules_would_rule_id"], "act_cse_label");
+    assert_eq!(i["action_control_mode"], "live");
+    assert!(!i.contains_key("action_control_forced_recording"), "{i:?}");
 }
 
 #[tokio::test]
-async fn a_rules_eval_error_locks_a_live_record_to_recording() {
+async fn a_rules_eval_error_leaves_a_live_page_setting_acting() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let rules = RULES_WITH_UNLISTED_CSE.replace(
-        r#"'"unlisted_cse_label" in score.labels'"#,
+    let rules = RULES_WITH_A_CSE_SUSPEND.replace(
+        r#"'"cse_label" in score.labels'"#,
         r#"'int("not a number") == 1'"#,
     );
     let seen_calls = || {
@@ -446,18 +440,18 @@ async fn a_rules_eval_error_locks_a_live_record_to_recording() {
             .sum::<u64>()
     };
     let b = bed_with(
-        vec![live("UnlistedHead", None, vec![SUSPEND])],
+        vec![live("SomeHead", None, vec![SUSPEND])],
         on_config(false, None),
         &rules,
     )
     .await;
     let before = seen_calls();
     let t = b
-        .run(&message(
+        .run_fresh(&message(
             EntityType::User,
-            "UnlistedHead",
+            "SomeHead",
             "clf",
-            &["unlisted_cse_label"],
+            &["cse_label"],
             Account::Clean,
         ))
         .await;
@@ -466,19 +460,12 @@ async fn a_rules_eval_error_locks_a_live_record_to_recording() {
         before,
         "no seen row when the rules couldn't be evaluated"
     );
-    assert_eq!(t.status, "dry_run");
-    assert!(t.ais.is_empty());
-    assert_eq!(t.tickets, 0);
+    assert_eq!(t.status, "success");
+    assert!(!t.ais.is_empty());
     let i = info(&t);
-    assert_eq!(i["action_control_forced_recording"], "rules_eval_error");
-    assert_eq!(i["dry_run_source"], "page");
-    assert!(
-        t.dedup_calls
-            .last()
-            .is_some_and(|c| c.starts_with("invalidate")),
-        "{:?}",
-        t.dedup_calls
-    );
+    assert_eq!(i["matched_rule_id"], "page");
+    assert!(!i.contains_key("rules_would_rule_id"));
+    assert!(!i.contains_key("action_control_forced_recording"), "{i:?}");
 }
 
 #[tokio::test]
@@ -869,11 +856,6 @@ async fn move_to_page(
                 .into()
         } else if was.status == "dedup_skipped" && moved.status != "dedup_skipped" {
             "dedup class from the page's actions outranks the held entry (auto)".into()
-        } else if head == "NearDupEmbeddingCseMatch"
-            && moved.status == "dry_run"
-            && moved.ais.is_empty()
-        {
-            "CSE head: live record runs as recording only".into()
         } else if head == "IsDelayedSuspendSpam" && moved.ais.is_empty() {
             "factory head: live record runs as recording only".into()
         } else if was.status == "already_deactivated" {

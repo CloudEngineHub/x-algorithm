@@ -326,6 +326,27 @@ class MultiHeadAttention(hk.Module):
         attn = jnp.reshape(attn, (*leading_dims, -1))
         attn_output = attn
 
+        if self.config.attn_output_gate:
+            z = projection(
+                input_to_query,
+                head_size=self.config.key_size,
+                num_heads=num_q_heads,
+                with_bias=self.config.with_bias,
+                name=f"gate{self.name_suffix}",
+                pspec=qkv_weights_pspec,
+                lr_multiplier=lr_multiplier,
+            )
+            z = jnp.reshape(z, (z.shape[0], z.shape[1], -1))
+            z = checkpoint_name(z, "attn_gate")
+            if self.config.attn_output_gate_activation == "silu":
+                attn = attn * jax.nn.silu(z)
+            elif self.config.attn_output_gate_activation == "sigmoid":
+                attn = attn * jax.nn.sigmoid(z)
+            else:
+                raise NotImplementedError(
+                    f"Activation {self.config.attn_output_gate_activation} is not supported"
+                )
+
         attn = with_sharding_constraint_unless_manual(
             attn,
             self.sharding_context.sharding_specs(

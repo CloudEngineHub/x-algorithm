@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 2;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 3;
 pub const BAND_RECORD_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,6 +47,53 @@ impl ConfidenceLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LevelRow {
+    Low,
+    Mid,
+    High,
+    Missing,
+}
+
+impl LevelRow {
+    pub const ALL: [LevelRow; 4] = [
+        LevelRow::Low,
+        LevelRow::Mid,
+        LevelRow::High,
+        LevelRow::Missing,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LevelRow::Low => "low",
+            LevelRow::Mid => "mid",
+            LevelRow::High => "high",
+            LevelRow::Missing => "missing",
+        }
+    }
+
+        pub fn level(self) -> Option<ConfidenceLevel> {
+        match self {
+            LevelRow::Low => Some(ConfidenceLevel::Low),
+            LevelRow::Mid => Some(ConfidenceLevel::Mid),
+            LevelRow::High => Some(ConfidenceLevel::High),
+            LevelRow::Missing => None,
+        }
+    }
+}
+
+impl From<ConfidenceLevel> for LevelRow {
+    fn from(level: ConfidenceLevel) -> Self {
+        match level {
+            ConfidenceLevel::Low => LevelRow::Low,
+            ConfidenceLevel::Mid => LevelRow::Mid,
+            ConfidenceLevel::High => LevelRow::High,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -79,7 +126,7 @@ pub enum ControlMode {
         Rules,
             Recording,
         Live,
-                    ConfidenceDefaults,
+            Rows,
 }
 
 impl ControlMode {
@@ -88,7 +135,7 @@ impl ControlMode {
             ControlMode::Rules => "rules",
             ControlMode::Recording => "recording",
             ControlMode::Live => "live",
-            ControlMode::ConfidenceDefaults => "confidence_defaults",
+            ControlMode::Rows => "rows",
         }
     }
 }
@@ -181,23 +228,23 @@ impl PageAction {
         }
     }
 
-            pub fn confidence_defaults(entity: ControlEntity, level: ConfidenceLevel) -> Vec<PageAction> {
-        match (entity, level) {
-            (ControlEntity::User, ConfidenceLevel::Low) => vec![PageAction::LivenessCheck {}],
-            (ControlEntity::User, ConfidenceLevel::Mid) => vec![
+            pub fn suggested(entity: ControlEntity, row: LevelRow) -> Vec<PageAction> {
+        match (entity, row) {
+            (ControlEntity::User, LevelRow::Low) => vec![PageAction::LivenessCheck {}],
+            (ControlEntity::User, LevelRow::Mid) => vec![
                 PageAction::LivenessCheck {},
                 PageAction::SpamHighRecall {
                     lifetime: Lifetime::Days7,
                 },
             ],
-            (ControlEntity::User, ConfidenceLevel::High) => vec![PageAction::Suspend {}],
-            (ControlEntity::Post, ConfidenceLevel::Low) => vec![],
-            (ControlEntity::Post, ConfidenceLevel::Mid) => vec![PageAction::PostSpamHighRecall {
+            (ControlEntity::User, LevelRow::High) => vec![PageAction::Suspend {}],
+            (ControlEntity::Post, LevelRow::Mid) => vec![PageAction::PostSpamHighRecall {
                 lifetime: Lifetime::Days30,
             }],
-            (ControlEntity::Post, ConfidenceLevel::High) => vec![PageAction::PostSpamHighRecall {
+            (ControlEntity::Post, LevelRow::High) => vec![PageAction::PostSpamHighRecall {
                 lifetime: Lifetime::Permanent,
             }],
+            (ControlEntity::Post, LevelRow::Low) | (_, LevelRow::Missing) => vec![],
         }
     }
 
@@ -237,7 +284,7 @@ pub struct ActionControlRecord {
         #[serde(default)]
     pub write_nonce: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<ConfidenceLevel>,
+    pub confidence: Option<LevelRow>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<ConfidenceEvidence>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,10 +315,10 @@ impl ActionControlRecord {
         self.confidence.is_some()
             || self.evidence.is_some()
             || self.evidence_override.is_some()
-            || self.mode == ControlMode::ConfidenceDefaults
+            || self.mode == ControlMode::Rows
     }
 
-            pub fn schema_version(&self) -> u32 {
+                pub fn schema_version(&self) -> u32 {
         if self.uses_confidence() {
             ACTION_CONTROL_RECORD_VERSION
         } else {
@@ -339,11 +386,63 @@ pub struct ActionControlPutRequest {
         #[serde(default)]
     pub updated_by: Option<String>,
         #[serde(default)]
-    pub confidence: Option<ConfidenceLevel>,
+    pub confidence: Option<LevelRow>,
         #[serde(default)]
     pub evidence: Option<ConfidenceEvidence>,
         #[serde(default)]
     pub evidence_override: Option<EvidenceOverride>,
+            #[serde(default)]
+    pub rows: Option<RowsRequest>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RowsRequest {
+    #[serde(default)]
+    pub low: Option<RowSetting>,
+    #[serde(default)]
+    pub mid: Option<RowSetting>,
+    #[serde(default)]
+    pub high: Option<RowSetting>,
+    #[serde(default)]
+    pub missing: Option<RowSetting>,
+}
+
+impl RowsRequest {
+    pub fn get(&self, row: LevelRow) -> Option<&RowSetting> {
+        match row {
+            LevelRow::Low => self.low.as_ref(),
+            LevelRow::Mid => self.mid.as_ref(),
+            LevelRow::High => self.high.as_ref(),
+            LevelRow::Missing => self.missing.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RowSetting {
+        pub mode: ControlMode,
+    #[serde(default)]
+    pub actions: Vec<PageAction>,
+    #[serde(default)]
+    pub evidence: Option<ConfidenceEvidence>,
+    #[serde(default)]
+    pub evidence_override: Option<EvidenceOverride>,
+        #[serde(default)]
+    pub expected_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ActionControlSeenRow {
+    pub entity_type: ControlEntity,
+    pub head: String,
+        pub classifier: String,
+    pub row: LevelRow,
+    pub last_seen_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -355,8 +454,6 @@ pub struct ActionControlSeen {
     pub entity_type: ControlEntity,
         #[serde(default)]
     pub factory: bool,
-        #[serde(default)]
-    pub cse: bool,
     pub last_seen_ms: i64,
         #[serde(default)]
     pub rule_id: String,
@@ -396,7 +493,7 @@ pub struct AllowedActions {
     pub post: Vec<PageAction>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CseLists {
     pub heads: Vec<String>,
@@ -431,8 +528,11 @@ pub struct ActionControlListResponse {
     pub seen: Vec<ActionControlSeen>,
     #[serde(default)]
     pub seen_error: Option<String>,
+        #[serde(default)]
+    pub seen_rows: Vec<ActionControlSeenRow>,
     pub safety_checks: SafetyChecksByEntity,
     pub allowed_actions: AllowedActions,
+    #[serde(default)]
     pub cse: CseLists,
     #[serde(default)]
     pub confidence: Option<ConfidenceView>,
@@ -440,28 +540,19 @@ pub struct ActionControlListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct ConfidenceLevelView {
-    pub level: ConfidenceLevel,
-        pub floor: f64,
-    pub user_defaults: Vec<PageAction>,
-    pub post_defaults: Vec<PageAction>,
+pub struct RowView {
+    pub row: LevelRow,
+            pub floor: Option<f64>,
+        pub suggested_actions: AllowedActions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConfidenceView {
-    pub levels: Vec<ConfidenceLevelView>,
+    pub rows: Vec<RowView>,
         pub evidence_max_age_ms: i64,
-        pub label_map: Vec<LabelMapEntry>,
             #[serde(default)]
     pub config_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct LabelMapEntry {
-    pub pattern: String,
-    pub level: ConfidenceLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,7 +720,7 @@ mod tests {
         r.classifier = None;
         assert_eq!(r.scope(), "band");
         r.band = None;
-        r.confidence = Some(ConfidenceLevel::Mid);
+        r.confidence = Some(LevelRow::Mid);
         assert_eq!(r.scope(), "confidence");
         r.classifier = Some("c".into());
         assert_eq!(r.scope(), "classifier+confidence");
@@ -644,11 +735,35 @@ mod tests {
         assert!(!back.contains("confidence"), "{back}");
         assert!(!back.contains("evidence"), "{back}");
         let mut l = r.clone();
-        l.confidence = Some(ConfidenceLevel::High);
+        l.confidence = Some(LevelRow::High);
+        assert_eq!(
+            l.schema_version(),
+            3,
+            "a row is refused by images that read v: 2 level records"
+        );
+        l.confidence = Some(LevelRow::Missing);
         assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
         let mut d = r;
-        d.mode = ControlMode::ConfidenceDefaults;
+        d.mode = ControlMode::Rows;
         assert_eq!(d.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+    }
+
+    #[test]
+    fn a_retired_mode_or_an_unknown_row_does_not_parse() {
+        for bad in [
+            r#"{"v":2,"entity_type":"user","head":"H","mode":"confidence_defaults","version":1}"#,
+            r#"{"v":3,"entity_type":"user","head":"H","mode":"live","confidence":"very_high","version":1}"#,
+        ] {
+            assert!(
+                ActionControlRecord::parse_strict(bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+        let missing = r#"{"v":3,"entity_type":"user","head":"H","mode":"recording","confidence":"missing","version":1}"#;
+        let r = ActionControlRecord::parse_strict(missing.as_bytes()).unwrap();
+        assert_eq!(r.confidence, Some(LevelRow::Missing));
+        assert_eq!(LevelRow::Missing.level(), None);
+        assert_eq!(LevelRow::from(ConfidenceLevel::Mid), LevelRow::Mid);
     }
 
     #[test]
@@ -678,10 +793,11 @@ mod tests {
     }
 
     #[test]
-    fn default_table() {
-        use ConfidenceLevel::*;
-        let user = |l| PageAction::confidence_defaults(ControlEntity::User, l);
-        let post = |l| PageAction::confidence_defaults(ControlEntity::Post, l);
+    fn suggested_table() {
+        use LevelRow::*;
+        let user = |l| PageAction::suggested(ControlEntity::User, l);
+        let post = |l| PageAction::suggested(ControlEntity::Post, l);
+        assert!(user(Missing).is_empty() && post(Missing).is_empty());
         assert_eq!(user(Low), vec![PageAction::LivenessCheck {}]);
         assert_eq!(
             user(Mid),
@@ -694,7 +810,7 @@ mod tests {
         );
         assert_eq!(user(High), vec![PageAction::Suspend {}]);
         assert!(post(Low).is_empty());
-        for l in ConfidenceLevel::ALL {
+        for l in LevelRow::ALL {
             for (e, a) in [
                 (ControlEntity::User, user(l)),
                 (ControlEntity::Post, post(l)),

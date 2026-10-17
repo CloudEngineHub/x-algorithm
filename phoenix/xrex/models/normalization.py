@@ -110,14 +110,13 @@ class RMSNorm(hk.Module):
             )
             if self.pspec:
                 scale = with_sharding_constraint_unless_manual(scale, self.pspec)
-            scale = jnp.broadcast_to(scale.astype(jnp.float32), inputs.shape)
+            scale = scale.astype(jnp.float32)
             gain = 1.0 + scale if self.reparameterize else scale
         else:
             gain = 1.0
 
         inputs = inputs.astype(jnp.float32)
-        mean_squared = jnp.mean(jnp.square(inputs), axis=[-1], keepdims=True)
-        mean_squared = jnp.broadcast_to(mean_squared, inputs.shape)
+        mean_squared = jnp.mean(jnp.square(inputs), axis=-1, keepdims=True)
 
         normed_inputs = inputs * jax.lax.rsqrt(mean_squared + self.eps)
         outputs = gain * normed_inputs

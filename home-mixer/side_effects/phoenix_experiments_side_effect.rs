@@ -67,8 +67,17 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for PhoenixExperimentsSideEffec
 
         let user_id = input.query.user_id;
 
-        let base_request =
-            build_prediction_request(&input.query, &input.selected_candidates, product_surface);
+        let serve_time_ms = input
+            .selected_candidates
+            .iter()
+            .find_map(|c| c.last_scored_at_ms)
+            .map_or(request_time_ms, |ms| ms as i64);
+        let base_request = build_prediction_request(
+            &input.query,
+            &input.selected_candidates,
+            product_surface,
+            serve_time_ms,
+        );
 
         let futures = PhoenixCluster::VARIANTS
             .iter()

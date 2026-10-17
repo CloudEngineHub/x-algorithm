@@ -3,12 +3,14 @@ use crate::hydration::decode::author::{AuthorColumn, DecodedAuthor};
 use crate::hydration::decode::tweet::{PureCoreColumn, TweetRowColumn};
 use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::fallback_cache::{Column, FallbackCache, FallbackCaches};
+use crate::hydration::hydrator::Edge;
+use crate::hydration::inventory::Source;
 use crate::hydration::metrics::{
     self, record_batch_size, record_expanded_batch, record_flock_missing_keys,
     record_keyed_hydrator_request, record_request_country, record_viewer_country,
     record_viewer_not_age_verified, record_viewer_state,
 };
-use crate::hydration::plan::{Edge, Group, Source};
+use crate::hydration::plan::Group;
 use crate::hydration::sources::{Answered, Sources};
 use crate::hydration::store::{CallRequest, Landing, Store};
 use crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator};
@@ -450,10 +452,10 @@ mod tests {
         BEST_EFFORT_HYDRATION_TIMEOUT, Cause, HYDRATION_TIMEOUT, Hydrator, Hydrators, Lookup,
         Unresolved,
     };
+    use crate::metrics::Rpc;
     use crate::models::{
         ArticleLifecycle, ClientCapability, Evaluation, TweetId, Viewer, ViewerProfile,
     };
-    use crate::rules::metrics::Rpc;
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::{InRequestOrder, Scenario, raw};
     use std::cell::RefCell;

@@ -25,7 +25,7 @@ def with_sharding_constraint_unless_manual(x: T, shardings) -> T:
 
 
 def shard_map_unless_manual(
-    f: Callable[..., Any],
+    f: Callable[..., Any] | None = None,
     /,
     *,
     out_specs,
@@ -33,6 +33,11 @@ def shard_map_unless_manual(
     mesh: Mesh,
     check_vma: bool = True,
 ) -> Callable[..., Any]:
+    if f is None:
+        return lambda f: shard_map_unless_manual(
+            f, out_specs=out_specs, in_specs=in_specs, mesh=mesh, check_vma=check_vma
+        )
+
     context_mesh = jax.sharding.get_abstract_mesh()
     manual = {
         axis

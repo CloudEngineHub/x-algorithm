@@ -495,10 +495,11 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                         assert isinstance(metric, RecsysAccumulatedLossMetrics)
                         if sample_scores is None:
                             rng, init_rng = jax.random.split(rng)
+                            num_samples = 2**14 - 2**14 % data_sharding.num_devices
                             sample_indices = jax.random.choice(
                                 init_rng,
                                 all_post_embeddings.shape[0],
-                                shape=(2**14,),
+                                shape=(num_samples,),
                                 replace=False,
                             )
                             sample_embeddings = all_post_embeddings[sample_indices]

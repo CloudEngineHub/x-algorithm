@@ -47,6 +47,7 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             feed_survey,
             video_carousel,
         } = partition_feed_items(candidates);
+        let video_carousel = drop_carousel_if_who_to_follow_present(video_carousel, &wtf_modules);
 
         let input_post_count = posts.len();
         let input_ad_count = ads.len();
@@ -150,6 +151,13 @@ fn insert_video_carousel(
             item: Some(feed_item::Item::VideoCarousel(carousel)),
         },
     );
+}
+
+fn drop_carousel_if_who_to_follow_present(
+    video_carousel: Option<VideoCarouselModule>,
+    wtf_modules: &[WhoToFollowModule],
+) -> Option<VideoCarouselModule> {
+    video_carousel.filter(|_| wtf_modules.is_empty())
 }
 
 fn pin_push_to_home(blended: &mut Vec<FeedItem>, push_to_home: Option<PushToHomePost>) {
@@ -404,5 +412,16 @@ mod tests {
             ),
             "the pinned card must not sit below an organic post"
         );
+    }
+
+    #[test]
+    fn the_video_carousel_yields_to_who_to_follow() {
+        let carousel = || Some(VideoCarouselModule::default());
+        assert!(drop_carousel_if_who_to_follow_present(
+            carousel(),
+            &[WhoToFollowModule::default()]
+        )
+        .is_none());
+        assert!(drop_carousel_if_who_to_follow_present(carousel(), &[]).is_some());
     }
 }

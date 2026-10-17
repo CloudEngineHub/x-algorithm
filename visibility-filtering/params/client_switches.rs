@@ -1,7 +1,7 @@
 use super::limited_actions_policy::REASON_FIELD;
 use super::LimitedActionsPolicies;
-use crate::limited_actions_copy::LimitedActionsCopy;
 use crate::models::{ClientCapability, LimitedEngagementReason, VerifyBlurSupport};
+use crate::params::limited_actions_copy::LimitedActionsCopy;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use strum::VariantArray;

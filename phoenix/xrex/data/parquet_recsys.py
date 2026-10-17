@@ -43,6 +43,7 @@ from xrex.data.parquet_recsys_metadata import (
 from xrex.data.parquet_recsys_metadata import (
     resolve_time_range as _resolve_time_range,
 )
+from xrex.data.recsys import id_list_features as id_lists
 from xrex.data.recsys import reply_features
 from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
@@ -147,6 +148,26 @@ def load_global_ids_from_parquet_file(
     return post_ids, author_ids, post_creation_datetimes, post_sids
 
 
+class _IdListSourceCounter:
+    def __init__(self, every: int = 1000):
+        self._every: int = every
+        self._counts: dict[str, int] = {"sidecar": 0, "native": 0, "none": 0}
+        self._seen: set[str] = set()
+
+    def note(self, fname: str, source: str) -> None:
+        self._counts[source] += 1
+        total = sum(self._counts.values())
+        if source not in self._seen:
+            self._seen.add(source)
+            rank_logger.info(f"id-list features: first file with source={source}: {fname}")
+        if total % self._every == 0:
+            rank_logger.info(f"id-list features: sources after {total} files: {self._counts}")
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return dict(self._counts)
+
+
 class LazyRecordBatchIterator:
     def __init__(
         self,
@@ -155,6 +176,10 @@ class LazyRecordBatchIterator:
         fname: str,
         conversion_delay_columns: list[str] | None = None,
         include_action_delay_columns: bool = False,
+        id_list_sidecar_root: str | None = None,
+        id_list_prefer_sidecar: bool = True,
+        id_list_sidecar_strict: bool = False,
+        id_list_sources: _IdListSourceCounter | None = None,
     ):
         self.pf: pq.ParquetFile = pf
         self.iter: Iterator[pa.RecordBatch] | None = None
@@ -165,6 +190,12 @@ class LazyRecordBatchIterator:
         self.conversion_delay_columns: list[str] | None = conversion_delay_columns
         self.include_action_delay_columns: bool = include_action_delay_columns
         self._sidecar_delays: dict[str, np.ndarray] | None = None
+        self.id_list_sidecar_root: str | None = id_list_sidecar_root
+        self.id_list_prefer_sidecar: bool = id_list_prefer_sidecar
+        self.id_list_sidecar_strict: bool = id_list_sidecar_strict
+        self._id_list_sources: _IdListSourceCounter | None = id_list_sources
+        self._id_list_sidecar: pa.Array | None = None
+        self._id_list_source: str | None = None
         self._row_pos: int = 0
 
     def seek(self):
@@ -187,6 +218,22 @@ class LazyRecordBatchIterator:
                         f"batch file has {self.num_rows}"
                     )
 
+        if self.id_list_sidecar_root is not None:
+            has_native = id_lists.COLUMN in arrow_schema.names
+            sidecar = id_lists.sidecar_path_for(self.fname, self.id_list_sidecar_root)
+            has_sidecar = os.path.exists(sidecar)
+            if self.id_list_sidecar_strict and not has_sidecar:
+                raise FileNotFoundError(f"id-list sidecar missing for {self.fname}: {sidecar}")
+            if has_sidecar and (self.id_list_prefer_sidecar or not has_native):
+                self._id_list_sidecar = id_lists.canonical_column(
+                    id_lists.load_sidecar_column(sidecar, expected_rows=self.num_rows)
+                )
+                self._id_list_source = "sidecar"
+            else:
+                self._id_list_source = "native" if has_native else "none"
+            if self._id_list_sources is not None:
+                self._id_list_sources.note(self.fname, self._id_list_source)
+
         cnt = 0
         while cnt < self.rows_to_skip:
             skipped = next(self.iter)
@@ -208,6 +255,17 @@ class LazyRecordBatchIterator:
                 for name, mat in self._sidecar_delays.items()
             }
             batch = conversion_labels.attach_delays(batch, window)
+        if self._id_list_source == "sidecar":
+            assert self._id_list_sidecar is not None
+            batch = id_lists.set_column(
+                batch, self._id_list_sidecar.slice(self._row_pos, batch.num_rows)
+            )
+        elif self._id_list_source == "native":
+            batch = id_lists.set_column(
+                batch, id_lists.canonical_column(batch.column(id_lists.COLUMN))
+            )
+        elif self._id_list_source == "none":
+            batch = id_lists.set_column(batch, id_lists.null_column(batch.num_rows))
         self._row_pos += batch.num_rows
         return batch
 
@@ -698,9 +756,16 @@ class InterleavingRecordBatchProvider:
         shuffle_mode: ShuffleMode | str = ShuffleMode.NONE,
         block_shuffle_block_time_slices: int = 0,
         block_shuffle_order_per_shard: bool = False,
+        id_list_sidecar_root: str | None = None,
+        id_list_prefer_sidecar: bool = True,
+        id_list_sidecar_strict: bool = False,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
+        self._id_list_sidecar_root = id_list_sidecar_root
+        self._id_list_prefer_sidecar = id_list_prefer_sidecar
+        self._id_list_sidecar_strict = id_list_sidecar_strict
+        self._id_list_sources = _IdListSourceCounter() if id_list_sidecar_root is not None else None
         if metadata_path is None and index_path is None:
             raise ValueError("Either metadata_path or index_path must be provided")
 
@@ -1030,6 +1095,10 @@ class InterleavingRecordBatchProvider:
                     path,
                     self._conversion_delay_columns,
                     self._include_action_delay_columns,
+                    id_list_sidecar_root=self._id_list_sidecar_root,
+                    id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                    id_list_sidecar_strict=self._id_list_sidecar_strict,
+                    id_list_sources=self._id_list_sources,
                 )
             except Exception as e:
                 if "No such file or directory" in str(e):
@@ -1156,6 +1225,10 @@ class InterleavingRecordBatchProvider:
                 path,
                 self._conversion_delay_columns,
                 self._include_action_delay_columns,
+                id_list_sidecar_root=self._id_list_sidecar_root,
+                id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                id_list_sidecar_strict=self._id_list_sidecar_strict,
+                id_list_sources=self._id_list_sources,
             )
         except Exception as e:
             if "No such file or directory" in str(e):
@@ -1469,6 +1542,10 @@ class InterleavingRecordBatchProvider:
                             file_path,
                             self._conversion_delay_columns,
                             self._include_action_delay_columns,
+                            id_list_sidecar_root=self._id_list_sidecar_root,
+                            id_list_prefer_sidecar=self._id_list_prefer_sidecar,
+                            id_list_sidecar_strict=self._id_list_sidecar_strict,
+                            id_list_sources=self._id_list_sources,
                         )
                         batch = holder.read()
                         return holder, batch
@@ -1657,6 +1734,11 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
     }
     if (cp := batch_unpadded.get("candidate_positions")) is not None:
         padded["candidate_positions"] = pad_array(cp)
+    if (il := batch_unpadded.get("user_id_list_hashes")) is not None and (
+        ilm := batch_unpadded.get("user_id_list_mask")
+    ) is not None:
+        padded["user_id_list_hashes"] = pad_array(il)
+        padded["user_id_list_mask"] = pad_array(ilm)
 
     extras = cast(dict[str, np.ndarray], batch_unpadded)
     padded_dict = cast(dict[str, np.ndarray], padded)
@@ -1723,6 +1805,15 @@ class PhoenixDataset(Dataset):
     conversion_label_types: tuple[str, ...] = ()
     fold_conversion_actions_into_multihot: bool = True
     emit_conversion_label_keys: bool = False
+
+    id_list_features: str = ""
+    id_list_sidecar_root: str | None = None
+    id_list_prefer_sidecar: bool = True
+    id_list_sidecar_strict: bool = False
+
+    @property
+    def id_list_specs(self) -> tuple[id_lists.IdListFeatureSpec, ...]:
+        return id_lists.parse_specs(self.id_list_features)
 
     @property
     def multimodal_embedding_dim(self) -> int:
@@ -2018,6 +2109,21 @@ class PhoenixDataset(Dataset):
                     conversion_delay_columns = [conversion_labels.DELAY_COLUMN] + [
                         conversion_labels.type_delay_column(t) for t in self.conversion_label_types
                     ]
+                id_list_specs = self.id_list_specs or None
+                if id_list_specs:
+                    rank_logger.info(
+                        f"id-list features: {[f'{x.name}:{x.k}' for x in id_list_specs]} "
+                        f"(sidecar root {self.id_list_sidecar_root!r}, "
+                        f"prefer sidecar {self.id_list_prefer_sidecar}, "
+                        f"strict {self.id_list_sidecar_strict})"
+                    )
+                if self.id_list_sidecar_root is not None and not os.path.isdir(
+                    self.id_list_sidecar_root
+                ):
+                    raise FileNotFoundError(
+                        f"id_list_sidecar_root does not exist: {self.id_list_sidecar_root!r}"
+                    )
+                id_list_fill_logged = False
 
                 min_timestamp_ms: int | None = None
                 max_timestamp_ms: int | None = None
@@ -2048,6 +2154,9 @@ class PhoenixDataset(Dataset):
                         conversion_delay_columns=conversion_delay_columns,
                         include_action_delay_columns=self.use_conversion_labels
                         and self.fold_conversion_actions_into_multihot,
+                        id_list_sidecar_root=self.id_list_sidecar_root,
+                        id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                        id_list_sidecar_strict=self.id_list_sidecar_strict,
                         shuffle_window_time_slices=shuffle_window,
                         shuffle_in_memory_buffer_rows=shuffle_buffer,
                         shuffle_seed=self.shuffle_seed,
@@ -2081,6 +2190,9 @@ class PhoenixDataset(Dataset):
                         conversion_delay_columns=conversion_delay_columns,
                         include_action_delay_columns=self.use_conversion_labels
                         and self.fold_conversion_actions_into_multihot,
+                        id_list_sidecar_root=self.id_list_sidecar_root,
+                        id_list_prefer_sidecar=self.id_list_prefer_sidecar,
+                        id_list_sidecar_strict=self.id_list_sidecar_strict,
                     )
                 self._rb_provider = rb_provider
                 data_iter = self._rb_provider.get_record_batches()
@@ -2149,6 +2261,7 @@ class PhoenixDataset(Dataset):
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
+                        id_list_specs=id_list_specs,
                         alloc=self._alloc,
                     )
 
@@ -2173,6 +2286,18 @@ class PhoenixDataset(Dataset):
                                     delays, self.conversion_label_window_ms
                                 )
                             )
+
+                    if (
+                        id_list_specs
+                        and not id_list_fill_logged
+                        and (id_list_mask := batch.get("user_id_list_mask")) is not None
+                    ):
+                        id_list_fill_logged = True
+                        rates = id_lists.fill_rates(id_list_mask, id_list_specs)
+                        rank_logger.info(
+                            "id-list features: rows with >=1 id in the first batch: "
+                            + ", ".join(f"{n}={r:.3f}" for n, r in rates.items())
+                        )
 
                     if record_batch.num_rows < batch_size:
                         rank_logger.warning(
@@ -2278,6 +2403,11 @@ class PhoenixDataset(Dataset):
             batch_shape["candidate_positions"] = jax.ShapeDtypeStruct(
                 candidate_seq["impr_ts"].shape, np.int32
             )
+        if (il := example_data.get("user_id_list_hashes")) is not None and (
+            ilm := example_data.get("user_id_list_mask")
+        ) is not None:
+            batch_shape["user_id_list_hashes"] = jax.ShapeDtypeStruct(il.shape, il.dtype)
+            batch_shape["user_id_list_mask"] = jax.ShapeDtypeStruct(ilm.shape, ilm.dtype)
 
         return batch_shape
 
@@ -2409,6 +2539,11 @@ class PhoenixDataset(Dataset):
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
             sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
+        if specs := self.id_list_specs:
+            ids, batch["user_id_list_mask"] = id_lists.empty_arrays(batch_size, specs)
+            batch["user_id_list_hashes"] = id_lists.hash_id_lists(
+                ids, specs, self.hash_table.get_item_hash, self.hash_table.get_author_hash
+            )
         return batch
 
     def get_latest_datetime(self, time_ms_seq) -> datetime:

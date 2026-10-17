@@ -6,7 +6,6 @@ use crate::clients::trusted_friends_client::TrustedFriendsClient;
 use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
-use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
 use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
 use crate::hydration::community_source::CommunitySource;
@@ -14,10 +13,11 @@ use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Backends, ProdSources};
 use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
-use crate::limited_actions_copy::LimitedActionsCopy;
+use crate::metrics::Rpc;
 use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
+use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
-use crate::rules::metrics::Rpc;
+use crate::post_evaluator::{PostBatch, PostEvaluations, PostEvaluator};
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
@@ -117,7 +117,7 @@ where
 
 pub(crate) struct ServerDeps {
     pub(crate) init_deadline: tokio::time::Instant,
-    pub(crate) filter_tweets: Arc<FilterTweets>,
+    pub(crate) post_evaluator: Arc<PostEvaluator>,
     pub(crate) client_switches: ClientSwitches,
     limited_actions_copy: LimitedActionsCopy,
     safety_label_source: Arc<SafetyLabelSource>,
@@ -221,13 +221,13 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
     } = serving(datacenter, metadata, CacheWarming::AsConfigured).await;
     let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
     let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
-    let filter_tweets = Arc::new(FilterTweets::new(
+    let post_evaluator = Arc::new(PostEvaluator::new(
         Arc::new(sources),
         rule_engine,
         Arc::new(fallback_caches),
     ));
 
-    warm_filter_tweets(&filter_tweets).await;
+    warm_post_evaluator(&post_evaluator).await;
 
     info!(
         hydrator_count = 5,
@@ -240,7 +240,7 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
 
     ServerDeps {
         init_deadline,
-        filter_tweets,
+        post_evaluator,
         client_switches,
         limited_actions_copy,
         safety_label_source,
@@ -255,11 +255,11 @@ impl ServerDeps {
     pub(crate) fn into_server(self, comparator: Option<Box<dyn Comparator>>) -> VFServer {
         VFServer::from_endpoints(
             EvaluateTweetsEndpoint::new(
-                Arc::clone(&self.filter_tweets),
+                Arc::clone(&self.post_evaluator),
                 self.client_switches,
                 self.limited_actions_copy,
             ),
-            FilterTweetsEndpoint::new(self.filter_tweets, comparator),
+            FilterTweetsEndpoint::new(self.post_evaluator, comparator),
             GetSafetyLabelsEndpoint::new(self.safety_label_source),
         )
     }
@@ -579,8 +579,8 @@ const WARM_FILTER_TWEETS_CONSECUTIVE: u32 = 3;
 const WARM_FILTER_TWEETS_DEADLINE: Duration = Duration::from_secs(20);
 const WARM_FILTER_TWEETS_SLEEP: Duration = Duration::from_millis(500);
 
-fn warm_filter_tweets_request() -> FilterRequest {
-    FilterRequest {
+fn warm_filter_tweets_request() -> PostBatch {
+    PostBatch {
         viewer_id: None,
         country_code: None,
         client_capability: ClientCapability::default(),
@@ -593,7 +593,7 @@ fn warm_filter_tweets_request() -> FilterRequest {
     }
 }
 
-fn filter_tweets_response_is_warm(response: &FilterResponse) -> bool {
+fn filter_tweets_response_is_warm(response: &PostEvaluations) -> bool {
     response
         .outcomes
         .iter()
@@ -606,13 +606,13 @@ fn filter_tweets_response_is_warm(response: &FilterResponse) -> bool {
         })
 }
 
-async fn warm_filter_tweets(filter_tweets: &FilterTweets) {
+async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
     let start = Instant::now();
     let mut attempts = 0u32;
     let mut consecutive_warm = 0u32;
     while start.elapsed() < WARM_FILTER_TWEETS_DEADLINE {
         attempts += 1;
-        let response = filter_tweets.run(warm_filter_tweets_request()).await;
+        let response = post_evaluator.run(warm_filter_tweets_request()).await;
         if filter_tweets_response_is_warm(&response) {
             consecutive_warm += 1;
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {

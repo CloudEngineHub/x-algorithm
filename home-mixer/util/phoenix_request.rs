@@ -1,6 +1,7 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate, RetrievalSource};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{PhoenixExperimentOverrides, RerankerHeadTag};
+use crate::util::post_engagers::set_post_engagers;
 use rustc_hash::{FxHashMap, FxHashSet};
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::TOP_LOG_PROBS_NUM;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
@@ -158,21 +159,27 @@ fn candidate_to_tweet_info(
     c: &PostCandidate,
     query: &ScoredPostsQuery,
     followed_ids: &FxHashSet<u64>,
+    serve_time_ms: i64,
 ) -> xai_recsys_proto::TweetInfo {
     let is_followed = followed_ids.contains(&c.get_original_author_id())
         || c.get_original_author_id() == query.user_id;
-    c.as_tweet_info(is_followed)
+    let mut tweet_info = c.as_tweet_info(is_followed);
+    if let Some(record) = &c.post_engagers {
+        set_post_engagers(&mut tweet_info, record, query.user_id, serve_time_ms);
+    }
+    tweet_info
 }
 
 pub fn build_tweet_infos(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
+    serve_time_ms: i64,
 ) -> Vec<xai_recsys_proto::TweetInfo> {
     let followed_ids = followed_user_ids(query);
     candidates
         .iter()
         .take(PHOENIX_CLIENT_MAX_CANDIDATES)
-        .map(|c| candidate_to_tweet_info(c, query, &followed_ids))
+        .map(|c| candidate_to_tweet_info(c, query, &followed_ids, serve_time_ms))
         .collect()
 }
 
@@ -215,9 +222,10 @@ pub fn build_prediction_request(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
     product_surface: ProductSurface,
+    serve_time_ms: i64,
 ) -> PredictNextActionsRequest {
     let mut request = build_request_without_sequence_and_candidates(query, product_surface);
-    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates);
+    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates, serve_time_ms);
     let mut sequence = query.scoring_sequence.clone().unwrap_or_default();
     sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);
     request.sequences = vec![sequence];
@@ -236,7 +244,8 @@ pub fn build_immersive_prediction_request(
     request.candidate_sets[0].candidates = candidates
         .iter()
         .map(|candidate| {
-            let tweet_info = candidate_to_tweet_info(candidate, query, &followed_ids);
+            let tweet_info =
+                candidate_to_tweet_info(candidate, query, &followed_ids, query.request_time_ms);
             TweetInfo {
                 first_video_duration_ms: tweet_info.min_video_duration_ms,
                 ..tweet_info

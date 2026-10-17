@@ -12,8 +12,16 @@ impl RecordingReceiver {
         *self.counters.lock().unwrap().get(key).unwrap_or(&0)
     }
 
-    pub(crate) fn vm_observations(&self, key: &str) -> u64 {
-        *self.vm_observations.lock().unwrap().get(key).unwrap_or(&0)
+    pub(crate) fn series(&self) -> Vec<String> {
+        let counters = self.counters.lock().unwrap();
+        let observations = self.vm_observations.lock().unwrap();
+        let mut series: Vec<String> = counters
+            .keys()
+            .map(|key| format!("incr {key}"))
+            .chain(observations.keys().map(|key| format!("observe_vm {key}")))
+            .collect();
+        series.sort();
+        series
     }
 }
 

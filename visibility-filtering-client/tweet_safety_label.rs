@@ -1,12 +1,11 @@
-use crate::discovery::{VfChannel, VfChannelError, VfChannelParams, VfDiscovery, build_vf_channel};
+use crate::discovery::{build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery};
+use crate::metrics::{ClientRpc, RequestMetrics};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::codec::CompressionEncoding;
-use tonic::{Status, async_trait};
+use tonic::{async_trait, Status};
 use tracing::warn;
 use xai_safety_label_store::types::SafetyLabelMap;
-use xai_stats_receiver::global_stats_receiver;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
@@ -59,57 +58,6 @@ impl VfServiceClient {
             Self::Wily(c) => c.get_safety_labels(request).await,
             Self::Xds(c) => c.get_safety_labels(request).await,
         }
-    }
-}
-
-enum RequestStatus {
-    Completed,
-    Degraded,
-    Cancelled,
-}
-
-struct RequestMetricsGuard {
-    start: Instant,
-    receiver: Option<Arc<dyn xai_stats_receiver::StatsReceiverExt>>,
-    result: RequestStatus,
-}
-
-impl RequestMetricsGuard {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-            receiver: global_stats_receiver(),
-            result: RequestStatus::Cancelled,
-        }
-    }
-
-        fn mark_completed(&mut self, failed_ids: usize) {
-        self.result = if failed_ids > 0 {
-            RequestStatus::Degraded
-        } else {
-            RequestStatus::Completed
-        };
-    }
-}
-
-impl Drop for RequestMetricsGuard {
-    fn drop(&mut self) {
-        let Some(sr) = &self.receiver else {
-            return;
-        };
-
-        let result = match self.result {
-            RequestStatus::Completed => "completed",
-            RequestStatus::Degraded => "degraded",
-            RequestStatus::Cancelled => "cancelled",
-        };
-
-        sr.incr("vf_client_get_safety_labels", &[("requests", result)], 1);
-        sr.observe_vm(
-            LATENCY_VM_METRIC,
-            &[],
-            self.start.elapsed().as_secs_f64() * 1000.0,
-        );
     }
 }
 
@@ -244,7 +192,7 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
         }
 
         let timeout = self.timeout;
-        let mut request_metrics = RequestMetricsGuard::new();
+        let mut request_metrics = RequestMetrics::start(ClientRpc::GetSafetyLabels);
 
         let futures: Vec<_> = tweet_ids
             .chunks(self.max_batch_size)
@@ -287,34 +235,11 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
                 Ok(batch) => {
                     labels.extend(batch.labels);
                     failures.extend(batch.failures);
-                    if let Some(sr) = global_stats_receiver() {
-                        sr.observe_vm(
-                            BATCH_LATENCY_VM_METRIC,
-                            &[("result", "success")],
-                            batch_elapsed.as_secs_f64() * 1000.0,
-                        );
-                    }
+                    request_metrics.batch(batch_elapsed, None);
                 }
                 Err(status) => {
                     warn!(batch = i, %status, "get_safety_labels batch failed");
-                    let error_type = match status.code() {
-                        tonic::Code::DeadlineExceeded => "deadline_exceeded",
-                        tonic::Code::Cancelled => "cancelled",
-                        tonic::Code::Unavailable => "unavailable",
-                        _ => "other",
-                    };
-                    if let Some(sr) = global_stats_receiver() {
-                        sr.incr(
-                            "vf_client_get_safety_labels_batch_error",
-                            &[("code", error_type)],
-                            1,
-                        );
-                        sr.observe_vm(
-                            BATCH_LATENCY_VM_METRIC,
-                            &[("result", "error")],
-                            batch_elapsed.as_secs_f64() * 1000.0,
-                        );
-                    }
+                    request_metrics.batch(batch_elapsed, Some(status.code()));
                     let start = i * self.max_batch_size;
                     let end = usize::min(start + self.max_batch_size, tweet_ids.len());
                     for id in &tweet_ids[start..end] {
@@ -324,17 +249,7 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
             }
         }
 
-        if !failures.is_empty()
-            && let Some(sr) = global_stats_receiver()
-        {
-            sr.incr(
-                "vf_client_get_safety_labels_failed_ids",
-                &[],
-                failures.len() as u64,
-            );
-        }
-
-        request_metrics.mark_completed(failures.len());
+        request_metrics.answered(failures.len());
         Ok(SafetyLabelsBatch { labels, failures })
     }
 }
@@ -357,7 +272,6 @@ impl TweetSafetyLabelClient for MockTweetSafetyLabelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::RecordingReceiver;
     use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -637,25 +551,5 @@ mod tests {
             ])
         );
         handle.abort();
-    }
-
-    fn request_guard_with(receiver: Arc<RecordingReceiver>) -> RequestMetricsGuard {
-        RequestMetricsGuard {
-            start: Instant::now(),
-            receiver: Some(receiver),
-            result: RequestStatus::Cancelled,
-        }
-    }
-
-    #[test]
-    fn request_guard_counts_completed_degraded_or_cancelled() {
-        let sr = Arc::new(RecordingReceiver::default());
-        request_guard_with(sr.clone()).mark_completed(0);
-        request_guard_with(sr.clone()).mark_completed(2);
-        drop(request_guard_with(sr.clone()));
-        for status in ["completed", "degraded", "cancelled"] {
-            let key = format!("vf_client_get_safety_labels|requests={status}");
-            assert_eq!(sr.counter(&key), 1, "{key}");
-        }
     }
 }

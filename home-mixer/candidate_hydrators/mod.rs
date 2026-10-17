@@ -15,6 +15,7 @@ pub mod language_code_hydrator;
 pub mod media_info_hydrator;
 pub mod mutual_follow_jaccard_hydrator;
 pub mod phoenix_reply_ancestors_hydrator;
+pub mod post_engagers_hydrator;
 pub mod quote_hydrator;
 pub mod quoted_post_text_hydrator;
 pub mod semantic_id_hydrator;

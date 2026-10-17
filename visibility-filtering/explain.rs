@@ -1,4 +1,5 @@
 pub use crate::hydration::{Hydrator, Hydrators, Lookup};
+pub use crate::metrics::Rpc;
 pub use crate::models::viewer::Client;
 pub use crate::models::{
     AuthorLabel, ClientCapability, Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement,
@@ -8,7 +9,6 @@ pub use crate::models::{
 pub use crate::params::{CountryList, LimitedActionType};
 pub use crate::post_card::{Author, CardMedia, CardMediaKind, PostCard};
 pub use crate::retweet::MergeSelection;
-pub use crate::rules::metrics::Rpc;
 pub use crate::rules::{
     ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
@@ -18,13 +18,13 @@ pub use crate::rules::{
 };
 
 use crate::evaluate_tweets::{Sends, evaluate_tweets_request};
-use crate::filter::{FilterRequest, FilterTweets, HydratedRequest};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Sources, test_users_metadata};
 use crate::hydration::{HydratedTweet, Hydration, request_context};
-use crate::limited_actions_copy::LimitedActionsCopy;
 use crate::models::{PostCandidate, RawCandidate, Viewer};
+use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
+use crate::post_evaluator::{HydratedRequest, PostBatch, PostEvaluator};
 use crate::result_label::{Class, NONE, label, state_label};
 use crate::retweet;
 use crate::rules::RuleEngine;
@@ -39,7 +39,7 @@ use xai_x_thrift::tweet_service::TweetFieldsResultState;
 
 pub struct Explainer {
     sources: Arc<dyn Sources>,
-    filter_tweets: FilterTweets,
+    post_evaluator: PostEvaluator,
     client_switches: ClientSwitches,
     copy: LimitedActionsCopy,
 }
@@ -325,7 +325,7 @@ impl Explainer {
         let rule_engine = RuleEngine::with_country_lists(country_lists);
         Self {
             sources: Arc::clone(&sources),
-            filter_tweets: FilterTweets::new(sources, rule_engine, Arc::new(fallback_caches)),
+            post_evaluator: PostEvaluator::new(sources, rule_engine, Arc::new(fallback_caches)),
             client_switches,
             copy,
         }
@@ -358,7 +358,7 @@ impl Explainer {
         let (context, request) = match route.rpc {
             Rpc::FilterTweets => (
                 None,
-                FilterRequest {
+                PostBatch {
                     viewer_id,
                     country_code: ask.country.clone(),
                     client_capability: ClientCapability::default(),
@@ -384,7 +384,7 @@ impl Explainer {
         request_context(Instant::now(), None)
             .scope(async {
                 let (hydrated, outcomes, mut traced) =
-                    retweet::hydrate_and_trace(&self.filter_tweets, request).await;
+                    retweet::hydrate_and_trace(&self.post_evaluator, request).await;
                 let post = TweetId(ask.post);
                 let source_tweet_id = hydrated
                     .hydration()
@@ -560,10 +560,10 @@ mod tests {
     use crate::clients::socialgraph_client::Graph;
     use crate::evaluate_tweets::EvaluateTweetsEndpoint;
     use crate::hydration::HydratedTweet;
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources, control, suspended};
-    use crate::limited_actions_copy::tests::BUNDLE;
     use crate::models::{SafetyLabelType, TweetFeatures};
+    use crate::params::limited_actions_copy::tests::BUNDLE;
     use strum::VariantArray;
     use vf_pb::tweet_evaluation::Outcome;
     use xai_core_entities::entities::{
@@ -675,7 +675,7 @@ mod tests {
             ]
         );
         let mut hydrated_with = explainer
-            .filter_tweets
+            .post_evaluator
             .client_capabilities
             .lock()
             .unwrap()
@@ -823,7 +823,7 @@ mod tests {
 
     async fn evaluate_tweets(world: InMemorySources, tweet_id: u64) -> Vec<Outcome> {
         let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::new(world),
                 RuleEngine::for_tests(),
                 Arc::default(),
@@ -1377,7 +1377,7 @@ mod tests {
             request_author_id: None,
         }];
         let request = match route.rpc() {
-            Rpc::FilterTweets => FilterRequest {
+            Rpc::FilterTweets => PostBatch {
                 viewer_id: Some(VIEWER),
                 country_code: Some("us".to_owned()),
                 client_capability: ClientCapability::default(),
@@ -1393,10 +1393,10 @@ mod tests {
                 candidates,
             ),
         };
-        let filter_tweets =
-            FilterTweets::new(Arc::new(world), RuleEngine::for_tests(), Arc::default());
+        let post_evaluator =
+            PostEvaluator::new(Arc::new(world), RuleEngine::for_tests(), Arc::default());
         let (_, outcomes) = request_context(Instant::now(), None)
-            .scope(retweet::hydrate_and_evaluate(&filter_tweets, request))
+            .scope(retweet::hydrate_and_evaluate(&post_evaluator, request))
             .await;
         outcomes[0].evaluation.clone()
     }

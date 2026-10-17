@@ -1,14 +1,7 @@
-use std::cell::Cell;
-use std::time::{Duration, Instant};
-
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
 use super::types::{FailureKind, FallbackReason, LabelSource};
-use crate::rules::metrics::{DeadlineOutcome, RequestOutcome};
 
-const REQUESTS: &str = "safety_labels_lookup_requests";
-const LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
-const DEADLINE: &str = "safety_labels_lookup_deadline";
 const LOOKUP_TWEET_IDS: &str = "safety_labels_lookup_tweet_ids";
 const FAILURES: &str = "safety_labels_lookup_failures";
 const SOURCE_REQUESTS: &str = "safety_labels_source_requests";
@@ -55,43 +48,6 @@ pub(crate) enum BatchStage {
     Request,
     LocalMiss,
     ManhattanFallback,
-}
-
-pub(crate) struct RequestMetricsGuard {
-    grpc_timeout: Option<Duration>,
-    start: Instant,
-    outcome: Cell<RequestOutcome>,
-}
-
-impl RequestMetricsGuard {
-    pub(crate) fn new(grpc_timeout: Option<Duration>) -> Self {
-        incr(REQUESTS, &[("outcome", RequestOutcome::Started.into())], 1);
-        Self {
-            grpc_timeout,
-            start: Instant::now(),
-            outcome: Cell::new(RequestOutcome::Cancelled),
-        }
-    }
-
-    pub(crate) fn mark_success(&self) {
-        self.outcome.set(RequestOutcome::Success);
-    }
-
-    pub(crate) fn mark_failure(&self) {
-        self.outcome.set(RequestOutcome::Failure);
-    }
-}
-
-impl Drop for RequestMetricsGuard {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed();
-        let outcome = self.outcome.get();
-        incr(REQUESTS, &[("outcome", outcome.into())], 1);
-        observe_vm(LATENCY_MS, &[], elapsed.as_secs_f64() * 1000.0);
-        if let Some(deadline) = DeadlineOutcome::of(outcome, self.grpc_timeout, elapsed) {
-            incr(DEADLINE, &[("outcome", deadline.into())], 1);
-        }
-    }
 }
 
 pub(crate) fn record_lookup_tweet_ids(success: usize, failed: usize) {
@@ -192,8 +148,6 @@ mod tests {
         BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
     };
 
-    use super::{DEADLINE, LATENCY_MS};
-
     #[test]
     fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
@@ -201,8 +155,6 @@ mod tests {
         let path = if Path::new(cargo).exists() { cargo } else { ws };
         let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         for pin in [
-            format!("LOOKUP_LATENCY_VM_METRIC = \"{LATENCY_MS}\""),
-            format!("LOOKUP_DEADLINE_METRIC = \"{DEADLINE}\""),
             format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
             format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),
         ] {

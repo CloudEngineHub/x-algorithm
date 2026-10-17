@@ -1,8 +1,9 @@
 mod client_switches;
+pub(crate) mod limited_actions_copy;
 mod limited_actions_policy;
 
-use crate::limited_actions_copy::DriftCheck;
 use arc_swap::ArcSwap;
+use limited_actions_copy::DriftCheck;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

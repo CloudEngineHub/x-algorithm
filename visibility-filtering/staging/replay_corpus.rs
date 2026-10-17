@@ -1,8 +1,8 @@
-use crate::filter::{FilterRequest, FilterTweets};
 use crate::hydration::request_context;
 use crate::hydration::sources::Id;
 use crate::models::ClientCapability;
 use crate::models::viewer::Client;
+use crate::post_evaluator::{PostBatch, PostEvaluator};
 use crate::result_label::Label;
 use crate::retweet;
 use crate::staging::recording::Recording;
@@ -104,13 +104,10 @@ impl Fixtures {
     }
 }
 
-pub(crate) async fn evaluate(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
-) -> Vec<Evaluated> {
+pub(crate) async fn evaluate(post_evaluator: &PostEvaluator, request: PostBatch) -> Vec<Evaluated> {
     let level = request.safety_level;
     let (_, outcomes) = request_context(Instant::now(), None)
-        .scope(retweet::hydrate_and_evaluate(filter_tweets, request))
+        .scope(retweet::hydrate_and_evaluate(post_evaluator, request))
         .await;
     outcomes
         .iter()
@@ -125,9 +122,9 @@ pub(crate) async fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Rpc;
     use crate::params::{CountryList, CountryLists};
     use crate::result_label::Class;
-    use crate::rules::metrics::Rpc;
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::raw;
     use crate::staging::recording::Replay;
@@ -314,12 +311,12 @@ mod tests {
             let country_lists =
                 CountryLists::from_codes(country_lists.as_ref().unwrap_or(&shared_lists))
                     .unwrap_or_else(|e| panic!("{}: {e}", case.id));
-            let filter_tweets = FilterTweets::new(
+            let post_evaluator = PostEvaluator::new(
                 Arc::<Replay>::clone(&sources),
                 RuleEngine::with_country_lists(Arc::new(country_lists)),
                 Arc::default(),
             );
-            let request = FilterRequest {
+            let request = PostBatch {
                 viewer_id: case.viewer_id,
                 country_code: case.country_code,
                 client_capability: case.client_capability,
@@ -327,7 +324,7 @@ mod tests {
                 candidates: case.tweets.iter().map(|t| raw(t.tweet_id, None)).collect(),
                 rpc: Rpc::EvaluateTweets,
             };
-            let evaluated = evaluate(&filter_tweets, request).await;
+            let evaluated = evaluate(&post_evaluator, request).await;
             let misses = sources.misses();
             if !misses.is_empty() {
                 failures.push(format!(

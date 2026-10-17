@@ -109,10 +109,10 @@ impl vf_pb::VisibilityFilteringService for VFServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::FilterTweets;
     use crate::hydration::sources::InMemorySources;
-    use crate::limited_actions_copy::LimitedActionsCopy;
+    use crate::params::limited_actions_copy::LimitedActionsCopy;
     use crate::params::ClientSwitches;
+    use crate::post_evaluator::PostEvaluator;
     use crate::rules::RuleEngine;
     use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
     use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
@@ -145,7 +145,7 @@ mod tests {
     }
 
     fn server(sources: InMemorySources) -> VFServer {
-        let filter_tweets = Arc::new(FilterTweets::new(
+        let post_evaluator = Arc::new(PostEvaluator::new(
             Arc::new(sources),
             RuleEngine::for_tests(),
             Arc::default(),
@@ -153,11 +153,11 @@ mod tests {
         let labels = Arc::new(NoLabels);
         VFServer::from_endpoints(
             EvaluateTweetsEndpoint::new(
-                Arc::clone(&filter_tweets),
+                Arc::clone(&post_evaluator),
                 ClientSwitches::for_tests(),
                 LimitedActionsCopy::from_json("[]"),
             ),
-            FilterTweetsEndpoint::new(filter_tweets, None),
+            FilterTweetsEndpoint::new(post_evaluator, None),
             GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
                 Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),
                 Some(1024),

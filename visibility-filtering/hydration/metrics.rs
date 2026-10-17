@@ -375,7 +375,7 @@ fn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: Histogram
 mod tests {
     use super::*;
     use crate::hydration::execute::Reply;
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::store::Store;
     use crate::models::{ClientCapability, RawCandidate, TweetFeatures, TweetId};
     use crate::rules::RuleEngine;

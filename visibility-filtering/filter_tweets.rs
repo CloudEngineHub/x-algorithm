@@ -1,7 +1,7 @@
-use crate::caller_identity::{self, Endpoint};
-use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
+use crate::caller_identity::Endpoint;
+use crate::metrics::{self as ft_metrics, Rpc};
 use crate::models::{ClientCapability, RawCandidate, TweetId};
-use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
-pub(crate) type FinishComparison = Box<dyn FnOnce(&[FilterOutcome]) + Send>;
+pub(crate) type FinishComparison = Box<dyn FnOnce(&[PostEvaluation]) + Send>;
 
 pub(crate) trait Comparator: Send + Sync {
     fn begin(
@@ -23,17 +23,17 @@ pub(crate) trait Comparator: Send + Sync {
 }
 
 pub struct FilterTweetsEndpoint {
-    filter_tweets: Arc<FilterTweets>,
+    post_evaluator: Arc<PostEvaluator>,
     comparator: Option<Box<dyn Comparator>>,
 }
 
 impl FilterTweetsEndpoint {
     pub(crate) fn new(
-        filter_tweets: Arc<FilterTweets>,
+        post_evaluator: Arc<PostEvaluator>,
         comparator: Option<Box<dyn Comparator>>,
     ) -> Self {
         Self {
-            filter_tweets,
+            post_evaluator,
             comparator,
         }
     }
@@ -43,9 +43,18 @@ impl FilterTweetsEndpoint {
         request: Request<vf_pb::VisibilityFilterRequest>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
         let entered = tokio::time::Instant::now();
-        let grpc_timeout = parse_grpc_timeout(request.metadata());
-        let request_metrics = RequestMetricsGuard::new(grpc_timeout);
-        let caller = caller_identity::record(Endpoint::FilterTweets, &request);
+        ft_metrics::observe_request(Endpoint::FilterTweets, request, |request, grpc_timeout| {
+            self.handle_inner(request, entered, grpc_timeout)
+        })
+        .await
+    }
+
+    async fn handle_inner(
+        &self,
+        request: Request<vf_pb::VisibilityFilterRequest>,
+        entered: tokio::time::Instant,
+        grpc_timeout: Option<Duration>,
+    ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
         let context = crate::hydration::request_context(entered, grpc_timeout);
         let req = request.into_inner();
         ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());
@@ -53,8 +62,6 @@ impl FilterTweetsEndpoint {
         ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
 
         let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {
-            request_metrics.mark_failure();
-            caller.mark_failure();
             return Err(Status::unimplemented("safety level has no Rust policy"));
         };
         let candidates: Vec<RawCandidate> = req
@@ -76,7 +83,7 @@ impl FilterTweetsEndpoint {
         });
 
         let response = context
-            .scope(self.filter_tweets.run(FilterRequest {
+            .scope(self.post_evaluator.run(PostBatch {
                 viewer_id,
                 country_code: req.country_code.filter(|code| !code.is_empty()),
                 client_capability: ClientCapability::default(),
@@ -117,8 +124,6 @@ impl FilterTweetsEndpoint {
             .map(to_visibility_result)
             .collect();
 
-        request_metrics.mark_success();
-        caller.mark_success();
         Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
     }
 }
@@ -146,7 +151,7 @@ pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
     Some(Duration::from_nanos(value.checked_mul(nanos_per_unit)?))
 }
 
-fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
+fn to_visibility_result(outcome: PostEvaluation) -> vf_pb::TweetVisibilityResult {
     let (action, filtered_reason) = treatment::proto_action(outcome.evaluation.into_verdict());
     vf_pb::TweetVisibilityResult {
         tweet_id: outcome.tweet_id.0,
@@ -159,7 +164,7 @@ fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::sources::InMemorySources;
     use crate::rules::RuleEngine;
     use std::sync::Mutex;
@@ -167,7 +172,7 @@ mod tests {
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let sources = Arc::new(InMemorySources::default());
         let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::<InMemorySources>::clone(&sources),
                 RuleEngine::for_tests(),
                 Arc::default(),
@@ -223,7 +228,7 @@ mod tests {
         let viewer_ids = ViewerIds::default();
         let seen = Arc::clone(&viewer_ids.0);
         let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
                 Arc::default(),
@@ -259,7 +264,7 @@ mod tests {
             _tweet_ids: Vec<u64>,
         ) -> Option<FinishComparison> {
             let finished = Arc::clone(&self.0);
-            Some(Box::new(move |outcomes: &[FilterOutcome]| {
+            Some(Box::new(move |outcomes: &[PostEvaluation]| {
                 finished
                     .lock()
                     .unwrap()
@@ -273,7 +278,7 @@ mod tests {
         let comparator = FinishedResults::default();
         let finished = Arc::clone(&comparator.0);
         let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
                 Arc::default(),

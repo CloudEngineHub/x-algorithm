@@ -3,16 +3,16 @@ use super::{
 };
 use crate::config::ENV_REFERENCE;
 use crate::evaluate_tweets::{evaluate_tweets_request, Sends};
-use crate::filter::{FilterOutcome, FilterTweets};
 use crate::hydration::{request_context, HYDRATION_TIMEOUT};
 use crate::models::viewer::Client;
 use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
+use crate::post_evaluator::{PostEvaluation, PostEvaluator};
 use crate::result_label::{failed, label, state_label, Class, Failure, Label, NONE};
 use crate::retweet;
 use crate::rules::SafetyLevel;
 use crate::server_deps::init_client_with_retry;
-use crate::staging::reference_compare::resolve_build_sha;
+use crate::staging::reference::vf_service::resolve_build_sha;
 use crate::treatment;
 use anyhow::Context;
 use futures::future::join;
@@ -97,7 +97,7 @@ impl Bucket {
 
 pub(super) async fn build(
     init_deadline: Instant,
-    filter_tweets: &Arc<FilterTweets>,
+    post_evaluator: &Arc<PostEvaluator>,
     client_switches: ClientSwitches,
     metadata: Option<&MetadataMap>,
 ) -> Arc<TweetypieReference> {
@@ -105,7 +105,7 @@ pub(super) async fn build(
     warn!("reference comparator: tweetypie enabled");
     Arc::new(TweetypieReference {
         tweetypie,
-        filter_tweets: Arc::clone(filter_tweets),
+        post_evaluator: Arc::clone(post_evaluator),
         client_switches,
         permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         sampler: Mutex::default(),
@@ -169,7 +169,7 @@ fn required_env(name: &str) -> String {
 
 pub(super) struct TweetypieReference {
     tweetypie: StratoGrpc,
-    filter_tweets: Arc<FilterTweets>,
+    post_evaluator: Arc<PostEvaluator>,
     client_switches: ClientSwitches,
     permits: Arc<Semaphore>,
     sampler: Mutex<(u64, HashMap<Bucket, u32>)>,
@@ -183,7 +183,7 @@ impl TweetypieReference {
         viewer_id: Option<u64>,
         country_code: Option<String>,
         safety_level: SafetyLevel,
-        outcomes: &[FilterOutcome],
+        outcomes: &[PostEvaluation],
     ) {
         let Some(viewer_id) = viewer_id else {
             return;
@@ -243,7 +243,7 @@ impl TweetypieReference {
             candidates,
         );
         let rust = request_context(Instant::now(), None).scope(retweet::evaluate_merging_sources(
-            &self.filter_tweets,
+            &self.post_evaluator,
             request,
         ));
         let tp = timeout(
@@ -254,7 +254,7 @@ impl TweetypieReference {
         let Ok(tp) = tp else {
             return BatchOutcome::TweetypieTimeout;
         };
-        let vf: HashMap<TweetId, &FilterOutcome> = rust
+        let vf: HashMap<TweetId, &PostEvaluation> = rust
             .iter()
             .map(|outcome| (outcome.tweet_id, outcome))
             .collect();
@@ -353,14 +353,14 @@ struct Compared<'a> {
     viewer_id: u64,
     country_code: Option<&'a str>,
     tp: &'a TpResult,
-    vf: Option<&'a FilterOutcome>,
+    vf: Option<&'a PostEvaluation>,
 }
 
 impl Compared<'_> {
     fn bucket(&self) -> Bucket {
         let vf = match self.vf {
             None => label(Class::Missing, NONE),
-            Some(FilterOutcome {
+            Some(PostEvaluation {
                 evaluation:
                     Evaluation::Complete {
                         fail_open_defaults, ..
@@ -446,7 +446,7 @@ fn vf_status(evaluation: &Evaluation) -> &'static str {
     }
 }
 
-pub(crate) fn vf_label(outcome: &FilterOutcome, level: SafetyLevel) -> Label {
+pub(crate) fn vf_label(outcome: &PostEvaluation, level: SafetyLevel) -> Label {
     Sends::new(
         &outcome.evaluation,
         level,
@@ -478,8 +478,8 @@ mod tests {
 
     const GOLDEN_RECORD: &str = "scripts/tests/fixtures/tweetypie_reference_record.json";
 
-    fn outcome(verdict: Verdict) -> FilterOutcome {
-        FilterOutcome {
+    fn outcome(verdict: Verdict) -> PostEvaluation {
+        PostEvaluation {
             tweet_id: TweetId(1),
             source_tweet_id: None,
             evaluation: Evaluation::complete(verdict),
@@ -499,7 +499,7 @@ mod tests {
         (class.to_string(), reason.to_string())
     }
 
-    fn compared<'a>(tp: &'a TpResult, vf: Option<&'a FilterOutcome>) -> Compared<'a> {
+    fn compared<'a>(tp: &'a TpResult, vf: Option<&'a PostEvaluation>) -> Compared<'a> {
         Compared {
             tweet_id: TweetId(1),
             viewer_id: 2,
@@ -517,7 +517,7 @@ mod tests {
             result: None,
             strato_error: None,
         };
-        let vf = FilterOutcome {
+        let vf = PostEvaluation {
             evaluation: Evaluation::Complete {
                 verdict: shown(),
                 fail_open_defaults: Hydrators::of(Hydrator::Follows),
@@ -632,7 +632,7 @@ mod tests {
             result: None,
             strato_error: None,
         };
-        let deleted = FilterOutcome {
+        let deleted = PostEvaluation {
             evaluation: Evaluation::NotFound(Lookup::Tweet),
             ..shown
         };

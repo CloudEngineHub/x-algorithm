@@ -2,6 +2,7 @@ mod author_rules;
 #[cfg(test)]
 mod catalog;
 mod context;
+pub mod engine;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
@@ -9,8 +10,6 @@ mod golden_corpus;
 #[cfg(test)]
 mod legacy_table;
 mod levels;
-pub mod metrics;
-pub mod registry;
 mod rule_spec;
 mod safety_level;
 mod tweet_rules;
@@ -20,7 +19,7 @@ use crate::models::{PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
-pub use registry::{Effect, PolicyTrace, RowTrace, RuleEngine};
+pub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};
 pub(crate) use rule_spec::observed::NoTrace;
 pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
 pub use rule_spec::{

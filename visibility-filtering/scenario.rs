@@ -1,12 +1,12 @@
-use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
+use crate::metrics::{RetweetSources, Rpc};
 use crate::models::{
     ClientCapability, Evaluation, PostCandidate, RawCandidate, TweetId, ViewerFeatures,
 };
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::retweet::hydrate_and_evaluate;
-use crate::rules::metrics::{RetweetSources, Rpc};
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub(crate) struct InRequestOrder {
 }
 
 pub(crate) struct Evaluated {
-    pub(crate) outcomes: Vec<FilterOutcome>,
+    pub(crate) outcomes: Vec<PostEvaluation>,
     pub(crate) retweet_sources: RetweetSources,
 }
 
@@ -122,16 +122,16 @@ impl<S: Sources + 'static> Scenario<S> {
     ) -> Evaluated {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
-        let filter_tweets = FilterTweets::new(sources, rule_engine, caches);
-        let (hydrated, outcomes) = hydrate_and_evaluate(&filter_tweets, self.request(raw)).await;
+        let post_evaluator = PostEvaluator::new(sources, rule_engine, caches);
+        let (hydrated, outcomes) = hydrate_and_evaluate(&post_evaluator, self.request(raw)).await;
         Evaluated {
             outcomes,
             retweet_sources: hydrated.retweet_sources(),
         }
     }
 
-    fn request(&self, raw: &[RawCandidate]) -> FilterRequest {
-        FilterRequest {
+    fn request(&self, raw: &[RawCandidate]) -> PostBatch {
+        PostBatch {
             viewer_id: self.viewer_id,
             country_code: self.country_code.clone(),
             client_capability: self.client_capability,

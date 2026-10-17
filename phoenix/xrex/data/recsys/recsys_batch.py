@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy import typing as npt
 
-from xrex.data.recsys import reply_features
+from xrex.data.recsys import id_list_features, reply_features
 from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
 from xrex.data.recsys.ads_pixel_head_masking import build_head_eligible_mask
 from xrex.data.recsys.array_allocator import ArrayAllocator
@@ -246,6 +246,21 @@ def _bool_col_as_categorical(
     return typing.cast(npt.NDArray[np.int16], arr)
 
 
+def _read_embedding_seq(
+    col: pa.Array, batch_size: int, num_slots: int, dim: int, alloc: ArrayAllocator
+) -> npt.NDArray[np.float32]:
+    values = _nested_list_values(col).fill_null(0.0).to_numpy(zero_copy_only=False)
+    out = alloc.copy(values.reshape(batch_size, num_slots, dim), np.float32)
+    if pa.types.is_fixed_size_list(col.type):
+        out[~col.is_valid().to_numpy(zero_copy_only=False)] = 0.0
+        slots = _list_values(col)
+        if pa.types.is_fixed_size_list(slots.type):
+            out.reshape(batch_size * num_slots, dim)[
+                ~slots.is_valid().to_numpy(zero_copy_only=False)
+            ] = 0.0
+    return out
+
+
 class PostSeq(TypedDict):
     impr_ts: npt.NDArray[np.int32] | None
     actions: npt.NDArray[np.bool_] | None
@@ -385,6 +400,8 @@ class RecsysFeaturesBatch(TypedDict):
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
     sample_source: NotRequired[npt.NDArray[np.int8] | None]
     candidate_positions: NotRequired[npt.NDArray[np.int32] | None]
+    user_id_list_hashes: NotRequired[npt.NDArray[np.int32]]
+    user_id_list_mask: NotRequired[npt.NDArray[np.bool_]]
     packing_layout: NotRequired[SequencePackedLayout | None]
 
 
@@ -558,6 +575,7 @@ def from_record_batch(
     ads_head_masking: bool = False,
     ads_pixel_head_masking: bool = False,
     page_records: bool = False,
+    id_list_specs: typing.Sequence[id_list_features.IdListFeatureSpec] | None = None,
     *,
     alloc: ArrayAllocator,
 ) -> RecsysFeaturesBatch:
@@ -726,20 +744,14 @@ def from_record_batch(
                 f"offline embedding table dim {offline_embedding_table.dim} != "
                 f"{embedding_type} dim {embedding_dim}"
             )
-        elif col_name not in record_batch.schema.names:
-            raise ValueError(
-                f"Embedding column '{col_name}' (embedding_type={embedding_type}) "
-                f"not found in record batch. Available columns: {record_batch.schema.names}"
-            )
-        else:
+        elif col_name in record_batch.schema.names:
             try:
-                emb_col = record_batch.column(col_name)
-                flat_values = _nested_list_values(emb_col)
-                embedding_raw = alloc.copy(
-                    flat_values.to_numpy(zero_copy_only=False).reshape(
-                        batch_size, max_candidates_for_embeddings, embedding_dim
-                    ),
-                    np.float32,
+                embedding_raw = _read_embedding_seq(
+                    record_batch.column(col_name),
+                    batch_size,
+                    max_candidates_for_embeddings,
+                    embedding_dim,
+                    alloc,
                 )
             except Exception as e:
                 raise ValueError(f"Failed to extract {col_name}: {e}") from e
@@ -835,6 +847,23 @@ def from_record_batch(
         .reshape(batch_size, -1)
         .astype(np.bool_)
     )
+
+    user_id_lists: tuple[np.ndarray, np.ndarray] | None = None
+    if id_list_specs:
+        id_list_col = (
+            record_batch.column(id_list_features.COLUMN)
+            if id_list_features.COLUMN in record_batch.schema.names
+            else None
+        )
+        id_list_ids, id_list_mask = id_list_features.parse_id_lists(
+            id_list_col, id_list_specs, batch_size
+        )
+        user_id_lists = (
+            id_list_features.hash_id_lists(
+                id_list_ids, id_list_specs, hash_table.get_item_hash, hash_table.get_author_hash
+            ),
+            id_list_mask,
+        )
 
     hist_shape_2d = (batch_size, max_history_post_action_pairs)
     hist_shape_3d = (batch_size, max_history_post_action_pairs, output_vocab_size)
@@ -1366,6 +1395,8 @@ def from_record_batch(
     )
     if cand_positions_aligned is not None:
         batch["candidate_positions"] = cand_positions_aligned
+    if user_id_lists is not None:
+        batch["user_id_list_hashes"], batch["user_id_list_mask"] = user_id_lists
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
         if candidate_negative_filter is not None

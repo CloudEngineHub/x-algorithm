@@ -1,19 +1,21 @@
-use crate::filter::{FilterOutcome, FilterRequest, FilterTweets, HydratedRequest, PostObserver};
 use crate::hydration::Hydrators;
+use crate::metrics as ft_metrics;
+use crate::metrics::Rpc;
 use crate::models::{Decided, Evaluation, TweetId, Verdict, Withholding};
-use crate::rules::metrics as ft_metrics;
-use crate::rules::metrics::Rpc;
+use crate::post_evaluator::{
+    HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver,
+};
 use crate::rules::{NoTrace, PolicyTrace};
 use std::collections::{HashMap, HashSet};
 
 const RETWEET_SOURCES: &str = "evaluate_tweets_retweet_sources";
 
 pub(crate) async fn evaluate_merging_sources(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
-) -> Vec<FilterOutcome> {
-    let hydrated = filter_tweets.hydrate_with_retweet_sources(request).await;
-    without_selections(merge_sources(filter_tweets, &hydrated, &mut NoTrace))
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> Vec<PostEvaluation> {
+    let hydrated = post_evaluator.hydrate_with_retweet_sources(request).await;
+    without_selections(merge_sources(post_evaluator, &hydrated, &mut NoTrace))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,13 +36,13 @@ pub(crate) struct Traced {
 }
 
 pub(crate) async fn hydrate_and_trace(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
-) -> (HydratedRequest, Vec<FilterOutcome>, Traced) {
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> (HydratedRequest, Vec<PostEvaluation>, Traced) {
     let rpc = request.rpc;
     let mut traced = Traced::default();
     let (hydrated, selected) =
-        hydrate_and_select(filter_tweets, request, &mut traced.policies).await;
+        hydrate_and_select(post_evaluator, request, &mut traced.policies).await;
     let outcomes = selected
         .into_iter()
         .map(|(outcome, selection)| {
@@ -49,28 +51,28 @@ pub(crate) async fn hydrate_and_trace(
         })
         .collect();
     if rpc == Rpc::EvaluateTweets {
-        trace_unmerged_sources(filter_tweets, &hydrated, &mut traced);
+        trace_unmerged_sources(post_evaluator, &hydrated, &mut traced);
     }
     (hydrated, outcomes, traced)
 }
 
 pub(crate) async fn hydrate_and_evaluate(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
-) -> (HydratedRequest, Vec<FilterOutcome>) {
-    let (hydrated, selected) = hydrate_and_select(filter_tweets, request, &mut NoTrace).await;
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
+) -> (HydratedRequest, Vec<PostEvaluation>) {
+    let (hydrated, selected) = hydrate_and_select(post_evaluator, request, &mut NoTrace).await;
     (hydrated, without_selections(selected))
 }
 
 async fn hydrate_and_select<O: PostObserver>(
-    filter_tweets: &FilterTweets,
-    request: FilterRequest,
+    post_evaluator: &PostEvaluator,
+    request: PostBatch,
     observer: &mut O,
-) -> (HydratedRequest, Vec<(FilterOutcome, MergeSelection)>) {
+) -> (HydratedRequest, Vec<(PostEvaluation, MergeSelection)>) {
     match request.rpc {
         Rpc::FilterTweets => {
-            let hydrated = filter_tweets.hydrate(request).await;
-            let selected = filter_tweets
+            let hydrated = post_evaluator.hydrate(request).await;
+            let selected = post_evaluator
                 .evaluate_in_request_order(&hydrated, observer)
                 .into_iter()
                 .map(|outcome| (outcome, MergeSelection::RequestedOnly))
@@ -78,19 +80,19 @@ async fn hydrate_and_select<O: PostObserver>(
             (hydrated, selected)
         }
         Rpc::EvaluateTweets => {
-            let hydrated = filter_tweets.hydrate_with_retweet_sources(request).await;
-            let selected = merge_sources(filter_tweets, &hydrated, observer);
+            let hydrated = post_evaluator.hydrate_with_retweet_sources(request).await;
+            let selected = merge_sources(post_evaluator, &hydrated, observer);
             (hydrated, selected)
         }
     }
 }
 
-fn without_selections(selected: Vec<(FilterOutcome, MergeSelection)>) -> Vec<FilterOutcome> {
+fn without_selections(selected: Vec<(PostEvaluation, MergeSelection)>) -> Vec<PostEvaluation> {
     selected.into_iter().map(|(outcome, _)| outcome).collect()
 }
 
 fn trace_unmerged_sources(
-    filter_tweets: &FilterTweets,
+    post_evaluator: &PostEvaluator,
     hydrated: &HydratedRequest,
     traced: &mut Traced,
 ) {
@@ -106,18 +108,18 @@ fn trace_unmerged_sources(
         })
         .collect();
     if !unmerged.is_empty() {
-        filter_tweets.trace(hydrated, unmerged, &mut traced.policies);
+        post_evaluator.trace(hydrated, unmerged, &mut traced.policies);
     }
 }
 
 fn merge_sources<O: PostObserver>(
-    filter_tweets: &FilterTweets,
+    post_evaluator: &PostEvaluator,
     hydrated: &HydratedRequest,
     observer: &mut O,
-) -> Vec<(FilterOutcome, MergeSelection)> {
+) -> Vec<(PostEvaluation, MergeSelection)> {
     let (in_batch, fetched) = source_ids(hydrated);
     if in_batch.is_empty() && fetched.is_empty() {
-        return filter_tweets
+        return post_evaluator
             .evaluate_in_request_order(hydrated, observer)
             .into_iter()
             .map(|outcome| {
@@ -136,7 +138,7 @@ fn merge_sources<O: PostObserver>(
         &[("outcome", "fetched")],
         fetched.len() as u64,
     );
-    let mut outcomes = filter_tweets.evaluate(
+    let mut outcomes = post_evaluator.evaluate(
         hydrated,
         hydrated.requested_ids().chain(fetched.iter().copied()),
         |tweet_id| !fetched.contains(&tweet_id),
@@ -150,7 +152,7 @@ fn merge_sources<O: PostObserver>(
         let source = outcomes.remove(source_id)?;
         Some((source.tweet_id, source.evaluation))
     }));
-    let mut merged: Vec<(FilterOutcome, MergeSelection)> =
+    let mut merged: Vec<(PostEvaluation, MergeSelection)> =
         Vec::with_capacity(hydrated.requested_ids().len());
     for tweet_id in hydrated.requested_ids() {
         let selected = match outcomes.remove(&tweet_id) {
@@ -166,9 +168,9 @@ fn merge_sources<O: PostObserver>(
 }
 
 fn merge_source(
-    outcome: FilterOutcome,
+    outcome: PostEvaluation,
     sources: &HashMap<TweetId, Evaluation>,
-) -> (FilterOutcome, MergeSelection) {
+) -> (PostEvaluation, MergeSelection) {
     let (evaluation, selection) = match (outcome.evaluation, outcome.source_tweet_id) {
         (
             Evaluation::Complete {
@@ -221,7 +223,7 @@ fn merge_source(
         }
     };
     (
-        FilterOutcome {
+        PostEvaluation {
             evaluation,
             ..outcome
         },
@@ -283,16 +285,16 @@ fn merge_selection(retweet: &Verdict, source: &Verdict) -> MergeSelection {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup};
+    use crate::metrics::Rpc;
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
         MediaInterstitial, MediaRestriction, NsfwFeature, RawCandidate, SafetyLabelType,
         TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
-    use crate::rules::metrics::Rpc;
     use crate::rules::SafetyLevel;
     use crate::scenario::{raw, Scenario};
     use std::time::Duration;
@@ -352,7 +354,7 @@ mod tests {
             (&unrestricted, &noticed, &noticed),
             (&limited, &noticed, &limited),
         ] {
-            let retweet = FilterOutcome {
+            let retweet = PostEvaluation {
                 tweet_id: TweetId(1),
                 source_tweet_id: Some(TweetId(5)),
                 evaluation: Evaluation::complete(retweet.clone()),
@@ -678,7 +680,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         Failed(Lookup),
     }
 
-    fn arms(outcomes: &[FilterOutcome]) -> Vec<Arm> {
+    fn arms(outcomes: &[PostEvaluation]) -> Vec<Arm> {
         outcomes
             .iter()
             .map(|outcome| match outcome.evaluation {
@@ -1237,7 +1239,7 @@ Flock blocks-rev[30]"
 
     #[tokio::test]
     async fn each_request_kind_labels_its_phase_samples() {
-        use crate::rules::metrics::RetweetSources::{Fetched, InBatch, NoSource};
+        use crate::metrics::RetweetSources::{Fetched, InBatch, NoSource};
         let scenario = evaluate_tweets(retweet_world(true));
         for (tweet_ids, expected) in [
             (&[2][..], NoSource),

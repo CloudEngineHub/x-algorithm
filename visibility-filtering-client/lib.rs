@@ -2,6 +2,7 @@ mod discovery;
 pub mod evaluated;
 pub mod graphql_results;
 pub mod links;
+mod metrics;
 pub mod models;
 #[cfg(test)]
 mod test_support;

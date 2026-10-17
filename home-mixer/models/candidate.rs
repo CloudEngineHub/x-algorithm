@@ -2,9 +2,11 @@ use crate::models::brand_safety::BrandSafetyVerdict;
 use crate::models::content_features;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 pub use xai_candidate_pipeline::component_library::models::PhoenixScores;
 use xai_home_mixer_proto as pb;
+use xai_proto::engagement_counter::PostEngagers;
 use xai_recsys_proto::SAFETY_BIT_AUTHOR_NSFW;
 use xai_visibility_filtering::models as vf;
 
@@ -109,6 +111,8 @@ pub struct PostCandidate {
     pub grok_topics: Option<Vec<String>>,
     pub ai_trend_name: Option<String>,
     pub ai_trend_id: Option<String>,
+    #[serde(skip)]
+    pub post_engagers: Option<Arc<PostEngagers>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

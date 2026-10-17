@@ -125,6 +125,16 @@ message ConversionHistoryContext {
   repeated int32 per_candidate_account_hashes = 8;
 }
 
+message RecentSearchQueries {
+  repeated RecentSearchQuery queries = 1;
+}
+
+message RecentSearchQuery {
+  string query = 1;
+  int64 timestamp_ms = 2;
+  bytes embedding_bf16 = 3;
+}
+
 message PredictNextActionsRequest {
   repeated UserActionSequence sequences = 1;
 
@@ -1421,11 +1431,19 @@ message TweetInfo {
   ContentFeatures contentFeatures = 36;
   ContentFeatures quotedContentFeatures = 37;
   SearchLexicalMatch searchLexicalMatch = 38;
+  PostEngagerFeatures postEngagers = 39;
 }
 
 message SearchLexicalMatch {
   float matchedWordFraction = 1;
   bool exactPhrase = 2;
+}
+
+message PostEngagerFeatures {
+  repeated uint64 userIds = 1;
+  repeated uint32 actionBits = 2;
+  repeated uint32 ageSecs = 3;
+  uint32 numPositive = 4;
 }
 
 message ContentFeatures {

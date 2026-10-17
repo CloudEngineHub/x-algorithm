@@ -16,7 +16,7 @@ impl XService for StagingServer {
         let comparator = reference::build(
             &ctx.datacenter,
             deps.init_deadline,
-            &deps.filter_tweets,
+            &deps.post_evaluator,
             &deps.client_switches,
             ctx.config.as_ref(),
         )

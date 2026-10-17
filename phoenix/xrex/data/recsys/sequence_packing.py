@@ -402,7 +402,7 @@ def pack_batch(
         packed_history: PostSeq, packed_candidates: PostSeq, layout: SequencePackedLayout
     ) -> RecsysFeaturesBatch:
         D, B = num_devices_per_process, bs_per_device
-        return RecsysFeaturesBatch(
+        out = RecsysFeaturesBatch(
             user_hashes=batch["user_hashes"].reshape(D, B, -1),
             user_ip_hashes=batch["user_ip_hashes"].reshape(D, B, -1),
             history_seq=packed_history,
@@ -441,6 +441,12 @@ def pack_batch(
             ),
             packing_layout=layout,
         )
+        if (il := batch.get("user_id_list_hashes")) is not None and (
+            ilm := batch.get("user_id_list_mask")
+        ) is not None:
+            out["user_id_list_hashes"] = il.reshape(D, B, *il.shape[1:])
+            out["user_id_list_mask"] = ilm.reshape(D, B, *ilm.shape[1:])
+        return out
 
     history_post_hashes = batch["history_seq"]["post_hashes"]
     real_history_len = np.count_nonzero(history_post_hashes[:, :, 0], axis=1).reshape(

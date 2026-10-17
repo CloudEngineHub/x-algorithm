@@ -1,6 +1,5 @@
-use crate::caller_identity::{self, Endpoint};
-use crate::filter_tweets::parse_grpc_timeout;
-use crate::safety_label_source::metrics::{self, BatchStage, RequestMetricsGuard};
+use crate::caller_identity::Endpoint;
+use crate::safety_label_source::metrics::{self, BatchStage};
 use crate::safety_label_source::types::FailureKind;
 use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
@@ -25,20 +24,10 @@ impl GetSafetyLabelsEndpoint {
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
     ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
-        let caller = caller_identity::record(Endpoint::GetSafetyLabels, &request);
-        let request_metrics = RequestMetricsGuard::new(parse_grpc_timeout(request.metadata()));
-        match self.handle_inner(request).await {
-            Ok(response) => {
-                request_metrics.mark_success();
-                caller.mark_success();
-                Ok(response)
-            }
-            Err(status) => {
-                request_metrics.mark_failure();
-                caller.mark_failure();
-                Err(status)
-            }
-        }
+        crate::metrics::observe_request(Endpoint::GetSafetyLabels, request, |request, _| {
+            self.handle_inner(request)
+        })
+        .await
     }
 
     async fn handle_inner(

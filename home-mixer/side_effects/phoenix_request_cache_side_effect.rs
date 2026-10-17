@@ -6,6 +6,7 @@ use crate::params::{
 use crate::util::phoenix_request::{
     build_request_without_sequence_and_candidates, build_tweet_infos,
 };
+use crate::util::post_engagers::clear_post_engagers;
 use futures::future::join_all;
 use prost::Message;
 use std::sync::Arc;
@@ -91,7 +92,9 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for PhoenixRequestCacheSideEffe
         }
 
         let log_slate_context = query.params.get(LogSlateContext);
-        let mut tweet_infos = build_tweet_infos(query, &input.selected_candidates);
+        let mut tweet_infos =
+            build_tweet_infos(query, &input.selected_candidates, query.request_time_ms);
+        tweet_infos.iter_mut().for_each(clear_post_engagers);
         if log_slate_context {
             for (info, candidate) in tweet_infos.iter_mut().zip(input.selected_candidates.iter()) {
                 info.score_info = Some(candidate.as_score_info_no_prediction_scores());

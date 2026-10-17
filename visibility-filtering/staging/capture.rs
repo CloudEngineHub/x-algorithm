@@ -1,17 +1,17 @@
 use crate::config::ENV_APP_ENV;
 use crate::evaluate_tweets::evaluate_tweets_request;
-use crate::filter::FilterTweets;
 pub use crate::hydration::sources::test_users_metadata;
 use crate::models::viewer::Client;
 use crate::models::{RawCandidate, TweetId};
 use crate::params::{ClientSwitches, CountryList, CountryLists, SwitchFiles};
+use crate::post_evaluator::PostEvaluator;
 use crate::result_label::Class;
 use crate::rules::RuleEngine;
 use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, CacheWarming, prod_sources};
 use crate::staging::recording::{Recorder, Recording};
 use crate::staging::reference::ENV_IMAGE;
 use crate::staging::reference::tweetypie::{self, get_tweet_fields};
-use crate::staging::reference_compare::resolve_build_sha;
+use crate::staging::reference::vf_service::resolve_build_sha;
 use crate::staging::replay_corpus::{Case, Expected, Fixtures, evaluate};
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
@@ -90,7 +90,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
     let country_lists = Arc::new(CountryLists::starting_at_default());
     country_lists.refresh(&feature_switches);
     let client_switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(feature_switches)));
-    let filter_tweets = FilterTweets::new(
+    let post_evaluator = PostEvaluator::new(
         Arc::new(sources.observed(Arc::clone(&recorder))),
         RuleEngine::with_country_lists(Arc::clone(&country_lists)),
         Arc::default(),
@@ -154,7 +154,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
         let client_capability = vf_request.client_capability;
         recorder.take();
         let (vf, tp) = join(
-            evaluate(&filter_tweets, vf_request),
+            evaluate(&post_evaluator, vf_request),
             get_tweet_fields(&tweetypie, &client, &ids),
         )
         .await;

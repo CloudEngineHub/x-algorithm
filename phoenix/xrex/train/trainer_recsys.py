@@ -82,10 +82,10 @@ from xrex.models.recsys_embedding import (
     get_recsys_embed_param_to_jax_array,
 )
 from xrex.models.recsys_model import (
-    CandidateInputs,
     RecsysAggregatedModel,
     RecsysAggregatedModelConfig,
 )
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partition_grad_norms
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
@@ -1651,8 +1651,9 @@ class RecsysTrainer(Trainer):
         batches: RecsysFeaturesBatch,
         embeddings: RecsysEmbeddingsParameter,
         rngs: jax.Array,
-        candidate_inputs: CandidateInputs,
+        candidate_inputs: typing.Any,
         loss_normalizers: dict[str, jax.Array],
+        step_fn: typing.Callable[..., typing.Any] | None = None,
     ):
         ctx = self._async_emb_context
         assert ctx is not None
@@ -1669,33 +1670,71 @@ class RecsysTrainer(Trainer):
             check_vma=False,
         )
         def run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
-            def body(gradients, loss_normalizers, rng, batch, embeddings, candidate_inputs):
-                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
-                (loss_k, (stats, metric_inputs)), (gradients_k, emb_gradients) = jax.value_and_grad(
-                    functools.partial(microbatch_loss_fn, loss_normalizers=loss_normalizers),
-                    argnums=(0, 3),
-                    has_aux=True,
-                )(params, rng, batch, embeddings, candidate_inputs=candidate_inputs)
-                gradients = jax.tree.map(
-                    lambda a, g: a + g.astype(jnp.float32), gradients, gradients_k
+            step_kwargs: dict[str, typing.Any] = {}
+            pool, pool_vjp = None, None
+            if step_fn is not None:
+                pool, pool_vjp = jax.vjp(
+                    lambda params, embeddings: step_fn(params, None, batches, embeddings),
+                    params,
+                    embeddings,
                 )
-                return gradients, (loss_k, stats, emb_gradients, metric_inputs)
+                step_kwargs["step_inputs"] = candidate_inputs
+
+            def loss(params, rng, batch, embeddings, candidate_inputs, pool):
+                return microbatch_loss_fn(
+                    params,
+                    rng,
+                    batch,
+                    embeddings,
+                    candidate_inputs=candidate_inputs,
+                    loss_normalizers=loss_normalizers,
+                    **step_kwargs,
+                    **({} if pool is None else {"candidate_pool": pool}),
+                )
+
+            def accumulate(sums, terms):
+                return jax.tree.map(lambda a, g: a + g.astype(jnp.float32), sums, terms)
+
+            def body(gradients, pool_gradients, rng, batch, embeddings, candidate_inputs):
+                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
+                argnums = (0, 3) if pool is None else (0, 3, 5)
+                (
+                    (loss_k, (stats, metric_inputs)),
+                    (gradients_k, emb_gradients, *pool_gradients_k),
+                ) = jax.value_and_grad(loss, argnums=argnums, has_aux=True)(
+                    params, rng, batch, embeddings, candidate_inputs, pool
+                )
+                gradients = accumulate(gradients, gradients_k)
+                if pool is not None:
+                    pool_gradients = accumulate(pool_gradients, pool_gradients_k[0])
+                return gradients, pool_gradients, (loss_k, stats, emb_gradients, metric_inputs)
 
             inputs = (rngs, batches, embeddings, candidate_inputs)
             inputs, loss_normalizers = jax.lax.optimization_barrier((inputs, loss_normalizers))
             gradients = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+            pool_gradients = (
+                None
+                if pool is None
+                else jax.tree.map(lambda x: jnp.zeros(x.shape, jnp.float32), pool)
+            )
             outputs = []
             for k in range(rngs.shape[0]):
                 if k > 0:
-                    inputs, gradients, outputs[-1] = jax.lax.optimization_barrier(
-                        (inputs, gradients, outputs[-1])
+                    inputs, gradients, pool_gradients, outputs[-1] = jax.lax.optimization_barrier(
+                        (inputs, gradients, pool_gradients, outputs[-1])
                     )
                 microbatch = jax.tree.map(operator.itemgetter(k), inputs)
-                gradients, output = body(gradients, loss_normalizers, *microbatch)
+                gradients, pool_gradients, output = body(gradients, pool_gradients, *microbatch)
                 outputs.append(output)
             losses, stats, emb_gradients, metric_inputs = jax.tree.map(
                 lambda *xs: jnp.stack(xs), *outputs
             )
+            if pool_vjp is not None:
+                pool_param_gradients, pool_emb_gradients = pool_vjp(
+                    jax.tree.map(lambda g, x: g.astype(x.dtype), pool_gradients, pool)
+                )
+                gradients = accumulate(gradients, pool_param_gradients)
+                emb_gradients = jax.tree.map(jnp.add, emb_gradients, pool_emb_gradients)
             gradients = jax.tree.map(lambda g, p: g.astype(p.dtype), gradients, params)
             loss_sum, stats = jax.tree.map(lambda x: x.sum(0), (losses, stats))
             joined = jax.tree.map(
@@ -1759,7 +1798,14 @@ class RecsysTrainer(Trainer):
         gate = prefetched_embeddings[0, :, 0, :1]
 
         if self.num_microbatch > 1:
-            loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
+            two_tower = isinstance(self.model_config, RecsysTwoTowerModelConfig)
+            step_fn = None
+            if two_tower:
+                loss_inputs_fn, step_fn, microbatch_loss_fn, metrics_fn = (
+                    self.microbatch_loss_fns.apply
+                )
+            else:
+                loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
             data_shards = math.prod(self.mesh.shape[a] for a in ctx.data_axis)
             candidate_inputs, loss_normalizers = loss_inputs_fn(
                 {}, None, data, self.num_microbatch * data_shards
@@ -1768,6 +1814,8 @@ class RecsysTrainer(Trainer):
             gate = recsys_async_emb.depend(
                 ctx, gate, jnp.stack(jax.tree.leaves(loss_normalizers)).sum(), on_sharded=False
             )
+            if two_tower and candidate_inputs.pool.tweet_counts is not None:
+                gate = recsys_async_emb.depend(ctx, gate, candidate_inputs.pool.tweet_counts[0])
 
         update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
@@ -1846,6 +1894,7 @@ class RecsysTrainer(Trainer):
                 jax.random.split(rng, self.num_microbatch),
                 candidate_inputs,
                 loss_normalizers,
+                step_fn=step_fn,
             )
             if not self.use_row_emb:
                 token_ids, gradients = jax.lax.optimization_barrier((token_ids, gradients))
@@ -1861,17 +1910,20 @@ class RecsysTrainer(Trainer):
             updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
                 (updated_emb_state, grad_update_done_pin)
             )
-            stats = metrics_fn(
-                {},
-                None,
-                metric_inputs,
-                batch,
-                stats,
-                state.rce_ema,
-                rce_alpha,
-                tuple(self.smoothing_windows) if state.rce_ema is not None else None,
-                state.calib_ema,
-            )
+            if two_tower:
+                stats = metrics_fn({}, None, metric_inputs, batch, stats)
+            else:
+                stats = metrics_fn(
+                    {},
+                    None,
+                    metric_inputs,
+                    batch,
+                    stats,
+                    state.rce_ema,
+                    rce_alpha,
+                    tuple(self.smoothing_windows) if state.rce_ema is not None else None,
+                    state.calib_ema,
+                )
         emb_valid_step = emb_valid_step | ~emb_update_pending
         if self.precision_level >= 2:
             gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
@@ -2297,8 +2349,11 @@ class RecsysTrainer(Trainer):
         if self.num_microbatch > 1:
             if not self.use_async_emb:
                 raise ValueError("num_microbatch > 1 requires use_async_emb=True")
-            if type(self.model_config) is not RecsysAggregatedModelConfig:
-                raise ValueError("num_microbatch > 1 supports only the ranker")
+            if isinstance(self.model_config, RecsysTwoTowerModelConfig):
+                if self.model_config.apply_u2u_and_i2i_loss:
+                    raise ValueError("num_microbatch > 1 does not support apply_u2u_and_i2i_loss")
+            elif type(self.model_config) is not RecsysAggregatedModelConfig:
+                raise ValueError("num_microbatch > 1 supports only the ranker and the two-tower")
             if self.empty_history_augmentation_rate > 0:
                 raise ValueError(
                     "num_microbatch > 1 does not support empty_history_augmentation_rate"
@@ -2429,10 +2484,23 @@ class RecsysTrainer(Trainer):
         if self.num_microbatch > 1:
 
             def microbatch_loss_fns():
-                assert isinstance(self.model_config, RecsysAggregatedModelConfig)
+                assert isinstance(
+                    self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
+                )
                 model = self.model_config.make(
                     sharding_context=make_legacy_sharding_context(self.mesh)
                 )
+                if isinstance(model, RecsysTwoTowerModel):
+
+                    def loss(batch, recsys_embeddings, **kwargs):
+                        return model.loss(None, batch, recsys_embeddings, True, **kwargs)
+
+                    return model.loss, (
+                        model.loss_inputs_and_normalizers,
+                        model.candidate_pool,
+                        loss,
+                        model.metrics,
+                    )
                 return model.loss, (model.loss_inputs_and_normalizers, model.loss, model.metrics)
 
             self.microbatch_loss_fns = hk.multi_transform(microbatch_loss_fns)
@@ -4084,7 +4152,7 @@ class RecsysTrainer(Trainer):
                 eval_module.eval_name,
                 eval_module.eval_conf,
                 eval_module.eval_dataset,
-                eval_module.eval_bs_per_device,
+                int(eval_module.eval_bs_per_device),
                 eval_module.eval_seq_len,
             )
             if not isinstance(eval_conf, RecsysTwoTowerEval):

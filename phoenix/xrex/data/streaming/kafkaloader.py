@@ -42,7 +42,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
     load_global_ids_from_parquet_file,
 )
-from xrex.data.recsys import reply_features
+from xrex.data.recsys import id_list_features, reply_features
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
@@ -151,6 +151,7 @@ def _rearm_catchup_request(generation: int) -> None:
 _meter = None
 _kafka_batches_processed = None
 _kafka_messages_processed = None
+_kafka_embedding_zero_filled = None
 _kafka_batch_processing_time = None
 _kafka_queue_size = None
 _kafka_empty_polls = None
@@ -281,6 +282,7 @@ def _init_otel_metrics(
     training_name: str = "recsys-kafka-loader",
 ) -> bool:
     global _meter, _kafka_batches_processed, _kafka_messages_processed
+    global _kafka_embedding_zero_filled
     global _kafka_batch_processing_time, _kafka_queue_size, _kafka_empty_polls
     global _kafka_partition_delivered_offset
     global _training_metrics_initialized, _training_histograms, _training_metric_values
@@ -507,6 +509,12 @@ def _init_otel_metrics(
     _kafka_messages_processed = _meter.create_counter(
         name="recsys_kafka_messages_processed_total",
         description="Total number of Kafka messages processed",
+        unit="1",
+    )
+
+    _kafka_embedding_zero_filled = _meter.create_counter(
+        name="recsys_kafka_embedding_zero_filled_total",
+        description="Records read as zero MM embeddings (no column, or null after unification)",
         unit="1",
     )
 
@@ -1146,16 +1154,17 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.info(f"Schema validated. Available columns: {available_cols}")
             self._logged_schema = True
 
-        if self.multimodal_embedding_type is not None:
-            embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
-            if batch and embedding_col_name in batch[0].schema.names:
-                required_columns.append(embedding_col_name)
-
         optional_columns = OPTIONAL_COLUMNS
         if self.reply_parent_mode:
             optional_columns = list(
                 dict.fromkeys(OPTIONAL_COLUMNS + reply_features.REPLY_OPTIONAL_COLUMNS)
             )
+        if self.id_list_specs:
+            optional_columns = [*optional_columns, id_list_features.COLUMN]
+        embedding_col_name: str | None = None
+        if self.multimodal_embedding_type is not None:
+            embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
+            optional_columns = [*optional_columns, embedding_col_name]
         unified_batches = _unify_record_batch_schemas(batch, required_columns, optional_columns)
 
         t = time.time()
@@ -1172,6 +1181,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
         if table.num_rows == 0:
             raise ValueError("Combined table has no rows")
+        embedding_zero_filled = 0
+        if embedding_col_name is not None:
+            embedding_zero_filled = (
+                table.column(embedding_col_name).null_count
+                if embedding_col_name in table.column_names
+                else table.num_rows
+            )
 
         with self._global_ids_lock:
             global_post_ids = self.global_post_ids
@@ -1210,6 +1226,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             ads_head_masking=self.ads_head_masking,
             ads_pixel_head_masking=self.ads_pixel_head_masking,
             page_records=self.page_records,
+            id_list_specs=self.id_list_specs or None,
             alloc=self._alloc,
         )
 
@@ -1245,6 +1262,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 _kafka_batch_processing_time.record(total_elapsed, shard_attrs)
             if _kafka_messages_processed:
                 _kafka_messages_processed.add(len(batch), shard_attrs)
+            if _kafka_embedding_zero_filled and embedding_col_name is not None:
+                _kafka_embedding_zero_filled.add(embedding_zero_filled, shard_attrs)
 
         return example
 

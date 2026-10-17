@@ -1,9 +1,9 @@
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, Unresolved};
+use crate::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
 use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
-use crate::rules::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
-use crate::rules::registry::AdmittedPosts;
+use crate::rules::engine::AdmittedPosts;
 use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 use xai_visibility_filtering_proto as vf_pb;
 
-pub struct FilterRequest {
+pub struct PostBatch {
     pub viewer_id: Option<u64>,
     pub country_code: Option<String>,
     pub client_capability: ClientCapability,
@@ -20,7 +20,7 @@ pub struct FilterRequest {
     pub rpc: Rpc,
 }
 
-impl FilterRequest {
+impl PostBatch {
     pub(crate) fn hydration_request<'a>(
         &'a mut self,
         is_expanding_retweet_sources: bool,
@@ -38,18 +38,18 @@ impl FilterRequest {
 }
 
 #[derive(Clone)]
-pub struct FilterOutcome {
+pub struct PostEvaluation {
     pub tweet_id: TweetId,
     pub source_tweet_id: Option<TweetId>,
     pub evaluation: Evaluation,
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
 }
 
-pub struct FilterResponse {
-    pub outcomes: Vec<FilterOutcome>,
+pub struct PostEvaluations {
+    pub outcomes: Vec<PostEvaluation>,
 }
 
-pub struct FilterTweets {
+pub struct PostEvaluator {
     sources: Arc<dyn Sources>,
     rule_engine: RuleEngine,
     fallback_caches: Arc<FallbackCaches>,
@@ -57,7 +57,7 @@ pub struct FilterTweets {
     pub(crate) client_capabilities: std::sync::Mutex<Vec<ClientCapability>>,
 }
 
-impl FilterTweets {
+impl PostEvaluator {
     pub(crate) fn new(
         sources: Arc<dyn Sources>,
         rule_engine: RuleEngine,
@@ -72,27 +72,24 @@ impl FilterTweets {
         }
     }
 
-    pub async fn run(&self, request: FilterRequest) -> FilterResponse {
+    pub async fn run(&self, request: PostBatch) -> PostEvaluations {
         let hydrated = self.hydrate(request).await;
-        FilterResponse {
+        PostEvaluations {
             outcomes: self.evaluate_in_request_order(&hydrated, &mut NoTrace),
         }
     }
 
-    pub(crate) async fn hydrate(&self, request: FilterRequest) -> HydratedRequest {
+    pub(crate) async fn hydrate(&self, request: PostBatch) -> HydratedRequest {
         self.hydrate_request(request, false).await
     }
 
-    pub(crate) async fn hydrate_with_retweet_sources(
-        &self,
-        request: FilterRequest,
-    ) -> HydratedRequest {
+    pub(crate) async fn hydrate_with_retweet_sources(&self, request: PostBatch) -> HydratedRequest {
         self.hydrate_request(request, true).await
     }
 
     async fn hydrate_request(
         &self,
-        mut request: FilterRequest,
+        mut request: PostBatch,
         is_expanding_retweet_sources: bool,
     ) -> HydratedRequest {
         #[cfg(test)]
@@ -141,7 +138,7 @@ impl FilterTweets {
         &self,
         hydrated: &HydratedRequest,
         observer: &mut O,
-    ) -> Vec<FilterOutcome> {
+    ) -> Vec<PostEvaluation> {
         let evaluating = Instant::now();
         let admitted = self.admit(hydrated);
         let outcomes = hydrated
@@ -163,7 +160,7 @@ impl FilterTweets {
         ids: impl IntoIterator<Item = TweetId>,
         copied: impl Fn(TweetId) -> bool,
         observer: &mut O,
-    ) -> HashMap<TweetId, FilterOutcome> {
+    ) -> HashMap<TweetId, PostEvaluation> {
         let evaluating = Instant::now();
         let admitted = self.admit(hydrated);
         let mut outcomes = HashMap::new();
@@ -220,7 +217,7 @@ impl FilterTweets {
         tweet_id: TweetId,
         copied: bool,
         observer: &mut O,
-    ) -> FilterOutcome {
+    ) -> PostEvaluation {
         let tweet = hydrated.hydration.tweet(tweet_id);
         let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied));
         let evaluation = match (tweet, post) {
@@ -248,7 +245,7 @@ impl FilterTweets {
                 Evaluation::Failed(Lookup::Tweet)
             }
         };
-        FilterOutcome {
+        PostEvaluation {
             tweet_id,
             source_tweet_id: tweet.and_then(HydratedTweet::source_tweet_id),
             evaluation,
@@ -307,7 +304,7 @@ impl HydratedRequest {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeQuery, Graph};
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::sources::{control, found_user, Fault, InMemorySources};
     use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Hydrator, Hydrators};
     use crate::models::{LimitedEngagementReason, TweetFeatures, Verdict};

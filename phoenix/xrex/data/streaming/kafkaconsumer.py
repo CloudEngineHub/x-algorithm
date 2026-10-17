@@ -363,6 +363,7 @@ KAFKA_RESET_SENTINEL_PATH = os.environ.get(
 
 MESSAGE_QUEUE_SIZE = 1000
 KAFKA_BATCH_BUILD_WORKERS = 2
+KAFKA_DECODE_CHUNK = 64
 FETCH_END_OFFSETS_INTERVAL_IN_CONSUMER_ROUNDS = 8
 
 MAX_COMMIT_FAILURES = 3
@@ -474,6 +475,22 @@ def deserialize_arrow_ipc(data: bytes) -> pa.RecordBatch:
         raise err
 
 
+def _decode_chunk(
+    msgs: list[ConsumerRecord],
+    negative_downsample_rate: int,
+    positive_action_indices: tuple[int, ...],
+) -> tuple[list[pa.RecordBatch | None], Exception | None]:
+    decoded: list[pa.RecordBatch | None] = []
+    for msg in msgs:
+        try:
+            decoded.append(
+                _decode_training_message(msg, negative_downsample_rate, positive_action_indices)
+            )
+        except Exception as err:
+            return decoded, err
+    return decoded, None
+
+
 def _decode_training_message(
     msg: ConsumerRecord, negative_downsample_rate: int, positive_action_indices: tuple[int, ...]
 ) -> pa.RecordBatch | None:
@@ -531,40 +548,48 @@ async def _deserialize_messages(
     positive_action_indices: tuple[int, ...] = (),
     builder: "_OrderedBatchBuilder | None" = None,
 ) -> tuple[list[tuple[pa.RecordBatch, int, int]], int]:
-    msg = await msg_queue.get()
+    messages = [await msg_queue.get()]
+    while len(messages) < KAFKA_DECODE_CHUNK and not msg_queue.empty():
+        messages.append(msg_queue.get_nowait())
 
-    partition, offset = msg.partition, msg.offset
-    count += 1
-    if count % sampling_factor != 0:
-        msg_queue.task_done()
-        return batch, count
+    to_decode: list[ConsumerRecord] = []
+    for msg in messages:
+        count += 1
+        if count % sampling_factor != 0:
+            msg_queue.task_done()
+        else:
+            to_decode.append(msg)
 
-    user_action_sequence = await asyncio.to_thread(
-        _decode_training_message, msg, negative_downsample_rate, positive_action_indices
-    )
-    if user_action_sequence is None:
-        msg_queue.task_done()
-        return batch, count
-
-    batch.append((user_action_sequence, partition, offset))
-    msg_queue.task_done()
-
-    if len(batch) < batch_size:
-        return batch, count
-
-    records: list[pa.RecordBatch] = []
-    offsets: dict[int, int] = {}
-    for record, tp, ts in batch:
-        offsets[tp] = max(offsets.get(tp, ts), ts)
-        records.append(record)
-
-    if builder is not None:
-        await builder.submit(records, offsets)
+    if to_decode:
+        decoded, error = await asyncio.to_thread(
+            _decode_chunk, to_decode, negative_downsample_rate, positive_action_indices
+        )
     else:
-        while example_queue.full():
-            await asyncio.sleep(0.1)
-        example_queue.put_nowait((post_process_fn(records), offsets))
-    return [], count
+        decoded, error = [], None
+
+    for msg, user_action_sequence in zip(to_decode, decoded):
+        if user_action_sequence is not None:
+            batch.append((user_action_sequence, msg.partition, msg.offset))
+        msg_queue.task_done()
+        if len(batch) < batch_size:
+            continue
+
+        records: list[pa.RecordBatch] = []
+        offsets: dict[int, int] = {}
+        for record, tp, ts in batch:
+            offsets[tp] = max(offsets.get(tp, ts), ts)
+            records.append(record)
+        batch = []
+
+        if builder is not None:
+            await builder.submit(records, offsets)
+        else:
+            while example_queue.full():
+                await asyncio.sleep(0.1)
+            example_queue.put_nowait((post_process_fn(records), offsets))
+    if error is not None:
+        raise error
+    return batch, count
 
 
 class _OrderedBatchBuilder:

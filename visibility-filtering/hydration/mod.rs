@@ -4,7 +4,8 @@ mod decode;
 mod execute;
 pub(crate) mod fallback_cache;
 mod fetcher;
-mod inventory;
+mod hydrator;
+pub(crate) mod inventory;
 pub mod metrics;
 pub(crate) mod plan;
 pub(crate) mod sources;
@@ -18,6 +19,7 @@ pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
+pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -41,89 +43,6 @@ pub(crate) fn request_context(
                     .unwrap_or(HYDRATION_TIMEOUT)
                     .saturating_sub(INBOUND_ALLOWANCE),
         ),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
-#[strum(serialize_all = "snake_case")]
-#[repr(u8)]
-pub enum Hydrator {
-    PureCore,
-    Tweet,
-    ConversationControl,
-    TweetSafetyLabels,
-    ViewerProfile,
-    ViewerLabels,
-    AuthorSafety,
-    AuthorLabels,
-    Follows,
-    Blocks,
-    Mutes,
-    MuteRetweets,
-    BlockedByAuthor,
-    BlockedByReplyRoot,
-    SuperFollowsExclusive,
-    RootFollowsViewer,
-    RootFollowsViewerSecondDegree,
-    SuperFollowsRoot,
-    BlockedByConversationRoot,
-    ConversationRootPost,
-    BlockedByConversationRootPost,
-    ViewerCountry,
-    CommunityModeration,
-    CommunityModerator,
-    CommunityViewerRemoved,
-    ArticleLifecycle,
-    ArticleMediaEntities,
-    ArticleCoverMedia,
-    TrustedFriends,
-    OutsideNarrowcastPlace,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Hydrators(u32);
-
-impl Hydrators {
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    #[cfg(test)]
-    pub fn all() -> Self {
-        Self(u32::MAX >> (u32::BITS as usize - <Hydrator as strum::VariantArray>::VARIANTS.len()))
-    }
-
-    pub const fn of(hydrator: Hydrator) -> Self {
-        Self(1 << hydrator as u8)
-    }
-
-    pub const fn with(self, hydrator: Hydrator) -> Self {
-        self.union(Self::of(hydrator))
-    }
-
-    #[cfg(test)]
-    pub const fn without(self, hydrator: Hydrator) -> Self {
-        Self(self.0 & !Self::of(hydrator).0)
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, hydrator: Hydrator) -> bool {
-        self.0 & Self::of(hydrator).0 != 0
-    }
-
-    pub const fn difference(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
-    }
-
-    pub const fn intersection(self, other: Self) -> Self {
-        Self(self.0 & other.0)
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
     }
 }
 

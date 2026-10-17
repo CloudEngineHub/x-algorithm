@@ -33,6 +33,8 @@ class AttentionConfig(Config):
     qkv_merge: bool = False
     max_num_segments_per_batch: int = 128
     enable_determinism: bool = False
+    attn_output_gate: bool = False
+    attn_output_gate_activation: str = "silu"
 
 
 class Attention(hk.Module):

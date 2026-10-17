@@ -513,6 +513,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     seqpack_packed_len_fractions: list[float] = field(default_factory=list)
 
+    seqpack_packed_len_buckets: list[int] = field(default_factory=list)
+
     history_seq_len: int = 1000
     candidate_seq_len: int = 1400
 
@@ -624,7 +626,14 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     def packed_seq_lens(self, bs: int) -> tuple[int, ...]:
         full = self.full_packed_seq_len(bs)
-        if not self.compact_candidate_slots or bs != max(self.sorted_buckets):
+        if not self.compact_candidate_slots:
+            return (full,)
+        rung_buckets = set(self.seqpack_packed_len_buckets) or {max(self.sorted_buckets)}
+        if unknown := rung_buckets - set(self.sorted_buckets):
+            raise ValueError(
+                f"seqpack_packed_len_buckets {sorted(unknown)} are not buckets {self.sorted_buckets}"
+            )
+        if bs not in rung_buckets:
             return (full,)
         block = self._seqpack_block_size
         lens = {full}
@@ -3987,6 +3996,9 @@ class RankingModelRunner(
     forward_no_decoder_jit_by_bs: dict[int, JittedOrCompiled] = field(
         default_factory=dict, init=False
     )
+    forward_no_decoder_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
     _zero_page_decode_by_bs: dict[int, PageDecodeInputs] = field(default_factory=dict, init=False)
 
     def _rng_and_init_data(
@@ -4169,7 +4181,12 @@ class RankingModelRunner(
             batch_id=batch_id,
         ):
             if self.serve_page_decoder:
-                return self.forward_no_decoder_jit_by_bs[bs](
+                no_decoder_jit = (
+                    self.forward_no_decoder_jit_by_bs[bs]
+                    if packed_seq_len is None
+                    else self.forward_no_decoder_jit_by_bs_len[(bs, packed_seq_len)]
+                )
+                return no_decoder_jit(
                     params, rng, batch, merged_embeddings, self.zero_page_decode_inputs(bs)
                 )
             return forward_jit(params, rng, batch, merged_embeddings)
@@ -4281,12 +4298,10 @@ class RankingModelRunner(
 
         self.create_embedding_init_data()
 
-        assert not (self.serve_page_decoder and self.compact_candidate_slots), (
-            "serve_page_decoder does not support compact candidate slots"
-        )
         self.forward_jit_by_bs = {}
         self.forward_jit_by_bs_len = {}
         self.forward_no_decoder_jit_by_bs = {}
+        self.forward_no_decoder_jit_by_bs_len = {}
         for bs in self.sorted_buckets:
             lens: tuple[int | None, ...] = (
                 self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
@@ -4296,11 +4311,17 @@ class RankingModelRunner(
                     bs, compiler_options, packed_seq_len=n
                 )
                 self.forward_jit_by_bs_len[(bs, n)] = jit_fn
+                if self.serve_page_decoder:
+                    self.forward_no_decoder_jit_by_bs_len[(bs, n)] = (
+                        self._build_and_register_forward_jit(
+                            bs, compiler_options, packed_seq_len=n, run_decoder=False
+                        )
+                    )
             self.forward_jit_by_bs[bs] = jit_fn
             if self.serve_page_decoder:
-                self.forward_no_decoder_jit_by_bs[bs] = self._build_and_register_forward_jit(
-                    bs, compiler_options, run_decoder=False
-                )
+                self.forward_no_decoder_jit_by_bs[bs] = self.forward_no_decoder_jit_by_bs_len[
+                    (bs, n)
+                ]
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
         if self.compact_candidate_slots:
             logger.info(

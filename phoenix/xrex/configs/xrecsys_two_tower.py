@@ -734,6 +734,7 @@ for config in configs:
             mol_train_user_chunk=mparams.get(
                 "mol_train_user_chunk", RecsysTwoTowerModelConfig.mol_train_user_chunk
             ),
+            mol_fused_gate=mparams.get("mol_fused_gate", RecsysTwoTowerModelConfig.mol_fused_gate),
             mol_eval_user_chunk=mparams.get(
                 "mol_eval_user_chunk", RecsysTwoTowerModelConfig.mol_eval_user_chunk
             ),

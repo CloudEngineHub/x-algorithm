@@ -548,9 +548,8 @@ async fn run_enforcement_inner(
                     user_id,
                     topic = %facts.topic,
                     error = %e,
-                    "action control: rules eval errored on a page decision; a live scope records only",
+                    "action control: rules eval errored on a page decision",
                 );
-                control.lock_rules_unknown();
                 None
             }
         }
@@ -565,9 +564,6 @@ async fn run_enforcement_inner(
                     "rules_would_action_specs".into(),
                     action_control::action_specs_json(specs),
                 );
-                if action_control::has_cse_policy(specs) {
-                    control.lock_cse();
-                }
             }
         }
         if control.recording() && !dry_run {
@@ -632,7 +628,7 @@ async fn run_enforcement_inner(
         None => None,
     };
     if let Some(rules) = seen_rules {
-        record_seen_bands(ctx, score, facts.entity_type, control, rules);
+        record_seen_bands(ctx, score, facts.entity_type, rules);
     }
     extra.insert("matched_rule_id".into(), rule_id);
 
@@ -925,7 +921,6 @@ fn record_seen_bands(
     ctx: &EnforcementCtx,
     score: &abuse_proto::ScoreResult,
     entity_type: EntityType,
-    control: &action_control::Resolved,
     rules: &(Decision, String),
 ) {
     let head = crate::facts::head_label(score);
@@ -950,17 +945,20 @@ fn record_seen_bands(
         Decision::Act(specs) => specs,
         _ => &[],
     };
-    let cse = ctx.dynamic_config.action_control_config().seen_cse(
-        head,
-        &bands,
-        action_control::has_cse_policy(specs) || control.forced == Some("cse_lock"),
-    );
     let classifier = if score.model_version.is_empty() {
         "-"
     } else {
         score.model_version.as_str()
     };
-    for (band, cse) in bands.into_iter().zip(cse) {
+    ctx.action_control
+        .record_seen_row(action_control::ActionControlSeenRow {
+            entity_type: action_control::entity_of(entity_type),
+            head: head.to_owned(),
+            classifier: classifier.to_owned(),
+            row: confidence::row_of(score.confidence).0,
+            last_seen_ms: now_millis(),
+        });
+    for band in bands {
         ctx.action_control
             .record_seen(action_control::ActionControlSeen {
                 head: head.to_owned(),
@@ -968,7 +966,6 @@ fn record_seen_bands(
                 band: band.to_owned(),
                 entity_type: action_control::entity_of(entity_type),
                 factory: is_factory_message(score),
-                cse,
                 last_seen_ms: now_millis(),
                 rule_id: rules.1.clone(),
                 action_specs: action_control::action_specs_value(specs),
@@ -1118,10 +1115,10 @@ async fn write_dedup_outcome(
     claim_nonce: Option<u64>,
 ) {
     let retention = dedup_retention_for(&outcome.status);
-    let locked_after_claim = outcome
+    let forced_recording = outcome
         .info
         .contains_key(action_control::FORCED_RECORDING_KEY);
-    if retention == DedupRetention::Release || locked_after_claim {
+    if retention == DedupRetention::Release || forced_recording {
         dedup_cache
             .invalidate(entity_type, entity_id, claim_nonce)
             .await;
@@ -1304,7 +1301,12 @@ async fn run_enforcement(
         }
     }
     outcome.info.extend(extra);
-    control.stamp_confidence(&mut outcome);
+    if control.row.is_some() && outcome.status == off_switch::STATUS_SWITCHED_OFF {
+        outcome
+            .info
+            .entry("logged_because".into())
+            .or_insert_with(|| "off_switch".into());
+    }
     publish_decision_outcome(ctx, &outcome);
     Ok(outcome)
 }
@@ -1330,15 +1332,13 @@ fn resolve_control(
 ) -> action_control::Resolved {
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     let producer_dry = score.dry_run || action_control::has_dry_run_prefix(labels);
-    let claim =
-        confidence::message_claim(score, &ctx.dynamic_config.confidence_config(), now_millis());
     if !ctx.action_control.has_records() {
         return action_control::Resolved {
             producer_dry,
-            confidence: claim.as_ref().map(confidence::LevelOutcome::routing_label),
             ..Default::default()
         };
     }
+    let claim = Some(confidence::message_claim(score, now_millis()));
     let input = action_control::ResolveInput {
         head: crate::facts::head_label(score),
         classifier: &score.model_version,

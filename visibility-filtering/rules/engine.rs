@@ -1249,7 +1249,7 @@ country_specific_nsfw_content_gating:
         use super::super::*;
         use crate::clients::socialgraph_client::{EdgeQuery, Graph};
         use crate::hydration::fallback_cache::FallbackCaches;
-        use crate::hydration::plan::Source;
+        use crate::hydration::inventory::Source;
         use crate::hydration::sources::InMemorySources;
         use crate::hydration::{HydrationRequest, Hydrator};
         use crate::models::{ClientCapability, RawCandidate, SafetyLabelType, TweetId};

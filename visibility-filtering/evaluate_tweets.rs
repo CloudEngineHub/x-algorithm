@@ -1,12 +1,12 @@
-use crate::caller_identity::{self, Endpoint};
-use crate::filter::{FilterRequest, FilterTweets};
+use crate::caller_identity::Endpoint;
 use crate::filter_tweets::normalize_viewer_id;
-use crate::limited_actions_copy::LimitedActionsCopy;
+use crate::metrics::{self as ft_metrics, Rpc};
 use crate::models::{Evaluation, RawCandidate, TweetId};
+use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
+use crate::post_evaluator::{PostBatch, PostEvaluator};
 use crate::result_label::{label, state_label, Class, Label, NONE};
 use crate::retweet;
-use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::collections::HashMap;
@@ -18,24 +18,22 @@ use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
 use xai_x_thrift::tweet_service::TweetFieldsResultState;
 
-const REQUESTS: &str = "evaluate_tweets_requests";
-const LATENCY_MS: &str = "evaluate_tweets_latency_ms";
 const BATCH_SIZE: &str = "evaluate_tweets_batch_size";
 
 pub struct EvaluateTweetsEndpoint {
-    filter_tweets: Arc<FilterTweets>,
+    post_evaluator: Arc<PostEvaluator>,
     client_switches: ClientSwitches,
     limited_actions_copy: LimitedActionsCopy,
 }
 
 impl EvaluateTweetsEndpoint {
     pub(crate) fn new(
-        filter_tweets: Arc<FilterTweets>,
+        post_evaluator: Arc<PostEvaluator>,
         client_switches: ClientSwitches,
         limited_actions_copy: LimitedActionsCopy,
     ) -> Self {
         Self {
-            filter_tweets,
+            post_evaluator,
             client_switches,
             limited_actions_copy,
         }
@@ -46,28 +44,20 @@ impl EvaluateTweetsEndpoint {
         request: Request<vf_pb::EvaluateTweetsRequest>,
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
         let entered = tokio::time::Instant::now();
-        let request_metrics = RequestMetricsGuard::named(REQUESTS, LATENCY_MS);
-        let caller = caller_identity::record(Endpoint::EvaluateTweets, &request);
-        let context = crate::hydration::request_context(
-            entered,
-            crate::filter_tweets::parse_grpc_timeout(request.metadata()),
-        );
-        let twitter_context = xai_twittercontext::extract_twitter_context(request.metadata());
-        match context
-            .scope(self.handle_inner(request.into_inner(), twitter_context))
-            .await
-        {
-            Ok(response) => {
-                request_metrics.mark_success();
-                caller.mark_success();
-                Ok(Response::new(response))
-            }
-            Err(status) => {
-                request_metrics.mark_failure();
-                caller.mark_failure();
-                Err(status)
-            }
-        }
+        ft_metrics::observe_request(
+            Endpoint::EvaluateTweets,
+            request,
+            |request, grpc_timeout| async move {
+                let context = crate::hydration::request_context(entered, grpc_timeout);
+                let twitter_context =
+                    xai_twittercontext::extract_twitter_context(request.metadata());
+                context
+                    .scope(self.handle_inner(request.into_inner(), twitter_context))
+                    .await
+                    .map(Response::new)
+            },
+        )
+        .await
     }
 
     async fn handle_inner(
@@ -101,7 +91,7 @@ impl EvaluateTweetsEndpoint {
             candidates,
         );
         let country_code = request.country_code.clone();
-        let outcomes = retweet::evaluate_merging_sources(&self.filter_tweets, request).await;
+        let outcomes = retweet::evaluate_merging_sources(&self.post_evaluator, request).await;
         ft_metrics::record_verdicts(
             Rpc::EvaluateTweets,
             safety_level,
@@ -162,11 +152,11 @@ pub(crate) fn evaluate_tweets_request(
     viewer_id: Option<u64>,
     safety_level: SafetyLevel,
     candidates: Vec<RawCandidate>,
-) -> FilterRequest {
+) -> PostBatch {
     let country_code = context
         .map(|context| context.request_country_code.as_str())
         .filter(|code| !code.is_empty());
-    FilterRequest {
+    PostBatch {
         viewer_id,
         country_code: country_code.map(str::to_owned),
         client_capability: client_switches.resolve(context, viewer_id, country_code),
@@ -233,7 +223,7 @@ fn evaluated_outcome(sends: Sends<'_>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::plan::Source;
+    use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
     use crate::models::{TweetFeatures, VerifyBlurSupport};
     use crate::rules::RuleEngine;
@@ -288,7 +278,7 @@ mod tests {
                 ),
         );
         let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::<InMemorySources>::clone(&sources),
                 RuleEngine::for_tests(),
                 Arc::default(),
@@ -433,7 +423,7 @@ mod tests {
                 world = world.fault(Source::CommunityModeration, fault);
             }
             let endpoint = EvaluateTweetsEndpoint::new(
-                Arc::new(FilterTweets::new(
+                Arc::new(PostEvaluator::new(
                     Arc::new(world),
                     RuleEngine::for_tests(),
                     Arc::default(),
@@ -475,7 +465,7 @@ mod tests {
         tweet_ids: &[u64],
     ) -> Vec<Outcome> {
         let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(
+            Arc::new(PostEvaluator::new(
                 Arc::new(world),
                 RuleEngine::for_tests(),
                 Arc::default(),
@@ -579,9 +569,9 @@ mod tests {
                 HYDRATION_TIMEOUT - INBOUND_ALLOWANCE,
             ),
         ] {
-            let filter_tweets =
-                FilterTweets::new(Arc::new(world()), RuleEngine::for_tests(), Arc::default());
-            let request = |rpc| FilterRequest {
+            let post_evaluator =
+                PostEvaluator::new(Arc::new(world()), RuleEngine::for_tests(), Arc::default());
+            let request = |rpc| PostBatch {
                 viewer_id: Some(VIEWER),
                 country_code: None,
                 client_capability: ClientCapability::default(),
@@ -595,8 +585,11 @@ mod tests {
                 rpc,
             };
             let counted = [
-                filter_tweets.run(request(Rpc::FilterTweets)).await.outcomes,
-                retweet::evaluate_merging_sources(&filter_tweets, request(Rpc::EvaluateTweets))
+                post_evaluator
+                    .run(request(Rpc::FilterTweets))
+                    .await
+                    .outcomes,
+                retweet::evaluate_merging_sources(&post_evaluator, request(Rpc::EvaluateTweets))
                     .await,
             ];
             for outcomes in counted {
@@ -655,9 +648,9 @@ mod tests {
 
     #[test]
     fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
-        use crate::limited_actions_copy::tests::BUNDLE;
         use crate::models::LimitedEngagementReason::ConversationControl;
         use crate::models::{Decided, LimitedEngagement, MediaRestriction, Verdict};
+        use crate::params::limited_actions_copy::tests::BUNDLE;
         use crate::rules::fixtures::limited;
         use xai_x_thrift::action::{
             AnyInterstitial, CtaLimitedActionPrompt, Interstitial, InterstitialReason,
@@ -803,13 +796,13 @@ mod tests {
                 )
                 .tweet(6, 60),
         );
-        let filter_tweets = Arc::new(FilterTweets::new(
+        let post_evaluator = Arc::new(PostEvaluator::new(
             sources,
             RuleEngine::for_tests(),
             Arc::default(),
         ));
         let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::clone(&filter_tweets),
+            Arc::clone(&post_evaluator),
             ClientSwitches::for_tests(),
             LimitedActionsCopy::from_json("[]"),
         );
@@ -842,7 +835,7 @@ mod tests {
             }
             endpoint.handle(request).await.unwrap();
             assert_eq!(
-                std::mem::take(&mut *filter_tweets.client_capabilities.lock().unwrap()),
+                std::mem::take(&mut *post_evaluator.client_capabilities.lock().unwrap()),
                 [expected]
             );
         }

@@ -1191,10 +1191,8 @@ def build_bundle(
 
     compact_candidate_slots = packed and bool(getattr(trainer, "compact_candidate_slots", False))
     serve_page_decoder = bool(getattr(trainer, "serve_page_decoder", False))
-    if serve_page_decoder and (retrieval is not None or compact_candidate_slots):
-        raise NotImplementedError(
-            "page decode programs are exported for ranking bundles without compact candidate slots"
-        )
+    if serve_page_decoder and retrieval is not None:
+        raise NotImplementedError("page decode programs are exported for ranking bundles")
     if serve_page_decoder:
         ensure_page_decode_serialization_registered()
     rungs = [

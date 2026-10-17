@@ -374,6 +374,12 @@ class RustParquetDataset(PhoenixDataset):
                 "conversion-label sidecar join is implemented in "
                 "InterleavingRecordBatchProvider only. Use PhoenixDataset."
             )
+        if self.id_list_sidecar_root is not None:
+            raise NotImplementedError(
+                "id_list_sidecar_root is not supported by RustParquetDataset: the id-list "
+                "sidecar join is implemented in InterleavingRecordBatchProvider only. "
+                "Use PhoenixDataset, or unset id_list_sidecar_root to read the native column."
+            )
 
         queue: Queue = Queue(maxsize=prefetch_factor)
         stop_event = Event()
@@ -411,6 +417,7 @@ class RustParquetDataset(PhoenixDataset):
                 ads_pixel_head_masking=dataset.ads_pixel_head_masking,
                 reply_parent_mode=dataset.reply_parent_mode,
                 page_records=dataset.page_records,
+                id_list_specs=dataset.id_list_specs or None,
                 alloc=dataset._alloc,
             )
 
