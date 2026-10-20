@@ -100,7 +100,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
 
         let predictions = self
             .dispatch
-            .predict_with_fallback(query, cluster, request)
+            .predict(query, cluster, request)
             .await
             .map_err(|e| format!("Phoenix prediction failed: {}", e));
 

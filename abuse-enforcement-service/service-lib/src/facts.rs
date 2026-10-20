@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use xai_abuse_proto::enforcement::ScoreResult;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, strum::EnumIter)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
     #[default]

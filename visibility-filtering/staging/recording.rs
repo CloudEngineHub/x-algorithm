@@ -272,7 +272,7 @@ mod replay;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::{EdgeDirection, EdgeQuery, Graph};
+    use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};
     use crate::hydration::batch::{HydrationError, RawHydrationBatch};
     use crate::hydration::sources::{Bytes, EdgeKey, InMemorySources, Sources, exchange};
     use crate::rules::SafetyLevel;
@@ -748,7 +748,7 @@ mod tests {
         impl SocialgraphClient for Fake {
             async fn select_edges(
                 &self,
-                _: u64,
+                _: Option<u64>,
                 queries: &[EdgeQuery],
             ) -> Result<Vec<Option<HashSet<u64>>>, tonic::Status> {
                 let asks = |query: &EdgeQuery, id| query.destination_ids.contains(&id);
@@ -993,6 +993,13 @@ mod tests {
                         ..control(ConversationControlArm::ByInvitation, AUTHOR, &[])
                     }),
                 )]),
+                quoted_tweets: HashMap::from([(
+                    TWEET,
+                    Some(QuotedTweet {
+                        tweet_id: SOURCE_TWEET,
+                        user_id: SOURCE_AUTHOR,
+                    }),
+                )]),
                 ..Default::default()
             };
             let gizmoduck = MockGizmoduckClient {
@@ -1082,6 +1089,10 @@ mod tests {
                         &keys,
                     )
                 }
+                Source::TesQuotedTweet => {
+                    let keys = [TWEET, MISSING, FAILED, ABSENT];
+                    shown(&sources.quoted_tweets(&keys).await.into_inner(), &keys)
+                }
                 Source::SafetyLabels => {
                     let keys = [TWEET, MISSING, FAILED];
                     shown(&sources.safety_labels(&keys).await.into_inner(), &keys)
@@ -1116,6 +1127,7 @@ mod tests {
                     let query = |graph, direction, destination| EdgeQuery {
                         graph,
                         direction,
+                        from: EdgeFrom::Viewer,
                         destination_ids: vec![destination],
                     };
                     let held: Vec<EdgeQuery> = EDGES
@@ -1127,6 +1139,26 @@ mod tests {
                     let mut shown_edges = vec![];
                     for queries in [held, failed] {
                         let batches = sources.select_edges(VIEWER, &queries).await.into_inner();
+                        for (query, batch) in queries.iter().zip(&batches) {
+                            shown_edges.push(shown(batch, &query.destination_ids));
+                        }
+                    }
+                    shown_edges.join(", ")
+                }
+                Source::FlockUserPair => {
+                    let query = |graph, destination| EdgeQuery {
+                        from: EdgeFrom::User(AUTHOR),
+                        ..EdgeQuery::forward(graph, vec![destination])
+                    };
+                    let held = vec![
+                        query(Graph::Blocks, FOLLOWER),
+                        query(Graph::Follows, FOLLOWER),
+                        query(Graph::Follows, MISSING),
+                    ];
+                    let failed = vec![query(Graph::Blocks, FAILED)];
+                    let mut shown_edges = vec![];
+                    for queries in [held, failed] {
+                        let batches = sources.select_pair_edges(&queries).await.into_inner();
                         for (query, batch) in queries.iter().zip(&batches) {
                             shown_edges.push(shown(batch, &query.destination_ids));
                         }

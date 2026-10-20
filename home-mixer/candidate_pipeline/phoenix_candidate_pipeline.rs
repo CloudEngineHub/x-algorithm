@@ -20,8 +20,8 @@ use crate::candidate_hydrators::subscription_hydrator::SubscriptionHydrator;
 use crate::candidate_hydrators::topic_feedback_context_hydrator::TopicFeedbackContextHydrator;
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
 use crate::candidate_hydrators::vf_candidate_hydrator::VFCandidateHydrator;
-use crate::candidate_hydrators::video_aspect_ratio_hydrator::VideoAspectRatioHydrator;
 use crate::candidate_hydrators::video_embedding_hydrator::VideoEmbeddingHydrator;
+use crate::candidate_hydrators::video_media_hydrator::VideoMediaHydrator;
 use crate::clients::author_brand_safety_client::{
     AuthorBrandSafetyClient, MockAuthorBrandSafetyClient,
 };
@@ -120,6 +120,7 @@ use crate::side_effects::reranking_kafka_side_effect::RerankingKafkaSideEffect;
 use crate::side_effects::response_diversity_stats_side_effect::ResponseDiversityStatsSideEffect;
 use crate::side_effects::retrieval_candidates_kafka_side_effect::RetrievalCandidatesKafkaSideEffect;
 use crate::side_effects::scored_stats_side_effect::ScoredStatsSideEffect;
+use crate::side_effects::serendipity_stats_side_effect::SerendipityStatsSideEffect;
 use crate::sources::cached_posts_source::CachedPostsSource;
 use crate::sources::phoenix_moe_source::PhoenixMOESource;
 use crate::sources::phoenix_source::PhoenixSource;
@@ -173,11 +174,10 @@ use std::time::Duration;
 use tonic::async_trait;
 use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
-    MockPredictClient, PhoenixPredictionClient, ProdPhoenixPredictionClient,
+    MockPredictClient, PhoenixPredictionClient,
 };
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{
-    MockRetrievalClient, PhoenixRetrievalClient, PhoenixRetrievalCluster,
-    ProdPhoenixRetrievalClient,
+    MockRetrievalClient, PhoenixRetrievalClient,
 };
 use xai_candidate_pipeline::component_library::clients::redis_client::{
     MockRedisClient, RedisClient,
@@ -261,7 +261,6 @@ impl PhoenixCandidatePipeline {
         user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient>,
         engagement_signals_client: Arc<dyn EngagementSignalsClient>,
         feature_switches: Arc<FeatureSwitches>,
-        phoenix_xds: &super::PhoenixXdsConfig,
         vm_ranker_xds: &super::VmRankerXdsConfig,
         sid_client: Arc<dyn SidClient>,
         sid_retrieval_client: Arc<dyn SidRetrievalClient>,
@@ -278,7 +277,7 @@ impl PhoenixCandidatePipeline {
                 user_action_aggregation_client.clone(),
             )),
             Box::new(RetrievalSequenceQueryHydrator::new(
-                user_action_aggregation_client,
+                user_action_aggregation_client.clone(),
             )),
             Box::new(BlockedUserIdsQueryHydrator {
                 socialgraph_client: socialgraph_client.clone(),
@@ -330,28 +329,14 @@ impl PhoenixCandidatePipeline {
             client: impressed_posts_client,
         };
 
-        let xds_retrieval_client = super::build_phoenix_xds_retrieval_client(phoenix_xds).await;
-        let mut retrieval_paths = Vec::new();
-        if let Some(xds) = xds_retrieval_client {
-            retrieval_paths.push(crate::util::egress::RetrievalPath {
-                name: "xDS",
-                gate: crate::util::xds::RETRIEVAL_XDS_GATE,
-                client: xds,
-                config: crate::util::egress::EgressConfig::DEFAULT,
-            });
-        }
-        let retrieval_dispatch = crate::util::egress::RetrievalDispatch {
-            prod: phoenix_retrieval_client,
-            paths: retrieval_paths,
-        };
         let phoenix_source = Box::new(PhoenixSource {
-            dispatch: retrieval_dispatch.clone(),
+            phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
         let phoenix_topics_source = Box::new(PhoenixTopicsSource {
-            dispatch: retrieval_dispatch.clone(),
+            phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
         let phoenix_moe_source = Box::new(PhoenixMOESource {
-            dispatch: retrieval_dispatch,
+            phoenix_retrieval_client,
         });
         let popular_posts_source = Box::new(PopularPostsSource { popular_posts });
         let thunder_source = Box::new(ThunderSource {
@@ -450,22 +435,10 @@ impl PhoenixCandidatePipeline {
             Box::new(FavHoldoutFilter),
         ];
 
-        let xds_client = super::build_phoenix_xds_client(phoenix_xds).await;
-        let mut prediction_paths = Vec::new();
-        if let Some(xds) = xds_client.as_ref() {
-            prediction_paths.push(crate::util::egress::PredictionPath {
-                name: "xDS",
-                gate: crate::util::xds::XDS_GATE,
-                client: Arc::clone(xds),
-                config: crate::util::egress::EgressConfig::DEFAULT,
-            });
-        }
         let phoenix_scorer = Box::new(PhoenixScorer {
             dispatch: crate::util::egress::PredictionDispatch {
-                prod: phoenix_client.clone(),
-                paths: prediction_paths,
+                client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
-                enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
             },
         });
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
@@ -478,10 +451,8 @@ impl PhoenixCandidatePipeline {
         });
         let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
             dispatch: crate::util::egress::PredictionDispatch {
-                prod: phoenix_client.clone(),
-                paths: Vec::new(),
+                client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
-                enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
             },
         });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
@@ -508,7 +479,7 @@ impl PhoenixCandidatePipeline {
             Box::new(AiTrendFeedbackContextHydrator {
                 strato_client: strato_client.clone(),
             }),
-            Box::new(VideoAspectRatioHydrator::new(tes_client.clone())),
+            Box::new(VideoMediaHydrator::new(tes_client.clone())),
             Box::new(VideoEmbeddingHydrator::new(post_v8_search_embedding_client)),
             Box::new(AncestorVideoHydrator {
                 media_info_cache_client,
@@ -527,9 +498,10 @@ impl PhoenixCandidatePipeline {
             Arc::new(vec![
                 Box::new(PhoenixExperimentsSideEffect::new(
                     phoenix_client,
-                    xds_client,
                     phoenix_kafka_client,
                     logged_scored_candidates_kafka_client,
+                    redis_client.clone(),
+                    user_action_aggregation_client,
                 )),
                 Box::new(RerankingKafkaSideEffect::new(reranking_kafka_client)),
                 Box::new(RetrievalCandidatesKafkaSideEffect::new(
@@ -538,6 +510,7 @@ impl PhoenixCandidatePipeline {
                 Box::new(RedisPostCandidateCacheSideEffect::new(redis_client)),
                 Box::new(ScoredStatsSideEffect),
                 Box::new(ResponseDiversityStatsSideEffect),
+                Box::new(SerendipityStatsSideEffect),
                 Box::new(AuthorServedMetricsSideEffect { popular_authors }),
                 Box::new(MutualFollowStatsSideEffect),
                 Box::new(DebugSideEffect),
@@ -631,21 +604,14 @@ impl PhoenixCandidatePipeline {
                 ) as Arc<dyn UserActionAggregationClient + Send + Sync>
             },
             async {
-                Arc::new(
-                    ProdPhoenixPredictionClient::new()
-                        .await
-                        .expect("Failed to create Phoenix prediction client"),
-                ) as Arc<dyn PhoenixPredictionClient + Send + Sync>
+                super::build_phoenix_xds_client(phoenix_xds)
+                    .await
+                    .expect("Failed to build Phoenix xDS ranking client")
             },
             async {
-                Arc::new(
-                    ProdPhoenixRetrievalClient::new(Some((
-                        PhoenixRetrievalCluster::Experiment1Fou,
-                        PhoenixRetrievalCluster::Experiment2Fou,
-                    )))
+                super::build_phoenix_xds_retrieval_client(phoenix_xds)
                     .await
-                    .expect("Failed to create Phoenix retrieval client"),
-                ) as Arc<dyn PhoenixRetrievalClient + Send + Sync>
+                    .expect("Failed to build Phoenix xDS retrieval client")
             },
             async { Arc::new(ThunderClient::new().await) },
             async {
@@ -997,7 +963,6 @@ impl PhoenixCandidatePipeline {
             user_installed_apps_client,
             engagement_signals_client,
             feature_switches,
-            phoenix_xds,
             vm_ranker_xds,
             sid_client,
             ProdSidRetrievalClient::new(vm_ranker_xds) as Arc<dyn SidRetrievalClient>,
@@ -1105,7 +1070,6 @@ impl PhoenixCandidatePipeline {
             user_installed_apps_client,
             engagement_signals_client,
             feature_switches,
-            &super::PhoenixXdsConfig::disabled(),
             &super::VmRankerXdsConfig::disabled_with_healthz(),
             Arc::new(MockSidClient) as Arc<dyn SidClient>,
             Arc::new(MockSidRetrievalClient) as Arc<dyn SidRetrievalClient>,

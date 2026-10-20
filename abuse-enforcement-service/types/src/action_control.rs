@@ -168,6 +168,7 @@ pub enum PageAction {
         Suspend {},
         LivenessCheck {},
         SpamHighRecall { lifetime: Lifetime },
+            PhoenixSkip { lifetime: Lifetime },
         PostSpamHighRecall { lifetime: Lifetime },
         SuspendAuthor {},
 }
@@ -194,7 +195,8 @@ impl PageAction {
         match self {
             PageAction::Suspend {}
             | PageAction::LivenessCheck {}
-            | PageAction::SpamHighRecall { .. } => ControlEntity::User,
+            | PageAction::SpamHighRecall { .. }
+            | PageAction::PhoenixSkip { .. } => ControlEntity::User,
             PageAction::PostSpamHighRecall { .. } | PageAction::SuspendAuthor {} => {
                 ControlEntity::Post
             }
@@ -213,6 +215,15 @@ impl PageAction {
                     lifetime: Lifetime::Days30,
                 },
                 PageAction::SpamHighRecall {
+                    lifetime: Lifetime::Permanent,
+                },
+                PageAction::PhoenixSkip {
+                    lifetime: Lifetime::Days7,
+                },
+                PageAction::PhoenixSkip {
+                    lifetime: Lifetime::Days30,
+                },
+                PageAction::PhoenixSkip {
                     lifetime: Lifetime::Permanent,
                 },
             ],
@@ -253,6 +264,7 @@ impl PageAction {
             PageAction::Suspend {} => "suspend",
             PageAction::LivenessCheck {} => "liveness_check",
             PageAction::SpamHighRecall { .. } => "spam_high_recall",
+            PageAction::PhoenixSkip { .. } => "phoenix_skip",
             PageAction::PostSpamHighRecall { .. } => "post_spam_high_recall",
             PageAction::SuspendAuthor {} => "suspend_author",
         }

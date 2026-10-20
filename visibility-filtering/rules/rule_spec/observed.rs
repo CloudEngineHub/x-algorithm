@@ -1,5 +1,6 @@
 use super::rule::{Rule, RuleCond};
-use super::{Predicate, Truth};
+use super::{truth_of, Predicate, Truth};
+use crate::rules::rule_spec::engine::{Engine, Fold};
 use crate::rules::RuleContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -9,13 +10,13 @@ pub enum Skip<H> {
     Terminal(usize),
 }
 
-pub(in crate::rules) trait NodeObserver {
+pub(in crate::rules) trait NodeObserver<E: Engine> {
     const TOTAL: bool;
     type Handle: Copy;
 
     fn enter(
         &mut self,
-        node: Option<RuleCond>,
+        node: Option<RuleCond<E>>,
         parent: Option<Self::Handle>,
         skip: Option<Skip<Self::Handle>>,
     ) -> Self::Handle;
@@ -25,28 +26,28 @@ pub(in crate::rules) trait NodeObserver {
 
 pub(crate) struct NoTrace;
 
-impl NodeObserver for NoTrace {
+impl<E: Engine> NodeObserver<E> for NoTrace {
     const TOTAL: bool = false;
     type Handle = ();
 
     #[inline]
-    fn enter(&mut self, _: Option<RuleCond>, _: Option<()>, _: Option<Skip<()>>) {}
+    fn enter(&mut self, _: Option<RuleCond<E>>, _: Option<()>, _: Option<Skip<()>>) {}
 
     #[inline]
     fn finish(&mut self, (): (), _: Truth) {}
 }
 
 #[inline]
-pub(in crate::rules) fn evaluate<O: NodeObserver>(
-    condition: RuleCond,
-    context: &RuleContext<'_>,
+pub(in crate::rules) fn evaluate<E: Fold, O: NodeObserver<E>>(
+    condition: RuleCond<E>,
+    context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
     parent: Option<O::Handle>,
     skip: Option<Skip<O::Handle>>,
 ) -> (Truth, O::Handle) {
     let handle = observer.enter(Some(condition), parent, skip);
     let truth = match condition {
-        RuleCond::Leaf(leaf) => leaf.truth(context),
+        RuleCond::Leaf(leaf) => truth_of(leaf, context),
         RuleCond::All(children) => group(
             children,
             context,
@@ -75,9 +76,9 @@ pub(in crate::rules) fn evaluate<O: NodeObserver>(
 }
 
 #[inline]
-fn group<O: NodeObserver>(
-    children: &[RuleCond],
-    context: &RuleContext<'_>,
+fn group<E: Fold, O: NodeObserver<E>>(
+    children: &[RuleCond<E>],
+    context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
     (handle, skip): (O::Handle, Option<Skip<O::Handle>>),
     (identity, absorbing): (Truth, Truth),
@@ -88,7 +89,7 @@ fn group<O: NodeObserver>(
     let mut decided = None;
     for &child in children {
         let answer = if let (false, RuleCond::Leaf(leaf)) = (O::TOTAL, child) {
-            leaf.truth(context)
+            truth_of(leaf, context)
         } else {
             let (answer, child_handle) = evaluate(
                 child,
@@ -111,9 +112,9 @@ fn group<O: NodeObserver>(
 }
 
 #[inline]
-pub(in crate::rules) fn evaluate_rule<O: NodeObserver>(
-    rule: &Rule,
-    context: &RuleContext<'_>,
+pub(in crate::rules) fn evaluate_rule<E: Fold, O: NodeObserver<E>>(
+    rule: &Rule<E>,
+    context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
     terminal: Option<usize>,
 ) -> (Truth, O::Handle) {
@@ -121,7 +122,7 @@ pub(in crate::rules) fn evaluate_rule<O: NodeObserver>(
     let root = observer.enter(None, None, skip);
     let truth = if O::TOTAL {
         let (audience, audience_handle) = evaluate(
-            rule.audience.condition(),
+            rule.audience.condition::<E>(),
             context,
             observer,
             Some(root),
@@ -131,10 +132,10 @@ pub(in crate::rules) fn evaluate_rule<O: NodeObserver>(
             skip.or((audience == Truth::False).then_some(Skip::FalseConjunct(audience_handle)));
         audience.and(evaluate(rule.when, context, observer, Some(root), skip).0)
     } else {
-        let audience = match rule.audience.condition() {
+        let audience = match rule.audience.condition::<E>() {
             RuleCond::All([]) => Truth::True,
-            RuleCond::Leaf(leaf) => leaf.truth(context),
-            RuleCond::Not(RuleCond::Leaf(leaf)) => !leaf.truth(context),
+            RuleCond::Leaf(leaf) => truth_of(leaf, context),
+            RuleCond::Not(RuleCond::Leaf(leaf)) => !truth_of(*leaf, context),
             condition @ (RuleCond::All(_)
             | RuleCond::Any(_)
             | RuleCond::Not(_)
@@ -183,19 +184,19 @@ pub(in crate::rules) struct NodeTracer {
     pub(in crate::rules) nodes: Vec<NodeTrace>,
 }
 
-impl NodeObserver for NodeTracer {
+impl<E: Engine> NodeObserver<E> for NodeTracer {
     const TOTAL: bool = true;
     type Handle = usize;
 
     fn enter(
         &mut self,
-        node: Option<RuleCond>,
+        node: Option<RuleCond<E>>,
         parent: Option<usize>,
         skip: Option<Skip<usize>>,
     ) -> usize {
         let kind = match node {
             None => NodeKind::Rule,
-            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(leaf),
+            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(E::lift(leaf)),
             Some(RuleCond::All(_)) => NodeKind::All,
             Some(RuleCond::Any(_)) => NodeKind::Any,
             Some(RuleCond::Not(_)) => NodeKind::Not,

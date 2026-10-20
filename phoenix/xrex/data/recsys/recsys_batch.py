@@ -279,7 +279,7 @@ class PostSeq(TypedDict):
     value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     conversion_delay_ms: NotRequired[npt.NDArray[np.int32]]
     safety_label_mask: npt.NDArray[np.int64] | None
-    embedding: npt.NDArray[np.float32] | jax.Array | None
+    embedding: npt.NDArray[np.float32] | npt.NDArray[np.float16] | jax.Array | None
     search_query_embeddings: npt.NDArray[np.float32] | None
     categorical_features: npt.NDArray[np.int16]
     int64_features: npt.NDArray[np.int64]
@@ -464,6 +464,14 @@ def empty_conversion_delays(batch_size: int, candidate_seq_len: int) -> np.ndarr
     )
 
 
+def empty_history_url_embedding(
+    batch_size: int, history_seq_len: int, history_url_embedding_dim: int
+) -> npt.NDArray[np.float16] | None:
+    if history_url_embedding_dim <= 0:
+        return None
+    return np.zeros((batch_size, history_seq_len, history_url_embedding_dim), np.float16)
+
+
 def _extend_conversion_delays(post_seq: PostSeq, shape: tuple[int, int]) -> np.ndarray:
     out = empty_conversion_delays(*shape)
     values = post_seq.get("conversion_delay_ms")
@@ -576,6 +584,7 @@ def from_record_batch(
     ads_pixel_head_masking: bool = False,
     page_records: bool = False,
     id_list_specs: typing.Sequence[id_list_features.IdListFeatureSpec] | None = None,
+    history_url_embedding_dim: int = 0,
     *,
     alloc: ArrayAllocator,
 ) -> RecsysFeaturesBatch:
@@ -1286,7 +1295,11 @@ def from_record_batch(
         promoted_ids=None,
         line_item_objective=None,
         safety_label_mask=history_safety_label_mask,
-        embedding=None,
+        embedding=(
+            alloc.zeros((*hist_shape_2d, history_url_embedding_dim), np.float16)
+            if history_url_embedding_dim > 0
+            else None
+        ),
         search_query_embeddings=None,
         categorical_features=hist_categorical_features,
         bool_features=hist_bool_features,

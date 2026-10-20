@@ -10,6 +10,7 @@ const DPP_VALUE_MODEL_ID: &str = "dpp";
 pub(crate) struct RequestShape {
     debias: bool,
     pacing: bool,
+    history_topics: bool,
 }
 
 impl RequestShape {
@@ -17,6 +18,8 @@ impl RequestShape {
         Self {
             debias: !query.has_cached_posts && query.params.get(VMRankerSendDebiasInputs),
             pacing: query.params.get(VMRankerSendPacingInputs),
+            history_topics: query.params.get(VMRankerSendHistoryTopics)
+                && query.history_topics.is_some(),
         }
     }
 
@@ -40,8 +43,9 @@ impl RequestShape {
             topic_request: query.is_topic_request(),
             ..Default::default()
         };
-        if self.debias {
-            request.experiment_payload = request_payload(query, candidates).into();
+        if self.debias || self.history_topics {
+            request.experiment_payload =
+                request_payload(query, candidates, self.debias, self.history_topics).into();
         }
         request
     }

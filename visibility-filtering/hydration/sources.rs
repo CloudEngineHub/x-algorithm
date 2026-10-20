@@ -16,7 +16,7 @@ use crate::hydration::tweet_source::{decode_tweet, TweetSource};
 use crate::models::{ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures};
 use crate::post_card::PostCard;
 use crate::safety_label_source::SafetyLabelSource;
-pub(crate) use exchange::{Bytes, EdgeKey, Exchange, Id, Scope, Visit};
+pub(crate) use exchange::{Bytes, EdgeKey, Exchange, Id, PairEdgeKey, Scope, Visit};
 use futures::future::join;
 use prost::Message;
 use rustc_hash::FxHashMap;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tracing::warn;
 use wingman_client::Exists;
-use xai_core_entities::entities::{ConversationControl, GizmoduckUser, PureCoreData};
+use xai_core_entities::entities::{ConversationControl, GizmoduckUser, PureCoreData, QuotedTweet};
 use xai_core_entities::gizmoduck_client::QueryFields;
 use xai_core_entities::tweet_entity_service_client::TESClient;
 use xai_visibility_filtering_proto as vf_pb;
@@ -98,6 +98,11 @@ pub(crate) trait Sources: Send + Sync {
         tweet_ids: &[u64],
     ) -> Answered<exchange::TesConversationControl, ConversationControl>;
 
+    async fn quoted_tweets(
+        &self,
+        outer_ids: &[u64],
+    ) -> Answered<exchange::TesQuotedTweet, QuotedTweet>;
+
     async fn safety_labels(
         &self,
         tweet_ids: &[u64],
@@ -120,6 +125,11 @@ pub(crate) trait Sources: Send + Sync {
         viewer_id: u64,
         queries: &[EdgeQuery],
     ) -> Observed<exchange::Flock, Vec<RawHydrationBatch<bool>>>;
+
+    async fn select_pair_edges(
+        &self,
+        queries: &[EdgeQuery],
+    ) -> Observed<exchange::FlockUserPair, Vec<RawHydrationBatch<bool>>>;
 
     async fn viewer_country(&self, viewer_id: u64) -> Answered<exchange::ViewerCountry, Arc<str>>;
 
@@ -211,6 +221,13 @@ fn edge_batches(
             HydrationBatch::from_hydrated(answers.collect())
         })
         .collect()
+}
+
+fn edge_answer(batch: &RawHydrationBatch<bool>, destination: u64) -> Hydrated<bool> {
+    batch
+        .hydrated(&destination)
+        .cloned()
+        .unwrap_or(Hydrated::Failed(HydrationError::Error))
 }
 
 pub(crate) fn core_batch(cores: RawHydrationBatch<PureCoreData>) -> RawHydrationBatch<PureCore> {
@@ -416,6 +433,18 @@ impl<O: Observer> Sources for ProdSources<O> {
         self.relay::<exchange::TesConversationControl, _>(tweet_ids.iter().copied(), controls)
     }
 
+    async fn quoted_tweets(
+        &self,
+        outer_ids: &[u64],
+    ) -> Answered<exchange::TesQuotedTweet, QuotedTweet> {
+        let quoted = self
+            .backends
+            .tes
+            .get_quoted_tweets(outer_ids.to_vec())
+            .await;
+        self.relay::<exchange::TesQuotedTweet, _>(outer_ids.iter().copied(), quoted)
+    }
+
     async fn safety_labels(
         &self,
         tweet_ids: &[u64],
@@ -471,18 +500,37 @@ impl<O: Observer> Sources for ProdSources<O> {
         let sets = self
             .backends
             .socialgraph
-            .select_edges(viewer_id, queries)
+            .select_edges(Some(viewer_id), queries)
             .await;
         let edges = edge_batches(queries, sets.as_deref());
         self.observe::<exchange::Flock>(queries.iter().zip(&edges).flat_map(|(query, batch)| {
             query.destination_ids.iter().map(move |&destination| {
-                let answer = batch
-                    .hydrated(&destination)
-                    .cloned()
-                    .unwrap_or(Hydrated::Failed(HydrationError::Error));
-                (EdgeKey::of(query, destination), answer)
+                (
+                    EdgeKey::of(query, destination),
+                    edge_answer(batch, destination),
+                )
             })
         }))
+        .map(|()| edges)
+    }
+
+    async fn select_pair_edges(
+        &self,
+        queries: &[EdgeQuery],
+    ) -> Observed<exchange::FlockUserPair, Vec<RawHydrationBatch<bool>>> {
+        let sets = self.backends.socialgraph.select_edges(None, queries).await;
+        let edges = edge_batches(queries, sets.as_deref());
+        self.observe::<exchange::FlockUserPair>(queries.iter().zip(&edges).flat_map(
+            |(query, batch)| {
+                query
+                    .destination_ids
+                    .iter()
+                    .filter_map(move |&destination| {
+                        let key = PairEdgeKey::of(query, destination)?;
+                        Some((key, edge_answer(batch, destination)))
+                    })
+            },
+        ))
         .map(|()| edges)
     }
 

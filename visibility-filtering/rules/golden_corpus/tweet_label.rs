@@ -1,15 +1,65 @@
 use super::builders::labeled;
 use super::{Role, Row};
-use crate::models::SafetyLabelType;
-use crate::rules::fixtures::{allow, appealed, candidate, dropped};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::models::{
+    ClientCapability, SafetyLabelType, TombstoneReason, ViewerFeatures, ViewerProfile,
+};
+use crate::rules::fixtures::{
+    allow, appealed, candidate, dropped, tombstoned, viewer_with_profile,
+};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
 use xai_x_thrift::action::AppealablePolicy;
 
+fn soft_nsfw_viewer(name: &'static str, is_new_account: bool, switch_on: bool) -> Role {
+    let base = viewer_with_profile(ViewerProfile {
+        is_new_account,
+        ..ViewerProfile::default()
+    });
+    Role::As(
+        name,
+        ViewerFeatures {
+            client_capability: ClientCapability {
+                soft_nsfw_new_user_drop: switch_on,
+                ..ClientCapability::default()
+            },
+            ..base
+        },
+    )
+}
+
 pub(super) fn rows() -> Vec<Row> {
     vec![
+        Row {
+            name: "soft_nsfw_label",
+            post: labeled(SafetyLabelType::SOFT_NSFW),
+            expect: vec![
+                (
+                    TimelineHomeRecommendations,
+                    soft_nsfw_viewer("new_account_switch_on", true, true),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "soft_nsfw_new_user/drop/unspecified",
+                    ),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    soft_nsfw_viewer("new_account_switch_off", true, false),
+                    allow(),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    soft_nsfw_viewer("old_account_switch_on", false, true),
+                    allow(),
+                ),
+                (
+                    TimelineHomeHydration,
+                    soft_nsfw_viewer("new_account_switch_on", true, true),
+                    allow(),
+                ),
+            ],
+        },
         Row {
             name: "for_emergency_use_only_label",
             post: labeled(SafetyLabelType::FOR_EMERGENCY_USE_ONLY),
@@ -80,6 +130,27 @@ pub(super) fn rows() -> Vec<Row> {
                     dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::NonFollower,
+                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
+                ),
+                (TimelineHomeHydration, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(Role::LoggedOut)),
+                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(Role::Author)),
+                    tombstoned(TombstoneReason::Bounced, "bounce_quoted/tombstone/bounced"),
+                ),
             ],
         },
         Row {

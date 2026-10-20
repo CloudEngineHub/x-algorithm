@@ -23,8 +23,10 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VideoCarouselFilter {
         let (removed, kept): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|candidate| candidate.video_carousel_extra);
+        let main_feed = &kept[..RESULT_SIZE.min(kept.len())];
         let _ = query.video_carousel.set(video_carousel::select_videos(
             kept.iter().skip(RESULT_SIZE).chain(&removed),
+            main_feed,
             query.params.get(VideoCarouselVideoOpenWeight),
             query.params.get(VideoCarouselImmersiveVqvWeight),
             query.params.get(EnableVideoCarouselAuthorDedupe),

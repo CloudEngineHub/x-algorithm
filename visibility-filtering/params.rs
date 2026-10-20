@@ -6,23 +6,30 @@ use arc_swap::ArcSwap;
 use limited_actions_copy::DriftCheck;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use strum::VariantArray;
-use xai_feature_switches::{Feature, FeatureSwitches, RecipientBuilder, Value};
+use xai_feature_switches::{
+    parse_query, DdgExperimentBucketsChooser, ExperimentBucketImpressor, ExperimentBucketsChooser,
+    Feature, FeatureSwitches, KafkaBucketImpressor, NullBucketImpressor,
+    NullExperimentBucketsChooser, QueryNode, RecipientBuilder, ReloadableAbDeciderStore, Value,
+    DEFAULT_ABDECIDER_PATH,
+};
 use xai_stats_receiver::StatsReceiverExt;
 
 pub(crate) use client_switches::ClientSwitches;
 pub use limited_actions_policy::LimitedActionType;
 pub(crate) use limited_actions_policy::LimitedActionsPolicies;
 
-const SCALA_FILES: [&str; 6] = [
+const SCALA_FILES: [&str; 7] = [
     "age_verification.yml",
     "community_tweet.yml",
     "country_specific_nsfw_content_gating.yml",
     "freedom_of_speech_not_reach.yml",
     "media_visibility_treatments.yml",
+    "soft_nsfw.yml",
     "stale_tweet.yml",
 ];
 
@@ -144,12 +151,126 @@ impl CountryLists {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct Experiments {
+    store: Option<Arc<ReloadableAbDeciderStore>>,
+    impressor: Arc<dyn ExperimentBucketImpressor>,
+}
+
+impl Experiments {
+    pub fn none() -> Self {
+        Self {
+            store: None,
+            impressor: Arc::new(NullBucketImpressor::new()),
+        }
+    }
+
+    pub async fn serving(datacenter: &str) -> Self {
+        Self {
+            store: abdecider_store(),
+            impressor: kafka_impressor(datacenter).await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        store: Arc<ReloadableAbDeciderStore>,
+        impressor: Arc<dyn ExperimentBucketImpressor>,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            impressor,
+        }
+    }
+
+    fn engine(&self, features: Vec<Feature>) -> xai_feature_switches::Result<FeatureSwitches> {
+        let chooser: Arc<dyn ExperimentBucketsChooser> = match &self.store {
+            Some(store) => Arc::new(
+                DdgExperimentBucketsChooser::new(Arc::clone(store) as _)
+                    .with_key_filter(experiment_keys(&features)),
+            ),
+            None => Arc::new(NullExperimentBucketsChooser::new()),
+        };
+        FeatureSwitches::with_options(features, chooser, Arc::clone(&self.impressor), None, false)
+    }
+}
+
+fn abdecider_store() -> Option<Arc<ReloadableAbDeciderStore>> {
+    match ReloadableAbDeciderStore::new(DEFAULT_ABDECIDER_PATH) {
+        Ok(store) => {
+            store.start_reload_task();
+            Some(store)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "feature switches: no abdecider store; bucket rules never match");
+            None
+        }
+    }
+}
+
+async fn kafka_impressor(datacenter: &str) -> Arc<dyn ExperimentBucketImpressor> {
+    let producer = FeatureSwitches::builder()
+        .without_abdecider()
+        .datacenter(datacenter)
+        .kafka_impressor_enabled(true)
+        .build()
+        .await
+        .ok()
+        .and_then(|engine| engine.kafka_producer().cloned());
+    match producer {
+        Some(producer) => Arc::new(KafkaBucketImpressor::new(producer)),
+        None => {
+            tracing::warn!("feature switches: no Kafka producer; DDG impressions are dropped");
+            Arc::new(NullBucketImpressor::new())
+        }
+    }
+}
+
+fn experiment_keys(features: &[Feature]) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for feature in features {
+        for rule in &feature.rules {
+            let query = rule.query.as_deref().unwrap_or_default();
+            if let Ok(node) = parse_query(query, &feature.name) {
+                collect_keys(&node, &mut keys);
+            }
+        }
+    }
+    keys
+}
+
+fn collect_keys(node: &QueryNode, keys: &mut BTreeSet<String>) {
+    match node {
+        QueryNode::Criteria(criteria) => {
+            let query = criteria.to_query();
+            let mut parts = query.trim_matches(['[', ']']).split_whitespace();
+            if let (
+                Some(key),
+                Some(
+                    "bucket_membership"
+                    | "bucket_membership_no_impression"
+                    | "experiment_membership",
+                ),
+            ) = (parts.next(), parts.next())
+            {
+                keys.insert(key.to_string());
+            }
+        }
+        QueryNode::And(children) | QueryNode::Or(children) => {
+            children.iter().for_each(|child| collect_keys(child, keys));
+        }
+        QueryNode::Not(child) => collect_keys(child, keys),
+        QueryNode::AlwaysTrue | QueryNode::Never => {}
+    }
+}
+
 pub(crate) struct SwitchFiles {
     files: Vec<(PathBuf, Vec<Feature>)>,
+    experiments: Experiments,
 }
 
 impl SwitchFiles {
-    pub fn beside(fs_path: &str) -> Self {
+    pub fn beside(fs_path: &str, experiments: Experiments) -> Self {
         let fs_path = Path::new(fs_path);
         let dir = fs_path.parent().unwrap_or_else(|| Path::new(""));
         let files = std::iter::once(fs_path.to_path_buf())
@@ -157,7 +278,7 @@ impl SwitchFiles {
             .chain(std::iter::once(dir.join(LIMITED_ACTIONS_POLICY_FILE)))
             .map(|path| (path, Vec::new()))
             .collect();
-        Self { files }
+        Self { files, experiments }
     }
 
     pub fn load(&mut self, stats: Option<&dyn StatsReceiverExt>) -> Option<FeatureSwitches> {
@@ -175,7 +296,8 @@ impl SwitchFiles {
             .iter()
             .flat_map(|(_, features)| features.iter().cloned())
             .collect();
-        FeatureSwitches::new(features)
+        self.experiments
+            .engine(features)
             .map_err(|error| load_failed("all", &error, stats))
             .ok()
     }
@@ -380,7 +502,7 @@ country_specific_nsfw_content_gating:
             "other:\n  parameters:\n    other_flag: {type: boolean, default: true}\n",
         );
         let fs_path = dir.join("rust_vf.yml");
-        let mut files = SwitchFiles::beside(fs_path.to_str().unwrap());
+        let mut files = SwitchFiles::beside(fs_path.to_str().unwrap(), Experiments::none());
         let stats = Counted::default();
         let ios_tombstone = |engine: &FeatureSwitches| {
             engine
@@ -401,6 +523,7 @@ country_specific_nsfw_content_gating:
                 failed("community_tweet.yml"),
                 failed("freedom_of_speech_not_reach.yml"),
                 failed("media_visibility_treatments.yml"),
+                failed("soft_nsfw.yml"),
                 failed("stale_tweet.yml"),
                 failed("limited_actions_policy.yml"),
             ]
@@ -412,6 +535,7 @@ country_specific_nsfw_content_gating:
             "media_visibility_treatments:\n  parameters: {}\n",
         );
         write("stale_tweet.yml", "stale_tweet:\n  parameters: {}\n");
+        write("soft_nsfw.yml", "soft_nsfw:\n  parameters: {}\n");
         write(
             "community_tweet.yml",
             "community_tweet:\n  parameters: {}\n",

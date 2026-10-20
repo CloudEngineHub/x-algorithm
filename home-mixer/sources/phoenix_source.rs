@@ -1,16 +1,17 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixColdStartMaxResults,
-    PhoenixMaxResults, PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
+    EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,
+    PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
     PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
     PhoenixXdsRetrievalMaxRetries,
 };
-use crate::util::egress::RetrievalDispatch;
 use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
 };
+use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{
     PhoenixRetrievalCluster, RetrievalExclusions,
 };
@@ -23,7 +24,7 @@ use xai_stats_receiver::global_stats_receiver;
 const ZERO_FAV_RETRIEVED_METRIC: &str = "ScoredStats.PhoenixRetrievalZeroFavTweets.Retrieved";
 
 pub struct PhoenixSource {
-    pub dispatch: RetrievalDispatch,
+    pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
 }
 
 impl PhoenixSource {
@@ -118,9 +119,8 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let user_context = build_user_context(query);
 
         let response = self
-            .dispatch
-            .retrieve_with_fallback_excluding(
-                query,
+            .phoenix_retrieval_client
+            .retrieve_excluding(
                 cluster,
                 user_id,
                 sequence.clone(),
@@ -132,7 +132,6 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
                 client_context,
                 user_context,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
-                query.params.get(EnablePhoenixRetrievalFallback),
                 vec![],
                 Self::seen_post_exclusions(query),
             )
@@ -177,10 +176,7 @@ mod tests {
 
     fn source() -> PhoenixSource {
         PhoenixSource {
-            dispatch: RetrievalDispatch {
-                prod: Arc::new(MockRetrievalClient),
-                paths: vec![],
-            },
+            phoenix_retrieval_client: Arc::new(MockRetrievalClient),
         }
     }
 

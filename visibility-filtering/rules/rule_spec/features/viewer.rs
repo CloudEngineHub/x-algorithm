@@ -1,8 +1,9 @@
-use super::{Feature, Leaf, Meaning};
+use super::{Feature, Leaf, Meaning, Reads};
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::{Viewer, ViewerProfile};
+use crate::models::{PostCandidate, Viewer, ViewerProfile};
 use crate::params::CountryList;
 use crate::rules::context::At;
+use crate::rules::rule_spec::engine::{Candidate, Engine};
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::{account_or_request_country_in, Predicate};
 
@@ -11,9 +12,11 @@ pub(in crate::rules) enum ViewerAccount {}
 impl Feature for ViewerAccount {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::ViewerProfile);
     type Value<'a> = Option<&'a ViewerProfile>;
+}
 
+impl<C: Candidate> Reads<C> for ViewerAccount {
     #[inline]
-    fn read<'a>(at: At<'_, 'a>) -> Option<&'a ViewerProfile> {
+    fn read<'a>(at: At<'_, 'a, C>) -> Option<&'a ViewerProfile> {
         match &at.viewer().viewer {
             Viewer::LoggedIn { profile, .. } => Some(profile),
             Viewer::LoggedOut => None,
@@ -30,6 +33,7 @@ pub enum ViewerAccountLeaf {
     ViewerAccountOrRequestCountryIn(CountryList),
     ViewerHasVerifiedBadge,
     ViewerReadOnly,
+    ViewerIsNewAccount,
 }
 
 impl Leaf for ViewerAccountLeaf {
@@ -58,12 +62,15 @@ impl Leaf for ViewerAccountLeaf {
             Self::ViewerReadOnly => {
                 m.run(|profile, _| profile.is_some_and(|profile| profile.is_read_only))
             }
+            Self::ViewerIsNewAccount => {
+                m.run(|profile, _| profile.is_some_and(|profile| profile.is_new_account))
+            }
         }
     }
 }
 
 impl ViewerAccountLeaf {
-    pub(in crate::rules) const fn leaf(self) -> RuleCond {
+    pub(in crate::rules) const fn leaf<E: Engine>(self) -> RuleCond<E> {
         RuleCond::Leaf(Predicate::ViewerAccount(self))
     }
 }
@@ -73,9 +80,11 @@ pub(in crate::rules) enum ViewerLabels {}
 impl Feature for ViewerLabels {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::ViewerLabels);
     type Value<'a> = bool;
+}
 
+impl<C: Candidate> Reads<C> for ViewerLabels {
     #[inline]
-    fn read<'a>(at: At<'_, 'a>) -> bool {
+    fn read<'a>(at: At<'_, 'a, C>) -> bool {
         match &at.viewer().viewer {
             Viewer::LoggedIn {
                 has_age_verified_18_label,
@@ -91,7 +100,9 @@ pub(in crate::rules) enum ViewerCountry {}
 impl Feature for ViewerCountry {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::ViewerCountry);
     type Value<'a> = Option<&'a str>;
+}
 
+impl Reads<PostCandidate> for ViewerCountry {
     #[inline]
     fn read<'a>(at: At<'_, 'a>) -> Option<&'a str> {
         let features = at.post().conversation_control.as_ref();

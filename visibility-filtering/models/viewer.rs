@@ -39,6 +39,7 @@ pub struct ViewerProfile {
     pub has_idv_premium: bool,
     pub is_read_only: bool,
     pub account_country_code: Option<String>,
+    pub is_new_account: bool,
 }
 
 impl ViewerProfile {
@@ -71,6 +72,8 @@ pub struct ClientCapability {
     pub gore_blur_ignores_settings: bool,
     pub fosnr_rules: bool,
     pub fosnr_fallback_drops: bool,
+    #[serde(default)]
+    pub soft_nsfw_new_user_drop: bool,
 }
 
 impl Default for ClientCapability {
@@ -83,6 +86,7 @@ impl Default for ClientCapability {
             gore_blur_ignores_settings: false,
             fosnr_rules: true,
             fosnr_fallback_drops: false,
+            soft_nsfw_new_user_drop: false,
         }
     }
 }

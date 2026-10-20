@@ -1,7 +1,9 @@
 use crate::hydration::Hydrators;
 use crate::metrics as ft_metrics;
 use crate::metrics::Rpc;
-use crate::models::{Decided, Evaluation, TweetId, Verdict, Withholding};
+use crate::models::{
+    Decided, Evaluation, EvaluationKey, PlacedCandidate, TweetId, Verdict, Withholding,
+};
 use crate::post_evaluator::{
     HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver,
 };
@@ -31,8 +33,8 @@ pub enum MergeSelection {
 
 #[derive(Default)]
 pub(crate) struct Traced {
-    pub(crate) policies: HashMap<TweetId, PolicyTrace>,
-    pub(crate) selections: HashMap<TweetId, MergeSelection>,
+    pub(crate) policies: HashMap<EvaluationKey, PolicyTrace>,
+    pub(crate) selections: HashMap<EvaluationKey, MergeSelection>,
 }
 
 pub(crate) async fn hydrate_and_trace(
@@ -46,7 +48,7 @@ pub(crate) async fn hydrate_and_trace(
     let outcomes = selected
         .into_iter()
         .map(|(outcome, selection)| {
-            traced.selections.insert(outcome.tweet_id, selection);
+            traced.selections.insert(outcome.key(), selection);
             outcome
         })
         .collect();
@@ -56,6 +58,7 @@ pub(crate) async fn hydrate_and_trace(
     (hydrated, outcomes, traced)
 }
 
+#[cfg(test)]
 pub(crate) async fn hydrate_and_evaluate(
     post_evaluator: &PostEvaluator,
     request: PostBatch,
@@ -97,15 +100,16 @@ fn trace_unmerged_sources(
     traced: &mut Traced,
 ) {
     let hydration = hydrated.hydration();
-    let unmerged: Vec<TweetId> = hydrated
+    let unmerged: Vec<EvaluationKey> = hydrated
         .requested_ids()
         .filter_map(|tweet_id| hydration.tweet(tweet_id)?.source_tweet_id())
-        .filter(|source_id| {
-            !traced.policies.contains_key(source_id)
-                && hydration
-                    .tweet(*source_id)
-                    .is_some_and(|source| source.candidate().is_some())
+        .filter(|&source_id| {
+            hydration
+                .tweet(source_id)
+                .is_some_and(|source| source.candidate().is_some())
         })
+        .map(EvaluationKey::retweet_source)
+        .filter(|key| !traced.policies.contains_key(key))
         .collect();
     if !unmerged.is_empty() {
         post_evaluator.trace(hydrated, unmerged, &mut traced.policies);
@@ -138,26 +142,25 @@ fn merge_sources<O: PostObserver>(
         &[("outcome", "fetched")],
         fetched.len() as u64,
     );
-    let mut outcomes = post_evaluator.evaluate(
-        hydrated,
-        hydrated.requested_ids().chain(fetched.iter().copied()),
-        |tweet_id| !fetched.contains(&tweet_id),
-        observer,
-    );
-    let mut sources: HashMap<TweetId, Evaluation> = in_batch
-        .iter()
-        .filter_map(|&source_id| Some((source_id, outcomes.get(&source_id)?.evaluation.clone())))
+    let source_ids = || in_batch.iter().chain(&fetched).copied();
+    let keys = hydrated
+        .candidates()
+        .map(PlacedCandidate::key)
+        .chain(source_ids().map(EvaluationKey::retweet_source));
+    let mut outcomes = post_evaluator.evaluate(hydrated, keys, observer);
+    let sources: HashMap<TweetId, Evaluation> = source_ids()
+        .filter_map(|source_id| {
+            let source = outcomes.remove(&EvaluationKey::retweet_source(source_id))?;
+            Some((source_id, source.evaluation))
+        })
         .collect();
-    sources.extend(fetched.iter().filter_map(|source_id| {
-        let source = outcomes.remove(source_id)?;
-        Some((source.tweet_id, source.evaluation))
-    }));
     let mut merged: Vec<(PostEvaluation, MergeSelection)> =
-        Vec::with_capacity(hydrated.requested_ids().len());
-    for tweet_id in hydrated.requested_ids() {
-        let selected = match outcomes.remove(&tweet_id) {
+        Vec::with_capacity(hydrated.candidates().len());
+    for candidate in hydrated.candidates() {
+        let key = candidate.key();
+        let selected = match outcomes.remove(&key) {
             Some(outcome) => merge_source(outcome, &sources),
-            None => match merged.iter().rfind(|(prior, _)| prior.tweet_id == tweet_id) {
+            None => match merged.iter().rfind(|(prior, _)| prior.key() == key) {
                 Some(selected) => selected.clone(),
                 None => continue,
             },
@@ -291,7 +294,7 @@ mod tests {
     use crate::metrics::Rpc;
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
-        MediaInterstitial, MediaRestriction, NsfwFeature, RawCandidate, SafetyLabelType,
+        MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate, SafetyLabelType,
         TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
@@ -356,6 +359,7 @@ mod tests {
         ] {
             let retweet = PostEvaluation {
                 tweet_id: TweetId(1),
+                placement: Placement::Standalone,
                 source_tweet_id: Some(TweetId(5)),
                 evaluation: Evaluation::complete(retweet.clone()),
                 safety_labels: None,
@@ -1235,6 +1239,42 @@ Flock follows-fwd[20, 40] blocks-rev[20, 40]
 Flock blocks-rev[30]"
         );
         assert_eq!(sources.keys(Source::TesConversationRoot), [vec![100]]);
+    }
+
+    #[tokio::test]
+    async fn a_requested_stale_source_is_dropped_standalone_and_kept_as_its_retweets_source() {
+        use crate::rules::fixtures::dropped;
+        use xai_core_entities::entities::{EditControl, EditControlInitial};
+        let superseded = TweetFeatures {
+            edit_control: Some(EditControl::Initial(EditControlInitial {
+                edit_tweet_ids: vec![5, 6],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let scenario = Scenario::new(
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(50))
+                .tweet(5, 50)
+                .tweet_features(5, superseded)
+                .authors(&[10, 50]),
+            SafetyLevel::TimelineHome,
+        )
+        .viewer(Some(1))
+        .rpc(Rpc::EvaluateTweets);
+        let stale = Evaluation::complete(dropped(
+            FilteredReason::UnspecifiedReason,
+            "stale_tweet/drop/unspecified",
+        ));
+        let allowed = Evaluation::complete(allow());
+        assert_eq!(
+            scenario.evaluate(&requested(&[1, 5])).await.evaluations(),
+            [allowed.clone(), stale]
+        );
+        assert_eq!(
+            scenario.evaluate(&requested(&[1])).await.evaluations(),
+            [allowed]
+        );
     }
 
     #[tokio::test]

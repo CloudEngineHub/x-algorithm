@@ -1,6 +1,7 @@
-use crate::clients::socialgraph_client::{EdgeDirection, EdgeQuery, Graph};
+use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};
 use crate::hydration::tweet_source::decode_tweet;
 use crate::models;
+use crate::thrift_read::read_fields;
 use anyhow::anyhow;
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -11,7 +12,7 @@ use std::str::FromStr;
 use strum::VariantArray;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use xai_core_entities::entities::{
-    ConversationControl, EditControl, GizmoduckUser, GizmoduckUserResult, PureCoreData,
+    ConversationControl, EditControl, GizmoduckUser, GizmoduckUserResult, PureCoreData, QuotedTweet,
 };
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_visibility_filtering_proto as vf_pb;
@@ -242,19 +243,17 @@ struct RawTweetIds {
 
 impl RawTweetIds {
     fn read(&mut self, proto: &mut dyn TInputProtocol, at: &mut Vec<i16>) -> thrift::Result<()> {
-        proto.read_struct_begin()?;
-        loop {
-            let field = proto.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
+        read_fields(proto, |proto, field| {
             at.push(field.id.unwrap_or_default());
             let id = RAW_ID_PATHS
                 .iter()
                 .find(|(path, _)| *path == at.as_slice())
                 .map(|&(_, id)| id);
-            match (id, field.field_type) {
-                (Some(id), TType::I64) => self.push(id, proto.read_i64()?),
+            let read = match (id, field.field_type) {
+                (Some(id), TType::I64) => {
+                    self.push(id, proto.read_i64()?);
+                    true
+                }
                 (Some(id), TType::List) => {
                     let list = proto.read_list_begin()?;
                     if list.element_type != TType::I64 {
@@ -264,19 +263,20 @@ impl RawTweetIds {
                         self.push(id, proto.read_i64()?);
                     }
                     proto.read_list_end()?;
+                    true
                 }
                 (Some(_), _) => return Err(not_an_id(at)),
                 (None, TType::Struct)
                     if RAW_ID_PATHS.iter().any(|(path, _)| path.starts_with(at)) =>
                 {
                     self.read(proto, at)?;
+                    true
                 }
-                (None, field_type) => proto.skip(field_type)?,
-            }
+                (None, _) => false,
+            };
             at.pop();
-            proto.read_field_end()?;
-        }
-        proto.read_struct_end()
+            Ok(read)
+        })
     }
 
     fn push(&mut self, id: fn(u64) -> Id, value: i64) {
@@ -324,6 +324,22 @@ impl Exchange for TesConversationControl {
         Ok(iter::once(Id::Tweet(tweet_id))
             .chain(users.map(Id::User))
             .collect())
+    }
+}
+
+pub(crate) struct TesQuotedTweet;
+
+impl Exchange for TesQuotedTweet {
+    const NAME: &'static str = "quoted_tweets";
+    const SCOPE: Scope = Scope::Shared;
+    type Key = u64;
+    type Wire = QuotedTweet;
+
+    fn ids(&outer_id: &u64, quoted: Option<&QuotedTweet>) -> anyhow::Result<Vec<Id>> {
+        let quoted = quoted
+            .into_iter()
+            .flat_map(|quoted| [Id::Tweet(quoted.tweet_id), Id::User(quoted.user_id)]);
+        Ok(iter::once(Id::Tweet(outer_id)).chain(quoted).collect())
     }
 }
 
@@ -404,6 +420,68 @@ impl Exchange for Flock {
 
     fn ids(key: &EdgeKey, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {
         Ok(vec![Id::User(key.destination)])
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PairEdgeKey {
+    pub(crate) graph: Graph,
+    pub(crate) source: u64,
+    pub(crate) destination: u64,
+}
+
+impl PairEdgeKey {
+    pub(crate) fn of(query: &EdgeQuery, destination: u64) -> Option<Self> {
+        let EdgeFrom::User(source) = query.from else {
+            return None;
+        };
+        Some(Self {
+            graph: query.graph,
+            source,
+            destination,
+        })
+    }
+}
+
+impl Display for PairEdgeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let graph: &str = self.graph.into();
+        write!(f, "{graph}/{}/{}", self.source, self.destination)
+    }
+}
+
+impl FromStr for PairEdgeKey {
+    type Err = anyhow::Error;
+
+    fn from_str(key: &str) -> anyhow::Result<Self> {
+        let mut parts = key.splitn(3, '/');
+        let (Some(graph), Some(source), Some(destination)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            anyhow::bail!("{key}: not a graph/source/destination key");
+        };
+        Ok(Self {
+            graph: *Graph::VARIANTS
+                .iter()
+                .find(|known| <&str>::from(**known) == graph)
+                .ok_or_else(|| anyhow!("{key}: no graph {graph}"))?,
+            source: source.parse()?,
+            destination: destination.parse()?,
+        })
+    }
+}
+
+pub(crate) struct FlockUserPair;
+
+impl Exchange for FlockUserPair {
+    const NAME: &'static str = "user_pair_edges";
+    const SCOPE: Scope = Scope::Shared;
+    const KEEPS_PARTIAL: bool = true;
+    type Key = PairEdgeKey;
+    type Wire = bool;
+
+    fn ids(key: &PairEdgeKey, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {
+        Ok(vec![Id::User(key.source), Id::User(key.destination)])
     }
 }
 

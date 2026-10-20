@@ -50,6 +50,7 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
                 gore_blur_ignores_settings,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
+                soft_nsfw_new_user_drop: false,
             },
         }
     }

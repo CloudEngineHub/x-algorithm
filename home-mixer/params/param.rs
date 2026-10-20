@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-16T16:00:32Z
+// mirrored from config feature-switch defaults; last sync 2026-10-19T16:00:41Z
 use xai_feature_switches::param;
 
 param!(
@@ -99,6 +99,12 @@ param!(
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
     vec![]
+);
+param!(
+    ShadowTrafficPhoenixClusterAggregationTypes,
+    Vec<String>,
+    "rust_home_mixer_shadow_traffic_phoenix_cluster_aggregation_types",
+    vec!["Experiment16Fou:DENSE_WITH_LONG_DWELL_HOME_EXCURSION".to_string()]
 );
 param!(
     ShadowTrafficDefaultPercent,
@@ -263,12 +269,6 @@ param!(
     u32,
     "rust_home_mixer_phoenix_xds_retrieval_max_retries",
     0
-);
-param!(
-    EnablePhoenixRetrievalFallback,
-    bool,
-    "rust_home_mixer_phoenix_retrieval_enable_fallback",
-    false
 );
 
 param!(
@@ -502,6 +502,30 @@ param!(
     VMRankerSendPacingInputs,
     bool,
     "rust_home_mixer_vm_ranker_send_pacing_inputs",
+    false
+);
+param!(
+    VMRankerSendHistoryTopics,
+    bool,
+    "rust_home_mixer_vm_ranker_send_history_topics",
+    false
+);
+param!(
+    HistoryTopicsEnabled,
+    bool,
+    "rust_home_mixer_history_topics_enabled",
+    false
+);
+param!(
+    HistoryTopicsWindowDays,
+    i64,
+    "rust_home_mixer_history_topics_window_days",
+    28
+);
+param!(
+    EnableSerendipityStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_serendipity_stats_experiment_bucket",
     false
 );
 param!(

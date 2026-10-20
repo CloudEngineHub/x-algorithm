@@ -1,3 +1,4 @@
+use crate::rules::rule_spec::engine::Engine;
 use crate::rules::rule_spec::features::{PostFactsLeaf, RequestLeaf};
 use crate::rules::rule_spec::rule::{Rule, RuleCond};
 use crate::rules::rule_spec::Predicate;
@@ -9,11 +10,13 @@ pub(super) struct Unrepresentable {
     pub(super) part: String,
 }
 
-pub(super) fn legacy_table(rules: &[(&'static str, Rule)]) -> Result<String, Unrepresentable> {
+pub(super) fn legacy_table<E: Engine>(
+    rules: &[(&'static str, Rule<E>)],
+) -> Result<String, Unrepresentable> {
     let mut table = String::new();
     let mut severity = None;
     for &(name, ref rule) in rules {
-        let unrepresentable = |part: RuleCond| Unrepresentable {
+        let unrepresentable = |part: RuleCond<E>| Unrepresentable {
             rule: name,
             part: part.spelled(),
         };
@@ -44,19 +47,22 @@ pub(super) fn legacy_table(rules: &[(&'static str, Rule)]) -> Result<String, Unr
     Ok(table)
 }
 
-fn conjuncts(condition: RuleCond, conjuncts: &mut Vec<String>) -> Result<(), RuleCond> {
-    let leaves = |branches: &[RuleCond]| -> Option<Vec<Predicate>> {
+fn conjuncts<E: Engine>(
+    condition: RuleCond<E>,
+    conjuncts: &mut Vec<String>,
+) -> Result<(), RuleCond<E>> {
+    let leaves = |branches: &[RuleCond<E>]| -> Option<Vec<Predicate>> {
         branches
             .iter()
             .map(|branch| match *branch {
-                RuleCond::Leaf(leaf) => Some(leaf),
+                RuleCond::Leaf(leaf) => Some(E::lift(leaf)),
                 RuleCond::All(_) | RuleCond::Any(_) | RuleCond::Not(_) | RuleCond::Named(_) => None,
             })
             .collect()
     };
     match condition {
-        RuleCond::Leaf(leaf) => conjuncts.push(leaf.spelled()),
-        RuleCond::Not(&RuleCond::Leaf(leaf)) => conjuncts.push(negated(leaf)),
+        RuleCond::Leaf(leaf) => conjuncts.push(E::lift(leaf).spelled()),
+        RuleCond::Not(&RuleCond::Leaf(leaf)) => conjuncts.push(negated(E::lift(leaf))),
         RuleCond::All(children) => {
             for &child in children {
                 self::conjuncts(child, conjuncts)?;

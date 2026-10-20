@@ -28,7 +28,7 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use xai_core_entities::entities::ConversationControl;
+use xai_core_entities::entities::{ConversationControl, QuotedTweet};
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_rpc::WithBudget;
 
@@ -121,10 +121,12 @@ pub(super) enum Reply {
     RootAuthors(RawHydrationBatch<AuthorId>),
     Tweets(RawHydrationBatch<TweetFeatures>),
     Controls(RawHydrationBatch<ConversationControl>),
+    QuotedTweets(RawHydrationBatch<QuotedTweet>),
     Labels(RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>>),
     Viewer(RawHydrationBatch<DecodedViewer>),
     Authors(RawHydrationBatch<DecodedAuthor>),
     Select(Vec<RawHydrationBatch<bool>>),
+    PairEdges(Vec<RawHydrationBatch<bool>>),
     Edge(Edge, RawHydrationBatch<bool>),
     ViewerCountry(RawHydrationBatch<Arc<str>>),
     CommunityModerations(RawHydrationBatch<CommunityModeration>),
@@ -198,9 +200,10 @@ impl HydrationPlan {
             self,
             request.viewer_id,
             request.client_capability,
-            request.raw_candidates,
+            &request.raw_candidates,
             request.is_expanding_retweet_sources,
-        );
+        )
+        .with_quotes(&request.quotes);
         let mut running: FuturesUnordered<InFlight<'_>> = FuturesUnordered::new();
         let inputless = || self.groups().filter(|g| g.input.is_none());
         let mut ready: Vec<&Group> = inputless().collect();
@@ -214,7 +217,7 @@ impl HydrationPlan {
                 break;
             };
             let group = call.group;
-            if store.land(&call, reply, started.elapsed()) == Landing::SourcesJoined {
+            if store.land(&call, reply, started.elapsed()) == Landing::KeysJoined {
                 ready.extend(inputless());
             }
             ready.extend(self.readers(group));
@@ -282,6 +285,12 @@ impl HydrationPlan {
                 identity,
                 Reply::Controls,
             ),
+            Source::TesQuotedTweet => timed.keyed(
+                call,
+                |call| sources.quoted_tweets(&call.keys),
+                identity,
+                Reply::QuotedTweets,
+            ),
             Source::SafetyLabels => timed.keyed(
                 call,
                 |call| sources.safety_labels(&call.keys),
@@ -320,6 +329,17 @@ impl HydrationPlan {
                     (call, Reply::Select(edges))
                 })
             }
+            Source::FlockUserPair => Box::pin(async move {
+                let select = async {
+                    let edges = sources.select_pair_edges(&call.queries).await.into_inner();
+                    let (edges, missing) = missing_sets_read_no_edge(edges);
+                    record_flock_missing_keys(&timed.client, &timed.method, level, missing);
+                    edges
+                };
+                let per_query = |timed_out| vec![timed_out; call.queries.len()];
+                let edges = timed.run(select, per_query).await;
+                (call, Reply::PairEdges(edges))
+            }),
             Source::ViewerCountry => {
                 let viewer_id = call.viewer_id?;
                 timed.keyed(
@@ -444,7 +464,7 @@ fn missing_sets_read_no_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::{EdgeDirection, EdgeQuery, Graph};
+    use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};
     use crate::hydration::decode::author::fallback_cache;
     use crate::hydration::decode::tweet::tweet_fallback_cache;
     use crate::hydration::sources::{Fault, InMemorySources, control, suspended};
@@ -452,13 +472,12 @@ mod tests {
         BEST_EFFORT_HYDRATION_TIMEOUT, Cause, HYDRATION_TIMEOUT, Hydrator, Hydrators, Lookup,
         Unresolved,
     };
-    use crate::metrics::Rpc;
+    use crate::metrics::{Rpc, thread_recorded};
     use crate::models::{
-        ArticleLifecycle, ClientCapability, Evaluation, TweetId, Viewer, ViewerProfile,
+        ArticleLifecycle, ClientCapability, Evaluation, Placement, TweetId, Viewer, ViewerProfile,
     };
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::{InRequestOrder, Scenario, raw};
-    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fmt::Write;
     use std::num::NonZeroU64;
@@ -468,7 +487,6 @@ mod tests {
         UserResponseState,
     };
     use xai_core_entities::gizmoduck_client::QueryFields;
-    use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
 
     const VIEWER: u64 = 50;
 
@@ -816,11 +834,13 @@ mod tests {
                 EdgeQuery {
                     graph: Graph::Follows,
                     direction: EdgeDirection::Forward,
+                    from: EdgeFrom::Viewer,
                     destination_ids: vec![10],
                 },
                 EdgeQuery {
                     graph: Graph::Blocks,
                     direction: EdgeDirection::Reverse,
+                    from: EdgeFrom::Viewer,
                     destination_ids: vec![10],
                 },
             ]]
@@ -1109,16 +1129,19 @@ mod tests {
                 EdgeQuery {
                     graph: Graph::Follows,
                     direction: EdgeDirection::Reverse,
+                    from: EdgeFrom::Viewer,
                     destination_ids: vec![30],
                 },
                 EdgeQuery {
                     graph: Graph::SuperFollows,
                     direction: EdgeDirection::Forward,
+                    from: EdgeFrom::Viewer,
                     destination_ids: vec![40],
                 },
                 EdgeQuery {
                     graph: Graph::Blocks,
                     direction: EdgeDirection::Reverse,
+                    from: EdgeFrom::Viewer,
                     destination_ids: vec![30, 40],
                 },
             ]]
@@ -1251,8 +1274,12 @@ mod tests {
                 "{delayed:?} lands last"
             );
             let engine = RuleEngine::for_tests();
-            let evaluation =
-                engine.evaluate(level, &hydrated.viewer_features, &hydrated.candidates[0]);
+            let evaluation = engine.evaluate(
+                level,
+                &hydrated.viewer_features,
+                &hydrated.candidates[0],
+                Placement::Standalone,
+            );
             assert!(matches!(evaluation, Evaluation::Complete { .. }));
         }
     }
@@ -1671,7 +1698,7 @@ mod tests {
             HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(retweet)))]));
         assert_eq!(
             store.land(&call, Reply::PureCores(cores), std::time::Duration::ZERO),
-            Landing::SourcesJoined
+            Landing::KeysJoined
         );
         for source in [Source::SafetyLabels, Source::Flock] {
             let group = plan.groups().find(|group| group.source == source).unwrap();
@@ -1821,35 +1848,9 @@ mod tests {
         );
     }
 
-    thread_local! {
-        static BATCH_SIZES: RefCell<Option<Vec<(String, usize)>>> = const { RefCell::new(None) };
-    }
-
-            struct ThreadBatchSizes;
-
-    impl StatsReceiverExt for ThreadBatchSizes {
-        fn incr(&self, _: &str, _: &[(&str, &str)], _: u64) {}
-        fn observe(&self, name: &str, scopes: &[(&str, &str)], value: f64, _: HistogramBuckets) {
-            if name != "vf_hydrator_batch_size" {
-                return;
-            }
-            let client = scopes.iter().find(|&&(label, _)| label == "client");
-            let client = client.map_or("", |&(_, client)| client).to_owned();
-            BATCH_SIZES.with_borrow_mut(|sizes| {
-                if let Some(sizes) = sizes {
-                    sizes.push((client, value as usize));
-                }
-            });
-        }
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-    }
-
     #[tokio::test]
     async fn each_planned_client_records_its_batch_sizes() {
         use SafetyLevel::{TimelineHome, TimelineHomeHydration};
-        xai_stats_receiver::init_stats_receiver_with(Arc::new(ThreadBatchSizes));
         let raw = [
             raw(1, None),
             raw(2, None),
@@ -1860,11 +1861,17 @@ mod tests {
         let engine = RuleEngine::for_tests();
         let mut rendered = String::new();
         for level in [TimelineHome, TimelineHomeHydration] {
-            BATCH_SIZES.set(Some(Vec::new()));
+            thread_recorded::start();
             executor(every_source_world(), level, Some(VIEWER))
                 .hydrate(&raw)
                 .await;
-            let recorded = BATCH_SIZES.take().unwrap();
+            let recorded: Vec<(String, usize)> = thread_recorded::take("vf_hydrator_batch_size")
+                .iter()
+                .map(|sample| {
+                    let client = sample.label("client").unwrap_or_default();
+                    (client.to_owned(), sample.value as usize)
+                })
+                .collect();
             let mut sources_by_client: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             for group in engine.plan(level).groups() {
                 let (client, _) = group.label();

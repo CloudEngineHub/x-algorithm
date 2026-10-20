@@ -4,14 +4,15 @@ use crate::hydration::batch::{HydrationBatch, HydrationError, RawHydrationBatch}
 use crate::hydration::community_source::CommunityPost;
 use crate::hydration::sources::{
     author_batch, core_batch, country_batch, exchange, label_batch, lifecycle_batch, tweet_batch,
-    viewer_batch, Answered, Bytes, DecodedAuthor, DecodedViewer, EdgeKey, Observed, Sources,
+    viewer_batch, Answered, Bytes, DecodedAuthor, DecodedViewer, EdgeKey, Observed, PairEdgeKey,
+    Sources,
 };
 use crate::models::{ArticleLifecycle, PureCore, TweetFeatures};
 use crate::post_card::PostCard;
 use prost::Message;
 use std::collections::HashMap;
 use std::hash::Hash;
-use xai_core_entities::entities::ConversationControl;
+use xai_core_entities::entities::{ConversationControl, QuotedTweet};
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) struct Replay {
@@ -130,6 +131,13 @@ impl Sources for Replay {
         self.batch::<exchange::TesConversationControl>(tweet_ids.iter().copied())
     }
 
+    async fn quoted_tweets(
+        &self,
+        outer_ids: &[u64],
+    ) -> Answered<exchange::TesQuotedTweet, QuotedTweet> {
+        self.batch::<exchange::TesQuotedTweet>(outer_ids.iter().copied())
+    }
+
     async fn safety_labels(
         &self,
         tweet_ids: &[u64],
@@ -176,6 +184,23 @@ impl Sources for Replay {
             let answers = query.destination_ids.iter().map(|&destination| {
                 let key = EdgeKey::of(query, destination);
                 (destination, self.answer::<exchange::Flock>(&key))
+            });
+            HydrationBatch::from_hydrated(answers.collect())
+        });
+        Observed::quiet(batches.collect())
+    }
+
+    async fn select_pair_edges(
+        &self,
+        queries: &[EdgeQuery],
+    ) -> Observed<exchange::FlockUserPair, Vec<RawHydrationBatch<bool>>> {
+        let batches = queries.iter().map(|query| {
+            let answers = query.destination_ids.iter().map(|&destination| {
+                let answer = PairEdgeKey::of(query, destination)
+                    .map_or(Hydrated::Failed(HydrationError::Error), |key| {
+                        self.answer::<exchange::FlockUserPair>(&key)
+                    });
+                (destination, answer)
             });
             HydrationBatch::from_hydrated(answers.collect())
         });

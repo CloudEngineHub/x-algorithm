@@ -3,13 +3,20 @@ use super::conditions::{
     VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES,
     VIEWER_IS_NOT_AGE_VERIFIED_IN_TOMBSTONE_COUNTRIES,
 };
+use super::engine::{Engine, Fold, PostEngine, UserEngine};
 use super::features::{CompoundLeaf, ReplyControlLeaf, RequestLeaf};
+use super::rule::Audience::{self, Everyone, NonAuthors, NonFollowers, OnlyAuthor};
 use super::rule::{Rule, RuleCond};
 use super::*;
 use crate::hydration::Hydrator;
-use crate::models::{ClientCapability, VerifyBlurSupport, ViewerFeatures};
+use crate::models::{
+    ClientCapability, Placement, PostCandidate, QuoteFacts, UserCandidate, VerifyBlurSupport,
+    ViewerFeatures,
+};
+use crate::params::CountryLists;
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 use crate::rules::golden_corpus::pairs;
+use crate::rules::levels::PostRules;
 use crate::rules::test_context;
 use crate::rules::SafetyLevel;
 use std::iter::once;
@@ -27,10 +34,10 @@ fn truths() -> Vec<Truth> {
     truths
 }
 
-fn wired_rules() -> Vec<&'static Rule> {
-    let mut rules: Vec<&'static Rule> = Vec::new();
+fn wired<E: Engine>(list: fn(PostRules) -> &'static [&'static Rule<E>]) -> Vec<&'static Rule<E>> {
+    let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for &rule in level.spec().rules {
+        for &rule in list(level.spec().rules.lists()) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -39,16 +46,28 @@ fn wired_rules() -> Vec<&'static Rule> {
     rules
 }
 
+fn wired_user_rules() -> Vec<&'static Rule<UserEngine>> {
+    wired(|rules| rules.user)
+}
+
+fn wired_rules() -> Vec<&'static Rule> {
+    wired(|rules| rules.post)
+}
+
 fn wired_leaves() -> Vec<Predicate> {
-    let mut leaves = Vec::new();
-    for rule in wired_rules() {
-        let mut read = Vec::new();
-        rule.audience.condition().leaves(&mut read);
+    let mut read = Vec::new();
+    for rule in wired_user_rules() {
+        rule.audience.condition::<UserEngine>().leaves(&mut read);
         rule.when.leaves(&mut read);
-        for leaf in read {
-            if !leaves.contains(&leaf) {
-                leaves.push(leaf);
-            }
+    }
+    for rule in wired_rules() {
+        rule.audience.condition::<PostEngine>().leaves(&mut read);
+        rule.when.leaves(&mut read);
+    }
+    let mut leaves = Vec::new();
+    for leaf in read {
+        if !leaves.contains(&leaf) {
+            leaves.push(leaf);
         }
     }
     leaves
@@ -130,6 +149,16 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         "the default drops the post for real followers",
     ),
     (
+        "quoted_viewer_mutes_author_not_following/drop",
+        Hydrator::Follows,
+        "the default drops the quote of a muted author the viewer really follows",
+    ),
+    (
+        "protected_quoted_author/drop",
+        Hydrator::OuterAuthorFollowsAuthor,
+        "the default drops the quote of a protected author the quoting author really follows",
+    ),
+    (
         "fosnr_abuse_insults_non_follower/drop/undesirable",
         Hydrator::Follows,
         "the default drops the post for real followers",
@@ -150,14 +179,16 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
 fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
     let mut unaccepted = Vec::new();
     let mut accepted = Vec::new();
-    for rule in wired_rules() {
-        let name = rule.name();
+    let user = wired_user_rules().into_iter().map(|rule| {
         let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
-        for node in rule
-            .requirements()
-            .iter()
-            .filter(|node| node.is_best_effort())
-        {
+        (rule.name(), limits, rule.requirements())
+    });
+    let post = wired_rules().into_iter().map(|rule| {
+        let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
+        (rule.name(), limits, rule.requirements())
+    });
+    for (name, limits, requirements) in user.chain(post) {
+        for node in requirements.iter().filter(|node| node.is_best_effort()) {
             match ACCEPTED_BEST_EFFORT_READS
                 .iter()
                 .find(|&&(by, accepted, _)| by == name && accepted == node)
@@ -177,9 +208,9 @@ fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
     }
 }
 
-fn holds(condition: RuleCond, context: &RuleContext<'_>) -> bool {
+fn holds<E: Fold>(condition: RuleCond<E>, context: &RuleContext<'_, E::Candidate>) -> bool {
     match condition {
-        RuleCond::Leaf(leaf) => leaf.holds(context),
+        RuleCond::Leaf(leaf) => truth_of(leaf, context).resolves_true(),
         RuleCond::All(children) => children.iter().all(|&child| holds(child, context)),
         RuleCond::Any(children) => children.iter().any(|&child| holds(child, context)),
         RuleCond::Not(child) => !holds(*child, context),
@@ -187,9 +218,32 @@ fn holds(condition: RuleCond, context: &RuleContext<'_>) -> bool {
     }
 }
 
+fn faithful<E: Fold>(
+    rules: &[&Rule<E>],
+    context: &RuleContext<'_, E::Candidate>,
+    failed: Hydrators,
+) {
+    for &rule in rules {
+        if rule.requirements().intersection(failed) != failed {
+            continue;
+        }
+        let (truth, ()) = observed::evaluate_rule(rule, context, &mut observed::NoTrace, None);
+        let (total, _) =
+            observed::evaluate_rule(rule, context, &mut observed::NodeTracer::default(), None);
+        assert_eq!(truth, total, "{} with {failed:?} failed", rule.name());
+        assert_eq!(
+            truth.resolves_true(),
+            holds(rule.audience.condition::<E>(), context) && holds(rule.when, context),
+            "{} with {failed:?} failed",
+            rule.name()
+        );
+    }
+}
+
 #[test]
 fn the_rule_evaluator_is_faithful() {
-    let rules = wired_rules();
+    let (user_rules, rules) = (wired_user_rules(), wired_rules());
+    let country_lists = CountryLists::starting_at_default();
     let failures: Vec<Hydrators> = once(Hydrators::empty())
         .chain(
             Hydrator::VARIANTS
@@ -199,44 +253,46 @@ fn the_rule_evaluator_is_faithful() {
         .collect();
     for (viewer, fetched) in pairs() {
         for &failed in &failures {
-            let mut candidate = fetched.clone();
-            candidate.failed = failed;
-            let context = test_context(&viewer, &candidate);
-            for &rule in &rules {
-                if rule.requirements().intersection(failed) != failed {
-                    continue;
-                }
-                let (truth, ()) =
-                    observed::evaluate_rule(rule, &context, &mut observed::NoTrace, None);
-                let (total, _) = observed::evaluate_rule(
-                    rule,
-                    &context,
-                    &mut observed::NodeTracer::default(),
-                    None,
-                );
-                assert_eq!(truth, total, "{} with {failed:?} failed", rule.name());
-                assert_eq!(
-                    truth.resolves_true(),
-                    holds(rule.audience.condition(), &context) && holds(rule.when, &context),
-                    "{} with {failed:?} failed",
-                    rule.name()
-                );
-            }
+            let candidate = PostCandidate {
+                failed,
+                ..fetched.clone()
+            };
+            let author = UserCandidate {
+                user: candidate.author.clone(),
+                viewer_relationship: candidate.viewer_relationship,
+                failed,
+            };
+            faithful(
+                &user_rules,
+                &RuleContext::new(
+                    &viewer,
+                    &author,
+                    Placement::Standalone,
+                    QuoteFacts::default(),
+                    &country_lists,
+                ),
+                failed,
+            );
+            faithful(&rules, &test_context(&viewer, &candidate), failed);
         }
     }
 }
 
-fn readers_through(definitions: &[RuleCond], leaves: &[Predicate]) -> usize {
-    fn walk(
-        condition: RuleCond,
-        definitions: &[RuleCond],
+fn reads_one_definition<E: Fold>(
+    rule: &Rule<E>,
+    definitions: &[RuleCond<E>],
+    leaves: &[Predicate],
+) -> bool {
+    fn walk<E: Engine>(
+        condition: RuleCond<E>,
+        definitions: &[RuleCond<E>],
         negated: bool,
         outside: &mut Vec<Predicate>,
         uses: &mut Vec<bool>,
     ) {
         match condition {
             condition if definitions.contains(&condition) => uses.push(negated),
-            RuleCond::Leaf(leaf) => outside.push(leaf),
+            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),
             RuleCond::All(children) | RuleCond::Any(children) => {
                 for &child in children {
                     walk(child, definitions, negated, outside, uses);
@@ -246,30 +302,36 @@ fn readers_through(definitions: &[RuleCond], leaves: &[Predicate]) -> usize {
             RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),
         }
     }
-    let mut readers = 0;
-    for rule in wired_rules() {
-        let (mut outside, mut uses) = (Vec::new(), Vec::new());
-        for root in [rule.audience.condition(), rule.when] {
-            walk(root, definitions, false, &mut outside, &mut uses);
-        }
-        for leaf in leaves {
-            assert!(
-                !outside.contains(leaf),
-                "{} reads {leaf:?} outside its named definition",
-                rule.name()
-            );
-        }
-        if !uses.is_empty() {
-            assert_eq!(
-                uses,
-                [false],
-                "{} must read one definition once, positively",
-                rule.name()
-            );
-            readers += 1;
-        }
+    let (mut outside, mut uses) = (Vec::new(), Vec::new());
+    for root in [rule.audience.condition::<E>(), rule.when] {
+        walk(root, definitions, false, &mut outside, &mut uses);
     }
-    readers
+    for leaf in leaves {
+        assert!(
+            !outside.contains(leaf),
+            "{} reads {leaf:?} outside its named definition",
+            rule.name()
+        );
+    }
+    if !uses.is_empty() {
+        assert_eq!(
+            uses,
+            [false],
+            "{} must read one definition once, positively",
+            rule.name()
+        );
+    }
+    !uses.is_empty()
+}
+
+fn readers_through(definitions: &[RuleCond], leaves: &[Predicate]) -> usize {
+    let user = wired_user_rules()
+        .into_iter()
+        .filter(|rule| reads_one_definition(rule, &[], leaves));
+    let post = wired_rules()
+        .into_iter()
+        .filter(|rule| reads_one_definition(rule, definitions, leaves));
+    user.count() + post.count()
 }
 
 #[test]
@@ -326,6 +388,7 @@ fn every_client_capability_is_live() {
         gore_blur_ignores_settings,
         fosnr_rules,
         fosnr_fallback_drops,
+        soft_nsfw_new_user_drop,
     } = base;
     let blur_supports = once(None)
         .chain(VerifyBlurSupport::VARIANTS.iter().copied().map(Some))
@@ -335,7 +398,7 @@ fn every_client_capability_is_live() {
             ..base
         })
         .collect();
-    let toggled: [(&str, Vec<ClientCapability>); 7] = [
+    let toggled: [(&str, Vec<ClientCapability>); 8] = [
         ("verify_blur_support", blur_supports),
         (
             "modern_blur",
@@ -379,6 +442,13 @@ fn every_client_capability_is_live() {
                 ..base
             }],
         ),
+        (
+            "soft_nsfw_new_user_drop",
+            vec![ClientCapability {
+                soft_nsfw_new_user_drop: !soft_nsfw_new_user_drop,
+                ..base
+            }],
+        ),
     ];
     let leaves = wired_leaves();
     let fetched = candidate().build();
@@ -400,4 +470,129 @@ fn every_client_capability_is_live() {
             "no wired leaf reads ClientCapability::{field}: wire a rule that reads it, or delete it"
         );
     }
+}
+
+#[test]
+fn only_the_quote_pass_reads_a_pair_edge() {
+    let mut readers = Vec::new();
+    for &level in SafetyLevel::VARIANTS {
+        let PostRules { user, post } = level.spec().rules.lists();
+        let mut read = Vec::new();
+        for rule in user {
+            rule.when.leaves(&mut read);
+        }
+        for rule in post {
+            rule.when.leaves(&mut read);
+        }
+        let reads_a_pair_edge = read
+            .iter()
+            .any(|leaf| matches!(leaf, Predicate::PairEdge(_)));
+        if reads_a_pair_edge && level != SafetyLevel::QuotedTweetRules {
+            readers.push(level);
+        }
+    }
+    assert_eq!(
+        readers,
+        Vec::<SafetyLevel>::new(),
+        "a pair edge is hydrated only for the quote pass's inner-quoted candidates"
+    );
+}
+
+const POST_RULES_READING_NO_POST: &[(&str, &str)] = &[
+    (
+        "filter_all/drop/unspecified",
+        "FilterAll's one rule drops every post, from either list",
+    ),
+    (
+        "read_only_viewer/limited_engagement",
+        "the user list would put it first among the engagement limits, so it would decide `by`",
+    ),
+];
+
+#[test]
+fn every_post_rule_reads_the_post() {
+    let reads_the_post = |leaf: &Predicate| match leaf {
+        Predicate::Request(_)
+        | Predicate::ViewerAccount(_)
+        | Predicate::AuthorFacts(_)
+        | Predicate::AuthorSafety(_)
+        | Predicate::AuthorLabels(_)
+        | Predicate::Relationship(_)
+        | Predicate::PairEdge(_) => false,
+        Predicate::PostFacts(_)
+        | Predicate::SourceTweetId(_)
+        | Predicate::Tweet(_)
+        | Predicate::TweetSafetyLabels(_)
+        | Predicate::ReplyControl(_)
+        | Predicate::PostModeration(_)
+        | Predicate::ArticleStage(_)
+        | Predicate::CommunityModerator(_)
+        | Predicate::CommunityViewerRemoved(_)
+        | Predicate::Edge(_)
+        | Predicate::Compound(_) => true,
+    };
+    let reading_no_post: Vec<String> = wired_rules()
+        .into_iter()
+        .filter(|rule| {
+            let mut read = Vec::new();
+            rule.when.leaves(&mut read);
+            let notice = matches!(
+                rule.action.spec(),
+                ActionSpec::SoftIntervention(_) | ActionSpec::Appealable(_)
+            );
+            !notice && !read.iter().any(reads_the_post)
+        })
+        .map(|rule| rule.name())
+        .collect();
+    assert_eq!(
+        reading_no_post,
+        POST_RULES_READING_NO_POST
+            .iter()
+            .map(|&(name, _)| name)
+            .collect::<Vec<_>>(),
+        "a post rule that reads no post is a `UserRule` in its levels' user lists, or a row of \
+         POST_RULES_READING_NO_POST"
+    );
+}
+
+#[test]
+fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
+    let ends_the_fold = |action: &ActionSpec<UserEngine>| match action {
+        ActionSpec::Drop(_)
+        | ActionSpec::Tombstone(_)
+        | ActionSpec::SoftIntervention(_)
+        | ActionSpec::Appealable(_) => true,
+        ActionSpec::MediaRestriction(_) | ActionSpec::LimitedEngagement(_) => false,
+    };
+    let disjoint = |user: Audience, post: Audience| match (user, post) {
+        (OnlyAuthor, NonAuthors | NonFollowers) | (NonAuthors | NonFollowers, OnlyAuthor) => true,
+        (Everyone, _)
+        | (_, Everyone)
+        | (OnlyAuthor, OnlyAuthor)
+        | (NonAuthors | NonFollowers, NonAuthors | NonFollowers) => false,
+    };
+    let mut shadowing = Vec::new();
+    for &level in SafetyLevel::VARIANTS {
+        let PostRules { user, post } = level.spec().rules.lists();
+        for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
+            let severity = user_rule.action.spec().severity();
+            for &post_rule in post {
+                if post_rule.action.spec().severity() > severity
+                    && !disjoint(user_rule.audience, post_rule.audience)
+                {
+                    shadowing.push(format!(
+                        "{level:?}: user {} shadows post {}",
+                        user_rule.name(),
+                        post_rule.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        shadowing,
+        Vec::<String>::new(),
+        "the user list folds before every post rule, so a user rule that ends the fold needs an \
+         audience disjoint from every more severe post rule"
+    );
 }

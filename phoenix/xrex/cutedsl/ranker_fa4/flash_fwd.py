@@ -41,7 +41,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Float32, Int32, const_expr
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import BaseDSL
 
@@ -805,7 +805,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         smem_copy_atom_QK = cute.make_copy_atom(
@@ -1046,7 +1046,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         sync()
 
@@ -1131,7 +1131,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax: Softmax,
         load_K: Callable,
         load_V: Callable,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
     ):
@@ -1262,7 +1262,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         sync()
         load_V(n_block, 0, need_predicates=False)

@@ -61,6 +61,7 @@ from xrex.data.recsys.recsys_batch import (
     RecsysFeaturesBatch,
     empty_conversion_delays,
     empty_feature_arrays,
+    empty_history_url_embedding,
     empty_page_record_arrays,
     empty_user_feature_arrays,
     from_record_batch,
@@ -1800,6 +1801,8 @@ class PhoenixDataset(Dataset):
 
     multimodal_embedding_type: EmbeddingType | None = None
 
+    history_url_embedding_dim: int = 0
+
     use_conversion_labels: bool = False
     conversion_label_window_ms: int = 7 * 24 * 60 * 60 * 1000
     conversion_label_types: tuple[str, ...] = ()
@@ -2262,6 +2265,7 @@ class PhoenixDataset(Dataset):
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
                         id_list_specs=id_list_specs,
+                        history_url_embedding_dim=self.history_url_embedding_dim,
                         alloc=self._alloc,
                     )
 
@@ -2461,7 +2465,9 @@ class PhoenixDataset(Dataset):
                 promoted_ids=None,
                 line_item_objective=None,
                 safety_label_mask=np.zeros((batch_size, history_seq_len), dtype=np.int64),
-                embedding=None,
+                embedding=empty_history_url_embedding(
+                    batch_size, history_seq_len, self.history_url_embedding_dim
+                ),
                 search_query_embeddings=None,
                 post_creation_ts_sec=np.zeros((batch_size, history_seq_len), dtype=np.int32),
                 post_sids=np.zeros(
@@ -2622,7 +2628,9 @@ class PhoenixToyDataset(PhoenixDataset):
                 promoted_ids=None,
                 line_item_objective=None,
                 safety_label_mask=np.zeros((batch_size, self.history_seq_len), dtype=np.int64),
-                embedding=None,
+                embedding=empty_history_url_embedding(
+                    batch_size, self.history_seq_len, self.history_url_embedding_dim
+                ),
                 search_query_embeddings=None,
                 post_creation_ts_sec=np.zeros((batch_size, self.history_seq_len), dtype=np.int32),
                 **empty_feature_arrays(batch_size, self.history_seq_len),

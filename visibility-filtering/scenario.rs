@@ -3,7 +3,8 @@ use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
 use crate::metrics::{RetweetSources, Rpc};
 use crate::models::{
-    ClientCapability, Evaluation, PostCandidate, RawCandidate, TweetId, ViewerFeatures,
+    ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, TweetId,
+    ViewerFeatures,
 };
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::retweet::hydrate_and_evaluate;
@@ -136,7 +137,11 @@ impl<S: Sources + 'static> Scenario<S> {
             country_code: self.country_code.clone(),
             client_capability: self.client_capability,
             safety_level: self.level,
-            candidates: raw.to_vec(),
+            candidates: raw
+                .iter()
+                .copied()
+                .map(PlacedCandidate::standalone)
+                .collect(),
             rpc: self.rpc,
         }
     }

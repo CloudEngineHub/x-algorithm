@@ -65,11 +65,84 @@ pub struct RawCandidate {
     pub request_author_id: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Placement {
+    Standalone,
+    InnerQuoted { outer: TweetId },
+    RetweetSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuoteLink {
+    pub outer: TweetId,
+    pub quoting_author: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PairEdges {
+    pub author_blocks_outer_author: bool,
+    pub outer_author_follows_author: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteFacts {
+    pub link: Option<QuoteLink>,
+    pub pair_edges: PairEdges,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlacedCandidate {
+    pub candidate: RawCandidate,
+    pub placement: Placement,
+}
+
+impl PlacedCandidate {
+    pub fn standalone(candidate: RawCandidate) -> Self {
+        Self {
+            candidate,
+            placement: Placement::Standalone,
+        }
+    }
+
+    pub fn tweet_id(self) -> TweetId {
+        self.candidate.tweet_id
+    }
+
+    pub fn key(self) -> EvaluationKey {
+        EvaluationKey {
+            tweet_id: self.tweet_id(),
+            placement: self.placement,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EvaluationKey {
+    pub tweet_id: TweetId,
+    pub placement: Placement,
+}
+
+impl EvaluationKey {
+    pub fn retweet_source(tweet_id: TweetId) -> Self {
+        Self {
+            tweet_id,
+            placement: Placement::RetweetSource,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PostCandidate {
     pub author: UserEntity,
     pub viewer_relationship: ViewerRelationship,
     pub post: PostEntity,
+    pub failed: Hydrators,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserCandidate {
+    pub user: UserEntity,
+    pub viewer_relationship: ViewerRelationship,
     pub failed: Hydrators,
 }
 
@@ -165,7 +238,10 @@ impl ViewerRelationship {
             | Hydrator::ArticleMediaEntities
             | Hydrator::ArticleCoverMedia
             | Hydrator::TrustedFriends
-            | Hydrator::OutsideNarrowcastPlace => None,
+            | Hydrator::OutsideNarrowcastPlace
+            | Hydrator::AuthorBlocksOuterAuthor
+            | Hydrator::OuterAuthorFollowsAuthor
+            | Hydrator::QuotedTweet => None,
         }
     }
 

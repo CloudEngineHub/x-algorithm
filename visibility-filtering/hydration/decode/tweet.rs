@@ -248,6 +248,7 @@ fn reply_to(core: &PureCoreData) -> Option<ReplyTo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Placement;
     use crate::rules::fixtures::{candidate, dropped, logged_out_viewer};
     use crate::rules::{RuleEngine, SafetyLevel};
     use xai_core_entities::entities::EditControlEdit;
@@ -347,7 +348,12 @@ mod tests {
             let post = candidate().with_tweet_features(cached).build();
             assert_eq!(
                 engine
-                    .evaluate(SafetyLevel::TimelineHome, &logged_out_viewer(), &post)
+                    .evaluate(
+                        SafetyLevel::TimelineHome,
+                        &logged_out_viewer(),
+                        &post,
+                        Placement::Standalone,
+                    )
                     .into_verdict(),
                 expected
             );

@@ -33,10 +33,12 @@ pub(crate) enum Source {
     TesConversationRoot,
     TesTweet,
     TesConversationControl,
+    TesQuotedTweet,
     SafetyLabels,
     GizmoduckViewer,
     GizmoduckAuthor,
     Flock,
+    FlockUserPair,
     ViewerCountry,
     Wingman,
     CommunityModeration,
@@ -68,6 +70,10 @@ impl Source {
                 miss: MissPolicy::FailsNode,
                 batch: Batch::Keys,
             },
+            Source::TesQuotedTweet => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
+            },
             Source::SafetyLabels => Row {
                 miss: MissPolicy::FailsNode,
                 batch: Batch::Requested,
@@ -83,6 +89,10 @@ impl Source {
             Source::Flock => Row {
                 miss: MissPolicy::FailsNode,
                 batch: Batch::Requested,
+            },
+            Source::FlockUserPair => Row {
+                miss: MissPolicy::FailsNode,
+                batch: Batch::Keys,
             },
             Source::ViewerCountry => Row {
                 miss: MissPolicy::FailsNode,
@@ -137,10 +147,12 @@ impl Source {
             Source::TesConversationRoot => <exchange::TesConversationRoot as Exchange>::SCOPE,
             Source::TesTweet => <exchange::TesTweet as Exchange>::SCOPE,
             Source::TesConversationControl => <exchange::TesConversationControl as Exchange>::SCOPE,
+            Source::TesQuotedTweet => <exchange::TesQuotedTweet as Exchange>::SCOPE,
             Source::SafetyLabels => <exchange::SafetyLabels as Exchange>::SCOPE,
             Source::GizmoduckViewer => <exchange::GizmoduckViewer as Exchange>::SCOPE,
             Source::GizmoduckAuthor => <exchange::GizmoduckAuthor as Exchange>::SCOPE,
             Source::Flock => <exchange::Flock as Exchange>::SCOPE,
+            Source::FlockUserPair => <exchange::FlockUserPair as Exchange>::SCOPE,
             Source::ViewerCountry => <exchange::ViewerCountry as Exchange>::SCOPE,
             Source::Wingman => <exchange::Wingman as Exchange>::SCOPE,
             Source::CommunityModeration => <exchange::CommunityModeration as Exchange>::SCOPE,
@@ -162,10 +174,12 @@ impl Source {
             Source::TesConversationControl => {
                 visitor.exchange::<exchange::TesConversationControl>()
             }
+            Source::TesQuotedTweet => visitor.exchange::<exchange::TesQuotedTweet>(),
             Source::SafetyLabels => visitor.exchange::<exchange::SafetyLabels>(),
             Source::GizmoduckViewer => visitor.exchange::<exchange::GizmoduckViewer>(),
             Source::GizmoduckAuthor => visitor.exchange::<exchange::GizmoduckAuthor>(),
             Source::Flock => visitor.exchange::<exchange::Flock>(),
+            Source::FlockUserPair => visitor.exchange::<exchange::FlockUserPair>(),
             Source::ViewerCountry => visitor.exchange::<exchange::ViewerCountry>(),
             Source::Wingman => visitor.exchange::<exchange::Wingman>(),
             Source::CommunityModeration => visitor.exchange::<exchange::CommunityModeration>(),

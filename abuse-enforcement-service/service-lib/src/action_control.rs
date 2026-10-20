@@ -24,6 +24,7 @@ pub use levels::level_lkey;
 use crate::confidence::{ConfidenceConfig, RowOutcome};
 use crate::decision::ActionSpec;
 use crate::facts::EntityType;
+use crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};
 use crate::growthbook::DynamicConfig;
 use crate::metrics;
 use crate::off_switch::valid_name;
@@ -131,7 +132,9 @@ pub fn entity_of(e: EntityType) -> ControlEntity {
 
 pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
     let rank = |a: &PageAction| match a {
-        PageAction::SpamHighRecall { .. } | PageAction::PostSpamHighRecall { .. } => 0,
+        PageAction::SpamHighRecall { .. }
+        | PageAction::PhoenixSkip { .. }
+        | PageAction::PostSpamHighRecall { .. } => 0,
         PageAction::LivenessCheck {} => 1,
         PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,
     };
@@ -141,11 +144,15 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
         .into_iter()
         .map(|a| match a {
             PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {
-                labels: vec!["SpamHighRecall".into()],
+                labels: vec![SPAM_HIGH_RECALL.into()],
+                ttl_msec: lifetime.ttl_msec(),
+            },
+            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {
+                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],
                 ttl_msec: lifetime.ttl_msec(),
             },
             PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {
-                labels: vec!["SpamHighRecall".into()],
+                labels: vec![SPAM_HIGH_RECALL.into()],
                 ttl_msec: lifetime.ttl_msec(),
             },
             PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,
@@ -157,8 +164,12 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
         .collect()
 }
 
-pub fn is_label_only(actions: &[PageAction]) -> bool {
-    matches!(actions, [PageAction::SpamHighRecall { .. }])
+pub fn label_only(actions: &[PageAction]) -> Option<&'static str> {
+    match actions {
+        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),
+        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),
+        _ => None,
+    }
 }
 
 fn ttl_days(ttl_msec: i64) -> Value {
@@ -698,7 +709,7 @@ fn seen_guard_key(pkey: &str, lkey: &str) -> String {
     }
 }
 
-fn new_nonce() -> u64 {
+pub(crate) fn new_nonce() -> u64 {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -711,7 +722,9 @@ fn new_nonce() -> u64 {
 
 fn label_days(a: &PageAction) -> Option<i64> {
     match a {
-        PageAction::SpamHighRecall { lifetime } | PageAction::PostSpamHighRecall { lifetime } => {
+        PageAction::SpamHighRecall { lifetime }
+        | PageAction::PhoenixSkip { lifetime }
+        | PageAction::PostSpamHighRecall { lifetime } => {
             Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))
         }
         _ => None,
@@ -968,6 +981,84 @@ impl ActionControl {
                 .inc();
         }
         out
+    }
+
+            pub fn resolve_run(
+        &self,
+        input: &ResolveInput<'_>,
+        cfg: &ControlConfig,
+        safety_ok: impl FnOnce(EntityType) -> bool,
+        actions: &[PageAction],
+    ) -> Resolved {
+        if cfg.ignore_store {
+            return Resolved {
+                mode: ControlMode::Recording,
+                page_actions: actions.to_vec(),
+                forced: Some("ignore_store"),
+                dedup_class: Some(page_class(actions)),
+                ..Default::default()
+            };
+        }
+        let snap = self.snapshot();
+        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);
+        let claim = input
+            .confidence
+            .clone()
+            .unwrap_or_else(|| crate::confidence::Claim {
+                row: LevelRow::Missing,
+                unknown: false,
+                evidence: None,
+                now_ms: crate::now_millis(),
+            });
+        let mut safety_ok = Some(safety_ok);
+        let mut safety = |e: EntityType| safety_ok.take().is_none_or(|f| f(e));
+        levels::resolve_run(
+            &snap,
+            &levels::RowContext {
+                entity: input.entity,
+                head: input.head,
+                alias: cfg.aliases.get(input.head).map(String::as_str),
+                classifier: input.classifier,
+                factory: input.factory,
+                stale,
+            },
+            &claim,
+            cfg,
+            &mut safety,
+            actions,
+        )
+    }
+
+            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {
+        Ok(self
+            .store
+            .get(MH_PKEY, lkey)
+            .await?
+            .map(|b| raw_version(&b)))
+    }
+
+            pub fn weak_rows(
+        &self,
+        entity: EntityType,
+        head: &str,
+        classifier: Option<&str>,
+        rows: &[LevelRow],
+        cfg: &ControlConfig,
+        now_ms: i64,
+    ) -> Vec<LevelRow> {
+        let snap = self.snapshot();
+        let names: Vec<&str> = std::iter::once(head)
+            .chain(cfg.aliases.get(head).map(String::as_str))
+            .collect();
+        levels::weak_rows(
+            &snap,
+            entity_of(entity),
+            &names,
+            classifier,
+            rows,
+            cfg,
+            now_ms,
+        )
     }
 
 
@@ -2780,8 +2871,27 @@ mod tests {
                 ttl_msec: None
             }]
         );
-        assert!(is_label_only(&[SHR30]));
-        assert!(!is_label_only(&[SHR30, LIVENESS]));
+        let phoenix30 = PageAction::PhoenixSkip {
+            lifetime: Lifetime::Days30,
+        };
+        assert_eq!(
+            page_specs(&[LIVENESS, phoenix30, SHR7]),
+            vec![
+                ActionSpec::AddLabelsV2 {
+                    labels: vec!["ClientEventPhoenixSkip".into()],
+                    ttl_msec: Some(2_592_000_000)
+                },
+                ActionSpec::AddLabelsV2 {
+                    labels: vec!["SpamHighRecall".into()],
+                    ttl_msec: Some(604_800_000)
+                },
+                ActionSpec::SpamLivenessCheck,
+            ]
+        );
+        assert_eq!(label_only(&[SHR30]), Some("SpamHighRecall"));
+        assert_eq!(label_only(&[phoenix30]), Some("ClientEventPhoenixSkip"));
+        assert_eq!(label_only(&[SHR30, LIVENESS]), None);
+        assert_eq!(label_only(&[SHR30, phoenix30]), None);
     }
 
     #[test]

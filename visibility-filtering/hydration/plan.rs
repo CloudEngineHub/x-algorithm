@@ -160,9 +160,11 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
         | Source::TesConversationRoot
         | Source::TesTweet
         | Source::TesConversationControl
+        | Source::TesQuotedTweet
         | Source::SafetyLabels
         | Source::GizmoduckViewer
         | Source::Flock
+        | Source::FlockUserPair
         | Source::ViewerCountry
         | Source::Wingman
         | Source::CommunityModeration
@@ -242,6 +244,12 @@ impl fmt::Display for HydrationPlan {
                     keys.join(",")
                 )?;
             }
+            for node in group.nodes.iter() {
+                if let Some(edge) = node.pair_edge() {
+                    let graph: &str = edge.graph().into();
+                    write!(f, " {graph}-fwd[{}]", node.spec().key)?;
+                }
+            }
             if group.nodes.iter().all(Hydrator::needs_viewer) {
                 f.write_str(" (skipped logged out)")?;
             }
@@ -317,6 +325,13 @@ exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_ex
 article/get_media_entities after: tweet nodes: article_media_entities
 article/get_cover_media after: tweet nodes: article_cover_media
 trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
+quoted_tweet_rules: 6 calls
+tes/get_tweet_core_datas after: - nodes: pure_core
+gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
+socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes follows-fwd[author] blocks-fwd[author] mutes-fwd[author] (skipped logged out)
+socialgraph/batch_check_user_pairs after: pure_core nodes: author_blocks_outer_author blocks-fwd[quoted_author>quoting_author]
+socialgraph/batch_check_user_pairs after: author_safety nodes: outer_author_follows_author follows-fwd[quoting_author>protected_quoted_author] timeout: 300ms
+tes/get_quoted_tweets after: pure_core nodes: quoted_tweet timeout: 300ms
 ";
 
     #[test]

@@ -122,7 +122,7 @@ impl QueryBuilder {
         let device_status = proto_query.device_status.unwrap_or_default();
         let prediction_id = generate_request_id();
         let request_id = resolve_request_id(proto_query.request_id);
-        let is_shadow_traffic = crate::util::shadow::is_shadow_traffic(&params, request_id);
+        let is_shadow_traffic = crate::util::shadow::is_shadow_traffic(&params, prediction_id);
         let mut query = ScoredPostsQuery::new(
             proto_query.viewer_id,
             proto_query.client_app_id,

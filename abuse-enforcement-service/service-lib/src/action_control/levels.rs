@@ -226,33 +226,8 @@ pub(super) fn resolve_rows(
     if forced.is_some() {
         return Some(logged(matched, actions, forced, outcome));
     }
-    if let Some(level) = claim.row.level() {
-        let evidence = record
-            .evidence
-            .as_deref()
-            .cloned()
-            .or_else(|| claim.evidence.clone());
-        let supports = evidence.as_ref().and_then(|e| {
-            confidence::supported_level(e, claim.now_ms, cfg.confidence.evidence_max_age_ms)
-        });
-        outcome.evidence_supports = Some(supports);
-        if supports.is_none_or(|s| s < level) {
-            let overridden = record
-                .evidence_override
-                .as_ref()
-                .filter(|o| confidence::override_active(o, record.updated_at_ms, claim.now_ms));
-            match overridden {
-                Some(o) => outcome.override_by = Some(o.by.clone()),
-                None => {
-                    let why = if evidence.is_some() {
-                        "evidence_below_floor"
-                    } else {
-                        "evidence_missing"
-                    };
-                    return Some(logged(matched, actions, Some(why), outcome));
-                }
-            }
-        }
+    if let Some(why) = evidence_floor(Some(record), claim, cfg, &mut outcome) {
+        return Some(logged(matched, actions, Some(why), outcome));
     }
     Some(Resolved {
         matched: Some(matched),
@@ -262,6 +237,133 @@ pub(super) fn resolve_rows(
         by_row: true,
         ..Default::default()
     })
+}
+
+fn evidence_floor(
+    row: Option<&ActionControlRecord>,
+    claim: &Claim,
+    cfg: &ControlConfig,
+    outcome: &mut RowOutcome,
+) -> Option<&'static str> {
+    let level = claim.row.level()?;
+    let evidence = row
+        .and_then(|r| r.evidence.as_deref().cloned())
+        .or_else(|| claim.evidence.clone());
+    let supports = evidence.as_ref().and_then(|e| {
+        confidence::supported_level(e, claim.now_ms, cfg.confidence.evidence_max_age_ms)
+    });
+    outcome.evidence_supports = Some(supports);
+    if supports.is_some_and(|s| s >= level) {
+        return None;
+    }
+    let overridden = row.and_then(|r| {
+        r.evidence_override
+            .as_ref()
+            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))
+    });
+    match overridden {
+        Some(o) => {
+            outcome.override_by = Some(o.by.clone());
+            None
+        }
+        None if evidence.is_some() => Some("evidence_below_floor"),
+        None => Some("evidence_missing"),
+    }
+}
+
+pub(super) fn resolve_run(
+    snap: &Snapshot,
+    m: &RowContext<'_>,
+    claim: &Claim,
+    cfg: &ControlConfig,
+    safety_ok: &mut dyn FnMut(EntityType) -> bool,
+    actions: &[PageAction],
+) -> Resolved {
+    let entity = entity_of(m.entity);
+    let names: Vec<&str> = std::iter::once(m.head).chain(m.alias).collect();
+    let classifier = (!m.classifier.is_empty() && valid_name(m.classifier)).then_some(m.classifier);
+    let mover = snap.mover(entity, &names, classifier);
+    let mut outcome = RowOutcome::new(claim);
+    let row = mover.and_then(|(_, scope)| {
+        match snap.at(&level_lkey(
+            entity,
+            &scope.head,
+            scope.classifier.as_deref(),
+            claim.row,
+        )) {
+            Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => Some(r),
+            _ => None,
+        }
+    });
+    let forced = if m.factory {
+        Some("factory_managed")
+    } else if actions.is_empty() || actions.iter().any(|a| a.entity() != entity) {
+        Some("wrong_entity")
+    } else if !cfg.enabled {
+        Some("kill_switch")
+    } else if m.stale {
+        Some("stale_snapshot")
+    } else if !safety_ok(m.entity) {
+        Some("safety_checks_changed")
+    } else if mover.is_some() && claim.row.level().is_some() && cfg.confidence.unreadable.is_some()
+    {
+        Some("confidence_config_unreadable")
+    } else if mover.is_some() {
+        evidence_floor(row, claim, cfg, &mut outcome)
+    } else {
+        None
+    };
+    Resolved {
+        matched: None,
+        mode: if forced.is_some() {
+            ControlMode::Recording
+        } else {
+            ControlMode::Live
+        },
+        page_actions: actions.to_vec(),
+        forced,
+        dedup_class: Some(page_class(actions)),
+        producer_dry: false,
+        row: mover.is_some().then_some(outcome),
+        by_row: mover.is_some(),
+    }
+}
+
+pub(super) fn weak_rows(
+    snap: &Snapshot,
+    entity: ControlEntity,
+    names: &[&str],
+    classifier: Option<&str>,
+    rows: &[LevelRow],
+    cfg: &ControlConfig,
+    now_ms: i64,
+) -> Vec<LevelRow> {
+    let Some((_, scope)) = snap.mover(entity, names, classifier) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .copied()
+        .filter(|row| {
+            let claim = Claim {
+                row: *row,
+                unknown: false,
+                evidence: None,
+                now_ms,
+            };
+            let record = match snap.at(&level_lkey(
+                entity,
+                &scope.head,
+                scope.classifier.as_deref(),
+                *row,
+            )) {
+                Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => Some(r),
+                _ => None,
+            };
+            let mut outcome = RowOutcome::new(&claim);
+            (row.level().is_some() && cfg.confidence.unreadable.is_some())
+                || evidence_floor(record, &claim, cfg, &mut outcome).is_some()
+        })
+        .collect()
 }
 
 pub(super) fn for_compare(rec: &ActionControlRecord) -> ActionControlRecord {

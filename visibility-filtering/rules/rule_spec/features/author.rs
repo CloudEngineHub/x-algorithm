@@ -1,18 +1,64 @@
-use super::{Feature, Leaf, Meaning};
+use super::{Feature, Leaf, Meaning, Reads};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 use crate::rules::context::At;
+use crate::rules::rule_spec::engine::{Candidate, Engine};
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::Predicate;
+
+pub(in crate::rules) enum AuthorFacts {}
+
+impl Feature for AuthorFacts {
+    const REQUIRED: Hydrators = Hydrators::empty();
+    type Value<'a> = u64;
+}
+
+impl<C: Candidate> Reads<C> for AuthorFacts {
+    #[inline]
+    fn read<'a>(at: At<'_, 'a, C>) -> u64 {
+        at.author().id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum AuthorFactsLeaf {
+    ViewerIsAuthor,
+    IsSelfQuote,
+}
+
+impl Leaf for AuthorFactsLeaf {
+    type Feature = AuthorFacts;
+
+    #[inline]
+    fn meaning<'a, M: Meaning<'a, AuthorFacts>>(self, m: M) -> M::Out {
+        match self {
+            Self::ViewerIsAuthor => m.run(|author, facts| facts.viewer_id() == Some(author)),
+            Self::IsSelfQuote => m.run(|author, facts| {
+                facts
+                    .quote_link()
+                    .is_some_and(|link| link.quoting_author == author)
+            }),
+        }
+    }
+}
+
+impl AuthorFactsLeaf {
+    pub(in crate::rules) const fn leaf<E: Engine>(self) -> RuleCond<E> {
+        RuleCond::Leaf(Predicate::AuthorFacts(self))
+    }
+}
 
 pub(in crate::rules) enum AuthorSafety {}
 
 impl Feature for AuthorSafety {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::AuthorSafety);
     type Value<'a> = AuthorFeatures;
+}
 
+impl<C: Candidate> Reads<C> for AuthorSafety {
     #[inline]
-    fn read<'a>(at: At<'_, 'a>) -> AuthorFeatures {
+    fn read<'a>(at: At<'_, 'a, C>) -> AuthorFeatures {
         at.author().features()
     }
 }
@@ -47,7 +93,7 @@ impl Leaf for AuthorSafetyLeaf {
 }
 
 impl AuthorSafetyLeaf {
-    pub(in crate::rules) const fn leaf(self) -> RuleCond {
+    pub(in crate::rules) const fn leaf<E: Engine>(self) -> RuleCond<E> {
         RuleCond::Leaf(Predicate::AuthorSafety(self))
     }
 }
@@ -57,9 +103,11 @@ pub(in crate::rules) enum AuthorLabels {}
 impl Feature for AuthorLabels {
     const REQUIRED: Hydrators = Hydrators::of(Hydrator::AuthorLabels);
     type Value<'a> = AuthorLabelSet;
+}
 
+impl<C: Candidate> Reads<C> for AuthorLabels {
     #[inline]
-    fn read<'a>(at: At<'_, 'a>) -> AuthorLabelSet {
+    fn read<'a>(at: At<'_, 'a, C>) -> AuthorLabelSet {
         at.author().labels
     }
 }
@@ -82,7 +130,7 @@ impl Leaf for AuthorLabelsLeaf {
 }
 
 impl AuthorLabelsLeaf {
-    pub(in crate::rules) const fn leaf(self) -> RuleCond {
+    pub(in crate::rules) const fn leaf<E: Engine>(self) -> RuleCond<E> {
         RuleCond::Leaf(Predicate::AuthorLabels(self))
     }
 }

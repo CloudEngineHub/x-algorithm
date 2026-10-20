@@ -1,9 +1,34 @@
 use super::builders::author_candidate;
 use super::{Role, Row};
-use crate::models::{AuthorFeatures, SafetyLabelType};
-use crate::rules::fixtures::{allow, candidate, dropped};
+use crate::models::{AuthorFeatures, PostCandidate, SafetyLabelType, Verdict};
+use crate::rules::fixtures::{allow, appealed, candidate, dropped};
+use crate::rules::SafetyLevel;
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::FilteredReason;
+use xai_x_thrift::action::AppealablePolicy;
+
+fn fosnr_post(set: fn(&mut AuthorFeatures)) -> PostCandidate {
+    let mut features = AuthorFeatures::default();
+    set(&mut features);
+    candidate()
+        .with_author_features(features)
+        .with_label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)
+        .build()
+}
+
+fn author_appeals() -> Vec<(SafetyLevel, Role, Verdict)> {
+    vec![(
+        TimelineHomeHydration,
+        Role::Author,
+        appealed(
+            AppealablePolicy::HATEFUL_CONDUCT,
+            3,
+            true,
+            false,
+            "fosnr_author/appealable",
+        ),
+    )]
+}
 
 pub(super) fn rows() -> Vec<Row> {
     vec![
@@ -212,6 +237,31 @@ pub(super) fn rows() -> Vec<Row> {
                     dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
                 ),
             ],
+        },
+        Row {
+            name: "suspended_author_fosnr_label",
+            post: fosnr_post(|a| a.is_suspended = true),
+            expect: author_appeals(),
+        },
+        Row {
+            name: "deactivated_author_fosnr_label",
+            post: fosnr_post(|a| a.is_deactivated = true),
+            expect: author_appeals(),
+        },
+        Row {
+            name: "erased_author_fosnr_label",
+            post: fosnr_post(|a| a.is_erased = true),
+            expect: author_appeals(),
+        },
+        Row {
+            name: "offboarded_author_fosnr_label",
+            post: fosnr_post(|a| a.is_offboarded = true),
+            expect: author_appeals(),
+        },
+        Row {
+            name: "protected_author_fosnr_label",
+            post: fosnr_post(|a| a.is_protected = true),
+            expect: author_appeals(),
         },
     ]
 }

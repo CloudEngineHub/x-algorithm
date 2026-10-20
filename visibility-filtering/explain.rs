@@ -10,18 +10,18 @@ pub use crate::params::{CountryList, LimitedActionType};
 pub use crate::post_card::{Author, CardMedia, CardMediaKind, PostCard};
 pub use crate::retweet::MergeSelection;
 pub use crate::rules::{
-    ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
-    PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, ReplyControlLeaf, RequestLeaf,
-    RowTrace, SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf, TweetSafetyLabelsLeaf,
-    ViewerAccountLeaf, Witness,
+    PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, RelationshipLeaf, ReplyControlLeaf,
+    RequestLeaf, RowTrace, SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf,
+    TweetSafetyLabelsLeaf, ViewerAccountLeaf, Witness,
 };
 
 use crate::evaluate_tweets::{Sends, evaluate_tweets_request};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Sources, test_users_metadata};
 use crate::hydration::{HydratedTweet, Hydration, request_context};
-use crate::models::{PostCandidate, RawCandidate, Viewer};
+use crate::models::{EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, Viewer};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_evaluator::{HydratedRequest, PostBatch, PostEvaluator};
@@ -288,7 +288,13 @@ impl Seen {
 impl Explainer {
                                                 pub async fn connect(datacenter: &str) -> Self {
         let metadata = test_users_metadata();
-        let serving = server_deps::serving(datacenter, Some(&metadata), CacheWarming::Off).await;
+        let serving = server_deps::serving(
+            datacenter,
+            Some(&metadata),
+            CacheWarming::Off,
+            crate::params::Experiments::none(),
+        )
+        .await;
         Self::new(
             Arc::new(serving.sources),
             serving.fallback_caches,
@@ -351,10 +357,11 @@ impl Explainer {
 
     async fn evaluate<const N: usize>(&self, ask: &Ask<N>, route: Route) -> RouteRun {
         let viewer_id = ask.viewer.map(NonZeroU64::get);
-        let candidates = vec![RawCandidate {
+        let requested = PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(ask.post),
             request_author_id: None,
-        }];
+        });
+        let candidates = vec![requested];
         let (context, request) = match route.rpc {
             Rpc::FilterTweets => (
                 None,
@@ -385,18 +392,21 @@ impl Explainer {
             .scope(async {
                 let (hydrated, outcomes, mut traced) =
                     retweet::hydrate_and_trace(&self.post_evaluator, request).await;
-                let post = TweetId(ask.post);
                 let source_tweet_id = hydrated
                     .hydration()
-                    .tweet(post)
+                    .tweet(requested.tweet_id())
                     .and_then(HydratedTweet::source_tweet_id);
                 let provenance = Provenance {
-                    requested: traced.policies.remove(&post),
+                    requested: traced.policies.remove(&requested.key()),
                     source_tweet_id,
-                    source: source_tweet_id.and_then(|source| traced.policies.remove(&source)),
+                    source: source_tweet_id.and_then(|source| {
+                        traced
+                            .policies
+                            .remove(&EvaluationKey::retweet_source(source))
+                    }),
                     selection: traced
                         .selections
-                        .get(&post)
+                        .get(&requested.key())
                         .copied()
                         .unwrap_or(MergeSelection::RequestedOnly),
                     evaluation: outcomes
@@ -830,6 +840,7 @@ mod tests {
             )),
             ClientSwitches::for_tests(),
             LimitedActionsCopy::from_json(BUNDLE),
+            None,
         );
         let mut request = tonic::Request::new(vf_pb::EvaluateTweetsRequest {
             safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
@@ -1372,10 +1383,10 @@ mod tests {
     }
 
     async fn served(world: InMemorySources, route: Route, post: u64) -> Evaluation {
-        let candidates = vec![RawCandidate {
+        let candidates = vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(post),
             request_author_id: None,
-        }];
+        })];
         let request = match route.rpc() {
             Rpc::FilterTweets => PostBatch {
                 viewer_id: Some(VIEWER),
@@ -1855,7 +1866,7 @@ mod tests {
         for row in &trace.rows {
             let nodes = subtree(trace, row.root);
             let [follows] = leaves(&nodes, |leaf| {
-                leaf == Predicate::Edge(EdgeLeaf::ViewerFollowsAuthor)
+                leaf == Predicate::Relationship(RelationshipLeaf::ViewerFollowsAuthor)
             })[..] else {
                 continue;
             };
@@ -1974,7 +1985,9 @@ mod tests {
             };
             assert_eq!(rendered(bounce), label);
             assert_eq!(
-                rendered(Predicate::Edge(EdgeLeaf::ViewerFollowsAuthor)),
+                rendered(Predicate::Relationship(
+                    RelationshipLeaf::ViewerFollowsAuthor
+                )),
                 follower
             );
             for level in &levels {

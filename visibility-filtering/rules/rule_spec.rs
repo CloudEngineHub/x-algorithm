@@ -6,6 +6,7 @@ use crate::models::{
 };
 use crate::params::{CountryList, LimitedActionType};
 use crate::rules::RuleContext;
+use engine::{Engine, Fold, PostEngine};
 use features::{In, TweetSafetyLabels};
 use inputs::Interpreter;
 use rule::{NamedCond, RuleCond};
@@ -15,9 +16,9 @@ use xai_safety_label_store::types::label_meta;
 use xai_visibility_filtering::models::{FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
-pub(super) enum RuleId {
+pub(crate) enum RuleId {
     FilterAll,
 
     SuspendedAuthor,
@@ -28,9 +29,13 @@ pub(super) enum RuleId {
     ViewerBlocksAuthor,
     ViewerMutesAuthor,
     ViewerMutesRetweets,
+    QuotedViewerMutesAuthorNotFollowing,
+    QuotedAuthorBlocksQuotingAuthor,
+    ProtectedQuotedAuthor,
 
     Pdna,
     Bounce,
+    BounceQuoted,
     Spam,
     ForEmergencyUseOnly,
     FosnrHatefulConduct,
@@ -79,6 +84,7 @@ pub(super) enum RuleId {
     NsfwUserTweetFlag,
     NsfwAdminTweetFlag,
     NsfwHighRecall,
+    SoftNsfwNewUser,
     DoNotAmplify,
     MaliciousUrl,
     SpamHighRecall,
@@ -109,6 +115,7 @@ pub(super) enum RuleId {
 }
 
 pub(super) mod conditions;
+pub(super) mod engine;
 pub(super) mod features;
 pub(super) mod inputs;
 #[cfg(test)]
@@ -119,15 +126,21 @@ pub(super) mod rule;
 
 pub(in crate::rules) use features::leaves;
 pub use features::{
-    ArticleStageLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, EdgeLeaf, PostFactsLeaf, PostModerationLeaf,
-    ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, TweetLeaf, TweetSafetyLabelsLeaf,
-    ViewerAccountLeaf,
+    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, TweetLeaf,
+    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
 pub use predicates::Predicate;
 pub(in crate::rules) use predicates::*;
 
-pub(super) fn rule_name(id: RuleId, action: &RuleAction) -> String {
+impl RuleId {
+    pub(crate) fn of_rule_name(name: &str) -> Option<Self> {
+        name.split('/').next()?.parse().ok()
+    }
+}
+
+pub(super) fn rule_name<E: Engine>(id: RuleId, action: &RuleAction<E>) -> String {
     let id: &str = id.into();
     let (kind, reason, prompt) = match action.spec() {
         ActionSpec::Drop(DropReason::Legacy(reason)) => {
@@ -182,8 +195,8 @@ pub(super) fn rule_name(id: RuleId, action: &RuleAction) -> String {
             Some(<&str>::from(reason).to_owned()),
             None,
         ),
-        ActionSpec::SoftIntervention { policy, .. } => {
-            let policy = match *policy {
+        ActionSpec::SoftIntervention(notice) => {
+            let policy = match E::open(*notice).policy {
                 AppealablePolicy::ABUSE => "abuse".to_owned(),
                 policy => policy.0.to_string(),
             };
@@ -191,7 +204,7 @@ pub(super) fn rule_name(id: RuleId, action: &RuleAction) -> String {
         }
         ActionSpec::Appealable(_) => ("appealable", None, None),
     };
-    let keeps_reason = matches!(action.spec(), ActionSpec::SoftIntervention { .. });
+    let keeps_reason = matches!(action.spec(), ActionSpec::SoftIntervention(_));
     let squashed = |name: &str| name.replace('_', "");
     let reason = reason
         .map(|reason| {
@@ -225,7 +238,7 @@ fn snake_case(variant: &str) -> String {
     snake
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FosnrViolation {
     pub(super) label: SafetyLabelType,
     pub(super) policy: AppealablePolicy,
@@ -233,42 +246,59 @@ pub(super) struct FosnrViolation {
     pub(super) limited_actions: &'static [LimitedActionType],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FosnrNotice {
+    pub(super) label: SafetyLabelType,
+    pub(super) policy: AppealablePolicy,
+    pub(super) level: i8,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum ActionSpec {
+pub(super) enum ActionSpec<E: Engine = PostEngine> {
     Drop(DropReason),
     Tombstone(TombstoneReason),
     MediaRestriction(MediaRestriction),
-    SoftIntervention {
-        label: SafetyLabelType,
-        policy: AppealablePolicy,
-        level: i8,
-    },
+    SoftIntervention(E::PostOnly<FosnrNotice>),
     LimitedEngagement(LimitedEngagementReason),
-    Appealable(&'static [FosnrViolation]),
+    Appealable(E::PostOnly<&'static [FosnrViolation]>),
 }
 
 #[derive(Clone, PartialEq)]
-pub(super) struct RuleAction {
-    spec: ActionSpec,
+pub(super) struct RuleAction<E: Engine = PostEngine> {
+    spec: ActionSpec<E>,
 }
 
-impl RuleAction {
-    pub(super) const fn spec(&self) -> &ActionSpec {
+impl<E: Engine> RuleAction<E> {
+    pub(super) const fn spec(&self) -> &ActionSpec<E> {
         &self.spec
+    }
+
+    pub(super) fn lift(&self) -> RuleAction {
+        let spec = match &self.spec {
+            ActionSpec::Drop(reason) => ActionSpec::Drop(reason.clone()),
+            ActionSpec::Tombstone(reason) => ActionSpec::Tombstone(*reason),
+            ActionSpec::MediaRestriction(restriction) => {
+                ActionSpec::MediaRestriction(restriction.clone())
+            }
+            ActionSpec::SoftIntervention(notice) => ActionSpec::SoftIntervention(E::open(*notice)),
+            ActionSpec::LimitedEngagement(reason) => ActionSpec::LimitedEngagement(*reason),
+            ActionSpec::Appealable(violations) => ActionSpec::Appealable(E::open(*violations)),
+        };
+        RuleAction { spec }
     }
 }
 
-impl Debug for RuleAction {
+impl<E: Engine> Debug for RuleAction<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.spec.fmt(f)
     }
 }
 
-impl Eq for RuleAction {}
+impl<E: Engine> Eq for RuleAction<E> {}
 
 #[cfg(test)]
-impl From<ActionSpec> for RuleAction {
-    fn from(spec: ActionSpec) -> Self {
+impl<E: Engine> From<ActionSpec<E>> for RuleAction<E> {
+    fn from(spec: ActionSpec<E>) -> Self {
         RuleAction { spec }
     }
 }
@@ -282,6 +312,7 @@ pub(super) enum DropAs {
     AuthorIsSuspended,
     AuthorIsDeactivated,
     AuthorIsProtected,
+    AuthorBlockViewer,
     ViewerBlocksAuthor,
     ViewerMutesAuthor,
     TweetIsBounced,
@@ -303,6 +334,7 @@ impl DropAs {
             DropAs::AuthorIsSuspended => FilteredReason::AuthorIsSuspended,
             DropAs::AuthorIsDeactivated => FilteredReason::AuthorIsDeactivated,
             DropAs::AuthorIsProtected => FilteredReason::AuthorIsProtected,
+            DropAs::AuthorBlockViewer => FilteredReason::AuthorBlockViewer,
             DropAs::ViewerBlocksAuthor => FilteredReason::ViewerBlocksAuthor,
             DropAs::ViewerMutesAuthor => FilteredReason::ViewerMutesAuthor,
             DropAs::TweetIsBounced => FilteredReason::TweetIsBounced,
@@ -328,19 +360,19 @@ impl DropAs {
     }
 }
 
-pub(super) const fn drop_post(reason: DropAs) -> RuleAction {
+pub(super) const fn drop_post<E: Engine>(reason: DropAs) -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::Drop(reason.reason()),
     }
 }
 
-pub(super) const fn tombstone(reason: TombstoneReason) -> RuleAction {
+pub(super) const fn tombstone<E: Engine>(reason: TombstoneReason) -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::Tombstone(reason),
     }
 }
 
-pub(super) const fn limit(reason: LimitedEngagementReason) -> RuleAction {
+pub(super) const fn limit<E: Engine>(reason: LimitedEngagementReason) -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::LimitedEngagement(reason),
     }
@@ -352,11 +384,11 @@ pub(super) const fn soft_intervention(
     level: i8,
 ) -> RuleAction {
     RuleAction {
-        spec: ActionSpec::SoftIntervention {
+        spec: ActionSpec::SoftIntervention(FosnrNotice {
             label,
             policy,
             level,
-        },
+        }),
     }
 }
 
@@ -366,18 +398,18 @@ pub(super) const fn appealable(violations: &'static [FosnrViolation]) -> RuleAct
     }
 }
 
-pub(super) const fn blur(reason: InterstitialReason) -> RuleAction {
+pub(super) const fn blur<E: Engine>(reason: InterstitialReason) -> RuleAction<E> {
     media_interstitial(reason, None)
 }
 
-pub(super) const fn blur_with_age_prompt(reason: InterstitialReason) -> RuleAction {
+pub(super) const fn blur_with_age_prompt<E: Engine>(reason: InterstitialReason) -> RuleAction<E> {
     media_interstitial(reason, Some(InterstitialAction::AGE_VERIFICATION_PROMPT))
 }
 
-const fn media_interstitial(
+const fn media_interstitial<E: Engine>(
     reason: InterstitialReason,
     prompt: Option<InterstitialAction>,
-) -> RuleAction {
+) -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::MediaRestriction(MediaRestriction::MediaInterstitial(
             MediaInterstitial {
@@ -389,21 +421,21 @@ const fn media_interstitial(
     }
 }
 
-pub(super) const fn legacy_nsfw_interstitial() -> RuleAction {
+pub(super) const fn legacy_nsfw_interstitial<E: Engine>() -> RuleAction<E> {
     RuleAction {
         spec: ActionSpec::MediaRestriction(MediaRestriction::NsfwInterstitial),
     }
 }
 
 #[cfg(test)]
-impl ActionSpec {
+impl<E: Engine> ActionSpec<E> {
     pub(super) const fn kind_and_slot(&self) -> (&'static str, &'static str) {
         match self {
             ActionSpec::Appealable(_) => ("appealable", "notice"),
             ActionSpec::Drop(_) => ("drop", "withholding"),
             ActionSpec::Tombstone(_) => ("tombstone", "withholding"),
             ActionSpec::MediaRestriction(_) => ("media restriction", "media"),
-            ActionSpec::SoftIntervention { .. } => ("soft intervention", "notice"),
+            ActionSpec::SoftIntervention(_) => ("soft intervention", "notice"),
             ActionSpec::LimitedEngagement(_) => ("limited engagement", "engagement"),
         }
     }
@@ -413,13 +445,16 @@ impl ActionSpec {
             ActionSpec::Drop(reason) => format!("{reason:?}"),
             ActionSpec::Tombstone(reason) => format!("{reason:?}"),
             ActionSpec::MediaRestriction(restriction) => format!("{restriction:?}"),
-            ActionSpec::SoftIntervention {
-                label,
-                policy,
-                level,
-            } => format!("{} {policy:?} level {level}", spelled_label(*label)),
+            ActionSpec::SoftIntervention(notice) => {
+                let FosnrNotice {
+                    label,
+                    policy,
+                    level,
+                } = E::open(*notice);
+                format!("{} {policy:?} level {level}", spelled_label(label))
+            }
             ActionSpec::LimitedEngagement(reason) => format!("{reason:?}"),
-            ActionSpec::Appealable(violations) => violations
+            ActionSpec::Appealable(violations) => E::open(*violations)
                 .iter()
                 .map(
                     |&FosnrViolation {
@@ -448,9 +483,9 @@ pub enum Contribution {
     Notice(Notice),
 }
 
-impl ActionSpec {
+impl<E: Fold> ActionSpec<E> {
     #[inline]
-    pub(super) fn interpret<'a, I: Interpreter<'a>>(
+    pub(super) fn interpret<'a, I: Interpreter<'a, E::Candidate>>(
         &self,
         interpreter: &I,
     ) -> I::Output<Option<Contribution>> {
@@ -465,32 +500,43 @@ impl ActionSpec {
             Self::LimitedEngagement(reason) => {
                 interpreter.run(|()| Some(Contribution::Engagement(*reason)))
             }
-            Self::SoftIntervention {
-                label,
-                policy,
-                level,
-            } => interpreter.run(|In::<TweetSafetyLabels>(labels)| {
-                Some(Contribution::Notice(Notice::SoftIntervention(
-                    fosnr_reason(*label, *policy, *level, labels),
-                )))
-            }),
-            Self::Appealable(violations) => interpreter.run(|In::<TweetSafetyLabels>(labels)| {
-                appeal(violations, labels).map(Contribution::Notice)
-            }),
+            Self::SoftIntervention(notice) => E::run_post(
+                interpreter,
+                *notice,
+                |FosnrNotice {
+                     label,
+                     policy,
+                     level,
+                 },
+                 In::<TweetSafetyLabels>(labels)| {
+                    Some(Contribution::Notice(Notice::SoftIntervention(
+                        fosnr_reason(label, policy, level, labels),
+                    )))
+                },
+            ),
+            Self::Appealable(violations) => E::run_post(
+                interpreter,
+                *violations,
+                |violations, In::<TweetSafetyLabels>(labels)| {
+                    appeal(violations, labels).map(Contribution::Notice)
+                },
+            ),
         }
     }
 
     pub(super) fn requirements(&self) -> Hydrators {
         self.interpret(&inputs::Required)
     }
+}
 
+impl<E: Engine> ActionSpec<E> {
     pub(super) const fn severity(&self) -> u8 {
         match self {
             Self::Appealable(_) => 18,
             Self::Drop(_) => 17,
             Self::Tombstone(_) => 16,
             Self::MediaRestriction(_) => 10,
-            Self::SoftIntervention { .. } => 8,
+            Self::SoftIntervention(_) => 8,
             Self::LimitedEngagement(_) => 6,
         }
     }
@@ -724,6 +770,7 @@ mod tests {
                 gore_blur_ignores_settings: true,
                 fosnr_rules: true,
                 fosnr_fallback_drops: true,
+                soft_nsfw_new_user_drop: false,
             },
             ..viewer(VIEWER_ID)
         };

@@ -9,6 +9,8 @@ use xai_feature_switches::{FeatureSwitches, RecipientBuilder, Version};
 use xai_stats_receiver::StatsReceiverExt;
 use xai_twittercontext_proto::TwitterContextViewer;
 
+const SOFT_NSFW_NEW_USER_DROP: &str = "soft_nsfw_tweet_label_new_user_rule_enabled";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClientSwitch {
     AgeVerification(VerifyBlurSupport),
@@ -106,7 +108,23 @@ impl ClientSwitches {
             gore_blur_ignores_settings: on(ClientSwitch::GoreBlurIgnoresSettings),
             fosnr_rules: on(ClientSwitch::FosnrRules),
             fosnr_fallback_drops: on(ClientSwitch::FosnrFallbackDrops),
+            soft_nsfw_new_user_drop: false,
         }
+    }
+
+    pub fn soft_nsfw_new_user_drop(
+        &self,
+        viewer_id: Option<u64>,
+        country_code: Option<&str>,
+    ) -> bool {
+        let Some(viewer_id) = viewer_id else {
+            return false;
+        };
+        self.feature_switches
+            .load()
+            .match_recipient(&recipient(None, Some(viewer_id), country_code).build())
+            .get_bool(SOFT_NSFW_NEW_USER_DROP)
+            .unwrap_or(false)
     }
 
     pub fn limited_actions_policies(
@@ -177,7 +195,44 @@ fn client_version(user_agent: &str) -> Option<Version> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::rules::fixtures::CLIENT_CLASSES;
+
+    #[test]
+    fn a_viewer_in_the_ddg_treatment_gets_the_switch_and_one_impression() {
+        use crate::params::{Experiments, SwitchFiles};
+        use xai_feature_switches::{ReloadableAbDeciderStore, SpyingBucketImpressor};
+        let root = tempfile::tempdir().unwrap();
+        let abdecider = root.path().join("abdecider.yml");
+        let all_slots = "f".repeat(1280);
+        std::fs::write(
+            &abdecider,
+            format!(
+                "_common: &common\n  soft_nsfw_ddg_1:\n    version: 1\n    logged_in_only: true\n    darkmode: false\n    group: g\n    group_bucket_strategy: splitted\n    diversion: user_id\n    experiment_id: 1\n    buckets:\n    - name: treatment\n      value: 10000\n      allocated_slots: \"{all_slots}\"\nproduction:\n  <<: *common\n"
+            ),
+        )
+        .unwrap();
+        let fs_path = root.path().join("rust_vf.yml");
+        std::fs::write(
+            root.path().join("soft_nsfw.yml"),
+            "soft_nsfw:\n  parameters:\n    soft_nsfw_tweet_label_new_user_rule_enabled: {type: boolean, default: false}\n  rules:\n  - query: \"[soft_nsfw_ddg_1 bucket_membership treatment]\"\n    values: {soft_nsfw_tweet_label_new_user_rule_enabled: true}\n",
+        )
+        .unwrap();
+        let impressor = Arc::new(SpyingBucketImpressor::new());
+        let experiments = Experiments::from_parts(
+            ReloadableAbDeciderStore::new(&abdecider).unwrap(),
+            Arc::clone(&impressor) as _,
+        );
+        let engine = SwitchFiles::beside(fs_path.to_str().unwrap(), experiments)
+            .load(None)
+            .unwrap();
+        let switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(engine)));
+
+        assert!(switches.soft_nsfw_new_user_drop(Some(TEST_USER_ID), Some("us")));
+        assert_eq!(impressor.impression_count("soft_nsfw_ddg_1"), 1);
+        assert!(!switches.soft_nsfw_new_user_drop(None, Some("us")));
+        assert_eq!(impressor.impression_count("soft_nsfw_ddg_1"), 1);
+    }
 
     const TEST_USER_ID: u64 = 1_000_000_000_000_000_001;
 
@@ -233,6 +288,7 @@ mod tests {
                 gore_blur_ignores_settings: false,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
+                soft_nsfw_new_user_drop: false,
             }
         );
         let app_id = |name: &str| {

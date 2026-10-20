@@ -9,12 +9,19 @@ use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
 use xai_core_entities::entities::MediaEntity;
 use xai_x_thrift::tweet_media::MediaInfo;
 
-pub struct VideoAspectRatioHydrator {
-    pub tes_client: Arc<dyn TESClient + Send + Sync>,
-    pub cache: QuickCache<u64, Option<f32>>,
+#[derive(Clone, Debug, Default)]
+pub struct VideoMedia {
+    aspect_ratio: Option<f32>,
+    media_id: Option<u64>,
+    md5_hashes: Option<Vec<String>>,
 }
 
-impl VideoAspectRatioHydrator {
+pub struct VideoMediaHydrator {
+    pub tes_client: Arc<dyn TESClient + Send + Sync>,
+    pub cache: QuickCache<u64, VideoMedia>,
+}
+
+impl VideoMediaHydrator {
     pub fn new(tes_client: Arc<dyn TESClient + Send + Sync>) -> Self {
         Self {
             tes_client,
@@ -24,10 +31,10 @@ impl VideoAspectRatioHydrator {
 }
 
 #[async_trait]
-impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoAspectRatioHydrator {
+impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoMediaHydrator {
     type CacheKey = u64;
 
-    type CacheValue = Option<f32>;
+    type CacheValue = VideoMedia;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         video_carousel::is_enabled(query)
@@ -42,12 +49,18 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoAspectRatioHydrato
     }
 
     fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        hydrated.video_aspect_ratio
+        VideoMedia {
+            aspect_ratio: hydrated.video_aspect_ratio,
+            media_id: hydrated.video_media_id,
+            md5_hashes: hydrated.video_md5_hashes.clone(),
+        }
     }
 
     fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
         PostCandidate {
-            video_aspect_ratio: value,
+            video_aspect_ratio: value.aspect_ratio,
+            video_media_id: value.media_id,
+            video_md5_hashes: value.md5_hashes,
             ..Default::default()
         }
     }
@@ -74,13 +87,9 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoAspectRatioHydrato
         tweet_ids
             .iter()
             .map(|tweet_id| match media_entities.get(tweet_id) {
-                Some(Ok(entities)) => Ok(PostCandidate {
-                    video_aspect_ratio: entities
-                        .as_ref()
-                        .and_then(|entities| entities.first())
-                        .and_then(video_aspect_ratio),
-                    ..Default::default()
-                }),
+                Some(Ok(entities)) => Ok(video_media(
+                    entities.as_ref().and_then(|entities| entities.first()),
+                )),
                 Some(Err(err)) => Err(err.to_string()),
                 None => Ok(PostCandidate::default()),
             })
@@ -89,7 +98,25 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoAspectRatioHydrato
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.video_aspect_ratio = hydrated.video_aspect_ratio;
+        candidate.video_media_id = hydrated.video_media_id;
+        candidate.video_md5_hashes = hydrated.video_md5_hashes;
     }
+}
+
+fn video_media(entity: Option<&MediaEntity>) -> PostCandidate {
+    PostCandidate {
+        video_aspect_ratio: entity.and_then(video_aspect_ratio),
+        video_media_id: entity
+            .and_then(|entity| entity.media_id)
+            .map(|id| id as u64),
+        video_md5_hashes: entity.and_then(md5_hashes),
+        ..Default::default()
+    }
+}
+
+fn md5_hashes(entity: &MediaEntity) -> Option<Vec<String>> {
+    let hashes = entity.additional_metadata.as_ref()?.md5_hashes.as_ref()?;
+    Some(hashes.iter().filter_map(|hash| hash.hash.clone()).collect())
 }
 
 fn video_aspect_ratio(entity: &MediaEntity) -> Option<f32> {

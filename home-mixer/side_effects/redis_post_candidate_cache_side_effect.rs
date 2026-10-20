@@ -7,7 +7,7 @@ use xai_candidate_pipeline::component_library::clients::redis_client::{self, Red
 use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 
-const REDIS_TTL_SECONDS: u64 = 180;
+pub(crate) const REDIS_TTL_SECONDS: u64 = 180;
 const ZSTD_COMPRESSION_LEVEL: i32 = 6;
 
 pub struct RedisPostCandidateCacheSideEffect {
@@ -19,7 +19,7 @@ impl RedisPostCandidateCacheSideEffect {
         Self { redis_client }
     }
 
-    fn get_candidates_to_cache<'a>(
+    pub(crate) fn get_candidates_to_cache<'a>(
         selected: &'a [PostCandidate],
         non_selected: &'a [PostCandidate],
         max_posts_to_cache: usize,

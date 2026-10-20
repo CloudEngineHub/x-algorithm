@@ -49,6 +49,46 @@ impl Column for AuthorColumn {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AuthorNotFound {
+    #[default]
+    Unresolves,
+    ReadsErased,
+}
+
+impl AuthorNotFound {
+    pub(crate) fn read(
+        self,
+        authors: RawHydrationBatch<DecodedAuthor>,
+    ) -> RawHydrationBatch<DecodedAuthor> {
+        match self {
+            AuthorNotFound::Unresolves => authors,
+            AuthorNotFound::ReadsErased => HydrationBatch::from_hydrated(
+                authors
+                    .into_hydrated()
+                    .into_iter()
+                    .map(|(author, decoded)| match decoded {
+                        Hydrated::NotFound => (author, Hydrated::Found(erased_author())),
+                        decoded @ (Hydrated::Found(_)
+                        | Hydrated::Partial(_)
+                        | Hydrated::Failed(_)) => (author, decoded),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn erased_author() -> DecodedAuthor {
+    (
+        AuthorFeatures {
+            is_erased: true,
+            ..AuthorFeatures::default()
+        },
+        AuthorLabelSet::default(),
+    )
+}
+
 pub(crate) fn author_batch(
     users: RawHydrationBatch<GizmoduckUserResult>,
 ) -> RawHydrationBatch<DecodedAuthor> {

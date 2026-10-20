@@ -3,7 +3,7 @@ use crate::params::{CountryList, LimitedActionType};
 use crate::rules::rule_spec::conditions::*;
 use crate::rules::rule_spec::leaves::*;
 use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors, NonFollowers, OnlyAuthor};
-use crate::rules::rule_spec::rule::{all, Rule};
+use crate::rules::rule_spec::rule::{all, Rule, UserRule};
 use crate::rules::rule_spec::*;
 use xai_core_entities::entities::ConversationControlArm;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
@@ -27,6 +27,13 @@ pub(super) const BOUNCE_DROP_BOUNCED: Rule = Rule {
     audience: NonAuthors,
     when: all![TweetHasLabel(SafetyLabelType::BOUNCE)],
     action: drop_post(DropAs::TweetIsBounced),
+};
+
+pub(super) const BOUNCE_QUOTED_TOMBSTONE_BOUNCED: Rule = Rule {
+    id: RuleId::BounceQuoted,
+    audience: Everyone,
+    when: all![IsQuotedInnerTweet, TweetHasLabel(SafetyLabelType::BOUNCE)],
+    action: tombstone(TombstoneReason::Bounced),
 };
 
 pub(super) const SPAM_DROP_UNDESIRABLE: Rule = Rule {
@@ -179,7 +186,12 @@ pub(super) const NULLCASTED_TWEET_DROP: Rule = Rule {
 pub(super) const STALE_TWEET_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::StaleTweet,
     audience: Everyone,
-    when: all![TweetIsSupersededEdit, !TweetIsRetweet],
+    when: all![
+        TweetIsSupersededEdit,
+        !IsQuotedInnerTweet,
+        !TweetIsRetweet,
+        !IsSourceTweet
+    ],
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
@@ -335,7 +347,7 @@ pub(super) const NSFW_SENSITIVE_VIEWER_TWEET_DROP_NSFW_MEDIA: Rule = Rule {
     action: drop_post(DropAs::ContainNsfwMedia),
 };
 
-pub(super) const NSFW_SENSITIVE_VIEWER_USER_DROP_NSFW_MEDIA: Rule = Rule {
+pub(super) const NSFW_SENSITIVE_VIEWER_USER_DROP_NSFW_MEDIA: UserRule = Rule {
     id: RuleId::NsfwSensitiveViewerUser,
     audience: NonAuthors,
     when: all![!ViewerAllowsSensitiveMedia, IS_NSFW_SENSITIVE_AUTHOR],
@@ -928,6 +940,17 @@ pub(super) const NSFW_HIGH_RECALL_DROP_NSFW_MEDIA: Rule = Rule {
     action: drop_post(DropAs::ContainNsfwMedia),
 };
 
+pub(super) const SOFT_NSFW_NEW_USER_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::SoftNsfwNewUser,
+    audience: NonAuthors,
+    when: all![
+        RequestHasSoftNsfwNewUserDrop,
+        ViewerIsNewAccount,
+        TweetHasLabel(SafetyLabelType::SOFT_NSFW)
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
 pub(super) const DO_NOT_AMPLIFY_DROP_UNDESIRABLE: Rule = Rule {
     id: RuleId::DoNotAmplify,
     audience: NonAuthors,
@@ -959,7 +982,7 @@ pub(super) const BRAZIL_ELECTION_LEGAL_DROP_UNDESIRABLE: Rule = Rule {
     action: drop_post(DropAs::PossiblyUndesirable),
 };
 
-pub(super) const BLOCKED_VIEWER_LIMITED_ENGAGEMENT: Rule = Rule {
+pub(super) const BLOCKED_VIEWER_LIMITED_ENGAGEMENT: UserRule = Rule {
     id: RuleId::BlockedViewer,
     audience: NonAuthors,
     when: all![ViewerIsBlockedByAuthor],
@@ -1086,7 +1109,7 @@ mod tests {
 
     #[test]
     fn the_moderated_community_drops_exempt_the_author_and_the_community_moderators() {
-        use crate::models::{CommunityModeration, Decided, TweetFeatures, Verdict};
+        use crate::models::{CommunityModeration, Decided, Placement, TweetFeatures, Verdict};
         use crate::rules::fixtures::{author_viewer, candidate, viewer};
         use crate::rules::{RuleEngine, SafetyLevel};
         use std::num::NonZeroU64;
@@ -1121,7 +1144,12 @@ mod tests {
                 post.post.community_moderation = moderation;
                 post.post.viewer_is_community_moderator = is_moderator;
                 let verdict = engine
-                    .evaluate(SafetyLevel::TimelineHomeHydration, &viewer, &post)
+                    .evaluate(
+                        SafetyLevel::TimelineHomeHydration,
+                        &viewer,
+                        &post,
+                        Placement::Standalone,
+                    )
                     .into_verdict();
                 assert_eq!(
                     matches!(verdict, Verdict::Withheld(Decided { by, .. }) if by == rule),
@@ -1136,6 +1164,7 @@ mod tests {
     fn home_hydration_label_blurs_add_the_modern_blur_gate_to_the_timeline_home_conditions() {
         use crate::rules::levels::{TIMELINE_HOME, TIMELINE_HOME_HYDRATION};
         let label_blurs: Vec<&Rule> = TIMELINE_HOME
+            .post
             .iter()
             .copied()
             .filter(|rule| {
@@ -1152,9 +1181,12 @@ mod tests {
             let mut gated = home.when.conjuncts().to_vec();
             gated.push(ClientHasModernBlur.leaf());
             assert!(
-                TIMELINE_HOME_HYDRATION.iter().any(|rule| rule.id == home.id
-                    && rule.action == home.action
-                    && rule.when.conjuncts() == gated.as_slice()),
+                TIMELINE_HOME_HYDRATION
+                    .post
+                    .iter()
+                    .any(|rule| rule.id == home.id
+                        && rule.action == home.action
+                        && rule.when.conjuncts() == gated.as_slice()),
                 "{} has no TimelineHomeHydration rule with its conditions and client_has_modern_blur",
                 home.name()
             );

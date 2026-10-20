@@ -9,6 +9,7 @@ from typing import Any, Literal, NamedTuple
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
@@ -226,6 +227,7 @@ class FeaturePrepConfig(Config):
     sid_cross_attn: bool = True
     sid_embedding_mode: Literal["learned", "recon"] = "learned"
     sid_decoder_path: str = ""
+    sid_recon_rows_per_decoder_pass: int = 16384
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
@@ -821,6 +823,8 @@ def _add_sid_features(
     result: jax.Array,
     batch_seq: dict,
     config: FeaturePrepConfig,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> jax.Array:
     if not config.enable_post_sid:
         return result
@@ -848,6 +852,9 @@ def _add_sid_features(
             config.embed_init_scale,
             fprop_dtype,
             "feat_prep_post",
+            mesh=mesh,
+            data_axis=data_axis,
+            rows_per_decoder_pass=config.sid_recon_rows_per_decoder_pass,
         )
         return result + sid_emb.astype(fprop_dtype)
     entity_hashes = _cast_jax(batch_seq["post_hashes"]) if config.sid_hash_level else None
@@ -1140,6 +1147,8 @@ def build_feature_prep_streams(
     include_candidates: bool = True,
     candidate_token_to_slot: jax.typing.ArrayLike | None = None,
     candidate_slot_to_token: jax.typing.ArrayLike | None = None,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> FeaturePrepStreams:
     user_tokens: jax.Array | None = None
     user_mask: jax.Array | None = None
@@ -1171,7 +1180,9 @@ def build_feature_prep_streams(
     history_tokens = _add_context_features(
         history_tokens, batch["history_seq"], config, prefix="hist", is_training=is_training
     )
-    history_tokens = _add_sid_features(history_tokens, batch["history_seq"], config)
+    history_tokens = _add_sid_features(
+        history_tokens, batch["history_seq"], config, mesh=mesh, data_axis=data_axis
+    )
     history_tokens = _add_history_features(history_tokens, batch, config, output_vocab_size)
 
     candidate_tokens: jax.Array | None = None
@@ -1203,7 +1214,9 @@ def build_feature_prep_streams(
             prefix="cand",
             is_training=is_training,
         )
-        candidate_tokens = _add_sid_features(candidate_tokens, candidate_seq, config)
+        candidate_tokens = _add_sid_features(
+            candidate_tokens, candidate_seq, config, mesh=mesh, data_axis=data_axis
+        )
         candidate_batch = typing.cast(
             RecsysFeaturesBatch, {**batch, "candidate_seq": candidate_seq}
         )
@@ -1326,6 +1339,8 @@ def build_feature_prep_inputs(
     output_vocab_size: int = 64,
     is_training: bool = True,
     include_candidates: bool = True,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array, int | None]:
     layout = batch.get("packing_layout")
 
@@ -1339,6 +1354,8 @@ def build_feature_prep_inputs(
             output_vocab_size,
             is_training=is_training,
             include_candidates=include_candidates,
+            mesh=mesh,
+            data_axis=data_axis,
         )
         return _assemble_unpacked(streams)
 
@@ -1356,5 +1373,7 @@ def build_feature_prep_inputs(
         include_candidates=include_candidates,
         candidate_token_to_slot=layout.candidate_token_to_slot,
         candidate_slot_to_token=layout.candidate_slot_to_token,
+        mesh=mesh,
+        data_axis=data_axis,
     )
     return _assemble_packed(streams, layout, num_devices, bs_per_device, config)

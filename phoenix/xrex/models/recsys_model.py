@@ -844,6 +844,8 @@ class RecsysAggregatedModelConfig(Config):
 
     attend_padded_history: bool = False
 
+    pad_candidates_to_128: bool = True
+
     use_seqpack: bool = False
 
     effective_sequence_len: int | None = None
@@ -869,6 +871,8 @@ class RecsysAggregatedModelConfig(Config):
     conversion_delay_slice_thresholds_s: tuple[int, ...] = ()
 
     multimodal_embedding_type: EmbeddingType | None = None
+
+    history_url_embedding_dim: int = 0
 
     search_query_embedding_dim: int = 0
 
@@ -938,6 +942,18 @@ class RecsysAggregatedModelConfig(Config):
     def make(self, sharding_context: ShardingContext) -> RecsysAggregatedModel:
         self.validate_purchase_value()
         self.validate_ads_head_masking()
+        if (
+            not (self.pad_candidates_to_128 or self.use_seqpack)
+            and self.model_config.attn_config.attn_impl != "cutedsl_ranker_attn"
+        ):
+            raise ValueError("pad_candidates_to_128=False requires attn_impl=cutedsl_ranker_attn")
+        if self.history_url_embedding_dim < 0 or (
+            self.history_url_embedding_dim > 0 and self.feature_prep_enabled
+        ):
+            raise ValueError(
+                f"history_url_embedding_dim={self.history_url_embedding_dim}: must be >= 0 "
+                "and is only wired on the legacy (feature_prep_enabled=False) path"
+            )
 
         if self.feature_prep_enabled:
             fp = self.feature_prep
@@ -1398,6 +1414,7 @@ def block_history_reduce(
     sid_post_embeddings: jnp.ndarray | None = None,
     history_bridge_prob: jnp.ndarray | None = None,
     history_web_conv_time_on_site: jnp.ndarray | None = None,
+    history_url_embeddings: jnp.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     num_item_hashes = hash_keys.num_item_hashes
     num_author_hashes = hash_keys.num_author_hashes
@@ -1439,6 +1456,19 @@ def block_history_reduce(
     history_post_author_embedding = jnp.dot(
         post_author_embedding.astype(proj_mat_3.dtype), proj_mat_3
     ).astype(post_author_embedding.dtype)
+    if history_url_embeddings is not None:
+        url_dim = history_url_embeddings.shape[-1]
+        hist_url_proj_mat = get_parameter(
+            "hist_url_proj_mat",
+            [url_dim, D],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=lr_multiplier_func(url_dim),
+        )
+        history_post_author_embedding = history_post_author_embedding + jnp.dot(
+            history_url_embeddings.astype(hist_url_proj_mat.dtype), hist_url_proj_mat
+        ).astype(history_post_author_embedding.dtype)
 
     post_action_embedding_seq = history_post_author_embedding.reshape(B, -1, D)
 
@@ -2975,6 +3005,8 @@ class RecsysAggregatedModel(hk.Module):
                 input_scale=scale_multiplier,
                 output_vocab_size=_config.model_config.output_vocab_size,
                 is_training=is_training,
+                mesh=self.sharding_context.mesh if is_training else None,
+                data_axis=self.data_axis,
             )
             tokens = with_sharding_constraint_unless_manual(
                 tokens, P(self.data_axis, ("seq", "model"))
@@ -3127,6 +3159,22 @@ class RecsysAggregatedModel(hk.Module):
             else:
                 multimodal_embeddings = cast_jax(embedding)
 
+        history_url_embeddings: jax.Array | None = None
+        if _config.history_url_embedding_dim > 0:
+            history_embedding = recsys_features_batch["history_seq"].get("embedding")
+            assert history_embedding is not None, (
+                "history_seq embedding must be present when history_url_embedding_dim > 0"
+            )
+            assert history_embedding.shape[-1] == _config.history_url_embedding_dim, (
+                f"history_seq embedding width {history_embedding.shape[-1]} != "
+                f"history_url_embedding_dim {_config.history_url_embedding_dim}"
+            )
+            history_url_embeddings = (
+                history_embedding
+                if isinstance(history_embedding, jax.Array)
+                else cast_jax(history_embedding)
+            )
+
         candidate_search_query_embeddings = None
         if self.config.search_query_embedding_dim > 0:
             search_query_emb = recsys_features_batch["candidate_seq"]["search_query_embeddings"]
@@ -3182,6 +3230,13 @@ class RecsysAggregatedModel(hk.Module):
                     None
                     if history_web_conv_time_on_site is None
                     else history_web_conv_time_on_site.reshape(num_devices, -1, 2)
+                ),
+                history_url_embeddings=(
+                    None
+                    if history_url_embeddings is None
+                    else history_url_embeddings.reshape(
+                        num_devices, -1, _config.history_url_embedding_dim
+                    )
                 ),
             )
 
@@ -3343,6 +3398,7 @@ class RecsysAggregatedModel(hk.Module):
                 sid_post_embeddings=None if _sid_recon else _sid_post_emb_h,
                 history_bridge_prob=history_bridge_prob,
                 history_web_conv_time_on_site=history_web_conv_time_on_site,
+                history_url_embeddings=history_url_embeddings,
             )
             if _sid_recon and _sid_post_emb_h is not None:
                 history_embeddings += _sid_post_emb_h.astype(history_embeddings.dtype)
@@ -3869,63 +3925,66 @@ class RecsysAggregatedModel(hk.Module):
             assert candidate_start_offset is not None
             history_len = None
 
-            (
-                input_embeddings,
-                padding_mask,
-                product_surface,
-                targets,
-                loss_weights,
-                negatives,
-                promoted_ids,
-                continuous_actions,
-                client_app_id,
-                line_item_objective,
-                safety_label_mask,
-                dpa_product_key,
-            ) = pad_to_next_128_multiple(
-                input_embeddings,
-                padding_mask,
-                c.product_surface,
-                c.targets,
-                c.loss_weights,
-                c.negative_sample_mask,
-                c.promoted_ids,
-                c.continuous_actions,
-                c.client_app_id,
-                c.line_item_objective,
-                c.safety_label_mask,
-                c.dpa_product_key,
-            )
-            assert targets is not None and negatives is not None
-            pad_len = targets.shape[1] - c.targets.shape[1]
+            if self.config.pad_candidates_to_128:
+                (
+                    input_embeddings,
+                    padding_mask,
+                    product_surface,
+                    targets,
+                    loss_weights,
+                    negatives,
+                    promoted_ids,
+                    continuous_actions,
+                    client_app_id,
+                    line_item_objective,
+                    safety_label_mask,
+                    dpa_product_key,
+                ) = pad_to_next_128_multiple(
+                    input_embeddings,
+                    padding_mask,
+                    c.product_surface,
+                    c.targets,
+                    c.loss_weights,
+                    c.negative_sample_mask,
+                    c.promoted_ids,
+                    c.continuous_actions,
+                    c.client_app_id,
+                    c.line_item_objective,
+                    c.safety_label_mask,
+                    c.dpa_product_key,
+                )
+                assert targets is not None and negatives is not None
+                pad_len = targets.shape[1] - c.targets.shape[1]
 
-            def pad(x: jax.Array) -> jax.Array:
-                return jnp.pad(x, ((0, 0), (0, pad_len)) + ((0, 0),) * (x.ndim - 2))
+                def pad(x: jax.Array) -> jax.Array:
+                    return jnp.pad(x, ((0, 0), (0, pad_len)) + ((0, 0),) * (x.ndim - 2))
 
-            c = c._replace(
-                targets=targets,
-                negative_sample_mask=negatives,
-                loss_weights=loss_weights,
-                product_surface=product_surface,
-                promoted_ids=promoted_ids,
-                continuous_actions=continuous_actions,
-                client_app_id=client_app_id,
-                line_item_objective=line_item_objective,
-                safety_label_mask=safety_label_mask,
-                dpa_product_key=dpa_product_key,
-                trained_heads=None
-                if c.trained_heads is None
-                else jnp.pad(c.trained_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True),
-                eligible_heads=None
-                if c.eligible_heads is None
-                else jnp.pad(
-                    c.eligible_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True
-                ),
-                target_padding_mask=pad(c.target_padding_mask),
-                loss_padding_mask=pad(c.loss_padding_mask),
-                continuous_heads=jax.tree.map(pad, c.continuous_heads),
-                purchase_value=jax.tree.map(pad, c.purchase_value),
-            )
+                c = c._replace(
+                    targets=targets,
+                    negative_sample_mask=negatives,
+                    loss_weights=loss_weights,
+                    product_surface=product_surface,
+                    promoted_ids=promoted_ids,
+                    continuous_actions=continuous_actions,
+                    client_app_id=client_app_id,
+                    line_item_objective=line_item_objective,
+                    safety_label_mask=safety_label_mask,
+                    dpa_product_key=dpa_product_key,
+                    trained_heads=None
+                    if c.trained_heads is None
+                    else jnp.pad(
+                        c.trained_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True
+                    ),
+                    eligible_heads=None
+                    if c.eligible_heads is None
+                    else jnp.pad(
+                        c.eligible_heads, ((0, 0), (0, pad_len), (0, 0)), constant_values=True
+                    ),
+                    target_padding_mask=pad(c.target_padding_mask),
+                    loss_padding_mask=pad(c.loss_padding_mask),
+                    continuous_heads=jax.tree.map(pad, c.continuous_heads),
+                    purchase_value=jax.tree.map(pad, c.purchase_value),
+                )
 
             segment_ids = attention_segment_ids(
                 padding_mask, candidate_start_offset, self.config.attend_padded_history
@@ -4581,17 +4640,20 @@ class RecsysAggregatedModel(hk.Module):
         else:
             assert candidate_start_offset is not None
 
-            input_embeddings, padding_mask, product_surface, targets, *_ = pad_to_next_128_multiple(
-                input_embeddings,
-                padding_mask,
-                product_surface,
-                targets,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            if self.config.pad_candidates_to_128:
+                input_embeddings, padding_mask, product_surface, targets, *_ = (
+                    pad_to_next_128_multiple(
+                        input_embeddings,
+                        padding_mask,
+                        product_surface,
+                        targets,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                )
             segment_ids = attention_segment_ids(
                 padding_mask, candidate_start_offset, self.config.attend_padded_history
             )

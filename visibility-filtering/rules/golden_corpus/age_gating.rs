@@ -179,6 +179,11 @@ pub(super) fn rows() -> Vec<Row> {
                     legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
                 ),
                 (
+                    TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(Role::NonFollower)),
+                    legacy_interstitial("nsfw_high_precision/legacy_interstitial"),
+                ),
+                (
                     ImmersiveExpandedRecommendations,
                     Role::As("sensitive_opt_in", sensitive_opt_in_viewer()),
                     allow(),

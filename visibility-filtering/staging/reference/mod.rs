@@ -1,9 +1,11 @@
 use crate::config::{ENV_APP_ENV, ENV_REFERENCE, parse_env_flag};
+use crate::evaluate_tweets::EntryComparator;
 use crate::filter_tweets::{Comparator, FinishComparison};
 use crate::params::ClientSwitches;
-use crate::post_evaluator::PostEvaluator;
+use crate::post_evaluator::{PostEvaluation, PostEvaluator};
+use crate::quote::Passes;
 use crate::rules::SafetyLevel;
-use crate::server_deps::{init_client_with_retry, with_metadata};
+use crate::server_deps::{Comparators, init_client_with_retry, with_metadata};
 use std::env;
 use std::sync::Arc;
 use strum::VariantNames;
@@ -12,6 +14,7 @@ use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
 use vf_service::{ReferenceCompareHarness, TweetVerdict};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
+use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
 
 pub(crate) mod tweetypie;
@@ -76,21 +79,28 @@ pub(crate) async fn build(
     post_evaluator: &Arc<PostEvaluator>,
     client_switches: &ClientSwitches,
     metadata: Option<&MetadataMap>,
-) -> Option<Box<dyn Comparator>> {
+) -> Comparators {
     match reference() {
-        Reference::None => None,
-        Reference::VfService => Some(Box::new(
-            build_vf_service(datacenter, init_deadline, metadata).await,
-        )),
-        Reference::Tweetypie => Some(Box::new(
-            tweetypie::build(
+        Reference::None => Comparators::default(),
+        Reference::VfService => Comparators {
+            filter_tweets: Some(Box::new(
+                build_vf_service(datacenter, init_deadline, metadata).await,
+            )),
+            evaluate_tweets: None,
+        },
+        Reference::Tweetypie => {
+            let reference = tweetypie::build(
                 init_deadline,
                 post_evaluator,
                 client_switches.clone(),
                 metadata,
             )
-            .await,
-        )),
+            .await;
+            Comparators {
+                filter_tweets: Some(Box::new(Arc::clone(&reference))),
+                evaluate_tweets: Some(Box::new(reference)),
+            }
+        }
     }
 }
 
@@ -168,6 +178,27 @@ impl Comparator for Arc<TweetypieReference> {
         Some(Box::new(move |outcomes| {
             reference.spawn(viewer_id, country_code, safety_level, outcomes);
         }))
+    }
+}
+
+impl EntryComparator for Arc<TweetypieReference> {
+    fn compare(
+        &self,
+        viewer_id: Option<u64>,
+        context: Option<&TwitterContextViewer>,
+        country_code: Option<&str>,
+        safety_level: SafetyLevel,
+        outcomes: &[PostEvaluation],
+        quote_passes: &Passes,
+    ) {
+        self.spawn_quote_comparison(
+            viewer_id,
+            context,
+            country_code,
+            safety_level,
+            outcomes,
+            quote_passes.ran(),
+        );
     }
 }
 

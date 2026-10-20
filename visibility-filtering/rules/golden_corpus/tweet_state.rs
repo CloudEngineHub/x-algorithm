@@ -92,6 +92,11 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
+                    TimelineHome,
+                    Role::RetweetSource(Box::new(Role::NonFollower)),
+                    allow(),
+                ),
+                (
                     TimelineHomeHydration,
                     Role::NonFollower,
                     limited(

@@ -1,13 +1,12 @@
 use super::*;
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
 use crate::hydration::inventory::Source;
-use std::iter;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
 use xai_core_entities::entities::{
-    ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety,
+    ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, QuotedTweet, Safety,
     UserResponseState,
 };
 
@@ -61,6 +60,7 @@ pub(crate) struct InMemorySources {
     pure_cores: HashMap<u64, PureCoreData>,
     tweets: HashMap<u64, TweetFeatures>,
     controls: HashMap<u64, ConversationControl>,
+    quoted_tweets: HashMap<u64, QuotedTweet>,
     labels: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,
     viewers: HashMap<u64, GizmoduckUser>,
     users: HashMap<u64, GizmoduckUserResult>,
@@ -141,6 +141,12 @@ impl InMemorySources {
 
     pub(crate) fn control(mut self, tweet_id: u64, control: ConversationControl) -> Self {
         self.controls.insert(tweet_id, control);
+        self
+    }
+
+    pub(crate) fn quote(mut self, outer: u64, tweet_id: u64, user_id: u64) -> Self {
+        self.quoted_tweets
+            .insert(outer, QuotedTweet { tweet_id, user_id });
         self
     }
 
@@ -362,6 +368,65 @@ impl InMemorySources {
             .map(|(_, fault)| *fault)
     }
 
+    async fn select(
+        &self,
+        source: Source,
+        viewer_id: Option<u64>,
+        queries: &[EdgeQuery],
+    ) -> Vec<RawHydrationBatch<bool>> {
+        let mut recorded = queries.to_vec();
+        for query in &mut recorded {
+            query.destination_ids.sort_unstable();
+        }
+        self.selects.lock().unwrap().push(recorded);
+        let failed_graph = queries.iter().any(|query| {
+            self.failed_graphs.contains(&query.graph)
+                || query
+                    .destination_ids
+                    .iter()
+                    .any(|&id| self.failed_edges.contains(&(query.graph, id)))
+        });
+        let keys: Vec<u64> = viewer_id
+            .into_iter()
+            .chain(queries.iter().flat_map(|query| {
+                query
+                    .from
+                    .id(None)
+                    .into_iter()
+                    .chain(query.destination_ids.iter().copied())
+            }))
+            .collect();
+        let fails = self.enter(source, &keys).await || failed_graph;
+        if queries
+            .iter()
+            .any(|query| self.hung_graphs.contains(&query.graph))
+        {
+            std::future::pending::<()>().await;
+        }
+        let answer = |query: &EdgeQuery| {
+            let from = query.from.id(viewer_id)?;
+            let holds = |&id: &u64| {
+                let edge = match query.direction {
+                    EdgeDirection::Forward => (query.graph, from, id),
+                    EdgeDirection::Reverse => (query.graph, id, from),
+                };
+                self.edges.contains(&edge)
+            };
+            (!self.missing_graphs.contains(&query.graph)).then(|| {
+                query
+                    .destination_ids
+                    .iter()
+                    .copied()
+                    .filter(holds)
+                    .collect()
+            })
+        };
+        let sets: Result<Vec<_>, _> = (!fails)
+            .then(|| queries.iter().map(answer).collect())
+            .ok_or_else(|| tonic::Status::unavailable("select failed"));
+        edge_batches(queries, sets.as_deref())
+    }
+
     async fn keyed<V: Clone>(
         &self,
         source: Source,
@@ -409,6 +474,16 @@ impl Sources for InMemorySources {
     ) -> Answered<exchange::TesConversationControl, ConversationControl> {
         Observed::quiet(
             self.keyed(Source::TesConversationControl, tweet_ids, &self.controls)
+                .await,
+        )
+    }
+
+    async fn quoted_tweets(
+        &self,
+        outer_ids: &[u64],
+    ) -> Answered<exchange::TesQuotedTweet, QuotedTweet> {
+        Observed::quiet(
+            self.keyed(Source::TesQuotedTweet, outer_ids, &self.quoted_tweets)
                 .await,
         )
     }
@@ -461,53 +536,14 @@ impl Sources for InMemorySources {
         viewer_id: u64,
         queries: &[EdgeQuery],
     ) -> Observed<exchange::Flock, Vec<RawHydrationBatch<bool>>> {
-        let mut recorded = queries.to_vec();
-        for query in &mut recorded {
-            query.destination_ids.sort_unstable();
-        }
-        self.selects.lock().unwrap().push(recorded);
-        let failed_graph = queries.iter().any(|query| {
-            self.failed_graphs.contains(&query.graph)
-                || query
-                    .destination_ids
-                    .iter()
-                    .any(|&id| self.failed_edges.contains(&(query.graph, id)))
-        });
-        let keys: Vec<u64> = iter::once(viewer_id)
-            .chain(
-                queries
-                    .iter()
-                    .flat_map(|query| query.destination_ids.iter().copied()),
-            )
-            .collect();
-        let fails = self.enter(Source::Flock, &keys).await || failed_graph;
-        if queries
-            .iter()
-            .any(|query| self.hung_graphs.contains(&query.graph))
-        {
-            std::future::pending::<()>().await;
-        }
-        let answer = |query: &EdgeQuery| {
-            let holds = |&id: &u64| {
-                let edge = match query.direction {
-                    EdgeDirection::Forward => (query.graph, viewer_id, id),
-                    EdgeDirection::Reverse => (query.graph, id, viewer_id),
-                };
-                self.edges.contains(&edge)
-            };
-            (!self.missing_graphs.contains(&query.graph)).then(|| {
-                query
-                    .destination_ids
-                    .iter()
-                    .copied()
-                    .filter(holds)
-                    .collect()
-            })
-        };
-        let sets: Result<Vec<_>, _> = (!fails)
-            .then(|| queries.iter().map(answer).collect())
-            .ok_or_else(|| tonic::Status::unavailable("select failed"));
-        Observed::quiet(edge_batches(queries, sets.as_deref()))
+        Observed::quiet(self.select(Source::Flock, Some(viewer_id), queries).await)
+    }
+
+    async fn select_pair_edges(
+        &self,
+        queries: &[EdgeQuery],
+    ) -> Observed<exchange::FlockUserPair, Vec<RawHydrationBatch<bool>>> {
+        Observed::quiet(self.select(Source::FlockUserPair, None, queries).await)
     }
 
     async fn viewer_country(&self, viewer_id: u64) -> Answered<exchange::ViewerCountry, Arc<str>> {

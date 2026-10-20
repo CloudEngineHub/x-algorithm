@@ -54,6 +54,12 @@ pub struct Config {
     )]
     pub topic_labels_config: String,
 
+    #[arg(long, env = "BACKFILL_TOPIC")]
+    pub backfill_topic: Option<String>,
+
+    #[arg(long, env = "BACKFILL_CLAIMS_PG_DSN", hide_env_values = true)]
+    pub backfill_claims_pg_dsn: Option<String>,
+
     #[arg(long, env = "KAFKA_CONSUMER_GROUP_ID")]
     pub kafka_consumer_group_id: Option<String>,
 
@@ -251,6 +257,7 @@ mod tests {
         let config = Config::parse_from(["xai-abuse-enforcement-service"]);
 
         assert!(!config.kafka_consumer_enabled);
+        assert_eq!(config.backfill_topic, None);
         assert_eq!(config.kafka_consumer_mtls_cluster, "phoenix");
         assert_eq!(config.kafka_consumer_mtls_zone, "atla");
         assert_eq!(config.kafka_group_id(), "xai-abuse-enforcement-service");

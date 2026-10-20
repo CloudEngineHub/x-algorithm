@@ -247,6 +247,10 @@ impl DynamicConfig {
         crate::action_control::ControlConfig::from_config(self.snapshot().config.as_ref())
     }
 
+    pub fn backfill_config(&self) -> crate::backfill::BackfillConfig {
+        crate::backfill::BackfillConfig::from_config(self.snapshot().config.as_ref())
+    }
+
     pub fn confidence_config(&self) -> crate::confidence::ConfidenceConfig {
         crate::confidence::ConfidenceConfig::from_config(self.snapshot().config.as_ref())
     }

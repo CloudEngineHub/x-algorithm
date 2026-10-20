@@ -65,12 +65,28 @@ pub(crate) struct DecodedViewer {
 pub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {
     match user {
         Some(user) => DecodedViewer {
-            profile: profile(ViewerData::from_user(user, fields)),
+            profile: ViewerProfile {
+                is_new_account: is_new_account(user.created_at_msec),
+                ..profile(ViewerData::from_user(user, fields))
+            },
             has_age_verified_18_label: has_age_verified_18_label(&user.labels),
             state: Some(ViewerState::of(&user.safety)),
         },
         None => DecodedViewer::default(),
     }
+}
+
+fn is_new_account(created_at_msec: Option<i64>) -> bool {
+    const NEW_ACCOUNT_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Some(created_at) = created_at_msec
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+    else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .duration_since(created_at)
+        .is_ok_and(|age| age < NEW_ACCOUNT_AGE)
 }
 
 fn profile(data: ViewerData) -> ViewerProfile {
@@ -84,6 +100,7 @@ fn profile(data: ViewerData) -> ViewerProfile {
         has_idv_premium: has_idv_premium(&data),
         is_read_only: data.access_policy == AccessPolicy::BounceAllPublicWrites,
         account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),
+        is_new_account: false,
     }
 }
 

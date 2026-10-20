@@ -1,13 +1,14 @@
 use crate::models::{MediaFeature, NsfwFeature, TweetFeatures};
+use crate::thrift_read::{read_fields, skip_elements, SKIP_DEPTH};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
+use thrift::protocol::TInputProtocol;
 use xai_core_entities::entities::{
     EditControl, ExclusiveTweetControl, TakedownReason, TrustedFriendsControl,
 };
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead, StratoResult};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
 
 const COLUMN: &str = "tweetypie/federated/tweetForVisibility.Tweet";
@@ -130,15 +131,10 @@ fn media_feature(entities: Vec<Media>) -> MediaFeature {
     feature
 }
 
-impl TSerializable for Tweet {
-    fn read_from_in_protocol(proto: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        proto.read_struct_begin()?;
+impl StratoRead for Tweet {
+    fn read(proto: &mut MValProtocol<'_>) -> thrift::Result<Self> {
         let mut tweet = Tweet::default();
-        loop {
-            let field = proto.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
-            }
+        read_fields(proto, |proto, field| {
             match field.id {
                 Some(2) => tweet.core_data = Some(read_core_data(proto)?),
                 Some(7) => {
@@ -152,8 +148,8 @@ impl TSerializable for Tweet {
                 }
                 Some(30) => tweet.takedown_reasons = Vec::<TakedownReason>::from_thrift(proto),
                 Some(118) => {
-                    proto.skip(field.field_type)?;
                     tweet.has_card_reference = true;
+                    return Ok(false);
                 }
                 Some(125) => tweet.community_id = read_first_community_id(proto)?,
                 Some(155) => {
@@ -176,128 +172,90 @@ impl TSerializable for Tweet {
                     })?;
                 }
                 Some(32766) => tweet.has_media_keys = skip_list_non_empty(proto)?,
-                _ => proto.skip(field.field_type)?,
+                _ => return Ok(false),
             }
-            proto.read_field_end()?;
-        }
-        proto.read_struct_end()?;
+            Ok(true)
+        })?;
         Ok(tweet)
-    }
-
-    fn write_to_out_protocol(&self, _proto: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "Tweet is decode-only",
-        ))
     }
 }
 
-fn read_core_data(proto: &mut dyn TInputProtocol) -> thrift::Result<CoreData> {
-    proto.read_struct_begin()?;
+fn read_core_data(proto: &mut MValProtocol<'_>) -> thrift::Result<CoreData> {
     let mut core_data = CoreData::default();
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
+    read_fields(proto, |proto, field| {
         match field.id {
             Some(9) => core_data.nsfw_user = proto.read_bool()?,
             Some(10) => core_data.nsfw_admin = proto.read_bool()?,
             Some(11) => core_data.nullcast = proto.read_bool()?,
-            _ => proto.skip(field.field_type)?,
+            _ => return Ok(false),
         }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        Ok(true)
+    })?;
     Ok(core_data)
 }
 
-fn read_media(proto: &mut dyn TInputProtocol) -> thrift::Result<Media> {
-    proto.read_struct_begin()?;
+fn read_media(proto: &mut MValProtocol<'_>) -> thrift::Result<Media> {
     let mut media = Media::default();
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
+    read_fields(proto, |proto, field| {
         match field.id {
             Some(21) => {
-                proto.skip(field.field_type)?;
                 media.has_media_key = true;
+                return Ok(false);
             }
             Some(22) => media.restrictions = read_additional_metadata_restrictions(proto)?,
-            _ => proto.skip(field.field_type)?,
+            _ => return Ok(false),
         }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        Ok(true)
+    })?;
     Ok(media)
 }
 
 fn read_additional_metadata_restrictions(
-    proto: &mut dyn TInputProtocol,
+    proto: &mut MValProtocol<'_>,
 ) -> thrift::Result<Option<MediaRestrictions>> {
-    proto.read_struct_begin()?;
     let mut restrictions = None;
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
+    read_fields(proto, |proto, field| {
+        if field.id != Some(12) {
+            return Ok(false);
         }
-        match field.id {
-            Some(12) => restrictions = Some(read_restrictions(proto)?),
-            _ => proto.skip(field.field_type)?,
-        }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        restrictions = Some(read_restrictions(proto)?);
+        Ok(true)
+    })?;
     Ok(restrictions)
 }
 
-fn read_restrictions(proto: &mut dyn TInputProtocol) -> thrift::Result<MediaRestrictions> {
-    proto.read_struct_begin()?;
+fn read_restrictions(proto: &mut MValProtocol<'_>) -> thrift::Result<MediaRestrictions> {
     let mut restrictions = MediaRestrictions::default();
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
+    read_fields(proto, |proto, field| {
         match field.id {
             Some(1) => restrictions.is_dmca = proto.read_bool()?,
             Some(3) => {
                 (restrictions.geo_allow_list, restrictions.geo_deny_list) =
                     read_geo_restrictions(proto)?;
             }
-            _ => proto.skip(field.field_type)?,
+            _ => return Ok(false),
         }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        Ok(true)
+    })?;
     Ok(restrictions)
 }
 
 fn read_geo_restrictions(
-    proto: &mut dyn TInputProtocol,
+    proto: &mut MValProtocol<'_>,
 ) -> thrift::Result<(Vec<String>, Vec<String>)> {
-    proto.read_struct_begin()?;
     let (mut allow, mut deny) = (Vec::new(), Vec::new());
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
+    read_fields(proto, |proto, field| {
         match field.id {
             Some(1) => allow = read_string_list(proto)?,
             Some(2) => deny = read_string_list(proto)?,
-            _ => proto.skip(field.field_type)?,
+            _ => return Ok(false),
         }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        Ok(true)
+    })?;
     Ok((allow, deny))
 }
 
-fn read_string_list(proto: &mut dyn TInputProtocol) -> thrift::Result<Vec<String>> {
+fn read_string_list(proto: &mut MValProtocol<'_>) -> thrift::Result<Vec<String>> {
     let list = proto.read_list_begin()?;
     let mut strings = Vec::with_capacity(usize::try_from(list.size).unwrap_or(0));
     for _ in 0..list.size {
@@ -307,60 +265,42 @@ fn read_string_list(proto: &mut dyn TInputProtocol) -> thrift::Result<Vec<String
     Ok(strings)
 }
 
-fn skip_list_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<bool> {
+fn skip_list_non_empty(proto: &mut MValProtocol<'_>) -> thrift::Result<bool> {
     let list = proto.read_list_begin()?;
-    for _ in 0..list.size {
-        proto.skip(list.element_type)?;
-    }
+    skip_elements(proto, &[list.element_type], list.size, SKIP_DEPTH)?;
     proto.read_list_end()?;
     Ok(list.size > 0)
 }
 
-fn read_first_community_id(proto: &mut dyn TInputProtocol) -> thrift::Result<Option<NonZeroU64>> {
-    proto.read_struct_begin()?;
+fn read_first_community_id(proto: &mut MValProtocol<'_>) -> thrift::Result<Option<NonZeroU64>> {
     let mut first = None;
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
+    read_fields(proto, |proto, field| {
+        if field.id != Some(1) {
+            return Ok(false);
         }
-        match field.id {
-            Some(1) => {
-                let list = proto.read_list_begin()?;
-                if list.size > 0 {
-                    first = NonZeroU64::new(proto.read_i64()?.cast_unsigned());
-                }
-                for _ in 1..list.size {
-                    proto.skip(list.element_type)?;
-                }
-                proto.read_list_end()?;
-            }
-            _ => proto.skip(field.field_type)?,
+        let list = proto.read_list_begin()?;
+        if list.size > 0 {
+            first = NonZeroU64::new(proto.read_i64()?.cast_unsigned());
+            skip_elements(proto, &[list.element_type], list.size - 1, SKIP_DEPTH)?;
         }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        proto.read_list_end()?;
+        Ok(true)
+    })?;
     Ok(first)
 }
 
 fn read_id_field<T>(
-    proto: &mut dyn TInputProtocol,
-    read: impl Fn(&mut dyn TInputProtocol) -> thrift::Result<Option<T>>,
+    proto: &mut MValProtocol<'_>,
+    read: impl Fn(&mut MValProtocol<'_>) -> thrift::Result<Option<T>>,
 ) -> thrift::Result<Option<T>> {
-    proto.read_struct_begin()?;
     let mut id = None;
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
+    read_fields(proto, |proto, field| {
+        if field.id != Some(1) {
+            return Ok(false);
         }
-        match field.id {
-            Some(1) => id = read(proto)?,
-            _ => proto.skip(field.field_type)?,
-        }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()?;
+        id = read(proto)?;
+        Ok(true)
+    })?;
     Ok(id)
 }
 
@@ -369,19 +309,27 @@ mod tests {
     use super::*;
     use crate::clients::strato_answer::Thrift::{self, Bool, List, Str, Struct, I64};
     use crate::clients::strato_answer::{found, no_row};
+    use crate::thrift_read::tests::assert_skips_like_thrift;
+    use std::collections::BTreeSet;
+    use thrift::protocol::TType;
+    use thrift::OrderedFloat;
     use xai_core_entities::entities::{EditControlInitial, MediaEntity};
-    use xai_x_thrift::media_common::MediaKey;
+    use xai_x_thrift::media_common::{MediaCategory, MediaKey, OwnershipInfo};
     use xai_x_thrift::media_entity::ColorValue;
     use xai_x_thrift::media_information::{
-        AdditionalMetadata, AltText, CalibrationBucket, ClassInfo, ClassificationInfo,
-        ContentIdInfo, DomainRestrictions, GeoRestrictions, Restrictions,
+        AdditionalMetadata, AltText, CalibrationBucket, CalibrationLevel, CandidateCropsResponse,
+        ClassInfo, ClassificationInfo, ComputationStatus, ContentIdInfo, DomainRestrictions, Face,
+        FaceResponse, GeoRestrictions, MediaAvailability, MediaAvailabilityStatus, Rect,
+        Restrictions,
     };
+    use xai_x_thrift::tweet_media::{MediaResizeMethod, MediaSize, MediaSizeType};
 
     const TWEET_ID: i64 = 10;
     const AUTHOR_ID: i64 = 7001;
     const CONVERSATION_AUTHOR_ID: i64 = 7003;
     const TRUSTED_FRIENDS_LIST_ID: i64 = 9001;
     const ARTICLE_ID: i64 = 9002;
+    const PHOTO_REPLY_ID: i64 = 20_000;
 
     fn exclusive_conversation() -> (i16, Thrift) {
         (155, Struct(vec![(1, I64(CONVERSATION_AUTHOR_ID))]))
@@ -447,6 +395,250 @@ mod tests {
 
     fn decode_fixture(bytes: &[u8]) -> TweetFeatures {
         decode_tweet(bytes).unwrap().unwrap()
+    }
+
+    fn media_id(tweet_id: i64, index: i64) -> i64 {
+        tweet_id - 1_000 + index
+    }
+
+    fn photo(tweet_id: i64, index: i64, geo_allow_list: Option<&[&str]>) -> MediaEntity {
+        let media_id = media_id(tweet_id, index);
+        let size = |size_type, width, height| MediaSize {
+            size_type: Some(MediaSizeType(size_type)),
+            resize_method: Some(MediaResizeMethod(i32::from(size_type == 0))),
+            width: Some(width),
+            height: Some(height),
+            ..Default::default()
+        };
+        let class = |label: &str| ClassInfo {
+            label: Some(label.to_string()),
+            probability: Some(OrderedFloat(0.0125)),
+            calibration_buckets: Some(
+                (1..=3)
+                    .map(|level| CalibrationBucket {
+                        level: Some(CalibrationLevel(level)),
+                        threshold: Some(OrderedFloat(0.25 * f64::from(level))),
+                        precision: Some(OrderedFloat(0.9)),
+                        recall: Some(OrderedFloat(0.5)),
+                    })
+                    .collect(),
+            ),
+            model_version: Some("model_8C_000001".to_string()),
+            ..Default::default()
+        };
+        let face = |left| Face {
+            bounding_box: Some(Rect {
+                left: Some(left),
+                top: Some(60),
+                width: Some(142),
+                height: Some(142),
+            }),
+        };
+        MediaEntity {
+            from_index: Some(186),
+            to_index: Some(209),
+            url: Some("https://t.co/Synthetic1".to_string()),
+            display_url: Some("pic.x.com/Synthetic1".to_string()),
+            media_url: Some(format!("http://media.example.com/{media_id}.jpg")),
+            media_url_https: Some(format!("https://media.example.com/{media_id}.jpg")),
+            expanded_url: Some(format!(
+                "https://x.example.com/synthetic_user/status/{tweet_id}/photo/{index}"
+            )),
+            media_id: Some(media_id),
+            nsfw: Some(false),
+            sizes: Some(BTreeSet::from([
+                size(0, 150, 150),
+                size(1, 680, 510),
+                size(2, 1200, 900),
+                size(3, 2048, 1536),
+            ])),
+            media_path: Some(format!("media/{media_id}.jpg")),
+            media_key: Some(MediaKey {
+                media_category: Some(MediaCategory::TWEET_IMAGE),
+                media_id: Some(media_id),
+            }),
+            additional_metadata: Some(AdditionalMetadata {
+                face_data: Some(FaceResponse {
+                    status: Some(ComputationStatus::COMPLETE),
+                    faces: Some(
+                        ["large", "medium", "small", "orig"]
+                            .into_iter()
+                            .zip([32, 24, 12, 48])
+                            .map(|(size, left)| (size.to_string(), vec![face(left)]))
+                            .collect(),
+                    ),
+                }),
+                classifications: Some(ClassificationInfo {
+                    probabilities: Some(
+                        [
+                            "IN", "NU", "SX", "GR", "VI", "DR", "WE", "HA", "SP", "MI", "OK",
+                        ]
+                        .into_iter()
+                        .map(class)
+                        .collect(),
+                    ),
+                    predictions: None,
+                }),
+                ownership_info: Some(OwnershipInfo {
+                    user_id: Some(AUTHOR_ID),
+                    tweet_id: Some(tweet_id),
+                    ..Default::default()
+                }),
+                candidate_crops: Some(CandidateCropsResponse {
+                    status: Some(ComputationStatus::COMPLETE),
+                    ..Default::default()
+                }),
+                media_availability: Some(MediaAvailability {
+                    status: MediaAvailabilityStatus::AVAILABLE,
+                    reason: None,
+                    unavailability_info: None,
+                }),
+                restrictions: geo_allow_list.map(|allow| Restrictions {
+                    is_dmca: Some(false),
+                    geo_restrictions: Some(GeoRestrictions {
+                        whitelisted_country_codes: Some(
+                            allow.iter().map(|s| s.to_string()).collect(),
+                        ),
+                        blacklisted_country_codes: Some(vec![]),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn photo_reply(index: i64) -> (Vec<u8>, TweetFeatures) {
+        let tweet_id = PHOTO_REPLY_ID + index;
+        let editable_until_msecs = 1_729_000_000 * 1_000 + 3_600_000;
+        let photos = 2 + index % 3;
+        let geo_allow_list: Option<&[&str]> = (index % 5 == 0).then_some(&["us", "ca"]);
+        let text = "Synthetic photo reply text for the decode fixture, as long as a typical post \
+                    body \u{1f415}\u{1f30a} @synthetic_parent @synthetic_friend \
+                    #synthetic #fixture https://t.co/Synthetic1 https://t.co/Synthetic1";
+        let core_data = vec![
+            (1, I64(AUTHOR_ID)),
+            (2, Str(text.into())),
+            (3, Str("synthetic client".into())),
+            (4, I64(1_729_000_000)),
+            (
+                5,
+                Struct(vec![
+                    (1, I64(tweet_id - 1)),
+                    (2, I64(AUTHOR_ID + 1)),
+                    (3, Str("synthetic_parent".into())),
+                ]),
+            ),
+            (8, Bool(false)),
+            (9, Bool(false)),
+            (10, Bool(false)),
+            (11, Bool(false)),
+            (13, I64(1)),
+            (14, I64(tweet_id - 1)),
+            (15, Bool(true)),
+            (19, Str("0123456789abcdef".into())),
+        ];
+        let annotation = |group| {
+            Struct(vec![
+                (1, I64(group)),
+                (2, I64(group * 1_000)),
+                (3, I64(group * 1_000_000)),
+            ])
+        };
+        let media_ref = |i| {
+            Struct(vec![
+                (1, Str(format!("3_{}", media_id(tweet_id, i)))),
+                (2, I64(tweet_id)),
+                (3, I64(AUTHOR_ID)),
+            ])
+        };
+        let media_key = |i| {
+            Thrift::generated(MediaKey {
+                media_category: Some(MediaCategory::TWEET_IMAGE),
+                media_id: Some(media_id(tweet_id, i)),
+            })
+        };
+        let edit = Struct(vec![
+            (1, List(TType::I64, vec![I64(tweet_id)])),
+            (2, I64(editable_until_msecs)),
+            (3, I64(5)),
+            (4, Bool(true)),
+        ]);
+        let bytes = found(Struct(vec![
+            (1, I64(tweet_id)),
+            (2, Struct(core_data)),
+            (
+                7,
+                List(
+                    TType::Struct,
+                    (0..photos)
+                        .map(|i| {
+                            Thrift::generated(photo(tweet_id, i, geo_allow_list.filter(|_| i == 0)))
+                        })
+                        .collect(),
+                ),
+            ),
+            (30, List(TType::Struct, vec![])),
+            (
+                106,
+                Struct(vec![(
+                    1,
+                    List(TType::Struct, (1..=5).map(annotation).collect()),
+                )]),
+            ),
+            (157, Struct(vec![(1, edit)])),
+            (
+                162,
+                List(TType::Struct, (0..photos).map(media_ref).collect()),
+            ),
+            (
+                32766,
+                List(TType::Struct, (0..photos).map(media_key).collect()),
+            ),
+        ]));
+        let features = TweetFeatures {
+            media: MediaFeature {
+                has_media: true,
+                has_uploaded_media: true,
+                geo_allow_list: geo_allow_list
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                ..Default::default()
+            },
+            edit_control: Some(EditControl::Initial(EditControlInitial {
+                edit_tweet_ids: vec![tweet_id.cast_unsigned()],
+                editable_until_msecs: Some(editable_until_msecs),
+                edits_remaining: Some(5),
+                is_edit_eligible: Some(true),
+            })),
+            ..Default::default()
+        };
+        (bytes, features)
+    }
+
+    #[test]
+    fn photo_replies_project_their_features() {
+        for (bytes, features) in (0..10).map(photo_reply) {
+            assert_eq!(decode_fixture(&bytes), features);
+        }
+    }
+
+    #[test]
+    fn skip_ends_where_thrift_does_and_fails_as_it_does_on_truncated_or_corrupt_bytes() {
+        let (bytes, _) = photo_reply(0);
+        for end in 0..=bytes.len() {
+            assert_skips_like_thrift(&bytes[..end], TType::Struct);
+        }
+        for at in 0..bytes.len() {
+            for byte in [0x00, 0x01, 0x05, 0x0f, 0x10, 0x7f, 0x80, 0xff] {
+                let mut corrupt = bytes.clone();
+                corrupt[at] = byte;
+                assert_skips_like_thrift(&corrupt, TType::Struct);
+            }
+        }
     }
 
     #[test]

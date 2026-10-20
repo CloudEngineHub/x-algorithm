@@ -22,6 +22,7 @@ pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
 
 pub(crate) fn select_videos<'a>(
     candidates: impl IntoIterator<Item = &'a PostCandidate>,
+    main_feed: &'a [PostCandidate],
     video_open_weight: f64,
     immersive_vqv_weight: f64,
     dedupe_by_author: bool,
@@ -37,6 +38,7 @@ pub(crate) fn select_videos<'a>(
     videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
     let videos = take_distinct(
         videos,
+        main_feed,
         dedupe_by_author,
         semantic_id_dedupe_levels,
         embedding_dedupe_threshold,
@@ -47,19 +49,32 @@ pub(crate) fn select_videos<'a>(
     videos.into_iter().cloned().collect()
 }
 
-fn take_distinct(
-    ranked: Vec<&PostCandidate>,
+fn take_distinct<'a>(
+    ranked: Vec<&'a PostCandidate>,
+    main_feed: &'a [PostCandidate],
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
     embedding_dedupe_threshold: Option<f64>,
-) -> Vec<&PostCandidate> {
+) -> Vec<&'a PostCandidate> {
     let mut authors = HashSet::new();
     let mut prefixes: HashSet<&[i32]> = HashSet::new();
     let mut embeddings: Vec<&[f32]> = Vec::new();
+    let mut media_ids: HashSet<u64> = main_feed
+        .iter()
+        .filter_map(|post| post.video_media_id)
+        .collect();
+    let mut hashes: HashSet<&str> = main_feed.iter().flat_map(md5_hashes).collect();
     let mut kept = Vec::with_capacity(VIDEO_CAROUSEL_MAX_VIDEOS);
     for video in ranked {
         if kept.len() == VIDEO_CAROUSEL_MAX_VIDEOS {
             break;
+        }
+        if video
+            .video_media_id
+            .is_some_and(|id| media_ids.contains(&id))
+            || md5_hashes(video).any(|hash| hashes.contains(hash))
+        {
+            continue;
         }
         let author = video.get_original_author_id();
         if dedupe_by_author && authors.contains(&author) {
@@ -85,9 +100,15 @@ fn take_distinct(
         authors.insert(author);
         prefixes.extend(prefix);
         embeddings.extend(embedding);
+        media_ids.extend(video.video_media_id);
+        hashes.extend(md5_hashes(video));
         kept.push(video);
     }
     kept
+}
+
+fn md5_hashes(post: &PostCandidate) -> impl Iterator<Item = &str> {
+    post.video_md5_hashes.iter().flatten().map(String::as_str)
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
@@ -198,7 +219,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0, None)),
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 0, None)),
             vec![4, 5, 1]
         );
     }
@@ -225,7 +246,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0, None)),
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, true, 0, None)),
             vec![1, 4, 5]
         );
     }
@@ -241,7 +262,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 2, None)),
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 2, None)),
             vec![1, 3, 4, 5]
         );
     }
@@ -260,7 +281,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, true, 0, None)),
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, true, 0, None)),
             vec![1, 4, 5, 6, 7]
         );
     }
@@ -273,7 +294,7 @@ mod tests {
             vertical(3, 20, &[], 0.7),
         ];
 
-        assert!(select_videos(&candidates, 1.0, 0.0, true, 0, None).is_empty());
+        assert!(select_videos(&candidates, &[], 1.0, 0.0, true, 0, None).is_empty());
     }
 
     fn with_immersive_vqv(candidate: PostCandidate, vqv: f64) -> PostCandidate {
@@ -296,7 +317,7 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 1.0, false, 0, None)),
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 1.0, false, 0, None)),
             vec![4, 2, 1, 3]
         );
     }
@@ -320,8 +341,69 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, 1.0, 0.0, false, 0, Some(0.72))),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                false,
+                0,
+                Some(0.72)
+            )),
             vec![1, 3, 4, 5]
+        );
+    }
+
+    fn with_media(candidate: PostCandidate, media_id: Option<u64>, md5: &[&str]) -> PostCandidate {
+        PostCandidate {
+            video_media_id: media_id,
+            video_md5_hashes: (!md5.is_empty())
+                .then(|| md5.iter().map(|hash| hash.to_string()).collect()),
+            ..candidate
+        }
+    }
+
+    #[test]
+    fn media_dedupe_skips_repeated_media_ids_and_md5_hashes() {
+        let candidates = vec![
+            with_media(vertical(1, 10, &[], 0.9), Some(100), &["a"]),
+            with_media(vertical(2, 20, &[], 0.8), Some(100), &[]),
+            with_media(vertical(3, 30, &[], 0.7), Some(300), &["b", "a"]),
+            with_media(vertical(4, 40, &[], 0.6), Some(400), &["c"]),
+            vertical(5, 50, &[], 0.5),
+        ];
+
+        assert_eq!(
+            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 0, None)),
+            vec![1, 4, 5]
+        );
+    }
+
+    #[test]
+    fn media_dedupe_skips_videos_already_in_the_main_feed() {
+        let main_feed = vec![
+            with_media(video(90, 1.7778, 0.9), Some(100), &[]),
+            with_media(video(91, 0.5625, 0.8), None, &["a"]),
+        ];
+        let candidates = vec![
+            with_media(vertical(1, 10, &[], 0.9), Some(100), &[]),
+            with_media(vertical(2, 20, &[], 0.8), Some(200), &["a"]),
+            vertical(3, 30, &[], 0.7),
+            vertical(4, 40, &[], 0.6),
+            vertical(5, 50, &[], 0.5),
+        ];
+
+        assert_eq!(
+            tweet_ids(&select_videos(
+                &candidates,
+                &main_feed,
+                1.0,
+                0.0,
+                false,
+                0,
+                None
+            )),
+            vec![3, 4, 5]
         );
     }
 }

@@ -62,6 +62,10 @@ pub struct PostCandidate {
     #[serde(default)]
     pub video_aspect_ratio: Option<f32>,
     #[serde(default)]
+    pub video_media_id: Option<u64>,
+    #[serde(default)]
+    pub video_md5_hashes: Option<Vec<String>>,
+    #[serde(default)]
     pub video_carousel_extra: bool,
     pub media_count: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,

@@ -40,10 +40,13 @@ pub enum Hydrator {
     ArticleCoverMedia,
     TrustedFriends,
     OutsideNarrowcastPlace,
+    AuthorBlocksOuterAuthor,
+    OuterAuthorFollowsAuthor,
+    QuotedTweet,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Hydrators(u32);
+pub struct Hydrators(u64);
 
 impl Hydrators {
     pub const fn empty() -> Self {
@@ -52,7 +55,7 @@ impl Hydrators {
 
     #[cfg(test)]
     pub fn all() -> Self {
-        Self(u32::MAX >> (u32::BITS as usize - <Hydrator as strum::VariantArray>::VARIANTS.len()))
+        Self(u64::MAX >> (u64::BITS as usize - <Hydrator as strum::VariantArray>::VARIANTS.len()))
     }
 
     pub const fn of(hydrator: Hydrator) -> Self {
@@ -94,6 +97,7 @@ pub(super) enum Part {
     Column,
     Fields(&'static [QueryFields]),
     Edge(Edge),
+    PairEdge(PairEdge),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, VariantArray)]
@@ -127,6 +131,35 @@ impl Edge {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, VariantArray)]
+#[repr(u8)]
+pub(super) enum PairEdge {
+    AuthorBlocksOuterAuthor,
+    OuterAuthorFollowsAuthor,
+}
+
+impl PairEdge {
+    pub(super) const fn graph(self) -> Graph {
+        match self {
+            PairEdge::AuthorBlocksOuterAuthor => Graph::Blocks,
+            PairEdge::OuterAuthorFollowsAuthor => Graph::Follows,
+        }
+    }
+
+    pub(super) fn of_graph(graph: Graph) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .find(|edge| edge.graph() == graph)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct UserPair {
+    pub(crate) source: u64,
+    pub(crate) destination: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KeyOrigin {
     RequestTweets,
@@ -147,6 +180,9 @@ pub(super) enum KeyOrigin {
     TweetCommunity,
     TrustedFriendsList,
     NarrowcastPlace,
+    QuotedAuthorToQuotingAuthor,
+    QuotingAuthorToProtectedQuotedAuthor,
+    OuterOfMissingQuote,
 }
 
 const COMMUNITY_OR_MY_NETWORK: &[ConversationControlArm] = &[
@@ -176,7 +212,10 @@ impl KeyOrigin {
             KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot
-            | KeyOrigin::ConversationRootToFetch => Some(Hydrator::PureCore),
+            | KeyOrigin::ConversationRootToFetch
+            | KeyOrigin::QuotedAuthorToQuotingAuthor
+            | KeyOrigin::OuterOfMissingQuote => Some(Hydrator::PureCore),
+            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => Some(Hydrator::AuthorSafety),
             KeyOrigin::ConversationRootPostAuthor => Some(Hydrator::ConversationRootPost),
             KeyOrigin::ExclusiveConversationAuthor
             | KeyOrigin::CommunityPost
@@ -207,9 +246,14 @@ impl KeyOrigin {
             KeyOrigin::ConversationRootPostAuthor => input
                 .with(Hydrator::PureCore)
                 .with(Hydrator::ConversationControl),
+            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => {
+                input.with(Hydrator::PureCore).with(Hydrator::QuotedTweet)
+            }
+            KeyOrigin::PureCoreAuthor | KeyOrigin::QuotedAuthorToQuotingAuthor => {
+                input.with(Hydrator::QuotedTweet)
+            }
             KeyOrigin::RequestTweets
             | KeyOrigin::Viewer
-            | KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot
             | KeyOrigin::ExclusiveConversationAuthor
@@ -219,7 +263,8 @@ impl KeyOrigin {
             | KeyOrigin::ModeratedCommunity
             | KeyOrigin::TweetCommunity
             | KeyOrigin::TrustedFriendsList
-            | KeyOrigin::NarrowcastPlace => input,
+            | KeyOrigin::NarrowcastPlace
+            | KeyOrigin::OuterOfMissingQuote => input,
         }
     }
 }
@@ -244,6 +289,7 @@ impl Hydrator {
         }
         const RELATIONSHIPS: (&str, &str) = ("socialgraph", "batch_check_relationships");
         const BLOCKED_BY: (&str, &str) = ("blocked_by", "batch_check_blocked_by");
+        const USER_PAIRS: (&str, &str) = ("socialgraph", "batch_check_user_pairs");
         match self {
             H::PureCore => node(
                 S::TesPureCoreData,
@@ -429,6 +475,24 @@ impl Hydrator {
                 K::NarrowcastPlace,
                 ("geoduck", "user_location"),
             ),
+            H::AuthorBlocksOuterAuthor => node(
+                S::FlockUserPair,
+                Part::PairEdge(PairEdge::AuthorBlocksOuterAuthor),
+                K::QuotedAuthorToQuotingAuthor,
+                USER_PAIRS,
+            ),
+            H::OuterAuthorFollowsAuthor => node(
+                S::FlockUserPair,
+                Part::PairEdge(PairEdge::OuterAuthorFollowsAuthor),
+                K::QuotingAuthorToProtectedQuotedAuthor,
+                USER_PAIRS,
+            ),
+            H::QuotedTweet => node(
+                S::TesQuotedTweet,
+                Part::Column,
+                K::OuterOfMissingQuote,
+                ("tes", "get_quoted_tweets"),
+            ),
         }
     }
 
@@ -447,7 +511,9 @@ impl Hydrator {
             | H::SuperFollowsRoot
             | H::ViewerCountry
             | H::CommunityViewerRemoved
-            | H::OutsideNarrowcastPlace => true,
+            | H::OutsideNarrowcastPlace
+            | H::OuterAuthorFollowsAuthor
+            | H::QuotedTweet => true,
             H::PureCore
             | H::Tweet
             | H::TweetSafetyLabels
@@ -464,7 +530,8 @@ impl Hydrator {
             | H::ArticleLifecycle
             | H::ArticleMediaEntities
             | H::ArticleCoverMedia
-            | H::TrustedFriends => false,
+            | H::TrustedFriends
+            | H::AuthorBlocksOuterAuthor => false,
         }
     }
 
@@ -475,7 +542,14 @@ impl Hydrator {
     pub(super) const fn edge(self) -> Option<Edge> {
         match self.spec().part {
             Part::Edge(edge) => Some(edge),
-            Part::Column | Part::Fields(_) => None,
+            Part::Column | Part::Fields(_) | Part::PairEdge(_) => None,
+        }
+    }
+
+    pub(super) const fn pair_edge(self) -> Option<PairEdge> {
+        match self.spec().part {
+            Part::PairEdge(edge) => Some(edge),
+            Part::Column | Part::Fields(_) | Part::Edge(_) => None,
         }
     }
 
@@ -587,11 +661,14 @@ const _: () = assert!(inputs_precede_nodes());
 const _: () = assert!(best_effort_inputs_key_only_best_effort_nodes());
 const _: () = assert!(miss_policies_fit_their_nodes());
 const _: () = assert!(viewer_scopes_fit_their_nodes());
-const _: () = assert!(Hydrator::VARIANTS.len() <= u32::BITS as usize);
+const _: () = assert!(Hydrator::VARIANTS.len() <= u64::BITS as usize);
 
 impl Hydrators {
     pub const fn closed(self) -> Self {
         let mut closed = self.with(Hydrator::PureCore);
+        if closed.contains(Hydrator::AuthorBlocksOuterAuthor) {
+            closed = closed.with(Hydrator::QuotedTweet);
+        }
         let mut rest = Hydrator::VARIANTS;
         while let [head @ .., node] = rest {
             if let Some(input) = node.input()
@@ -638,6 +715,11 @@ impl fmt::Display for KeyOrigin {
             KeyOrigin::TweetCommunity => f.write_str("tweet_community"),
             KeyOrigin::TrustedFriendsList => f.write_str("trusted_friends_list"),
             KeyOrigin::NarrowcastPlace => f.write_str("narrowcast_place"),
+            KeyOrigin::QuotedAuthorToQuotingAuthor => f.write_str("quoted_author>quoting_author"),
+            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => {
+                f.write_str("quoting_author>protected_quoted_author")
+            }
+            KeyOrigin::OuterOfMissingQuote => f.write_str("outer_of_missing_quote"),
         }
     }
 }

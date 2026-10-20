@@ -36,11 +36,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for ImmersiveVideoScorer {
 
         let cluster = PhoenixCluster::parse(&query.params.get(VideoCarouselImmersiveClusterId));
         let request = build_immersive_prediction_request(query, &videos);
-        let predictions = match self
-            .dispatch
-            .predict_with_fallback(query, cluster, request)
-            .await
-        {
+        let predictions = match self.dispatch.predict(query, cluster, request).await {
             Ok(predictions) => predictions,
             Err(err) => {
                 return vec![Err(format!("Immersive prediction failed: {err}")); candidates.len()];

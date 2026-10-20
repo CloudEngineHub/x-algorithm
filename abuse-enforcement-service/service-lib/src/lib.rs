@@ -4,6 +4,8 @@ pub mod ais_client;
 pub mod allowlist;
 pub mod api_doc;
 pub mod auth;
+pub mod backfill;
+pub mod backfill_claims;
 pub mod confidence;
 pub mod config;
 pub mod decision;
@@ -32,6 +34,8 @@ pub mod test_user;
 
 #[cfg(test)]
 mod action_control_path_tests;
+#[cfg(test)]
+mod backfill_path_tests;
 #[cfg(test)]
 mod confidence_adversarial_tests;
 #[cfg(test)]
@@ -153,6 +157,8 @@ struct DecisionContext {
             would_dedup_held: Option<u8>,
                 held_class: u8,
                 global_dry_run: bool,
+            run: Option<Arc<backfill::BackfillRunRecord>>,
+                run_nonce: i64,
 }
 
 impl DecisionContext {
@@ -205,6 +211,7 @@ struct EnforcementCtx {
                             hold_gate: Arc<overturn_hold::HoldGate>,
             off_switch: Arc<off_switch::OffSwitch>,
             action_control: Arc<action_control::ActionControl>,
+            backfill: Arc<backfill::Backfill>,
         #[cfg(test)]
     outcome_log: Option<Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>>,
 }
@@ -265,6 +272,7 @@ struct ScoreResultProcessor {
     retry_queue: Arc<Mutex<BinaryHeap<RetryEntry>>>,
         last_progress: Arc<AtomicI64>,
         max_in_flight: usize,
+                backfill_topic: bool,
 }
 
 
@@ -387,6 +395,7 @@ async fn run_enforcement_inner(
     held_class: u8,
     pinned_global_dry_run: bool,
     extra: &mut BTreeMap<String, String>,
+    run: Option<(&backfill::BackfillRunRecord, i64)>,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let user_id = score.user_id;
     let (entity_type, entity_id) = Facts::resolve_target(score);
@@ -656,15 +665,15 @@ async fn run_enforcement_inner(
         ExpandedDecision::Act(mut specs) => {
             if control.page_driven()
                 && facts.entity_type == EntityType::User
-                && action_control::is_label_only(&control.page_actions)
-                && facts.user().labels.iter().any(|l| l == "SpamHighRecall")
+                && let Some(label) = action_control::label_only(&control.page_actions)
+                && facts.user().labels.iter().any(|l| l == label)
             {
-                return Ok(skip_outcome(
-                    "already_spam_high_recall_labeled".into(),
-                    dry_run,
-                    &facts,
-                    score,
-                ));
+                let reason = if label == gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP {
+                    "already_phoenix_skip_labeled"
+                } else {
+                    "already_spam_high_recall_labeled"
+                };
+                return Ok(skip_outcome(reason.into(), dry_run, &facts, score));
             }
             if control.page_driven() {
                 let account = facts.user();
@@ -731,8 +740,27 @@ async fn run_enforcement_inner(
             // Overturn-hold gate: skip a suspend, or strip a label, that a
             // human reviewer overturned on appeal while that hold is still active.
             let mut hold_gate_info = BTreeMap::new();
-            let gate_cfg = ctx.dynamic_config.overturn_hold_gate();
+            let live_gate_cfg = ctx.dynamic_config.overturn_hold_gate();
+            let (gate_cfg, run_unchecked) =
+                match run.map(|_| backfill::run_gate_cfg(&live_gate_cfg)) {
+                    None => (live_gate_cfg, false),
+                    Some(Some(cfg)) => (cfg, false),
+                    Some(None) => (live_gate_cfg, true),
+                };
             let gated = gated_actions(&specs, &gate_cfg);
+            if run_unchecked && !gated.is_empty() {
+                return Ok(hold_gate_skip_outcome(
+                    overturn_hold::STATUS_HOLD_LOOKUP_FAILED,
+                    BTreeMap::from([(
+                        "overturn_hold_probe_error".to_owned(),
+                        "gate_off".to_owned(),
+                    )]),
+                    dry_run,
+                    &facts,
+                    score,
+                    requested_actions_skipped.take(),
+                ));
+            }
             if !gated.is_empty() {
                 let mut gate = ctx
                     .hold_gate
@@ -810,8 +838,9 @@ async fn run_enforcement_inner(
                 dry_run,
                 &mut hold_gate_info,
                 &mut requested_actions_skipped,
+                run.map(|(r, nonce)| (ctx.backfill.as_ref(), r, nonce)),
             )
-            .await
+            .await?
             {
                 return Ok(outcome);
             }
@@ -984,7 +1013,8 @@ async fn final_checks(
     dry_run: bool,
     hold_gate_info: &mut BTreeMap<String, String>,
     requested_actions_skipped: &mut Option<String>,
-) -> Option<abuse_proto::DecisionOutcome> {
+    run: Option<(&backfill::Backfill, &backfill::BackfillRunRecord, i64)>,
+) -> Result<Option<abuse_proto::DecisionOutcome>> {
     if dynamic_config.off_switch_enabled() {
         let head = crate::facts::head_label(score);
         let classifier = score.model_version.as_str();
@@ -1017,14 +1047,14 @@ async fn final_checks(
                 "action_specs".into(),
                 action_control::action_specs_json(specs),
             );
-            return Some(hold_gate_skip_outcome(
+            return Ok(Some(hold_gate_skip_outcome(
                 off_switch::STATUS_SWITCHED_OFF,
                 info,
                 dry_run,
                 facts,
                 score,
                 requested_actions_skipped.take(),
-            ));
+            )));
         }
     }
 
@@ -1032,7 +1062,10 @@ async fn final_checks(
         if let Some((used, cap, _)) = dynamic_config.rate_limit_stats(facts.entity_type) {
             hold_gate_info.insert("would_rate_cap".into(), (used >= cap).to_string());
         }
-        return None;
+        return Ok(None);
+    }
+    if let Some((bf, run, nonce)) = run {
+        return run_checks(bf, dynamic_config, run, nonce, facts, score).await;
     }
     if !dynamic_config.try_enforce(facts.entity_type).await {
         warn!(
@@ -1045,9 +1078,54 @@ async fn final_checks(
                 .info
                 .insert("requested_actions_skipped".into(), json);
         }
-        return Some(outcome);
+        return Ok(Some(outcome));
     }
-    None
+    Ok(None)
+}
+
+async fn run_checks(
+    bf: &backfill::Backfill,
+    dynamic_config: &DynamicConfig,
+    run: &backfill::BackfillRunRecord,
+    nonce: i64,
+    facts: &Facts,
+    score: &abuse_proto::ScoreResult,
+) -> Result<Option<abuse_proto::DecisionOutcome>> {
+    let skip = |status: &str| Ok(Some(skip_outcome(status.into(), false, facts, score)));
+    let Some(now) = bf.run(&run.run_id).await? else {
+        return skip(backfill::STATUS_RUN_UNKNOWN);
+    };
+    if let Err(status) = backfill::gate(&now, now_millis()) {
+        return skip(status);
+    }
+    let claims = bf
+        .claims()
+        .ok_or_else(|| anyhow::anyhow!("no backfill claim store on this pod"))?;
+    let key = backfill_claims::ClaimKey {
+        run_id: run.run_id.clone(),
+        entity: facts.entity_type,
+        entity_id: facts.entity_id,
+    };
+    match claims.state(&key).await? {
+        backfill_claims::ItemClaim::Finished { .. } => {
+            return skip(backfill::STATUS_ALREADY_FINISHED);
+        }
+        backfill_claims::ItemClaim::Handed { nonce: holder, age }
+            if holder != nonce
+                && age >= backfill_claims::STALE_AFTER
+                && backfill::already_applied(&run.actions, facts.user()) =>
+        {
+            return skip(backfill::STATUS_ALREADY_APPLIED);
+        }
+        _ => {}
+    }
+    let budget = dynamic_config.backfill_config().budget(facts.entity_type);
+    match claims.take(&key, nonce, budget, bf.pod()).await? {
+        backfill_claims::Take::Taken => Ok(None),
+        backfill_claims::Take::Held => skip(backfill::STATUS_CLAIM_TAKEN),
+        backfill_claims::Take::BudgetReached => skip(backfill::STATUS_BUDGET_REACHED),
+        backfill_claims::Take::NotInList => skip(backfill::STATUS_NOT_IN_RUN),
+    }
 }
 
 fn skip_outcome(
@@ -1277,7 +1355,18 @@ async fn run_enforcement(
 ) -> Result<abuse_proto::DecisionOutcome> {
     let mut control = decision.control.clone();
     let mut extra = BTreeMap::new();
-    let mut outcome = run_enforcement_inner(
+    let run = decision.run.as_deref();
+    let (entity_type, entity_id) = Facts::resolve_target(score);
+    let key = run.map(|r| backfill_claims::ClaimKey {
+        run_id: r.run_id.clone(),
+        entity: entity_type,
+        entity_id,
+    });
+    let _pair = match &key {
+        Some(k) => Some(ctx.backfill.key_locks.lock(k).await),
+        None => None,
+    };
+    let result = run_enforcement_inner(
         ctx,
         score,
         source_topic,
@@ -1285,8 +1374,36 @@ async fn run_enforcement(
         decision.held_class,
         decision.global_dry_run,
         &mut extra,
+        run.map(|r| (r, decision.run_nonce)),
     )
-    .await?;
+    .await;
+    let finish = |status: String| async move {
+        if let (Some(k), Some(claims)) = (&key, ctx.backfill.claims())
+            && let Err(e) = claims.finish(k, decision.run_nonce, &status).await
+        {
+            warn!(run_id = %k.run_id, entity_id = k.entity_id, "backfill claim finish failed: {e:#}");
+        }
+    };
+    let mut outcome = match (result, run) {
+        (Ok(outcome), _) => outcome,
+        (Err(e), Some(_)) if e.downcast_ref::<PermanentAisFailure>().is_some() => {
+            finish("ais_rejected".into()).await;
+            return Err(e);
+        }
+        (Err(e), _) => return Err(e),
+    };
+    if let Some(run) = run {
+        outcome.info.extend(backfill::info_keys(run, score));
+        if outcome.status == off_switch::STATUS_SWITCHED_OFF {
+            ctx.backfill.hold_for_off_switch(run, now_millis()).await?;
+        }
+        if !decision.records_only() && !backfill::leaves_claim(&outcome.status) {
+            finish(outcome.status.clone()).await;
+            outcome
+                .info
+                .insert("backfill_claim".into(), "finished".into());
+        }
+    }
     outcome.info.extend(env_info(ctx));
     outcome.info.extend(control.info_keys());
     if decision.records_only() {
@@ -1352,6 +1469,30 @@ fn resolve_control(
         &input,
         &ctx.dynamic_config.action_control_config(),
         |entity| safety_checks_ok(ctx, entity),
+    )
+}
+
+fn resolve_run_control(
+    ctx: &EnforcementCtx,
+    score: &abuse_proto::ScoreResult,
+    entity_type: EntityType,
+    run: &backfill::BackfillRunRecord,
+) -> action_control::Resolved {
+    let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
+    let input = action_control::ResolveInput {
+        head: crate::facts::head_label(score),
+        classifier: &score.model_version,
+        labels,
+        entity: entity_type,
+        factory: is_factory_message(score),
+        producer_dry: false,
+        confidence: Some(confidence::message_claim(score, now_millis())),
+    };
+    ctx.action_control.resolve_run(
+        &input,
+        &ctx.dynamic_config.action_control_config(),
+        |entity| safety_checks_ok(ctx, entity),
+        &run.actions,
     )
 }
 
@@ -1447,15 +1588,42 @@ impl ScoreResultProcessor {
             return Ok("invalid_entity_id".into());
         }
 
+        match (self.backfill_topic, score.backfill_run_id.is_empty()) {
+            (false, false) => {
+                return Ok(self.early_skip(
+                    score,
+                    backfill::STATUS_ID_ON_LIVE_TOPIC,
+                    BTreeMap::new(),
+                ));
+            }
+            (true, true) => {
+                return Ok(self.early_skip(score, backfill::STATUS_ID_MISSING, BTreeMap::new()));
+            }
+            _ => {}
+        }
+
         self.ctx
             .action_control
             .ensure_loaded(&self.ctx.dynamic_config.action_control_config())
             .await;
+        let (control, run) = if self.backfill_topic {
+            match self.admit_run(score, entity_type, entity_id).await {
+                Ok(run) => (
+                    resolve_run_control(&self.ctx, score, entity_type, &run),
+                    Some(run),
+                ),
+                Err((status, info)) => return Ok(self.early_skip(score, status, info)),
+            }
+        } else {
+            (resolve_control(&self.ctx, score, entity_type), None)
+        };
         let mut decision = DecisionContext {
-            control: resolve_control(&self.ctx, score, entity_type),
+            control,
             would_dedup_held: None,
             held_class: dedup_cache::CLASS_NONE,
             global_dry_run: self.ctx.dynamic_config.is_dry_run(),
+            run,
+            run_nonce: backfill_claims::new_claim_nonce(),
         };
 
         let incoming_class = decision.control.incoming_dedup_class(incoming_dedup_class(
@@ -1510,15 +1678,13 @@ impl ScoreResultProcessor {
                             model,
                         ])
                         .inc();
+                    let mut info = env_info(&self.ctx);
+                    if let Some(run) = decision.run.as_deref() {
+                        info.extend(backfill::info_keys(run, score));
+                    }
                     publish_decision_outcome(
                         &self.ctx,
-                        &decision_outcome(
-                            score,
-                            topic,
-                            "dedup_skipped".into(),
-                            false,
-                            env_info(&self.ctx),
-                        ),
+                        &decision_outcome(score, topic, "dedup_skipped".into(), false, info),
                     );
                     return Ok("dedup_skipped".into());
                 }
@@ -1590,6 +1756,101 @@ impl ScoreResultProcessor {
         }
 
         Ok(status)
+    }
+
+            fn early_skip(
+        &self,
+        score: &abuse_proto::ScoreResult,
+        status: &str,
+        info: BTreeMap<String, String>,
+    ) -> String {
+        let (entity_type, _) = Facts::resolve_target(score);
+        metrics::ENFORCEMENT_TOTAL
+            .with_label_values(&[
+                "kafka",
+                &self.topic,
+                entity_type.as_str(),
+                "final",
+                status,
+                "",
+                "",
+                crate::facts::head_label(score),
+                &score.model_version,
+            ])
+            .inc();
+        let mut info = info;
+        info.extend(env_info(&self.ctx));
+        publish_decision_outcome(
+            &self.ctx,
+            &decision_outcome(score, &self.topic, status.into(), false, info),
+        );
+        status.to_owned()
+    }
+
+                                async fn admit_run(
+        &self,
+        score: &abuse_proto::ScoreResult,
+        entity_type: EntityType,
+        entity_id: i64,
+    ) -> Result<Arc<backfill::BackfillRunRecord>, (&'static str, BTreeMap<String, String>)> {
+        let bf = &self.ctx.backfill;
+        let run_id = score.backfill_run_id.as_str();
+        let mut last_err = None;
+        for backoff_ms in [0u64, 100, 500] {
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            let run = match bf.run(run_id).await {
+                Ok(run) => run,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let Some(run) = run else {
+                let info = BTreeMap::from([("backfill_run_id".to_owned(), run_id.to_owned())]);
+                return Err((backfill::STATUS_RUN_UNKNOWN, info));
+            };
+            let info: BTreeMap<String, String> =
+                backfill::info_keys(&run, score).into_iter().collect();
+            if let Err(status) = backfill::gate(&run, now_millis()) {
+                return Err((status, info));
+            }
+            if let Err(status) = backfill::check_message(&run, score) {
+                return Err((status, info));
+            }
+            let Some(claims) = bf.claims() else {
+                last_err = Some(anyhow::anyhow!("no backfill claim store on this pod"));
+                break;
+            };
+            let key = backfill_claims::ClaimKey {
+                run_id: run_id.to_owned(),
+                entity: entity_type,
+                entity_id,
+            };
+            match claims.state(&key).await {
+                Ok(backfill_claims::ItemClaim::NotInList) => {
+                    return Err((backfill::STATUS_NOT_IN_RUN, info));
+                }
+                Ok(backfill_claims::ItemClaim::Finished { status }) => {
+                    let mut info = info;
+                    info.insert("backfill_claim_status".into(), status);
+                    return Err((backfill::STATUS_ALREADY_FINISHED, info));
+                }
+                Ok(_) => return Ok(Arc::new(run)),
+                Err(e) => {
+                    warn!(run_id, error = %format!("{e:#}"), "backfill claim read failed on arrival; deciding on");
+                    return Ok(Arc::new(run));
+                }
+            }
+        }
+        warn!(
+            run_id,
+            error = %last_err.map(|e| format!("{e:#}")).unwrap_or_default(),
+            "backfill run or claim unreadable; recording without acting"
+        );
+        let info = BTreeMap::from([("backfill_run_id".to_owned(), run_id.to_owned())]);
+        Err((backfill::STATUS_RUN_UNREADABLE, info))
     }
 }
 
@@ -2023,6 +2284,30 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     action_control.spawn_refresh(dynamic_config.clone());
     action_control.spawn_seen_writer();
 
+    let claims: Option<Arc<dyn backfill_claims::ClaimStore>> = match cfg
+        .backfill_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        None => None,
+        Some(_) => {
+            let dsn = cfg.backfill_claims_pg_dsn.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("BACKFILL_TOPIC is set but BACKFILL_CLAIMS_PG_DSN is not")
+            })?;
+            let env = std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned());
+            Some(Arc::new(backfill_claims::PgClaimStore::new(dsn, &env)?))
+        }
+    };
+    let backfill = Arc::new(backfill::Backfill::new(
+        Arc::new(action_control::ManhattanControlStore::new(
+            mh_client.clone(),
+            mh_tenant.clone(),
+        )),
+        claims,
+        std::env::var("HOSTNAME").unwrap_or_default(),
+    ));
+
     let state = Arc::new(AppState {
         ais_client,
         dynamic_config,
@@ -2038,6 +2323,7 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
         hold_gate,
         off_switch,
         action_control,
+        backfill,
         boot_config,
     });
 
@@ -2092,6 +2378,22 @@ pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) 
         .route(
             "/action_controls/pod",
             get(service::handle_action_controls_pod),
+        )
+        .route(
+            "/backfill_runs",
+            get(service::handle_backfill_runs_list).post(service::handle_backfill_run_start),
+        )
+        .route(
+            "/backfill_runs/budget",
+            get(service::handle_backfill_runs_budget),
+        )
+        .route(
+            "/backfill_runs/{run_id}",
+            get(service::handle_backfill_run_get),
+        )
+        .route(
+            "/backfill_runs/{run_id}/{change}",
+            post(service::handle_backfill_run_change),
         )
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -2422,33 +2724,16 @@ pub async fn start_kafka_consumers(
         });
     }
 
-    let growthbook_enabled = cfg.growthbook_url.is_some() && cfg.growthbook_key.is_some();
-    let topic_labels_json: serde_json::Value =
-        match std::fs::read_to_string(&cfg.topic_labels_config) {
-            Ok(data) => serde_json::from_str(&data).with_context(|| {
-                format!(
-                    "failed to parse topic-labels config: {}",
-                    cfg.topic_labels_config
-                )
-            })?,
-            Err(e) if growthbook_enabled => {
-                warn!(
-                    "topic-labels config not found ({e}), falling back to GrowthBook / empty config"
-                );
-                serde_json::Value::Object(Default::default())
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to read topic-labels config {}: {e}",
-                    cfg.topic_labels_config
-                ));
-            }
-        };
-
-    let effective_topic_config =
-        growthbook::kafka_consumer_topic_labels_from_config(Some(&state.boot_config))
-            .unwrap_or(topic_labels_json);
-    let topics = parse_topic_config(effective_topic_config)?;
+    let backfill_topic = cfg
+        .backfill_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let topics = match backfill_topic {
+        Some(topic) => backfill_topic_config(topic),
+        None => live_topic_config(&state, cfg)?,
+    };
+    let backfill_topic = backfill_topic.is_some();
     let default_cluster = cfg.kafka_consumer_mtls_cluster.as_str();
     let default_zone = cfg.kafka_consumer_mtls_zone.as_str();
     info!("topic config: {} topic(s)", topics.len());
@@ -2616,6 +2901,7 @@ pub async fn start_kafka_consumers(
         hold_gate: state.hold_gate.clone(),
         off_switch: state.off_switch.clone(),
         action_control: state.action_control.clone(),
+        backfill: state.backfill.clone(),
         #[cfg(test)]
         outcome_log: None,
     };
@@ -2793,6 +3079,7 @@ pub async fn start_kafka_consumers(
                     retry_queue: retry_queue.clone(),
                     last_progress: last_progress.clone(),
                     max_in_flight,
+                    backfill_topic,
                 };
 
                 consumers.spawn(async move {
@@ -2871,6 +3158,63 @@ pub async fn start_kafka_consumers(
         cancel,
         supervisor: supervise(consumers),
     })
+}
+
+fn live_topic_config(
+    state: &service::AppState,
+    cfg: &Config,
+) -> Result<HashMap<String, TopicEntry>> {
+    let growthbook_enabled = cfg.growthbook_url.is_some() && cfg.growthbook_key.is_some();
+    let topic_labels_json: serde_json::Value =
+        match std::fs::read_to_string(&cfg.topic_labels_config) {
+            Ok(data) => serde_json::from_str(&data).with_context(|| {
+                format!(
+                    "failed to parse topic-labels config: {}",
+                    cfg.topic_labels_config
+                )
+            })?,
+            Err(e) if growthbook_enabled => {
+                warn!(
+                    "topic-labels config not found ({e}), falling back to GrowthBook / empty config"
+                );
+                serde_json::Value::Object(Default::default())
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read topic-labels config {}: {e}",
+                    cfg.topic_labels_config
+                ));
+            }
+        };
+
+    let effective_topic_config =
+        growthbook::kafka_consumer_topic_labels_from_config(Some(&state.boot_config))
+            .unwrap_or(topic_labels_json);
+    let mut topics = parse_topic_config(effective_topic_config)?;
+    topics.retain(|topic, _| {
+        let keep = !backfill::is_backfill_topic(topic);
+        if !keep {
+            error!(
+                "topic map lists {topic}; the live pods never consume a backfill topic (the backfill deployment does)"
+            );
+        }
+        keep
+    });
+    Ok(topics)
+}
+
+fn backfill_topic_config(topic: &str) -> HashMap<String, TopicEntry> {
+    HashMap::from([(
+        topic.to_owned(),
+        TopicEntry {
+            cluster: None,
+            zone: None,
+            processor: TopicConfig::ScoreResult {
+                labels: HashSet::new(),
+                negative_labels: HashSet::new(),
+            },
+        },
+    )])
 }
 
 fn supervise(mut consumers: JoinSet<()>) -> JoinHandle<()> {
@@ -3881,8 +4225,10 @@ mod off_switch_hook_tests {
             dry_run,
             &mut hold_gate_info,
             &mut requested_actions_skipped,
+            None,
         )
-        .await;
+        .await
+        .unwrap();
         Run {
             outcome,
             hold_gate_info,
@@ -5168,6 +5514,11 @@ rules:
                 "test".into(),
                 String::new(),
             )),
+            backfill: Arc::new(backfill::Backfill::new(
+                Arc::new(action_control::test_support::MemControlStore::default()),
+                None,
+                String::new(),
+            )),
             outcome_log: None,
         };
         Harness {
@@ -5206,6 +5557,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5234,6 +5586,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5256,6 +5609,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5281,6 +5635,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5302,6 +5657,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5327,6 +5683,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
         )
         .await
         .unwrap_err();

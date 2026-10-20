@@ -1,5 +1,5 @@
-use crate::clients::read_fields;
 use crate::models::CommunityModeration;
+use crate::thrift_read::read_fields;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use thrift::protocol::{

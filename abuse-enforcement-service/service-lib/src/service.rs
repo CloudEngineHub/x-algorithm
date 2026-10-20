@@ -113,6 +113,7 @@ pub struct AppState {
                 pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
                 pub off_switch: std::sync::Arc<crate::off_switch::OffSwitch>,
             pub action_control: std::sync::Arc<crate::action_control::ActionControl>,
+                pub backfill: std::sync::Arc<crate::backfill::Backfill>,
                 pub boot_config: serde_json::Value,
 }
 
@@ -2466,6 +2467,324 @@ pub async fn handle_action_controls_pod(State(state): State<Arc<AppState>>) -> i
     (StatusCode::OK, Json(view))
 }
 
+
+use crate::backfill::{
+    BackfillRunChangeRequest, BackfillRunListResponse, BackfillRunRecord, BackfillRunStartRequest,
+    Change as RunChange, RunError, RunState,
+};
+
+fn run_person(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(UPDATED_BY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn run_error_response(e: RunError) -> (StatusCode, Json<Value>) {
+    match e {
+        RunError::Forbidden(code, detail) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::Invalid(code, detail) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        RunError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not_found", "detail": "no run has this id"})),
+        ),
+        RunError::Conflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::Store(detail) => {
+            error!("backfill run store error: {detail}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "store", "detail": detail})),
+            )
+        }
+    }
+}
+
+fn run_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: Result<&BackfillRunRecord, &RunError>,
+) -> AdminActionEvent {
+    let (success, error) = match result {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, format!("{e:?}")),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct RunListQuery {
+        #[serde(default)]
+    pub state: Option<String>,
+        #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(RunListQuery),
+    responses(
+        (status = 200, description = "Runs", body = BackfillRunListResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_list(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RunListQuery>,
+) -> impl IntoResponse {
+    let runs = match state.backfill.list().await {
+        Ok(runs) => runs,
+        Err(e) => return run_error_response(RunError::Store(e.to_string())),
+    };
+    let states: Option<Vec<String>> = q.state.as_deref().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let runs: Vec<BackfillRunRecord> = runs
+        .into_iter()
+        .filter(|r| {
+            states
+                .as_ref()
+                .is_none_or(|ss| ss.iter().any(|s| s == r.state.as_str()))
+                && q.entity.as_deref().is_none_or(|e| e == r.entity.as_str())
+                && q.head.as_deref().is_none_or(|h| h == r.head)
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(BackfillRunListResponse { runs }).unwrap_or_default()),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/budget",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses((status = 200, description = "Budget per entity")),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_runs_budget(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.dynamic_config.backfill_config();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "user": cfg.budget(EntityType::User),
+            "post": cfg.budget(EntityType::Post),
+        })),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_runs/{run_id}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(("run_id" = String, Path, description = "The run's id")),
+    responses(
+        (status = 200, description = "The run", body = BackfillRunRecord),
+        (status = 404, description = "No such run"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_get(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.backfill.run(&run_id).await {
+        Ok(Some(rec)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(rec).unwrap_or_default()),
+        ),
+        Ok(None) => run_error_response(RunError::NotFound),
+        Err(e) => run_error_response(RunError::Store(e.to_string())),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillRunStartRequest,
+    responses(
+        (status = 201, description = "Run started", body = BackfillRunRecord),
+        (status = 200, description = "The same run, already started", body = BackfillRunRecord),
+        (status = 400, description = "Invalid request: {error: code, detail}"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_start(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillRunStartRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        run_id = %req.run_id,
+        head = %req.head,
+        entity = req.entity.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .start(
+            req,
+            who.as_deref(),
+            &actor.0,
+            &state.dynamic_config.backfill_config(),
+            &state.action_control,
+            &state.dynamic_config.action_control_config(),
+            &state.off_switch,
+            crate::now_millis(),
+        )
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(
+                actor.0,
+                &method,
+                uri.path(),
+                request_json,
+                result.as_ref().map(|(r, _)| r),
+            ),
+        );
+    }
+    match result {
+        Ok((rec, created)) => (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(serde_json::to_value(rec).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/backfill_runs/{run_id}/{change}",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    params(
+        ("run_id" = String, Path, description = "The run's id"),
+        ("change" = String, Path, description = "pause, resume, stop or done"),
+    ),
+    request_body = BackfillRunChangeRequest,
+    responses(
+        (status = 200, description = "The run after the change", body = BackfillRunRecord),
+        (status = 400, description = "confirm_required"),
+        (status = 403, description = "key_not_allowed or person_required"),
+        (status = 404, description = "No such run or change"),
+        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off, weak_evidence or lost_race"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_run_change(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Path((run_id, change)): Path<(String, String)>,
+    Json(req): Json<BackfillRunChangeRequest>,
+) -> impl IntoResponse {
+    let change = match change.as_str() {
+        "pause" => RunChange::Pause,
+        "resume" => RunChange::Resume,
+        "stop" => RunChange::Stop,
+        "done" => RunChange::Done,
+        _ => return run_error_response(RunError::NotFound),
+    };
+    let who = run_person(&headers);
+    info!(
+        run_id = %run_id,
+        change = change.as_str(),
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        "POST /api/backfill_runs/{{run_id}}/{{change}}"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .change(
+            &run_id,
+            change,
+            req,
+            who.as_deref(),
+            &actor.0,
+            &state.dynamic_config.backfill_config(),
+            &state.action_control,
+            &state.dynamic_config.action_control_config(),
+            &state.off_switch,
+            crate::now_millis(),
+        )
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &run_admin_event(actor.0, &method, uri.path(), request_json, result.as_ref()),
+        );
+    }
+    match result {
+        Ok(rec) => {
+            if rec.state == RunState::Stopped {
+                info!(run_id = %rec.run_id, by = %rec.state_changed_by, "backfill run stopped");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(rec).unwrap_or_default()),
+            )
+        }
+        Err(e) => run_error_response(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3042,6 +3361,55 @@ mod tests {
         assert_eq!(captcha.actor_header(), plugin_header);
         let liveness = EnforcementAction::spam_liveness_check(42, vec![]);
         assert_eq!(liveness.actor_header(), plugin_header);
+    }
+
+    #[test]
+    fn phoenix_skip_label_encodes_as_label_value_118() {
+        use xai_abuse_thrift_codec::{SCHEMA_AIS, Transcoder};
+        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let action = EnforcementAction::from_spec(
+            &ActionSpec::AddLabelsV2 {
+                labels: vec![crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP.into()],
+                ttl_msec: Some(30 * 86_400_000),
+            },
+            9,
+            9,
+            vec!["head: AdsRenderBot".into()],
+        );
+        assert_eq!(
+            action.actor_header(),
+            json!({"plugin": {"pluginId": PLUGIN_ID}})
+        );
+        let payload = build_intake_request(
+            action.actor_header(),
+            action.to_json(),
+            AIS_TOOL,
+            Some(action.audit_note()),
+        );
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        let label_id = "/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels";
+        assert_eq!(
+            payload.pointer(label_id),
+            Some(&json!("ClientEventPhoenixSkip"))
+        );
+        let mut by_ordinal = payload.clone();
+        *by_ordinal.pointer_mut(label_id).unwrap() = json!(118);
+        assert_eq!(encode(&payload).unwrap(), encode(&by_ordinal).unwrap());
     }
 
 

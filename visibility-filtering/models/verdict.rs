@@ -121,6 +121,7 @@ impl LimitedEngagement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum TombstoneReason {
+    Bounced,
     SensitiveViewerAgeVerification,
     UpdateAppIos,
     UpdateAppAndroid,

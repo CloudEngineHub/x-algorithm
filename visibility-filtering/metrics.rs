@@ -373,12 +373,84 @@ fn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {
 }
 
 #[cfg(test)]
+pub(crate) mod thread_recorded {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use xai_stats_receiver::{HistogramBuckets, StatsReceiverExt};
+
+    thread_local! {
+        static SAMPLES: RefCell<Option<Vec<Sample>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Sample {
+        pub(crate) name: String,
+        pub(crate) labels: Vec<(String, String)>,
+        pub(crate) value: f64,
+    }
+
+    impl Sample {
+        pub(crate) fn label(&self, name: &str) -> Option<&str> {
+            self.labels
+                .iter()
+                .find(|(label, _)| label == name)
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    struct ThreadRecorded;
+
+    fn push(name: &str, scopes: &[(&str, &str)], value: f64) {
+        SAMPLES.with_borrow_mut(|samples| {
+            if let Some(samples) = samples {
+                samples.push(Sample {
+                    name: name.to_owned(),
+                    labels: scopes
+                        .iter()
+                        .map(|&(label, value)| (label.to_owned(), value.to_owned()))
+                        .collect(),
+                    value,
+                });
+            }
+        });
+    }
+
+    impl StatsReceiverExt for ThreadRecorded {
+        fn incr(&self, name: &str, scopes: &[(&str, &str)], count: u64) {
+            push(name, scopes, count as f64);
+        }
+        fn observe(&self, name: &str, scopes: &[(&str, &str)], value: f64, _: HistogramBuckets) {
+            push(name, scopes, value);
+        }
+        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+        fn observe_vm(&self, name: &str, scopes: &[(&str, &str)], value: f64) {
+            push(name, scopes, value);
+        }
+        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
+    }
+
+    pub(crate) fn start() {
+        xai_stats_receiver::init_stats_receiver_with(Arc::new(ThreadRecorded));
+        SAMPLES.set(Some(Vec::new()));
+    }
+
+    pub(crate) fn take(name: &str) -> Vec<Sample> {
+        let samples = SAMPLES.take().unwrap_or_default();
+        samples
+            .into_iter()
+            .filter(|sample| sample.name == name)
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{
         Decided, DropReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
         MediaRestriction, Withholding,
     };
+    use crate::quote::QUOTE_PASS;
     use std::fs;
     use std::path::Path;
     use xai_visibility_filtering::models::FilteredReason;
@@ -436,6 +508,7 @@ mod tests {
             "LOOKUP_LATENCY_VM_METRIC = \"{LOOKUP_LATENCY_MS}\""
         )));
         assert!(dashboard.contains(&format!("LOOKUP_DEADLINE_METRIC = \"{LOOKUP_DEADLINE}\"")));
+        assert!(dashboard.contains(&format!("QUOTE_PASS_METRIC = \"{QUOTE_PASS}\"")));
         assert!(dashboard.contains(&format!(
             "REQUESTS_BY_CALLER_METRIC = \"{REQUESTS_BY_CALLER}\""
         )));

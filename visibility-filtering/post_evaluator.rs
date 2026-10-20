@@ -1,8 +1,12 @@
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
-use crate::hydration::{Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, Unresolved};
+use crate::hydration::{
+    Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, QuoteEntry, Unresolved,
+};
 use crate::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
-use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
+use crate::models::{
+    ClientCapability, Evaluation, EvaluationKey, PlacedCandidate, Placement, TweetId,
+};
 use crate::rules::engine::AdmittedPosts;
 use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
 use std::collections::HashMap;
@@ -11,18 +15,22 @@ use std::time::Instant;
 use tracing::warn;
 use xai_visibility_filtering_proto as vf_pb;
 
+mod author;
+
+pub(crate) use author::UserEvaluation;
+
 pub struct PostBatch {
     pub viewer_id: Option<u64>,
     pub country_code: Option<String>,
     pub client_capability: ClientCapability,
     pub safety_level: SafetyLevel,
-    pub candidates: Vec<RawCandidate>,
+    pub candidates: Vec<PlacedCandidate>,
     pub rpc: Rpc,
 }
 
 impl PostBatch {
     pub(crate) fn hydration_request<'a>(
-        &'a mut self,
+        &mut self,
         is_expanding_retweet_sources: bool,
         fallback_caches: &'a FallbackCaches,
     ) -> HydrationRequest<'a> {
@@ -30,8 +38,23 @@ impl PostBatch {
             self.viewer_id,
             self.country_code.take(),
             self.client_capability,
-            &self.candidates,
+            self.candidates
+                .iter()
+                .map(|placed| placed.candidate)
+                .collect(),
             fallback_caches,
+        )
+        .with_quotes(
+            self.candidates
+                .iter()
+                .filter_map(|placed| match placed.placement {
+                    Placement::InnerQuoted { outer } => Some(QuoteEntry {
+                        inner: placed.tweet_id(),
+                        outer,
+                    }),
+                    Placement::Standalone | Placement::RetweetSource => None,
+                })
+                .collect(),
         )
         .with_retweet_sources(is_expanding_retweet_sources)
     }
@@ -40,9 +63,19 @@ impl PostBatch {
 #[derive(Clone)]
 pub struct PostEvaluation {
     pub tweet_id: TweetId,
+    pub placement: Placement,
     pub source_tweet_id: Option<TweetId>,
     pub evaluation: Evaluation,
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
+}
+
+impl PostEvaluation {
+    pub fn key(&self) -> EvaluationKey {
+        EvaluationKey {
+            tweet_id: self.tweet_id,
+            placement: self.placement,
+        }
+    }
 }
 
 pub struct PostEvaluations {
@@ -112,7 +145,7 @@ impl PostEvaluator {
             RetweetSources::Fetched
         } else if request.candidates.iter().any(|candidate| {
             hydration
-                .tweet(candidate.tweet_id)
+                .tweet(candidate.tweet_id())
                 .is_some_and(|tweet| tweet.source_to_merge().is_some())
         }) {
             RetweetSources::InBatch
@@ -128,6 +161,7 @@ impl PostEvaluator {
         HydratedRequest {
             safety_level: request.safety_level,
             rpc: request.rpc,
+            is_expanding_retweet_sources,
             retweet_sources,
             candidates: request.candidates,
             hydration,
@@ -142,8 +176,8 @@ impl PostEvaluator {
         let evaluating = Instant::now();
         let admitted = self.admit(hydrated);
         let outcomes = hydrated
-            .requested_ids()
-            .map(|tweet_id| Self::outcome(hydrated, admitted.as_ref(), tweet_id, false, observer))
+            .candidates()
+            .map(|candidate| Self::outcome(hydrated, admitted.as_ref(), candidate.key(), observer))
             .collect();
         ft_metrics::record_phase(
             hydrated.rpc,
@@ -157,23 +191,16 @@ impl PostEvaluator {
     pub(crate) fn evaluate<O: PostObserver>(
         &self,
         hydrated: &HydratedRequest,
-        ids: impl IntoIterator<Item = TweetId>,
-        copied: impl Fn(TweetId) -> bool,
+        keys: impl IntoIterator<Item = EvaluationKey>,
         observer: &mut O,
-    ) -> HashMap<TweetId, PostEvaluation> {
+    ) -> HashMap<EvaluationKey, PostEvaluation> {
         let evaluating = Instant::now();
         let admitted = self.admit(hydrated);
         let mut outcomes = HashMap::new();
-        for tweet_id in ids {
-            outcomes.entry(tweet_id).or_insert_with(|| {
-                Self::outcome(
-                    hydrated,
-                    admitted.as_ref(),
-                    tweet_id,
-                    copied(tweet_id),
-                    observer,
-                )
-            });
+        for key in keys {
+            outcomes
+                .entry(key)
+                .or_insert_with(|| Self::outcome(hydrated, admitted.as_ref(), key, observer));
         }
         ft_metrics::record_phase(
             hydrated.rpc,
@@ -187,13 +214,13 @@ impl PostEvaluator {
     pub(crate) fn trace(
         &self,
         hydrated: &HydratedRequest,
-        ids: impl IntoIterator<Item = TweetId>,
-        traces: &mut HashMap<TweetId, PolicyTrace>,
+        keys: impl IntoIterator<Item = EvaluationKey>,
+        traces: &mut HashMap<EvaluationKey, PolicyTrace>,
     ) {
         let admitted = self.admit(hydrated);
-        for tweet_id in ids {
-            if !traces.contains_key(&tweet_id) {
-                Self::outcome(hydrated, admitted.as_ref(), tweet_id, false, traces);
+        for key in keys {
+            if !traces.contains_key(&key) {
+                Self::outcome(hydrated, admitted.as_ref(), key, traces);
             }
         }
     }
@@ -214,18 +241,22 @@ impl PostEvaluator {
     fn outcome<O: PostObserver>(
         hydrated: &HydratedRequest,
         admitted: Option<&AdmittedPosts<'_>>,
-        tweet_id: TweetId,
-        copied: bool,
+        key: EvaluationKey,
         observer: &mut O,
     ) -> PostEvaluation {
+        let EvaluationKey {
+            tweet_id,
+            placement,
+        } = key;
+        let copied = hydrated.is_expanding_retweet_sources && placement != Placement::RetweetSource;
         let tweet = hydrated.hydration.tweet(tweet_id);
-        let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied));
+        let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied, placement));
         let evaluation = match (tweet, post) {
             (Some(HydratedTweet::Resolved { .. }), Some(post)) => {
                 if O::TOTAL {
                     let trace = post.trace();
                     let evaluation = trace.evaluation.clone();
-                    observer.record(tweet_id, trace);
+                    observer.record(key, trace);
                     evaluation
                 } else {
                     post.evaluate()
@@ -247,6 +278,7 @@ impl PostEvaluator {
         };
         PostEvaluation {
             tweet_id,
+            placement,
             source_tweet_id: tweet.and_then(HydratedTweet::source_tweet_id),
             evaluation,
             safety_labels: tweet
@@ -259,29 +291,30 @@ impl PostEvaluator {
 pub(crate) trait PostObserver {
     const TOTAL: bool;
 
-    fn record(&mut self, tweet_id: TweetId, trace: PolicyTrace);
+    fn record(&mut self, key: EvaluationKey, trace: PolicyTrace);
 }
 
 impl PostObserver for NoTrace {
     const TOTAL: bool = false;
 
     #[inline]
-    fn record(&mut self, _: TweetId, _: PolicyTrace) {}
+    fn record(&mut self, _: EvaluationKey, _: PolicyTrace) {}
 }
 
-impl PostObserver for HashMap<TweetId, PolicyTrace> {
+impl PostObserver for HashMap<EvaluationKey, PolicyTrace> {
     const TOTAL: bool = true;
 
-    fn record(&mut self, tweet_id: TweetId, trace: PolicyTrace) {
-        self.insert(tweet_id, trace);
+    fn record(&mut self, key: EvaluationKey, trace: PolicyTrace) {
+        self.insert(key, trace);
     }
 }
 
 pub(crate) struct HydratedRequest {
     safety_level: SafetyLevel,
     rpc: Rpc,
+    is_expanding_retweet_sources: bool,
     retweet_sources: RetweetSources,
-    candidates: Vec<RawCandidate>,
+    candidates: Vec<PlacedCandidate>,
     hydration: Hydration,
 }
 
@@ -296,7 +329,11 @@ impl HydratedRequest {
     }
 
     pub(crate) fn requested_ids(&self) -> impl ExactSizeIterator<Item = TweetId> + '_ {
-        self.candidates.iter().map(|candidate| candidate.tweet_id)
+        self.candidates().map(PlacedCandidate::tweet_id)
+    }
+
+    pub(crate) fn candidates(&self) -> impl ExactSizeIterator<Item = PlacedCandidate> + '_ {
+        self.candidates.iter().copied()
     }
 }
 

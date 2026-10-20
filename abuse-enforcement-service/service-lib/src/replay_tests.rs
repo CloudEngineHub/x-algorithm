@@ -45,6 +45,7 @@ pub(crate) enum Account {
     Followers200k,
     HighCred,
     NotFound,
+    HasPhoenixSkip,
 }
 
 impl Account {
@@ -58,6 +59,8 @@ impl Account {
         Account::HighCred,
         Account::NotFound,
     ];
+
+        pub(crate) const EXTRA: [Account; 1] = [Account::HasPhoenixSkip];
 
     pub(crate) fn user_id(self) -> i64 {
         1_700_100_000 + self as i64
@@ -77,8 +80,10 @@ pub(crate) struct TestBed {
     pub dedup: Arc<RecordingDedup>,
     pub ais: Arc<AisRecorder>,
     pub tickets: Arc<AtomicI64>,
+        pub claims: Arc<backfill_claims::test_support::MemClaimStore>,
     pub outcomes: Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>,
     control_store: Arc<action_control::test_support::MemControlStore>,
+    pub backfill_store: Arc<action_control::test_support::MemControlStore>,
     _strato: wiremock::MockServer,
 }
 
@@ -94,13 +99,16 @@ fn gizmoduck_user(account: Account) -> Option<GizmoduckUserResult> {
     if matches!(account, Account::NotFound) {
         return None;
     }
-    let labels = if matches!(account, Account::HasSpamHighRecall) {
-        vec![Label {
+    let labels = match account {
+        Account::HasSpamHighRecall => vec![Label {
             label_value: 23,
             created_at_msec: 0,
-        }]
-    } else {
-        Vec::new()
+        }],
+        Account::HasPhoenixSkip => vec![Label {
+            label_value: 118,
+            created_at_msec: 0,
+        }],
+        _ => Vec::new(),
     };
     Some(GizmoduckUserResult {
         user: Some(GizmoduckUser {
@@ -120,7 +128,7 @@ fn gizmoduck_user(account: Account) -> Option<GizmoduckUserResult> {
 impl TestBed {
     pub(crate) async fn new(cfg: BedConfig<'_>) -> TestBed {
         let server = wiremock::MockServer::start().await;
-        for account in Account::ALL {
+        for account in Account::ALL.into_iter().chain(Account::EXTRA) {
             let body = serde_json::json!({"v": {
                 "isHighPageRankUser": matches!(account, Account::HighCred),
                 "userCredScore": 1.0,
@@ -153,8 +161,9 @@ impl TestBed {
         };
         let gd = Arc::new(MockGizmoduckClient {
             users: Account::ALL
-                .iter()
-                .map(|a| (a.user_id(), gizmoduck_user(*a)))
+                .into_iter()
+                .chain(Account::EXTRA)
+                .map(|a| (a.user_id(), gizmoduck_user(a)))
                 .collect::<HashMap<_, _>>(),
             ..Default::default()
         });
@@ -198,6 +207,8 @@ impl TestBed {
             String::new(),
         ));
         action_control.refresh().await.unwrap();
+        let backfill_store = Arc::new(action_control::test_support::MemControlStore::default());
+        let claims = Arc::new(backfill_claims::test_support::MemClaimStore::listing_all());
         let ctx = EnforcementCtx {
             ais_client: ais_client::AisClient::recording(ais.clone()),
             gd: gizmoduck::GizmoduckCoreClient::from_client(gd),
@@ -211,9 +222,16 @@ impl TestBed {
             allowlist: None,
             kafka_producer_decisions: None,
             kafka_producer_decisions_json: None,
-            hold_gate: Arc::new(overturn_hold::HoldGate::new(None)),
+            hold_gate: Arc::new(overturn_hold::HoldGate::new(Some(
+                overturn_hold::FakeHoldStore::new(Vec::new()),
+            ))),
             off_switch,
             action_control,
+            backfill: Arc::new(backfill::Backfill::new(
+                backfill_store.clone(),
+                Some(claims.clone()),
+                String::new(),
+            )),
             outcome_log: Some(outcomes.clone()),
         };
         TestBed {
@@ -221,8 +239,10 @@ impl TestBed {
             dedup: Arc::new(RecordingDedup::default()),
             ais,
             tickets,
+            claims,
             outcomes,
             control_store,
+            backfill_store,
             _strato: server,
         }
     }
@@ -237,6 +257,15 @@ impl TestBed {
             retry_queue: Arc::new(Mutex::new(BinaryHeap::new())),
             last_progress: Arc::new(AtomicI64::new(0)),
             max_in_flight: 1,
+            backfill_topic: false,
+        }
+    }
+
+        pub(crate) fn backfill_processor(&self) -> ScoreResultProcessor {
+        ScoreResultProcessor {
+            topic: backfill::BACKFILL_TOPIC.into(),
+            backfill_topic: true,
+            ..self.processor()
         }
     }
 
@@ -254,11 +283,19 @@ impl TestBed {
     }
 
         pub(crate) async fn run(&self, score: &ScoreResult) -> Trace {
+        self.run_on(&self.processor(), score).await
+    }
+
+        pub(crate) async fn run_on(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
         self.dedup.take_calls();
         self.ais.take();
         self.outcomes.lock().unwrap().clear();
         let tickets_before = self.tickets.load(Ordering::Relaxed);
-        let result = self.processor().process(score).await;
+        let result = processor.process(score).await;
         let status = match &result {
             Ok(s) => s.clone(),
             Err(e) => format!("error:{}", e.source),

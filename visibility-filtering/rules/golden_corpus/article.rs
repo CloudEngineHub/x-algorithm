@@ -10,8 +10,8 @@ use crate::rules::fixtures::{
     sensitive_opt_in_viewer, AUTHOR_ID,
 };
 use crate::rules::SafetyLevel::{
-    self, ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
-    TimelineHomeRecommendations,
+    self, FilterAll, ImmersiveExpandedRecommendations, QuotedTweetRules, TimelineHome,
+    TimelineHomeHydration, TimelineHomeRecommendations,
 };
 use std::num::NonZeroU64;
 use xai_visibility_filtering::models::FilteredReason;
@@ -95,12 +95,24 @@ pub(super) fn rows() -> Vec<Row> {
         };
         let mut expect = Vec::new();
         for &level in levels {
+            let restricted = |reason, by| match level {
+                TimelineHomeRecommendations => dropped(
+                    FilteredReason::ContainNsfwMedia,
+                    "nsfw_user_author/drop/nsfw_media",
+                ),
+                ImmersiveExpandedRecommendations => dropped(
+                    FilteredReason::ContainNsfwMedia,
+                    "nsfw_sensitive_viewer_user/drop/nsfw_media",
+                ),
+                FilterAll | TimelineHome | TimelineHomeHydration => nsfw_viewer_dropped(reason, by),
+                QuotedTweetRules => unreachable!("a user-only level judges no post"),
+            };
             expect.extend([
                 (
                     level,
                     Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
                     if restricts {
-                        nsfw_viewer_dropped(
+                        restricted(
                             NsfwViewerDropReason::IsUnderage,
                             "sensitive_viewer_underage/drop",
                         )
@@ -115,7 +127,7 @@ pub(super) fn rows() -> Vec<Row> {
                         on_client("web", "de", viewer_with_age(ViewerAge::NotStated)),
                     ),
                     if restricts {
-                        nsfw_viewer_dropped(
+                        restricted(
                             NsfwViewerDropReason::HasNoStatedAge,
                             "sensitive_viewer_no_stated_age/drop",
                         )
@@ -127,7 +139,7 @@ pub(super) fn rows() -> Vec<Row> {
                     level,
                     Role::LoggedOut,
                     if restricts {
-                        nsfw_viewer_dropped(
+                        restricted(
                             NsfwViewerDropReason::LoggedOut,
                             "sensitive_viewer_logged_out/drop",
                         )
@@ -213,7 +225,7 @@ pub(super) fn rows() -> Vec<Row> {
                     if flagged {
                         dropped(
                             FilteredReason::ContainNsfwMedia,
-                            "nsfw_sensitive_viewer_tweet/drop/nsfw_media",
+                            "nsfw_sensitive_viewer_user/drop/nsfw_media",
                         )
                     } else {
                         allow()

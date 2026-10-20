@@ -1227,6 +1227,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             ads_pixel_head_masking=self.ads_pixel_head_masking,
             page_records=self.page_records,
             id_list_specs=self.id_list_specs or None,
+            history_url_embedding_dim=self.history_url_embedding_dim,
             alloc=self._alloc,
         )
 

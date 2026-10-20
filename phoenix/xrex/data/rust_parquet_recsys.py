@@ -418,6 +418,7 @@ class RustParquetDataset(PhoenixDataset):
                 reply_parent_mode=dataset.reply_parent_mode,
                 page_records=dataset.page_records,
                 id_list_specs=dataset.id_list_specs or None,
+                history_url_embedding_dim=dataset.history_url_embedding_dim,
                 alloc=dataset._alloc,
             )
 

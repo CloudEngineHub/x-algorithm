@@ -13,8 +13,10 @@ mod store;
 pub mod tweet_source;
 
 use crate::models::{
-    ClientCapability, PostCandidate, RawCandidate, TweetFeatures, TweetId, ViewerFeatures,
+    ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures, TweetId,
+    ViewerFeatures,
 };
+pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
@@ -50,9 +52,16 @@ pub(crate) struct HydrationRequest<'a> {
     viewer_id: Option<u64>,
     country_code: Option<String>,
     client_capability: ClientCapability,
-    raw_candidates: &'a [RawCandidate],
+    raw_candidates: Vec<RawCandidate>,
+    quotes: Vec<QuoteEntry>,
     is_expanding_retweet_sources: bool,
     fallback_caches: &'a FallbackCaches,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct QuoteEntry {
+    pub(crate) inner: TweetId,
+    pub(crate) outer: TweetId,
 }
 
 impl<'a> HydrationRequest<'a> {
@@ -60,7 +69,7 @@ impl<'a> HydrationRequest<'a> {
         viewer_id: Option<u64>,
         country_code: Option<String>,
         client_capability: ClientCapability,
-        raw_candidates: &'a [RawCandidate],
+        raw_candidates: Vec<RawCandidate>,
         fallback_caches: &'a FallbackCaches,
     ) -> Self {
         Self {
@@ -68,9 +77,15 @@ impl<'a> HydrationRequest<'a> {
             country_code,
             client_capability,
             raw_candidates,
+            quotes: Vec::new(),
             is_expanding_retweet_sources: false,
             fallback_caches,
         }
+    }
+
+    pub(crate) fn with_quotes(mut self, quotes: Vec<QuoteEntry>) -> Self {
+        self.quotes = quotes;
+        self
     }
 
     pub(crate) fn with_retweet_sources(mut self, is_expanding_retweet_sources: bool) -> Self {
@@ -96,7 +111,14 @@ pub(crate) struct Hydration {
     planned: Hydrators,
     incomplete: Hydrators,
     tweets: FxHashMap<TweetId, HydratedTweet>,
+    quotes: FxHashMap<QuoteEntry, Quoted>,
     has_fetched_sources: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Quoted {
+    pub(crate) facts: QuoteFacts,
+    pub(crate) failed: Hydrators,
 }
 
 impl Hydration {
@@ -118,6 +140,17 @@ impl Hydration {
 
     pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {
         self.tweets.get(&id)
+    }
+
+    pub(crate) fn quoted(&self, id: TweetId, placement: Placement) -> Quoted {
+        match placement {
+            Placement::InnerQuoted { outer } => self
+                .quotes
+                .get(&QuoteEntry { inner: id, outer })
+                .copied()
+                .unwrap_or_default(),
+            Placement::Standalone | Placement::RetweetSource => Quoted::default(),
+        }
     }
 
             pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {

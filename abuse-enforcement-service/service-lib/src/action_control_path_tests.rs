@@ -309,6 +309,31 @@ async fn repeat_label_skip_is_label_only() {
 }
 
 #[tokio::test]
+async fn phoenix_skip_page_label_writes_label_118_once() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    let phoenix = PageAction::PhoenixSkip {
+        lifetime: Lifetime::Days30,
+    };
+    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;
+    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["addLabelsV2"]);
+    let label_id = t.ais[0].1.pointer(
+        "/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels",
+    );
+    assert_eq!(label_id, Some(&serde_json::json!("ClientEventPhoenixSkip")));
+
+    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;
+    assert_eq!(t.status, "already_phoenix_skip_labeled");
+    assert!(t.ais.is_empty());
+    let t = b
+        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))
+        .await;
+    assert_eq!(t.status, "success", "another label does not count");
+}
+
+#[tokio::test]
 async fn band_records_split_a_two_band_head() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let b = bed(

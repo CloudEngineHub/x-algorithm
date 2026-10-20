@@ -1,3 +1,4 @@
+use crate::thrift_read::read_fields;
 use anyhow::bail;
 use std::collections::HashMap;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
@@ -162,21 +163,14 @@ const LIFECYCLE: i16 = 1;
 
 impl TSerializable for ArticleLifecycleState {
     fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
-        i_prot.read_struct_begin()?;
         let mut lifecycle = None;
-        loop {
-            let field = i_prot.read_field_begin()?;
-            if field.field_type == TType::Stop {
-                break;
+        read_fields(i_prot, |i_prot, field| {
+            if field.id != Some(LIFECYCLE) || field.field_type != TType::I32 {
+                return Ok(false);
             }
-            if field.id == Some(LIFECYCLE) && field.field_type == TType::I32 {
-                lifecycle = Some(i_prot.read_i32()?);
-            } else {
-                i_prot.skip(field.field_type)?;
-            }
-            i_prot.read_field_end()?;
-        }
-        i_prot.read_struct_end()?;
+            lifecycle = Some(i_prot.read_i32()?);
+            Ok(true)
+        })?;
         let Some(lifecycle) = lifecycle else {
             return Err(thrift::new_protocol_error(
                 thrift::ProtocolErrorKind::InvalidData,

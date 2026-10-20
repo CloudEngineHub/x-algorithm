@@ -1,3 +1,5 @@
+use crate::quote::QuoteRendering;
+use crate::treatment;
 use std::fmt::Debug;
 use xai_x_thrift::action::Action;
 use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
@@ -82,6 +84,16 @@ pub(crate) fn debug_label(value: &impl Debug) -> Label {
         };
     };
     (class, reason)
+}
+
+pub(crate) fn quote_label(rendering: QuoteRendering<'_>, served: Label) -> Label {
+    match rendering {
+        QuoteRendering::Served => served,
+        QuoteRendering::Rerendered(rerendered) => {
+            state_label(&treatment::rerendered_state(rerendered))
+        }
+        QuoteRendering::Omitted => label(Class::Missing, NONE),
+    }
 }
 
 pub(crate) fn state_label(state: &TweetFieldsResultState) -> Label {

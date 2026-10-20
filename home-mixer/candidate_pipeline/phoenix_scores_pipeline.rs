@@ -46,7 +46,7 @@ use xai_candidate_pipeline::component_library::clients::media_info_cache_client:
     MediaInfoCacheClient, MockMediaInfoCacheClient, ProdMediaInfoCacheClient,
 };
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
-    MockPredictClient, PhoenixPredictionClient, ProdPhoenixPredictionClient,
+    MockPredictClient, PhoenixPredictionClient,
 };
 use xai_candidate_pipeline::component_library::clients::user_demographics_client::{
     MockUserDemographicsClient, ProdUserDemographicsClient, UserDemographicsClient,
@@ -92,7 +92,6 @@ impl PhoenixScoresPipeline {
     pub(crate) async fn build_with_clients(
         user_action_aggregation_client: Arc<dyn UserActionAggregationClient + Send + Sync>,
         phoenix_client: Arc<dyn PhoenixPredictionClient + Send + Sync>,
-        xds_client: Option<Arc<dyn PhoenixPredictionClient + Send + Sync>>,
         tes_client: Arc<dyn TESClient + Send + Sync>,
         media_info_cache_client: Arc<dyn MediaInfoCacheClient + Send + Sync>,
         gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
@@ -152,22 +151,9 @@ impl PhoenixScoresPipeline {
 
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(PhoenixScorer {
-                dispatch: {
-                    let mut paths = Vec::new();
-                    if let Some(xds) = xds_client {
-                        paths.push(crate::util::egress::PredictionPath {
-                            name: "xDS",
-                            gate: crate::util::xds::XDS_GATE,
-                            client: xds,
-                            config: crate::util::egress::EgressConfig::DEFAULT,
-                        });
-                    }
-                    crate::util::egress::PredictionDispatch {
-                        prod: phoenix_client,
-                        paths,
-                        max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
-                        enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
-                    }
+                dispatch: crate::util::egress::PredictionDispatch {
+                    client: phoenix_client,
+                    max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
                 },
             }),
             Box::new(PhoenixScoresRankingScorer),
@@ -193,12 +179,13 @@ impl PhoenixScoresPipeline {
         datacenter: &str,
         phoenix_xds: &super::PhoenixXdsConfig,
     ) -> PhoenixScoresPipeline {
-        let xds_client = build_phoenix_xds_client(phoenix_xds).await;
+        let phoenix_client = build_phoenix_xds_client(phoenix_xds)
+            .await
+            .expect("Failed to build Phoenix xDS ranking client");
 
         let (
             socialgraph_client,
             user_action_aggregation_client,
-            phoenix_client,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,
@@ -229,13 +216,6 @@ impl PhoenixScoresPipeline {
                         .await
                         .expect("Failed to create User Action Aggregation client"),
                 ) as Arc<dyn UserActionAggregationClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    ProdPhoenixPredictionClient::new()
-                        .await
-                        .expect("Failed to create Phoenix prediction client"),
-                ) as Arc<dyn PhoenixPredictionClient + Send + Sync>
             },
             async {
                 Arc::new(
@@ -347,7 +327,6 @@ impl PhoenixScoresPipeline {
         PhoenixScoresPipeline::build_with_clients(
             user_action_aggregation_client,
             phoenix_client,
-            xds_client,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,
@@ -388,7 +367,6 @@ impl PhoenixScoresPipeline {
         PhoenixScoresPipeline::build_with_clients(
             user_action_aggregation_client,
             phoenix_client,
-            None,
             tes_client,
             media_info_cache_client,
             gizmoduck_client,

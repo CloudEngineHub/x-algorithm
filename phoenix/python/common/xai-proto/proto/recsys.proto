@@ -350,6 +350,8 @@ message CandidateSet {
   repeated float searchQueryEmbedding = 4;
 
   DeviceFeature deviceFeature = 5;
+
+  optional int64 requestTimestampMs = 6;
 }
 
 message CandidateDistributionSet {
@@ -1432,6 +1434,12 @@ message TweetInfo {
   ContentFeatures quotedContentFeatures = 37;
   SearchLexicalMatch searchLexicalMatch = 38;
   PostEngagerFeatures postEngagers = 39;
+  uint64 notInterestedCount = 40;
+  uint64 notificationSentCount = 41;
+  uint64 notificationOpenCount = 42;
+  uint64 notificationClickCount = 43;
+  uint64 notificationDismissCount = 44;
+  uint64 notificationSeeLessOftenCount = 45;
 }
 
 message SearchLexicalMatch {
@@ -1901,7 +1909,7 @@ enum UserActionAggregationType {
   ADS_WITH_KV_AD_HISTORY = 28;
   IMMERSIVE_LONG_DWELL = 29;
   DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
-  PLACEHOLDER_31 = 31;
+  IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
   PLACEHOLDER_32 = 32;
 }
 

@@ -412,6 +412,14 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (
                     TimelineHomeHydration,
+                    Role::InnerQuoted(Box::new(web_in_us())),
+                    blurred(
+                        InterstitialReason::Nudity(true),
+                        "nsfw_high_precision/blur/nudity",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
                     author_web_in_fr(),
                     blurred(
                         InterstitialReason::Nudity(true),
@@ -693,6 +701,7 @@ pub(super) fn rows() -> Vec<Row> {
                                 gore_blur_ignores_settings: false,
                                 fosnr_rules: true,
                                 fosnr_fallback_drops: false,
+                                soft_nsfw_new_user_drop: false,
                             },
                             ..sensitive_opt_in_viewer()
                         },

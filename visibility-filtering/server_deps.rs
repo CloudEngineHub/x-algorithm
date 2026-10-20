@@ -5,7 +5,7 @@ use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::clients::trusted_friends_client::TrustedFriendsClient;
 use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
-use crate::evaluate_tweets::EvaluateTweetsEndpoint;
+use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
 use crate::hydration::community_source::CommunitySource;
@@ -14,7 +14,7 @@ use crate::hydration::sources::{Backends, ProdSources};
 use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
 use crate::metrics::Rpc;
-use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
+use crate::models::{ClientCapability, Evaluation, PlacedCandidate, RawCandidate, TweetId};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_evaluator::{PostBatch, PostEvaluations, PostEvaluator};
@@ -158,6 +158,7 @@ pub(crate) async fn serving(
     datacenter: &str,
     metadata: Option<&MetadataMap>,
     cache_warming: CacheWarming,
+    experiments: crate::params::Experiments,
 ) -> Serving {
     let stats = xai_stats_receiver::global_stats_receiver();
     let (limited_actions_copy, copy_drift) =
@@ -177,7 +178,8 @@ pub(crate) async fn serving(
         tweets: tweet_cache_capacity.map(tweet_fallback_cache),
         authors: author_cache_capacity.map(author_fallback_cache),
     };
-    let mut switch_files = crate::params::SwitchFiles::beside(&crate::config::fs_path());
+    let mut switch_files =
+        crate::params::SwitchFiles::beside(&crate::config::fs_path(), experiments);
     let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
         switch_files
             .load(stats.as_deref())
@@ -218,7 +220,13 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         limited_actions_copy,
         author_cache_capacity,
         tweet_cache_capacity,
-    } = serving(datacenter, metadata, CacheWarming::AsConfigured).await;
+    } = serving(
+        datacenter,
+        metadata,
+        CacheWarming::AsConfigured,
+        crate::params::Experiments::serving(datacenter).await,
+    )
+    .await;
     let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
     let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
     let post_evaluator = Arc::new(PostEvaluator::new(
@@ -251,15 +259,27 @@ fn deterministic_aperture() -> bool {
     std::env::var("APP_ENV").as_deref() == Ok("prod")
 }
 
+#[derive(Default)]
+pub(crate) struct Comparators {
+    pub(crate) filter_tweets: Option<Box<dyn Comparator>>,
+    pub(crate) evaluate_tweets: Option<Box<dyn EntryComparator>>,
+}
+
 impl ServerDeps {
-    pub(crate) fn into_server(self, comparator: Option<Box<dyn Comparator>>) -> VFServer {
+    pub(crate) fn into_server(self, comparators: Comparators) -> VFServer {
         VFServer::from_endpoints(
             EvaluateTweetsEndpoint::new(
                 Arc::clone(&self.post_evaluator),
-                self.client_switches,
+                self.client_switches.clone(),
                 self.limited_actions_copy,
+                comparators.evaluate_tweets,
+            )
+            .with_quote_pass(crate::config::quote_pass()),
+            FilterTweetsEndpoint::new(
+                self.post_evaluator,
+                self.client_switches,
+                comparators.filter_tweets,
             ),
-            FilterTweetsEndpoint::new(self.post_evaluator, comparator),
             GetSafetyLabelsEndpoint::new(self.safety_label_source),
         )
     }
@@ -585,10 +605,10 @@ fn warm_filter_tweets_request() -> PostBatch {
         country_code: None,
         client_capability: ClientCapability::default(),
         safety_level: SafetyLevel::TimelineHomeRecommendations,
-        candidates: vec![RawCandidate {
+        candidates: vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
             request_author_id: None,
-        }],
+        })],
         rpc: Rpc::FilterTweets,
     }
 }

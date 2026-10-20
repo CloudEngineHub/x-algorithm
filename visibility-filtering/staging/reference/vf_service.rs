@@ -327,7 +327,9 @@ pub(crate) fn comparable_request(
         SafetyLevel::ImmersiveExpandedRecommendations => {
             ReferenceSafetyLevel::ImmersiveExpandedRecommendations
         }
-        SafetyLevel::FilterAll | SafetyLevel::TimelineHomeHydration => {
+        SafetyLevel::FilterAll
+        | SafetyLevel::TimelineHomeHydration
+        | SafetyLevel::QuotedTweetRules => {
             return Err("level_unmapped");
         }
     };

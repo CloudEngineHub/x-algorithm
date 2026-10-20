@@ -10,7 +10,9 @@ use std::sync::Arc;
 use crate::clients::author_brand_safety_client::{
     AuthorBrandSafetyClient, ProdAuthorBrandSafetyClient,
 };
-use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PhoenixPredictionClient;
+use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
+    PhoenixPredictionClient, PhoenixProduct,
+};
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::{
     build_phoenix_xds_prediction_client, build_phoenix_xds_retrieval_client_boxed,
@@ -22,24 +24,24 @@ pub type VmRankerXdsConfig = XdsP2cConfig;
 
 pub(crate) async fn build_phoenix_xds_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixPredictionClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixPredictionClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_CLIENT
-        .get_or_init(|| build_phoenix_xds_prediction_client(config))
+        .get_or_init(|| build_phoenix_xds_prediction_client(config, PhoenixProduct::Home))
         .await
         .clone()
 }
 
 pub(crate) async fn build_phoenix_xds_retrieval_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_RETRIEVAL_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_RETRIEVAL_CLIENT
-        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config))
+        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config, PhoenixProduct::Home))
         .await
         .clone()
 }

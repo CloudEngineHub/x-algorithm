@@ -1,3 +1,5 @@
+use crate::quote::QuotePassMode;
+
 pub const ENV_AUTHOR_CACHE_CAPACITY: &str = "VF_AUTHOR_CACHE_CAPACITY";
 pub const ENV_TWEET_CACHE_CAPACITY: &str = "VF_TWEET_CACHE_CAPACITY";
 pub const ENV_SAFETY_LABEL_CACHE_CAPACITY: &str = "VF_SAFETY_LABEL_CACHE_CAPACITY";
@@ -8,6 +10,7 @@ pub const ENV_APP_ENV: &str = "APP_ENV";
 pub const ENV_FS_PATH: &str = "VF_FS_PATH";
 pub const ENV_GIZMODUCK_CLIENT_ID: &str = "VF_GIZMODUCK_CLIENT_ID";
 pub const ENV_TWEMCACHE_CLIENT_NAME: &str = "VF_TWEMCACHE_CLIENT_NAME";
+pub const ENV_QUOTE_PASS: &str = "VF_QUOTE_PASS";
 
 const DEFAULT_FS_PATH: &str = "/usr/local/config/features/visibility/main/rust_vf.yml";
 
@@ -85,6 +88,21 @@ fn parse_capacity(value: Option<&str>) -> Option<usize> {
     (capacity > 0).then_some(capacity)
 }
 
+#[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
+pub(crate) fn quote_pass() -> QuotePassMode {
+    let value = std::env::var(ENV_QUOTE_PASS).ok();
+    parse_quote_pass(value.as_deref())
+        .unwrap_or_else(|| panic!("{ENV_QUOTE_PASS}={value:?} is neither off nor shadow"))
+}
+
+fn parse_quote_pass(value: Option<&str>) -> Option<QuotePassMode> {
+    match value {
+        None | Some("off") => Some(QuotePassMode::Off),
+        Some("shadow") => Some(QuotePassMode::Shadow),
+        Some(_) => None,
+    }
+}
+
 pub(crate) fn cache_warm_enabled() -> bool {
     parse_env_flag(std::env::var(ENV_CACHE_WARM_ENABLED).ok().as_deref())
 }
@@ -101,9 +119,23 @@ pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CACHE_CAPACITY, parse_capacity, parse_env_flag, resolve_gizmoduck_client_id,
-        resolve_twemcache_client_name,
+        DEFAULT_CACHE_CAPACITY, QuotePassMode, parse_capacity, parse_env_flag, parse_quote_pass,
+        resolve_gizmoduck_client_id, resolve_twemcache_client_name,
     };
+
+    #[test]
+    fn the_quote_pass_is_off_unless_set_to_shadow_and_refuses_any_other_value() {
+        for (value, expected) in [
+            (None, Some(QuotePassMode::Off)),
+            (Some("off"), Some(QuotePassMode::Off)),
+            (Some("shadow"), Some(QuotePassMode::Shadow)),
+            (Some(""), None),
+            (Some("on"), None),
+            (Some("Shadow"), None),
+        ] {
+            assert_eq!(parse_quote_pass(value), expected, "{value:?}");
+        }
+    }
 
     #[test]
     fn zero_turns_a_cache_off_and_an_unparsable_capacity_keeps_the_default() {

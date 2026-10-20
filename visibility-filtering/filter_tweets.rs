@@ -1,6 +1,7 @@
 use crate::caller_identity::Endpoint;
 use crate::metrics::{self as ft_metrics, Rpc};
-use crate::models::{ClientCapability, RawCandidate, TweetId};
+use crate::models::{ClientCapability, PlacedCandidate, RawCandidate, TweetId};
+use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::rules::SafetyLevel;
 use crate::treatment;
@@ -9,6 +10,17 @@ use std::time::Duration;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
+
+fn impresses_soft_nsfw_new_user(level: SafetyLevel) -> bool {
+    match level {
+        SafetyLevel::TimelineHomeRecommendations => true,
+        SafetyLevel::FilterAll
+        | SafetyLevel::TimelineHome
+        | SafetyLevel::TimelineHomeHydration
+        | SafetyLevel::ImmersiveExpandedRecommendations
+        | SafetyLevel::QuotedTweetRules => false,
+    }
+}
 
 pub(crate) type FinishComparison = Box<dyn FnOnce(&[PostEvaluation]) + Send>;
 
@@ -24,16 +36,19 @@ pub(crate) trait Comparator: Send + Sync {
 
 pub struct FilterTweetsEndpoint {
     post_evaluator: Arc<PostEvaluator>,
+    client_switches: ClientSwitches,
     comparator: Option<Box<dyn Comparator>>,
 }
 
 impl FilterTweetsEndpoint {
     pub(crate) fn new(
         post_evaluator: Arc<PostEvaluator>,
+        client_switches: ClientSwitches,
         comparator: Option<Box<dyn Comparator>>,
     ) -> Self {
         Self {
             post_evaluator,
+            client_switches,
             comparator,
         }
     }
@@ -64,12 +79,14 @@ impl FilterTweetsEndpoint {
         let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {
             return Err(Status::unimplemented("safety level has no Rust policy"));
         };
-        let candidates: Vec<RawCandidate> = req
+        let candidates: Vec<PlacedCandidate> = req
             .tweets
             .iter()
-            .map(|t| RawCandidate {
-                tweet_id: TweetId(t.tweet_id),
-                request_author_id: t.author_id,
+            .map(|t| {
+                PlacedCandidate::standalone(RawCandidate {
+                    tweet_id: TweetId(t.tweet_id),
+                    request_author_id: t.author_id,
+                })
             })
             .collect();
 
@@ -82,11 +99,19 @@ impl FilterTweetsEndpoint {
             )
         });
 
+        let country_code = req.country_code.filter(|code| !code.is_empty());
+        let client_capability = ClientCapability {
+            soft_nsfw_new_user_drop: impresses_soft_nsfw_new_user(safety_level)
+                && self
+                    .client_switches
+                    .soft_nsfw_new_user_drop(viewer_id, country_code.as_deref()),
+            ..ClientCapability::default()
+        };
         let response = context
             .scope(self.post_evaluator.run(PostBatch {
                 viewer_id,
-                country_code: req.country_code.filter(|code| !code.is_empty()),
-                client_capability: ClientCapability::default(),
+                country_code,
+                client_capability,
                 safety_level,
                 candidates,
                 rpc: Rpc::FilterTweets,
@@ -168,6 +193,7 @@ mod tests {
     use crate::hydration::sources::InMemorySources;
     use crate::rules::RuleEngine;
     use std::sync::Mutex;
+    use strum::VariantArray;
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let sources = Arc::new(InMemorySources::default());
@@ -177,6 +203,7 @@ mod tests {
                 RuleEngine::for_tests(),
                 Arc::default(),
             )),
+            ClientSwitches::for_tests(),
             None,
         );
         let response = endpoint
@@ -197,6 +224,18 @@ mod tests {
             .into_iter()
             .filter(|source| matches!(source, Source::GizmoduckViewer | Source::GizmoduckAuthor))
             .count()
+    }
+
+    #[test]
+    fn only_levels_that_wire_soft_nsfw_new_user_resolve_its_switch() {
+        let rule_engine = RuleEngine::for_tests();
+        for &level in SafetyLevel::VARIANTS {
+            let wired = rule_engine
+                .wired_rule_names(level)
+                .iter()
+                .any(|name| name.starts_with("soft_nsfw_new_user/"));
+            assert_eq!(impresses_soft_nsfw_new_user(level), wired, "{level:?}");
+        }
     }
 
     #[tokio::test]
@@ -233,6 +272,7 @@ mod tests {
                 RuleEngine::for_tests(),
                 Arc::default(),
             )),
+            ClientSwitches::for_tests(),
             Some(Box::new(viewer_ids)),
         );
         for viewer_id in [Some(0), Some(42)] {
@@ -283,6 +323,7 @@ mod tests {
                 RuleEngine::for_tests(),
                 Arc::default(),
             )),
+            ClientSwitches::for_tests(),
             Some(Box::new(comparator)),
         );
         let served = endpoint

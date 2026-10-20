@@ -2,7 +2,7 @@ use crate::dark_traffic_setup;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
-use crate::server_deps;
+use crate::server_deps::{self, Comparators};
 use std::sync::Arc;
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
@@ -32,9 +32,9 @@ pub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::R
         .otel_endpoint(args.otel_endpoint)
         .with_tls(TlsMode::server_mtls_from_env()?)
         .with_reflection(vf_pb::FILE_DESCRIPTOR_SET)
-        .with_layer(GrpcZstdLayer)
         .with_layer(dark_traffic_setup::resolve_layer())
         .with_layer(RejectDarkTrafficLayer::from_env())
+        .with_layer(GrpcZstdLayer)
         .http_routes(xai_profiling::profiling_router())
         .run::<S>(config)
         .await
@@ -66,7 +66,9 @@ impl XService for VFServer {
 impl VFServer {
     pub(crate) async fn new(datacenter: &str) -> Self {
         crate::config::refuse_reference();
-        server_deps::build(datacenter, None).await.into_server(None)
+        server_deps::build(datacenter, None)
+            .await
+            .into_server(Comparators::default())
     }
 
     pub(crate) fn from_endpoints(
@@ -156,8 +158,9 @@ mod tests {
                 Arc::clone(&post_evaluator),
                 ClientSwitches::for_tests(),
                 LimitedActionsCopy::from_json("[]"),
+                None,
             ),
-            FilterTweetsEndpoint::new(post_evaluator, None),
+            FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests(), None),
             GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
                 Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),
                 Some(1024),
@@ -196,10 +199,8 @@ mod tests {
         let client = XaiVfClient::from_channel(channel);
         let tweet = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {
             tweet_id,
-            quote_context: outer_tweet_id.map(|outer_tweet_id| vf_pb::QuoteContext {
-                outer_tweet_id,
-                outer_author_id: None,
-            }),
+            quote_context: outer_tweet_id
+                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
         };
         let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
         let protected = || {

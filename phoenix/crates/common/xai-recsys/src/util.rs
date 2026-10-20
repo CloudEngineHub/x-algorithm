@@ -321,18 +321,31 @@ pub fn with_fixed_now_sec<R>(now: i32, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-fn now_epoch_sec() -> i32 {
+fn fixed_now_sec() -> Option<i32> {
     if let Some(ts) = FIXED_NOW_SEC.with(std::cell::Cell::get) {
-        return ts;
+        return Some(ts);
     }
     static FIXED: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-    let fixed = FIXED.get_or_init(|| {
+    *FIXED.get_or_init(|| {
         std::env::var("RECSYS_FIXED_NOW_SEC")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-    });
-    if let Some(ts) = fixed {
-        return *ts;
+    })
+}
+
+fn candidate_impression_sec(candidate_set: &pb::CandidateSet) -> i32 {
+    if let Some(ts) = fixed_now_sec() {
+        return ts;
+    }
+    match candidate_set.request_timestamp_ms {
+        Some(ms) if ms > 0 => (ms / 1000) as i32,
+        _ => now_epoch_sec(),
+    }
+}
+
+fn now_epoch_sec() -> i32 {
+    if let Some(ts) = fixed_now_sec() {
+        return ts;
     }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -532,7 +545,7 @@ impl InputBuffer {
 
         let candidates_to_process = candidate_set.candidates.len().min(candidate_seq_len);
 
-        let now_sec = now_epoch_sec();
+        let now_sec = candidate_impression_sec(candidate_set);
 
         for (j, candidate) in candidate_set
             .candidates
@@ -1784,6 +1797,25 @@ mod tests {
         PRODUCT_SURFACE_SEQ, PRODUCT_SURFACE_SEQ_COLUMN, PRODUCT_SURFACE_SEQ_NAME,
     };
     use crate::feature_config::int64_feature::{CLIENT_APP_ID_SEQ, CLIENT_APP_ID_SEQ_NAME};
+
+    #[test]
+    fn candidate_impression_time_uses_request_timestamp() {
+        let model_config = test_model_config(1);
+        let mut candidate_set = pb::CandidateSet::default();
+        candidate_set.candidates.push(pb::TweetInfo {
+            tweet_id: 1000,
+            author_id: 2000,
+            ..Default::default()
+        });
+        candidate_set.request_timestamp_ms = Some(1_760_000_123_999);
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        assert_eq!(cand.impr_ts[0], 1_760_000_123);
+
+        candidate_set.request_timestamp_ms = None;
+        let before = now_epoch_sec();
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        assert!((before..=now_epoch_sec()).contains(&cand.impr_ts[0]));
+    }
 
     fn test_model_config(num_post_categorical_features: usize) -> ModelConfig {
         ModelConfig {

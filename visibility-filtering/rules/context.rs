@@ -1,14 +1,16 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, ClientCapability, PostCandidate, PostEntity, UserEntity, ViewerFeatures,
+    tweet_timestamp_ms, ClientCapability, PairEdges, Placement, PostCandidate, PostEntity,
+    QuoteFacts, QuoteLink, UserEntity, ViewerFeatures, ViewerRelationship,
 };
 use crate::params::{CountryList, CountryLists};
-use crate::rules::rule_spec::features::Feature;
+use crate::rules::rule_spec::engine::Candidate;
+use crate::rules::rule_spec::features::Reads;
 
-pub(crate) struct RuleContext<'a> {
+pub(crate) struct RuleContext<'a, C = PostCandidate> {
     facts: CoreFacts<'a>,
     viewer: &'a ViewerFeatures,
-    candidate: &'a PostCandidate,
+    candidate: &'a C,
     #[cfg(test)]
     hydrated: Hydrators,
 }
@@ -18,16 +20,20 @@ pub(super) struct CoreFacts<'a> {
     viewer_id: Option<u64>,
     request_country: Option<&'a str>,
     client_capability: ClientCapability,
+    placement: Placement,
+    quote: QuoteFacts,
     country_lists: &'a CountryLists,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct PostCoreFacts<'a>(&'a PostCandidate);
 
-impl<'a> RuleContext<'a> {
+impl<'a, C: Candidate> RuleContext<'a, C> {
     pub(super) fn new(
         viewer: &'a ViewerFeatures,
-        candidate: &'a PostCandidate,
+        candidate: &'a C,
+        placement: Placement,
+        quote: QuoteFacts,
         country_lists: &'a CountryLists,
     ) -> Self {
         Self {
@@ -35,6 +41,8 @@ impl<'a> RuleContext<'a> {
                 viewer_id: viewer.viewer.user_id(),
                 request_country: viewer.country_code.as_deref(),
                 client_capability: viewer.client_capability,
+                placement,
+                quote,
                 country_lists,
             },
             viewer,
@@ -70,14 +78,28 @@ impl<'a> RuleContext<'a> {
 
     #[inline]
     pub(super) fn failed(&self) -> Hydrators {
-        self.candidate.failed
+        self.candidate.failed()
     }
 
     #[inline]
-    pub(super) fn acquire<F: Feature>(&self) -> F::Value<'a> {
+    pub(super) fn acquire<F: Reads<C>>(&self) -> F::Value<'a> {
         F::read(At(self.reads(F::REQUIRED)))
     }
 
+    #[inline]
+    pub(super) fn acquire_pair_edges(&self, node: Hydrator) -> PairEdges {
+        self.reads(Hydrators::of(node)).facts.quote.pair_edges
+    }
+
+    #[inline]
+    pub(super) fn acquire_relationship(&self, node: Hydrator) -> ViewerRelationship {
+        self.reads(Hydrators::of(node))
+            .candidate
+            .viewer_relationship()
+    }
+}
+
+impl RuleContext<'_> {
     #[inline]
     pub(super) fn acquire_edge(&self, node: Hydrator) -> bool {
         At(self.reads(Hydrators::of(node))).edge(node)
@@ -85,7 +107,19 @@ impl<'a> RuleContext<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct At<'c, 'a>(&'c RuleContext<'a>);
+pub(super) struct At<'c, 'a, C = PostCandidate>(&'c RuleContext<'a, C>);
+
+impl<'a, C: Candidate> At<'_, 'a, C> {
+    #[inline]
+    pub(super) fn author(self) -> &'a UserEntity {
+        self.0.candidate.author()
+    }
+
+    #[inline]
+    pub(super) fn viewer(self) -> &'a ViewerFeatures {
+        self.0.viewer
+    }
+}
 
 impl<'a> At<'_, 'a> {
     #[inline]
@@ -96,16 +130,6 @@ impl<'a> At<'_, 'a> {
     #[inline]
     pub(super) fn post_facts(self) -> PostCoreFacts<'a> {
         PostCoreFacts(self.0.candidate)
-    }
-
-    #[inline]
-    pub(super) fn author(self) -> &'a UserEntity {
-        &self.0.candidate.author
-    }
-
-    #[inline]
-    pub(super) fn viewer(self) -> &'a ViewerFeatures {
-        self.0.viewer
     }
 
     #[inline]
@@ -141,6 +165,16 @@ impl<'a> CoreFacts<'a> {
     }
 
     #[inline]
+    pub(super) fn placement(self) -> Placement {
+        self.placement
+    }
+
+    #[inline]
+    pub(super) fn quote_link(self) -> Option<QuoteLink> {
+        self.quote.link
+    }
+
+    #[inline]
     pub(super) fn in_country_list(self, list: CountryList, country_code: &str) -> bool {
         self.country_lists.contains(list, country_code)
     }
@@ -150,11 +184,6 @@ impl PostCoreFacts<'_> {
     #[inline]
     pub(super) fn tweet_id(self) -> u64 {
         self.0.post.tweet_id
-    }
-
-    #[inline]
-    pub(super) fn author_id(self) -> u64 {
-        self.0.author.id
     }
 
     #[inline]

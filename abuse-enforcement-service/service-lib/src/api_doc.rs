@@ -70,6 +70,11 @@ pub struct AllowlistDeleteResponse {
         service::handle_allowlist_delete_entity,
         service::handle_off_switches_get,
         service::handle_off_switches_put,
+        service::handle_backfill_runs_list,
+        service::handle_backfill_runs_budget,
+        service::handle_backfill_run_get,
+        service::handle_backfill_run_start,
+        service::handle_backfill_run_change,
     ),
     components(schemas(
         xai_abuse_enforcement_types::action_control::ActionControlRecord,
@@ -105,6 +110,14 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::off_switch::OffSwitchView,
         xai_abuse_enforcement_types::off_switch::OffSwitchSeen,
         xai_abuse_enforcement_types::off_switch::OffSwitchListResponse,
+        xai_abuse_enforcement_types::backfill::BackfillRunRecord,
+        xai_abuse_enforcement_types::backfill::BackfillRunStartRequest,
+        xai_abuse_enforcement_types::backfill::BackfillRunChangeRequest,
+        xai_abuse_enforcement_types::backfill::BackfillRunListResponse,
+        xai_abuse_enforcement_types::backfill::RunState,
+        xai_abuse_enforcement_types::backfill::RunSource,
+        xai_abuse_enforcement_types::backfill::PausedReason,
+        xai_abuse_enforcement_types::backfill::RunTransition,
         ApiError,
         DryRunStatus,
         RateLimitStats,
@@ -115,6 +128,7 @@ pub struct AllowlistDeleteResponse {
         (name = "allowlist", description = "🔒 PROTECTED (bearer token). Allowlist — read + write (single + bulk)."),
         (name = "action_control", description = "🔒 PROTECTED (bearer token). Page-owned action control — per entity (user or post) and head / classifier / band: follow the GrowthBook rules, record only, or act with the page's actions; history."),
         (name = "off_switch", description = "🔒 PROTECTED (bearer token). Enforcement off switches — turn enforcement off or back on for a whole head or one head + classifier."),
+        (name = "backfill_runs", description = "🔒 PROTECTED (bearer token). Runs that act on past decisions: start, pause, resume and stop (page key only), done (the sender), reads and claims."),
         (name = "debug", description = "Open (no auth) ops/debug endpoints — dry-run flag, rate-limit usage, dedup lookup — EXCEPT POST /action and both rate-limit writes (POST /rate_limit and POST /rate_limit/reset), which are 🔒 protected because they mutate the enforcement budget. Look for the lock icon per endpoint."),
     ),
     servers(
@@ -124,7 +138,7 @@ pub struct AllowlistDeleteResponse {
         title = "xai-abuse-enforcement-service",
         description = "HTTP API for the xAI abuse-enforcement system. Used by the slackbot + the embedded admin UI at /admin.\n\n\
         **Auth:** endpoints with a 🔒 lock icon require `Authorization: Bearer <token>` — click **Authorize** and paste a key. \
-        PROTECTED: everything under `config` + `allowlist` + `off_switch` + `action_control`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
+        PROTECTED: everything under `config` + `allowlist` + `off_switch` + `action_control` + `backfill_runs`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
         OPEN (no auth): `GET /dry_run`, `GET /rate_limit`, `GET /dedup/{user_id}`.",
     ),
 )]
@@ -161,6 +175,11 @@ mod tests {
         ("/action_controls", "put", true),
         ("/action_controls/history", "get", true),
         ("/action_controls/pod", "get", true),
+        ("/backfill_runs", "get", true),
+        ("/backfill_runs", "post", true),
+        ("/backfill_runs/budget", "get", true),
+        ("/backfill_runs/{run_id}", "get", true),
+        ("/backfill_runs/{run_id}/{change}", "post", true),
     ];
 
     #[test]

@@ -5,6 +5,7 @@ use crate::models::{
 };
 use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::params::{LimitedActionType, LimitedActionsPolicies};
+use crate::quote::Rerendered;
 use crate::rules::SafetyLevel;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering_proto as vf_pb;
@@ -108,6 +109,10 @@ pub(crate) fn thrift_action(
             })
         }
     }
+}
+
+pub(crate) fn rerendered_state(rerendered: &Rerendered) -> TweetFieldsResultState {
+    TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(rerendered.reason.clone()))
 }
 
 pub(crate) fn thrift_result_state(
@@ -386,6 +391,7 @@ fn drop_reason(reason: &DropReason, level: SafetyLevel) -> Option<action::DropRe
 
 fn tombstone_reason(reason: TombstoneReason) -> action::TombstoneReason {
     match reason {
+        TombstoneReason::Bounced => action::TombstoneReason::BOUNCED,
         TombstoneReason::SensitiveViewerAgeVerification => {
             action::TombstoneReason::SENSITIVE_VIEWER_AGE_VERIFICATION
         }
@@ -705,7 +711,7 @@ mod tests {
         rows: &'static [(&'static str, &'static str)],
     }
 
-    fn verdict_cases() -> [(Verdict, Projected); 18] {
+    fn verdict_cases() -> [(Verdict, Projected); 19] {
         use action::LimitedActionType as T;
         let proto_drop = Kind::Drop(vf_pb::DropReason {});
         let tombstone = |reason, code| {
@@ -771,6 +777,7 @@ mod tests {
                 NsfwViewerDropReason::LoggedOut,
                 action::DropReason::NsfwLoggedOut(true),
             ),
+            tombstone(TombstoneReason::Bounced, 2),
             tombstone(TombstoneReason::SensitiveViewerAgeVerification, 30),
             tombstone(TombstoneReason::UpdateAppIos, 31),
             tombstone(TombstoneReason::UpdateAppAndroid, 32),

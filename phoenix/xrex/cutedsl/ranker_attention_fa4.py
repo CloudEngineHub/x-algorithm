@@ -23,11 +23,12 @@ def cutedsl_arch():
 def build_dense_block_sparse_layout(seq_len, hist_len, num_q_heads, hist_valid_len):
     block = 128
     cand_len = seq_len - hist_len
-    assert hist_len % block == 0 and cand_len % block == 0, (
-        f"dense block-sparse needs tile-aligned lengths (hist={hist_len}, cand={cand_len})"
+    assert hist_len % block == 0 and cand_len > 0, (
+        f"dense block-sparse needs tile-aligned history and a non-empty candidate region "
+        f"(hist={hist_len}, cand={cand_len})"
     )
     h_blocks = hist_len // block
-    num_blocks = seq_len // block
+    num_blocks = (seq_len + block - 1) // block
     cand_blocks = num_blocks - h_blocks
     idx_w = max(h_blocks, 1)
 

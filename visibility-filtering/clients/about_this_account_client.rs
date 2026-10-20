@@ -1,4 +1,4 @@
-use crate::clients::read_fields;
+use crate::thrift_read::read_fields;
 use anyhow::bail;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use xai_strato::strato_thrift::{strato_decode, StratoResult};

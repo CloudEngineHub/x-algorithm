@@ -1,4 +1,4 @@
-use crate::clients::read_fields;
+use crate::thrift_read::read_fields;
 use anyhow::bail;
 use std::collections::HashSet;
 use thrift::protocol::{

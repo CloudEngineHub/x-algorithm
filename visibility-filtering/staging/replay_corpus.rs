@@ -1,10 +1,10 @@
 use crate::hydration::request_context;
 use crate::hydration::sources::Id;
-use crate::models::ClientCapability;
 use crate::models::viewer::Client;
+use crate::models::{ClientCapability, Placement, TweetId};
 use crate::post_evaluator::{PostBatch, PostEvaluator};
-use crate::result_label::Label;
-use crate::retweet;
+use crate::quote::{QuotePassMode, QuotePassRunner};
+use crate::result_label::{Label, quote_label};
 use crate::staging::recording::Recording;
 use crate::staging::reference::tweetypie::vf_label;
 use crate::treatment;
@@ -34,14 +34,31 @@ pub(crate) struct Case {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Expected {
     pub(crate) tweet_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quote_context: Option<QuoteContext>,
         pub(crate) tags: Vec<String>,
     pub(crate) tweetypie: Label,
         pub(crate) vf: Label,
     pub(crate) vf_rule: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct QuoteContext {
+    pub(crate) outer_tweet_id: u64,
+}
+
+pub(crate) fn placement(quote_context: Option<QuoteContext>) -> Placement {
+    match quote_context {
+        None => Placement::Standalone,
+        Some(quote) => Placement::InnerQuoted {
+            outer: TweetId(quote.outer_tweet_id),
+        },
+    }
+}
+
 pub(crate) struct Evaluated {
     pub(crate) tweet_id: u64,
+    pub(crate) placement: Placement,
     pub(crate) label: Label,
     pub(crate) rule: Option<&'static str>,
 }
@@ -106,15 +123,33 @@ impl Fixtures {
 
 pub(crate) async fn evaluate(post_evaluator: &PostEvaluator, request: PostBatch) -> Vec<Evaluated> {
     let level = request.safety_level;
-    let (_, outcomes) = request_context(Instant::now(), None)
-        .scope(retweet::hydrate_and_evaluate(post_evaluator, request))
+    let (outcomes, passes) = request_context(Instant::now(), None)
+        .scope(async {
+            let (outcomes, pending) = QuotePassRunner::new(QuotePassMode::Shadow)
+                .serve(post_evaluator, request)
+                .await;
+            let passes = pending.run(post_evaluator, &outcomes).await;
+            (outcomes, passes)
+        })
         .await;
     outcomes
         .iter()
-        .map(|outcome| Evaluated {
-            tweet_id: outcome.tweet_id.0,
-            label: vf_label(outcome, level),
-            rule: treatment::decided_by(outcome.evaluation.verdict()),
+        .map(|outcome| {
+            let served = vf_label(outcome, level);
+            let rule = treatment::decided_by(outcome.evaluation.verdict());
+            let (label, rule) = match passes.ran().iter().find(|pass| pass.key == outcome.key()) {
+                None => (served, rule),
+                Some(pass) => (
+                    quote_label(pass.outcome.rendering(), served),
+                    pass.decided_by(rule),
+                ),
+            };
+            Evaluated {
+                tweet_id: outcome.tweet_id.0,
+                placement: outcome.placement,
+                label,
+                rule,
+            }
         })
         .collect()
 }
@@ -123,6 +158,7 @@ pub(crate) async fn evaluate(post_evaluator: &PostEvaluator, request: PostBatch)
 mod tests {
     use super::*;
     use crate::metrics::Rpc;
+    use crate::models::PlacedCandidate;
     use crate::params::{CountryList, CountryLists};
     use crate::result_label::Class;
     use crate::rules::{RuleEngine, SafetyLevel};
@@ -155,12 +191,29 @@ mod tests {
                 && !SCREENED_DROPS.contains(&tweetypie.1.as_str()))
     }
 
+    type Entry = (String, u64, Option<QuoteContext>);
+
+    fn entry_name((case, tweet_id, quote): &Entry) -> String {
+        match quote {
+            None => format!("{case}/{tweet_id}"),
+            Some(quote) => format!("{case}/{tweet_id} quoted in {}", quote.outer_tweet_id),
+        }
+    }
+
     #[derive(Deserialize)]
     struct KnownDivergence {
         case: String,
         tweet_id: u64,
+        #[serde(default)]
+        quote_context: Option<QuoteContext>,
                 vf: Label,
         reason: String,
+    }
+
+    impl KnownDivergence {
+        fn entry(&self) -> Entry {
+            (self.case.clone(), self.tweet_id, self.quote_context)
+        }
     }
 
             fn corpus_dir() -> PathBuf {
@@ -206,11 +259,12 @@ mod tests {
         stored(dir).into_iter().map(|stored| stored.case).collect()
     }
 
-            const DECIDED_AT_LEAST: [&str; 64] = [
+                const DECIDED_AT_LEAST: [&str; 69] = [
         "author_blocks_viewer_exclusive_content/drop/unspecified",
         "blocked_viewer/limited_engagement",
         "blocked_viewer/limited_engagement/root_author_blocked_viewer",
         "bounce/drop/bounced",
+        "bounce_quoted/tombstone/bounced",
         "creator_tweet_nsfw/drop/nsfw_media",
         "deactivated_author/drop",
         "exclusive_tweet/drop",
@@ -264,6 +318,9 @@ mod tests {
         "offboarded_author/drop/inactive",
         "pdna/drop/safety_result",
         "protected_author/drop",
+        "protected_quoted_author/drop",
+        "quoted_author_blocks_quoting_author/drop/author_block_viewer",
+        "quoted_viewer_mutes_author_not_following/drop",
         "read_only_viewer/limited_engagement",
         "sensitive_viewer_logged_out/drop",
         "sensitive_viewer_no_stated_age/drop",
@@ -271,13 +328,14 @@ mod tests {
         "spam/drop/undesirable",
         "stale_tweet/limited_engagement",
         "suspended_author/drop",
+        "viewer_blocks_author/drop",
     ];
 
     struct Replayed {
         failures: Vec<String>,
                 decided: BTreeSet<&'static str>,
                 diverging: BTreeSet<&'static str>,
-                mismatched: BTreeSet<(String, u64)>,
+                mismatched: BTreeSet<Entry>,
     }
 
     async fn replay_cases(dir: &Path) -> Replayed {
@@ -299,7 +357,11 @@ mod tests {
             country_lists,
         } in cases
         {
-            replayed.extend(case.tweets.iter().map(|t| (case.id.clone(), t.tweet_id)));
+            replayed.extend(
+                case.tweets
+                    .iter()
+                    .map(|t| (case.id.clone(), t.tweet_id, t.quote_context)),
+            );
             let recording = case.recording.with_shared(&shared);
             let sources = match recording.into_replay(case.viewer_id) {
                 Ok(sources) => Arc::new(sources),
@@ -321,7 +383,14 @@ mod tests {
                 country_code: case.country_code,
                 client_capability: case.client_capability,
                 safety_level: SAFETY_LEVEL,
-                candidates: case.tweets.iter().map(|t| raw(t.tweet_id, None)).collect(),
+                candidates: case
+                    .tweets
+                    .iter()
+                    .map(|t| PlacedCandidate {
+                        candidate: raw(t.tweet_id, None),
+                        placement: placement(t.quote_context),
+                    })
+                    .collect(),
                 rpc: Rpc::EvaluateTweets,
             };
             let evaluated = evaluate(&post_evaluator, request).await;
@@ -334,14 +403,16 @@ mod tests {
                 continue;
             }
             for expected in &case.tweets {
-                let Some(vf) = evaluated.iter().find(|vf| vf.tweet_id == expected.tweet_id) else {
-                    failures.push(format!("{}/{}: no outcome", case.id, expected.tweet_id));
+                let entry = (case.id.clone(), expected.tweet_id, expected.quote_context);
+                let key = entry_name(&entry);
+                let Some(vf) = evaluated.iter().find(|vf| {
+                    vf.tweet_id == expected.tweet_id
+                        && vf.placement == placement(expected.quote_context)
+                }) else {
+                    failures.push(format!("{key}: no outcome"));
                     continue;
                 };
-                let known = divergences
-                    .iter()
-                    .find(|d| d.case == case.id && d.tweet_id == expected.tweet_id);
-                let key = format!("{}/{}", case.id, expected.tweet_id);
+                let known = divergences.iter().find(|d| d.entry() == entry);
                 match (renders_alike(&vf.label, &expected.tweetypie), known) {
                     (true, None) => decided.extend(vf.rule),
                     (false, Some(known)) if vf.label == known.vf => diverging.extend(vf.rule),
@@ -360,7 +431,7 @@ mod tests {
                             expected.vf,
                             expected.vf_rule,
                         ));
-                        mismatched.insert((case.id.clone(), expected.tweet_id));
+                        mismatched.insert(entry);
                     }
                     (true, Some(known)) => failures.push(format!(
                         "{key}: now matches tweetypie; remove its known divergence ({})",
@@ -372,11 +443,12 @@ mod tests {
         failures.extend(
             divergences
                 .iter()
-                .filter(|d| !replayed.contains(&(d.case.clone(), d.tweet_id)))
-                .map(|d| {
+                .map(KnownDivergence::entry)
+                .filter(|entry| !replayed.contains(entry))
+                .map(|entry| {
                     format!(
-                        "{}/{}: known divergence names no replayed tweet",
-                        d.case, d.tweet_id
+                        "{}: known divergence names no replayed tweet",
+                        entry_name(&entry)
                     )
                 }),
         );
@@ -431,24 +503,53 @@ mod tests {
         for stored in &mut cases {
             for tweet in &mut stored.case.tweets {
                 tweet.tweetypie = (UNMATCHABLE.0.to_owned(), UNMATCHABLE.1.to_owned());
-                let pinned = divergences
-                    .iter()
-                    .any(|d| d.case == stored.case.id && d.tweet_id == tweet.tweet_id);
-                if !pinned {
-                    unpinned.insert((stored.case.id.clone(), tweet.tweet_id));
+                let entry = (stored.case.id.clone(), tweet.tweet_id, tweet.quote_context);
+                if !divergences.iter().any(|d| d.entry() == entry) {
+                    unpinned.insert(entry);
                 }
             }
         }
 
         let mismatched = replay_stored(&dir, cases).await.mismatched;
 
-        let unreached: Vec<&(String, u64)> = unpinned.difference(&mismatched).collect();
+        let unreached: Vec<&Entry> = unpinned.difference(&mismatched).collect();
         assert!(
             unreached.is_empty(),
             "{} of {} unpinned pairs went unreported against a label no rule renders, first {:?}",
             unreached.len(),
             unpinned.len(),
             &unreached[..unreached.len().min(5)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quote_entry_whose_tweetypie_label_flips_fails_naming_it_and_its_outer() {
+        let dir = corpus_dir();
+        let mut stored = stored(&dir)
+            .into_iter()
+            .find(|stored| stored.case.tweets.iter().any(|t| t.quote_context.is_some()))
+            .expect("the corpus holds a quote entry");
+        let case = stored.case.id.clone();
+        let quote = stored
+            .case
+            .tweets
+            .iter_mut()
+            .find(|t| t.quote_context.is_some())
+            .unwrap();
+        quote.tweetypie = (UNMATCHABLE.0.to_owned(), UNMATCHABLE.1.to_owned());
+        let entry = (case.clone(), quote.tweet_id, quote.quote_context);
+        let named = format!("{} [", entry_name(&entry));
+
+        let replayed = replay_stored(&dir, vec![stored]).await;
+
+        assert_eq!(replayed.mismatched, BTreeSet::from([entry]));
+        assert!(
+            replayed
+                .failures
+                .iter()
+                .any(|failure| failure.starts_with(&named)),
+            "no failure names {named}: {:?}",
+            replayed.failures
         );
     }
 
@@ -548,7 +649,7 @@ mod tests {
         assert!(strangers.is_empty(), "not in fixtures.json: {strangers:?}");
     }
 
-            const NEVER_ALLOWED: [(&str, &str); 12] = [
+            const NEVER_ALLOWED: [(&str, &str); 19] = [
         (
             "author:deactivated_author",
             "Tweetypie drops a deactivated author's post for every viewer, the author included",
@@ -580,6 +681,31 @@ mod tests {
         (
             "offboarded_author_text",
             "Tweetypie drops an offboarded author's post for every viewer",
+        ),
+        (
+            "qt_inner_deleted",
+            "its author deleted it, so Tweetypie answers it not found",
+        ),
+        ("qt_inner_deleted_blocker", "as qt_inner_deleted"),
+        (
+            "quoted_in:qt_of_blocker",
+            "the quoted author blocks the quoting author, which drops the quote for every viewer; quoted_in:qt_of_muted_followed is an allowed quote",
+        ),
+        (
+            "quoted_in:qt_of_bounced",
+            "a Bounce-labeled quote is dropped for other viewers and tombstoned for its author",
+        ),
+        (
+            "quoted_in:qt_of_deleted",
+            "as qt_inner_deleted, inside its quote",
+        ),
+        (
+            "quoted_in:qt_of_deleted_blocker",
+            "the deleted quoted post's author blocks the quoting author, which drops the quote for every viewer; quoted_in:qt_of_deleted is its not-found control",
+        ),
+        (
+            "quoted_in:qt_of_protected",
+            "the quoting author does not follow the protected quoted author, which drops the quote for every viewer; quoted_in:qt_of_protected_by_follower is its allowed control",
         ),
         (
             "stale_original",

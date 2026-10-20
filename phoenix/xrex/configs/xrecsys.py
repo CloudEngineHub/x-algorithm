@@ -93,6 +93,7 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_cross_attn=mparams.get("sid_cross_attn", False),
         sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
         sid_decoder_path=mparams.get("sid_decoder_path", ""),
+        sid_recon_rows_per_decoder_pass=mparams.get("sid_recon_rows_per_decoder_pass", 16384),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -712,6 +713,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             ads_pixel_head_masking=mparams.get("ads_pixel_head_masking", False),
             enable_dpa_input_embedding=mparams.get("enable_dpa_input_embedding", False),
             attend_padded_history=mparams.get("attend_padded_history", False),
+            pad_candidates_to_128=mparams.get("pad_candidates_to_128", True),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
             concat_history_web_conv_time_on_site=mparams.get(
                 "concat_history_web_conv_time_on_site", False
