@@ -298,7 +298,7 @@ mod tests {
         TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
-    use crate::rules::SafetyLevel;
+    use crate::rules::{RuleId, SafetyLevel};
     use crate::scenario::{raw, Scenario};
     use std::time::Duration;
     use xai_core_entities::entities::{ConversationControlArm, PureCoreData};
@@ -310,10 +310,12 @@ mod tests {
     fn merge_source_prefers_the_more_severe_withholding_then_restricted_retweet() {
         let dropped = Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         });
         let tombstoned = Verdict::Withheld(Decided {
             value: Withholding::Tombstone(TombstoneReason::LocalRegulations),
+            id: RuleId::NsfwHighPrecision,
             by: "nsfw_high_precision/tombstone/local_regulations",
         });
         let blurred = Verdict::Shown {
@@ -324,6 +326,7 @@ mod tests {
                     reason: InterstitialReason::Sensitive(true),
                     prompt: None,
                 }),
+                id: RuleId::NsfwUser,
                 by: "nsfw_user/blur/sensitive_user",
             }),
             engagement: None,
@@ -333,6 +336,7 @@ mod tests {
             media: None,
             engagement: Some(Decided {
                 value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+                id: RuleId::LimitRepliesByInvitation,
                 by: "limit_replies_by_invitation/limited_engagement/conversation_control",
             }),
         };

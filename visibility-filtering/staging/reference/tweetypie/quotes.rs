@@ -249,6 +249,7 @@ mod tests {
         };
         let muted = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::ViewerMutesAuthor)),
+            id: RuleId::QuotedViewerMutesAuthorNotFollowing,
             by: "quoted_viewer_mutes_author_not_following/drop",
         }));
         let allowed = Evaluation::complete(shown());
@@ -376,6 +377,7 @@ mod tests {
         };
         let suspended = Evaluation::complete(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         }));
         let dropped = PassOutcome::Dropped(Rerendered {

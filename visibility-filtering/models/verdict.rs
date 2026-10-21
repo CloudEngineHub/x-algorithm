@@ -1,5 +1,6 @@
 use crate::hydration::{Hydrators, Lookup};
 use crate::params::LimitedActionType;
+use crate::rules::RuleId;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
@@ -33,6 +34,7 @@ pub struct FosnrReason {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decided<T> {
     pub value: T,
+    pub(crate) id: RuleId,
     pub by: &'static str,
 }
 
@@ -181,6 +183,7 @@ impl Verdict {
     pub const fn not_found() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            id: RuleId::NotFound,
             by: "not_found",
         })
     }
@@ -188,6 +191,7 @@ impl Verdict {
     pub const fn lookup_failed() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            id: RuleId::LookupFailed,
             by: "lookup_failed",
         })
     }

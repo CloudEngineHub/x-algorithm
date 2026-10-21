@@ -12,6 +12,7 @@ use crate::clients::user_action_aggregation_client::{
     MockUserActionAggregationClient, ProdUserActionAggregationClient, UserActionAggregationClient,
 };
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
+use crate::filters::fair_share_ranking_filter::FairShareRankingFilter;
 use crate::filters::result_size_filter::ResultSizeFilter;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
@@ -146,8 +147,10 @@ impl PhoenixScoresPipeline {
             Box::new(SemanticIdHydrator::new(sid_client)),
         ];
 
-        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> =
-            vec![Box::new(CoreDataHydrationFilter)];
+        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
+            Box::new(CoreDataHydrationFilter),
+            Box::new(FairShareRankingFilter),
+        ];
 
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(PhoenixScorer {

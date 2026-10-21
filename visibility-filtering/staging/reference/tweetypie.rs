@@ -536,6 +536,7 @@ mod tests {
     use super::*;
     use crate::hydration::{Hydrators, Lookup};
     use crate::models::{Decided, DropReason, Withholding};
+    use crate::rules::RuleId;
     use crate::rules::fixtures::CLIENT_CLASSES;
     use std::fs;
     use std::path::Path;
@@ -704,6 +705,7 @@ mod tests {
         );
         let suspended = outcome(Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         }));
         let bucket = compared(&allow, Some(&suspended)).bucket();

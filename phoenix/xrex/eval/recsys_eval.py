@@ -39,6 +39,19 @@ rank_logger = logging.getLogger("rank")
 
 _membership_validation_done = False
 
+_metadata_cache: tuple[tuple[Any, ...], pd.DataFrame] | None = None
+
+
+def _read_metadata_table(path: Path, columns: List[str]) -> pd.DataFrame:
+    global _metadata_cache
+    resolved = os.path.realpath(path)
+    stat = os.stat(resolved)
+    key = (resolved, stat.st_mtime_ns, stat.st_size, tuple(columns))
+    if _metadata_cache is None or _metadata_cache[0] != key:
+        _metadata_cache = None
+        _metadata_cache = (key, pq.read_table(resolved, columns=columns).to_pandas())
+    return _metadata_cache[1]
+
 
 def _weighted_slot_scores(
     users: np.ndarray, cands: np.ndarray, slot_weights: Optional[Tuple[float, ...]]
@@ -334,9 +347,7 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 columns = ["post_id"] + self.metadata_stats
                 for attempt in range(3):
                     try:
-                        metadata_table = pq.read_table(
-                            self.metadata_path, columns=columns
-                        ).to_pandas()
+                        metadata_table = _read_metadata_table(self.metadata_path, columns)
                         break
                     except Exception as e:
                         if attempt == 2:
@@ -469,19 +480,19 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                             "post_id"
                         ].map(_ids_and_counts_mapping)
                         if _stat in self.metadata_stats_unique_groups:
-                            val = jnp.array(
+                            val = np.float64(
                                 np.unique(np.array(global_top_k_metadata[_stat])).shape[0]
                                 / len(global_top_k_ids_flattened)
                             )
                         elif _stat in self.metadata_stats_mean_groups:
-                            val = jnp.mean(
+                            val = np.mean(
                                 np.repeat(
                                     np.array(global_top_k_metadata[_stat]),
                                     global_top_k_metadata["unique_count"],
                                 )
                             )
                         elif _stat in self.metadata_stats_median_groups:
-                            val = jnp.median(
+                            val = np.median(
                                 np.repeat(
                                     np.array(global_top_k_metadata[_stat]),
                                     global_top_k_metadata["unique_count"],

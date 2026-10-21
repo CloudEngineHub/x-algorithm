@@ -19,3 +19,4 @@ pub mod served_event_kafka_side_effect;
 pub mod truncate_served_history_side_effect;
 pub mod update_past_request_timestamps_side_effect;
 pub mod update_served_history_side_effect;
+pub mod video_carousel_candidates_kafka_side_effect;

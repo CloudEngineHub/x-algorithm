@@ -13,7 +13,7 @@ use xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;
 
 pub(crate) const QUOTE_PASS: &str = "vf_quote_pass";
 const SHED: &str = "shed";
-pub(crate) const MAX_SHADOW_PASSES_IN_FLIGHT: usize = 32;
+const MAX_SHADOW_PASSES_IN_FLIGHT: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuotePassMode {
@@ -79,7 +79,7 @@ impl QuotePass {
     }
 }
 
-pub(crate) fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
+fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
     let quotes: Vec<PlacedCandidate> = request
         .candidates
         .iter()
@@ -280,9 +280,9 @@ fn judge(level: SafetyLevel, author: Option<&UserEvaluation>) -> PassOutcome {
     };
     match &author.evaluation {
         Evaluation::Complete {
-            verdict: Verdict::Withheld(Decided { by, .. }),
+            verdict: Verdict::Withheld(Decided { id, .. }),
             ..
-        } => rerender(level, by).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),
+        } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),
         Evaluation::Complete {
             verdict: Verdict::Shown { .. },
             ..
@@ -293,11 +293,10 @@ fn judge(level: SafetyLevel, author: Option<&UserEvaluation>) -> PassOutcome {
     }
 }
 
-fn rerender(level: SafetyLevel, rule: &str) -> Option<Rerendered> {
+fn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {
     let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {
         return None;
     };
-    let by = RuleId::of_rule_name(rule)?;
     let (_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;
     Some(Rerendered { by, reason })
 }
@@ -796,6 +795,28 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_level_65_drop_rerenders_by_its_rule_identity_whatever_its_name() {
+        use crate::hydration::Hydrators;
+        use crate::models::{DropReason, Withholding};
+        use xai_visibility_filtering::models::FilteredReason;
+        let author = UserEvaluation {
+            evaluation: Evaluation::complete(Verdict::Withheld(Decided {
+                value: Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
+                id: RuleId::SuspendedAuthor,
+                by: "renamed",
+            })),
+            failed: Hydrators::empty(),
+        };
+        assert!(matches!(
+            judge(SafetyLevel::TimelineHomeHydration, Some(&author)),
+            PassOutcome::Dropped(Rerendered {
+                by: RuleId::SuspendedAuthor,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use crate::models::{
     Viewer, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::params::LimitedActionType;
+use crate::rules::RuleId;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
@@ -137,6 +138,10 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
     ]
 };
 
+fn id_of(by: &str) -> RuleId {
+    RuleId::of_rule_name(by).unwrap_or(RuleId::FilterAll)
+}
+
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
         notice: None,
@@ -154,6 +159,7 @@ pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str)
                 proactive,
                 appeal_submitted,
             }),
+            id: id_of(by),
             by,
         }),
         media: None,
@@ -199,6 +205,7 @@ pub(crate) fn appealed(
                 },
                 limited_actions,
             },
+            id: id_of(by),
             by,
         }),
         media: None,
@@ -209,6 +216,7 @@ pub(crate) fn appealed(
 pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::Legacy(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -216,6 +224,7 @@ pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
 pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::NsfwViewer(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -223,6 +232,7 @@ pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str
 pub(crate) fn tombstoned(reason: TombstoneReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Tombstone(reason),
+        id: id_of(by),
         by,
     })
 }
@@ -252,6 +262,7 @@ fn media_blurred(
                 reason,
                 prompt,
             }),
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -263,6 +274,7 @@ pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
         notice: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -282,7 +294,11 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
     Verdict::Shown {
         notice: None,
         media: None,
-        engagement: Some(Decided { value, by }),
+        engagement: Some(Decided {
+            value,
+            id: id_of(by),
+            by,
+        }),
     }
 }
 

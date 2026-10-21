@@ -248,16 +248,14 @@ def ranker_attention_fa4(
     hdr = ((head_dim + 31) // 32) * 32
     sr_q = ((seq_len + m_block - 1) // m_block) * m_block
     sr_k = ((seq_len + n_block - 1) // n_block) * n_block
+    dKV_postprocess = qhead_per_kvhead > 1
     if arch == 80:
         assert seq_len % m_block == 0, "SM80 cutedsl ranker attention requires seq_len % 128 == 0"
         bwd_tile_m = 64
-        dKV_postprocess = qhead_per_kvhead > 1
     elif arch == 90:
         bwd_tile_m = 64
-        dKV_postprocess = qhead_per_kvhead > 1
     else:
         bwd_tile_m = m_block
-        dKV_postprocess = True
 
     fwd_bs, bwd_bs = block_sparse_layout
     if valid_block_upper is None or valid_block_lower is None:

@@ -60,13 +60,17 @@ impl PostBatch {
     }
 }
 
+pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
+    raw.filter(|&id| id.cast_signed() > 0)
+}
+
 #[derive(Clone)]
 pub struct PostEvaluation {
     pub tweet_id: TweetId,
     pub placement: Placement,
     pub source_tweet_id: Option<TweetId>,
     pub evaluation: Evaluation,
-    pub safety_labels: Option<vf_pb::SafetyLabelMap>,
+    pub safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
 }
 
 impl PostEvaluation {
@@ -76,10 +80,6 @@ impl PostEvaluation {
             placement: self.placement,
         }
     }
-}
-
-pub struct PostEvaluations {
-    pub outcomes: Vec<PostEvaluation>,
 }
 
 pub struct PostEvaluator {
@@ -105,11 +105,9 @@ impl PostEvaluator {
         }
     }
 
-    pub async fn run(&self, request: PostBatch) -> PostEvaluations {
+    pub async fn run(&self, request: PostBatch) -> Vec<PostEvaluation> {
         let hydrated = self.hydrate(request).await;
-        PostEvaluations {
-            outcomes: self.evaluate_in_request_order(&hydrated, &mut NoTrace),
-        }
+        self.evaluate_in_request_order(&hydrated, &mut NoTrace)
     }
 
     pub(crate) async fn hydrate(&self, request: PostBatch) -> HydratedRequest {
@@ -281,9 +279,7 @@ impl PostEvaluator {
             placement,
             source_tweet_id: tweet.and_then(HydratedTweet::source_tweet_id),
             evaluation,
-            safety_labels: tweet
-                .and_then(HydratedTweet::safety_labels)
-                .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
+            safety_labels: tweet.and_then(HydratedTweet::safety_labels).cloned(),
         }
     }
 }
@@ -1123,9 +1119,9 @@ mod tests {
             .unwrap()
             .labels
             .is_empty());
-        assert_eq!(
-            response.outcomes[0].safety_labels,
-            response.outcomes[2].safety_labels
-        );
+        assert!(Arc::ptr_eq(
+            response.outcomes[0].safety_labels.as_ref().unwrap(),
+            response.outcomes[2].safety_labels.as_ref().unwrap()
+        ));
     }
 }

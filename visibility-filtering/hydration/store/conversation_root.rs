@@ -1,4 +1,4 @@
-use super::{RequestTweet, Store};
+use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::Edge;
 use crate::hydration::Cause;
@@ -17,31 +17,30 @@ pub(super) enum ConversationRootAuthor {
 impl Store {
     pub(super) fn conversation_root_author(
         &self,
-        request_tweet: &RequestTweet,
+        row: &RequestRow,
     ) -> Option<ConversationRootAuthor> {
-        let (conversation_id, parent_id) =
-            match self.pure_cores.get(request_tweet.tweet_id.0)?.reply_to? {
-                ReplyTo::Root { root_author_id, .. } => {
-                    return Some(ConversationRootAuthor::PureCore(root_author_id));
-                }
-                ReplyTo::Nested {
-                    conversation_id,
-                    parent_id,
-                } => (conversation_id, parent_id),
-            };
+        let id = row.tweet_id()?.0;
+        let (conversation_id, parent_id) = match self.pure_cores.get(id)?.reply_to? {
+            ReplyTo::Root { root_author_id, .. } => {
+                return Some(ConversationRootAuthor::PureCore(root_author_id));
+            }
+            ReplyTo::Nested {
+                conversation_id,
+                parent_id,
+            } => (conversation_id, parent_id),
+        };
         if let Some(author) = self.root_author_in_batch(conversation_id, parent_id) {
             return Some(ConversationRootAuthor::PureCore(author));
         }
-        let id = request_tweet.tweet_id.0;
         let root = match (self.controls.get(id), self.controls.miss(id)) {
             (Some(control), _) => ConversationRootAuthor::ConversationControl(AuthorId(
                 control.conversation_tweet_author_id,
             )),
             (None, Some(Cause::NotFound))
                 if !self
-                    .request_tweets
+                    .rows
                     .iter()
-                    .any(|request_tweet| request_tweet.tweet_id == conversation_id) =>
+                    .any(|row| row.tweet_id() == Some(conversation_id)) =>
             {
                 ConversationRootAuthor::RootPost(conversation_id)
             }

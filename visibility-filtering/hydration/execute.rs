@@ -203,7 +203,8 @@ impl HydrationPlan {
             &request.raw_candidates,
             request.is_expanding_retweet_sources,
         )
-        .with_quotes(&request.quotes);
+        .with_quotes(&request.quotes)
+        .with_users(&request.users);
         let mut running: FuturesUnordered<InFlight<'_>> = FuturesUnordered::new();
         let inputless = || self.groups().filter(|g| g.input.is_none());
         let mut ready: Vec<&Group> = inputless().collect();
@@ -1578,6 +1579,48 @@ mod tests {
         );
         assert!(hydrated.failed_ids.is_empty());
         assert!(hydrated.unresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_rows_key_author_lookups_by_user_without_pure_core_and_ask_a_repeated_user_once() {
+        use crate::hydration::{HydratedUser, RequestRows};
+        let sources = InMemorySources::default()
+            .user(10, suspended())
+            .authors(&[20])
+            .edge(Graph::Blocks, VIEWER, 20)
+            .fail_key(Source::GizmoduckAuthor, 30);
+        let plan = HydrationPlan::with_rows(
+            SafetyLevel::QuotedTweetRules,
+            RequestRows::Users,
+            Hydrators::of(Hydrator::AuthorSafety).with(Hydrator::Blocks),
+        );
+        let caches = FallbackCaches {
+            tweets: None,
+            authors: None,
+        };
+        let users = [10, 20, 10, 30].map(AuthorId).to_vec();
+        let hydration = plan
+            .hydrate(
+                &sources,
+                HydrationRequest::for_users(VIEWER, users, &caches),
+            )
+            .await;
+        assert_eq!(call_labels(&sources), ["Flock blocks", "GizmoduckAuthor"]);
+        assert_eq!(sources.keys(Source::GizmoduckAuthor), [vec![10, 20, 30]]);
+        assert!(matches!(
+            hydration.user(AuthorId(10)),
+            Some(HydratedUser::Resolved { user, viewer_relationship, failed })
+                if user.is_suspended && !viewer_relationship.blocks && failed.is_empty()
+        ));
+        assert!(matches!(
+            hydration.user(AuthorId(20)),
+            Some(HydratedUser::Resolved { viewer_relationship, failed, .. })
+                if viewer_relationship.blocks && failed.is_empty()
+        ));
+        assert!(matches!(
+            hydration.user(AuthorId(30)),
+            Some(HydratedUser::Unresolved(Cause::Failed))
+        ));
     }
 
     #[tokio::test]

@@ -482,6 +482,7 @@ impl ReferenceCompareHarness {
 mod tests {
     use super::*;
     use crate::models::{MediaInterstitial, MediaRestriction};
+    use crate::rules::RuleId;
     use xai_visibility_filtering::models::{
         Action, DropReason, KeywordMatch, SafetyResult as ReferenceSafetyResult,
     };
@@ -523,6 +524,7 @@ mod tests {
     fn service_drop_of(reason: FilteredReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(crate::models::DropReason::Legacy(reason)),
+            id: RuleId::SuspendedAuthor,
             by: "suspended_author/drop",
         })
     }
@@ -540,6 +542,7 @@ mod tests {
                     reason: InterstitialReason::Sensitive(true),
                     prompt: None,
                 }),
+                id: RuleId::FilterAll,
                 by: "nsfw_media",
             }),
             engagement: None,

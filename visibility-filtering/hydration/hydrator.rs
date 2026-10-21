@@ -45,6 +45,17 @@ pub enum Hydrator {
     QuotedTweet,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RequestRows {
+    #[default]
+    Posts,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "remove once a served level takes user rows")
+    )]
+    Users,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Hydrators(u64);
 
@@ -163,6 +174,7 @@ pub(crate) struct UserPair {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KeyOrigin {
     RequestTweets,
+    RequestUsers,
     Viewer,
     PureCoreAuthor,
     PureCoreRetweeter,
@@ -208,7 +220,7 @@ pub(super) struct NodeSpec {
 impl KeyOrigin {
     const fn input(self) -> Option<Hydrator> {
         match self {
-            KeyOrigin::RequestTweets | KeyOrigin::Viewer => None,
+            KeyOrigin::RequestTweets | KeyOrigin::RequestUsers | KeyOrigin::Viewer => None,
             KeyOrigin::PureCoreAuthor
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot
@@ -229,6 +241,17 @@ impl KeyOrigin {
             KeyOrigin::MyNetworkRootNotFollowingViewer => Some(Hydrator::RootFollowsViewer),
             KeyOrigin::ModeratedCommunity => Some(Hydrator::CommunityModeration),
         }
+    }
+
+    pub(super) const fn at(self, rows: RequestRows) -> Self {
+        match (rows, self) {
+            (RequestRows::Users, KeyOrigin::PureCoreAuthor) => KeyOrigin::RequestUsers,
+            _ => self,
+        }
+    }
+
+    pub(super) const fn keys_user_rows(self) -> bool {
+        matches!(self, KeyOrigin::RequestUsers | KeyOrigin::Viewer)
     }
 
     pub(super) fn reads(self) -> Hydrators {
@@ -253,6 +276,7 @@ impl KeyOrigin {
                 input.with(Hydrator::QuotedTweet)
             }
             KeyOrigin::RequestTweets
+            | KeyOrigin::RequestUsers
             | KeyOrigin::Viewer
             | KeyOrigin::PureCoreRetweeter
             | KeyOrigin::PureCoreReplyRoot
@@ -539,6 +563,14 @@ impl Hydrator {
         self.spec().key.input()
     }
 
+    pub(super) const fn key_at(self, rows: RequestRows) -> KeyOrigin {
+        self.spec().key.at(rows)
+    }
+
+    pub(super) const fn input_at(self, rows: RequestRows) -> Option<Hydrator> {
+        self.key_at(rows).input()
+    }
+
     pub(super) const fn edge(self) -> Option<Edge> {
         match self.spec().part {
             Part::Edge(edge) => Some(edge),
@@ -664,14 +696,17 @@ const _: () = assert!(viewer_scopes_fit_their_nodes());
 const _: () = assert!(Hydrator::VARIANTS.len() <= u64::BITS as usize);
 
 impl Hydrators {
-    pub const fn closed(self) -> Self {
-        let mut closed = self.with(Hydrator::PureCore);
+    pub(crate) const fn closed(self, rows: RequestRows) -> Self {
+        let mut closed = match rows {
+            RequestRows::Posts => self.with(Hydrator::PureCore),
+            RequestRows::Users => self,
+        };
         if closed.contains(Hydrator::AuthorBlocksOuterAuthor) {
             closed = closed.with(Hydrator::QuotedTweet);
         }
         let mut rest = Hydrator::VARIANTS;
         while let [head @ .., node] = rest {
-            if let Some(input) = node.input()
+            if let Some(input) = node.input_at(rows)
                 && closed.contains(*node)
             {
                 closed = closed.with(input);
@@ -693,6 +728,7 @@ impl fmt::Display for KeyOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KeyOrigin::RequestTweets => f.write_str("tweets"),
+            KeyOrigin::RequestUsers => f.write_str("users"),
             KeyOrigin::Viewer => f.write_str("viewer"),
             KeyOrigin::PureCoreAuthor => f.write_str("author"),
             KeyOrigin::PureCoreRetweeter => f.write_str("retweeter"),

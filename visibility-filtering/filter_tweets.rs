@@ -2,12 +2,11 @@ use crate::caller_identity::Endpoint;
 use crate::metrics::{self as ft_metrics, Rpc};
 use crate::models::{ClientCapability, PlacedCandidate, RawCandidate, TweetId};
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
+use crate::post_evaluator::{normalize_viewer_id, PostBatch, PostEvaluation, PostEvaluator};
 use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
@@ -19,6 +18,29 @@ fn impresses_soft_nsfw_new_user(level: SafetyLevel) -> bool {
         | SafetyLevel::TimelineHomeHydration
         | SafetyLevel::ImmersiveExpandedRecommendations
         | SafetyLevel::QuotedTweetRules => false,
+    }
+}
+
+pub(crate) fn filter_tweets_request(
+    client_switches: &ClientSwitches,
+    viewer_id: Option<u64>,
+    country_code: Option<String>,
+    safety_level: SafetyLevel,
+    candidates: Vec<PlacedCandidate>,
+) -> PostBatch {
+    let country_code = country_code.filter(|code| !code.is_empty());
+    let client_capability = ClientCapability {
+        soft_nsfw_new_user_drop: impresses_soft_nsfw_new_user(safety_level)
+            && client_switches.soft_nsfw_new_user_drop(viewer_id, country_code.as_deref()),
+        ..ClientCapability::default()
+    };
+    PostBatch {
+        viewer_id,
+        country_code,
+        client_capability,
+        safety_level,
+        candidates,
+        rpc: Rpc::FilterTweets,
     }
 }
 
@@ -99,81 +121,40 @@ impl FilterTweetsEndpoint {
             )
         });
 
-        let country_code = req.country_code.filter(|code| !code.is_empty());
-        let client_capability = ClientCapability {
-            soft_nsfw_new_user_drop: impresses_soft_nsfw_new_user(safety_level)
-                && self
-                    .client_switches
-                    .soft_nsfw_new_user_drop(viewer_id, country_code.as_deref()),
-            ..ClientCapability::default()
-        };
-        let response = context
-            .scope(self.post_evaluator.run(PostBatch {
-                viewer_id,
-                country_code,
-                client_capability,
-                safety_level,
-                candidates,
-                rpc: Rpc::FilterTweets,
-            }))
-            .await;
+        let request = filter_tweets_request(
+            &self.client_switches,
+            viewer_id,
+            req.country_code,
+            safety_level,
+            candidates,
+        );
+        let outcomes = context.scope(self.post_evaluator.run(request)).await;
         ft_metrics::record_verdicts(
             Rpc::FilterTweets,
             safety_level,
-            response
-                .outcomes
-                .iter()
-                .map(|outcome| outcome.evaluation.verdict()),
+            outcomes.iter().map(|outcome| outcome.evaluation.verdict()),
         );
         ft_metrics::record_unresolved(
             Rpc::FilterTweets,
             safety_level,
-            response.outcomes.iter().map(|outcome| &outcome.evaluation),
+            outcomes.iter().map(|outcome| &outcome.evaluation),
         );
         ft_metrics::record_fail_open_defaults(
             Rpc::FilterTweets,
             safety_level,
-            response
-                .outcomes
+            outcomes
                 .iter()
                 .map(|outcome| outcome.evaluation.fail_open_defaults()),
         );
 
         if let Some(finish_comparison) = finish_comparison {
-            finish_comparison(&response.outcomes);
+            finish_comparison(&outcomes);
         }
 
-        let results = response
-            .outcomes
-            .into_iter()
-            .map(to_visibility_result)
-            .collect();
+        let results = outcomes.into_iter().map(to_visibility_result).collect();
 
         Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
     }
-}
-
-pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
-    raw.filter(|&id| id.cast_signed() > 0)
-}
-
-pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
-    let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
-    let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
-    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let value: u64 = digits.parse().ok()?;
-    let nanos_per_unit = match unit {
-        "H" => 3_600_000_000_000,
-        "M" => 60_000_000_000,
-        "S" => 1_000_000_000,
-        "m" => 1_000_000,
-        "u" => 1_000,
-        "n" => 1,
-        _ => return None,
-    };
-    Some(Duration::from_nanos(value.checked_mul(nanos_per_unit)?))
 }
 
 fn to_visibility_result(outcome: PostEvaluation) -> vf_pb::TweetVisibilityResult {
@@ -182,7 +163,7 @@ fn to_visibility_result(outcome: PostEvaluation) -> vf_pb::TweetVisibilityResult
         tweet_id: outcome.tweet_id.0,
         action: Some(action),
         filtered_reason,
-        safety_labels: outcome.safety_labels,
+        safety_labels: outcome.safety_labels.map(Arc::unwrap_or_clone),
     }
 }
 
@@ -343,27 +324,5 @@ mod tests {
             .into_inner()
             .results;
         assert_eq!(*finished.lock().unwrap(), vec![served]);
-    }
-
-    #[test]
-    fn parse_grpc_timeout_units_and_garbage() {
-        let parsed = |value: &str| {
-            let mut metadata = MetadataMap::new();
-            metadata.insert("grpc-timeout", value.parse().unwrap());
-            parse_grpc_timeout(&metadata)
-        };
-        assert_eq!(parsed("400m"), Some(Duration::from_millis(400)));
-        assert_eq!(parsed("1S"), Some(Duration::from_secs(1)));
-        assert_eq!(parsed("2M"), Some(Duration::from_secs(120)));
-        assert_eq!(parsed("500u"), Some(Duration::from_micros(500)));
-        assert_eq!(parsed("3H"), Some(Duration::from_secs(10_800)));
-        assert_eq!(parsed("9n"), Some(Duration::from_nanos(9)));
-        assert_eq!(parsed("400"), None);
-        assert_eq!(parsed("m"), None);
-        assert_eq!(parsed("400x"), None);
-        assert_eq!(parsed("+400m"), None);
-        assert_eq!(parsed("12345678m"), Some(Duration::from_millis(12_345_678)));
-        assert_eq!(parsed("123456789m"), None);
-        assert_eq!(parse_grpc_timeout(&MetadataMap::new()), None);
     }
 }

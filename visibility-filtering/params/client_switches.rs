@@ -69,12 +69,18 @@ impl ClientSwitches {
 
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with(&[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with(yamls: &[&str]) -> Self {
         const SCALA_RULES_COPY: &str =
             include_str!("../../tests/fixtures/scala_client_switches.yml");
         const SCALA_POLICY_COPY: &str =
             include_str!("../../tests/fixtures/limited_actions_policy.yml");
         let features = [SCALA_RULES_COPY, SCALA_POLICY_COPY]
-            .into_iter()
+            .iter()
+            .chain(yamls)
             .flat_map(|yaml| xai_feature_switches::load_yaml_string(yaml).unwrap())
             .collect();
         Self::new(Arc::new(ArcSwap::from_pointee(

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets, StatsReceiverExt};
 
 use crate::caller_identity::{self, Endpoint};
-use crate::filter_tweets::parse_grpc_timeout;
 use crate::hydration::{Cause, Hydrators, Lookup, INBOUND_ALLOWANCE};
 use crate::models::{Evaluation, Verdict};
 use crate::rules::SafetyLevel;
@@ -262,6 +262,25 @@ where
     result
 }
 
+fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
+    let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    let nanos_per_unit = match unit {
+        "H" => 3_600_000_000_000,
+        "M" => 60_000_000_000,
+        "S" => 1_000_000_000,
+        "m" => 1_000_000,
+        "u" => 1_000,
+        "n" => 1,
+        _ => return None,
+    };
+    Some(Duration::from_nanos(value.checked_mul(nanos_per_unit)?))
+}
+
 struct RequestMetricsGuard {
     endpoint: Endpoint,
     caller_identity: Option<String>,
@@ -451,6 +470,7 @@ mod tests {
         MediaRestriction, Withholding,
     };
     use crate::quote::QUOTE_PASS;
+    use crate::rules::RuleId;
     use std::fs;
     use std::path::Path;
     use xai_visibility_filtering::models::FilteredReason;
@@ -468,6 +488,7 @@ mod tests {
     fn drop_by(rule: &'static str) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            id: RuleId::FilterAll,
             by: rule,
         })
     }
@@ -475,6 +496,7 @@ mod tests {
     fn limit_by(rule: &'static str) -> Decided<LimitedEngagement> {
         Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+            id: RuleId::FilterAll,
             by: rule,
         }
     }
@@ -682,6 +704,7 @@ mod tests {
                     reason: InterstitialReason::Sensitive(true),
                     prompt: None,
                 }),
+                id: RuleId::FilterAll,
                 by: "nsfw_media",
             }),
             engagement: Some(limit_by("conversation_control")),
@@ -710,5 +733,27 @@ mod tests {
                 .get(&("conversation_control", "limited_engagement")),
             Some(&2)
         );
+    }
+
+    #[test]
+    fn parse_grpc_timeout_units_and_garbage() {
+        let parsed = |value: &str| {
+            let mut metadata = MetadataMap::new();
+            metadata.insert("grpc-timeout", value.parse().unwrap());
+            parse_grpc_timeout(&metadata)
+        };
+        assert_eq!(parsed("400m"), Some(Duration::from_millis(400)));
+        assert_eq!(parsed("1S"), Some(Duration::from_secs(1)));
+        assert_eq!(parsed("2M"), Some(Duration::from_secs(120)));
+        assert_eq!(parsed("500u"), Some(Duration::from_micros(500)));
+        assert_eq!(parsed("3H"), Some(Duration::from_secs(10_800)));
+        assert_eq!(parsed("9n"), Some(Duration::from_nanos(9)));
+        assert_eq!(parsed("400"), None);
+        assert_eq!(parsed("m"), None);
+        assert_eq!(parsed("400x"), None);
+        assert_eq!(parsed("+400m"), None);
+        assert_eq!(parsed("12345678m"), Some(Duration::from_millis(12_345_678)));
+        assert_eq!(parsed("123456789m"), None);
+        assert_eq!(parse_grpc_timeout(&MetadataMap::new()), None);
     }
 }

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-19T16:00:41Z
+// mirrored from config feature-switch defaults; last sync 2026-10-20T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -276,6 +276,13 @@ param!(
     bool,
     "rust_home_mixer_phoenix_retrieval_exclude_seen_posts",
     false
+);
+
+param!(
+    RetrievalValueModelWeights,
+    String,
+    "rust_home_mixer_retrieval_value_model_weights",
+    ""
 );
 
 param!(
@@ -1141,6 +1148,12 @@ param!(
     0.72
 );
 param!(
+    EnableVideoCarouselCandidatesLogging,
+    bool,
+    "rust_home_mixer_enable_video_carousel_candidates_logging",
+    false
+);
+param!(
     VideoCarouselVideoOpenWeight,
     f64,
     "rust_home_mixer_video_carousel_video_open_weight",
@@ -1177,4 +1190,10 @@ param!(
     u32,
     "rust_home_mixer_phoenix_scores_result_size",
     2800
+);
+param!(
+    EnableFairShareRanking,
+    bool,
+    "rust_home_mixer_enable_fair_share_ranking",
+    false
 );

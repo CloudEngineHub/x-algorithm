@@ -158,7 +158,7 @@ fn is_vertical(candidate: &PostCandidate) -> bool {
         .is_some_and(|ratio| ratio < MAX_VERTICAL_ASPECT_RATIO)
 }
 
-fn carousel_score(
+pub(crate) fn carousel_score(
     candidate: &PostCandidate,
     video_open_weight: f64,
     immersive_vqv_weight: f64,

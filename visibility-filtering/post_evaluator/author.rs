@@ -1,7 +1,7 @@
 use super::{PostBatch, PostEvaluator};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::{Cause, HydratedTweet, Hydrators, Lookup, Unresolved};
-use crate::models::{Evaluation, EvaluationKey, UserCandidate};
+use crate::models::{Evaluation, EvaluationKey};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -40,43 +40,35 @@ impl PostEvaluator {
             .candidates
             .iter()
             .filter_map(|placed| {
-                let post = match hydration.tweet(placed.tweet_id())? {
-                    HydratedTweet::Resolved { candidate, .. } => candidate,
-                    HydratedTweet::Unresolved {
-                        reason:
-                            Unresolved {
-                                lookup,
-                                cause: Cause::Failed,
-                            },
-                        ..
-                    } => {
-                        return Some((
-                            placed.key(),
-                            UserEvaluation {
-                                evaluation: Evaluation::Failed(*lookup),
-                                failed: Hydrators::empty(),
-                            },
-                        ));
-                    }
-                    HydratedTweet::Unresolved { .. } => return None,
-                };
-                let quoted = hydration.quoted(placed.tweet_id(), placed.placement);
-                let author = UserCandidate {
-                    user: post.author.clone(),
-                    viewer_relationship: post.viewer_relationship,
-                    failed: post.failed.union(quoted.failed),
-                };
-                let evaluation = match &admitted {
-                    Some(admitted) => admitted.evaluate(&author, placed.placement, quoted.facts),
-                    None => Evaluation::Failed(Lookup::Tweet),
-                };
-                Some((
-                    placed.key(),
-                    UserEvaluation {
-                        evaluation,
-                        failed: author.failed,
+                let evaluation = match (hydration.tweet(placed.tweet_id())?, &admitted) {
+                    (
+                        HydratedTweet::Unresolved {
+                            reason:
+                                Unresolved {
+                                    lookup,
+                                    cause: Cause::Failed,
+                                },
+                            ..
+                        },
+                        _,
+                    ) => UserEvaluation {
+                        evaluation: Evaluation::Failed(*lookup),
+                        failed: Hydrators::empty(),
                     },
-                ))
+                    (HydratedTweet::Unresolved { .. }, _) => return None,
+                    (HydratedTweet::Resolved { .. }, None) => UserEvaluation {
+                        evaluation: Evaluation::Failed(Lookup::Tweet),
+                        failed: Hydrators::empty(),
+                    },
+                    (HydratedTweet::Resolved { .. }, Some(admitted)) => {
+                        let author = admitted.post(placed.tweet_id(), placed.placement)?;
+                        UserEvaluation {
+                            evaluation: author.evaluate(),
+                            failed: author.user_candidate().failed,
+                        }
+                    }
+                };
+                Some((placed.key(), evaluation))
             })
             .collect()
     }
@@ -218,20 +210,22 @@ mod tests {
                 candidates: vec![quoted(1, 8), quoted(2, 9)],
                 rpc: Rpc::EvaluateTweets,
             })
-            .await
-            .into_iter()
-            .map(|(key, author)| (key, author.evaluation))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(authors[&quoted(1, 8).key()], Evaluation::complete(allow()));
-        assert!(
-            matches!(
-                &authors[&quoted(2, 9).key()],
-                Evaluation::Partial { verdict, fail_open_defaults }
-                    if *verdict == allow()
-                        && *fail_open_defaults == Hydrators::of(Hydrator::AuthorBlocksOuterAuthor)
-            ),
-            "{:?}",
-            authors[&quoted(2, 9).key()]
+            .await;
+        assert_eq!(
+            authors[&quoted(1, 8).key()].evaluation,
+            Evaluation::complete(allow())
+        );
+        let pair_nodes = Hydrators::of(Hydrator::AuthorBlocksOuterAuthor)
+            .with(Hydrator::OuterAuthorFollowsAuthor);
+        assert_eq!(
+            authors[&quoted(2, 9).key()],
+            UserEvaluation {
+                evaluation: Evaluation::Partial {
+                    verdict: allow(),
+                    fail_open_defaults: Hydrators::of(Hydrator::AuthorBlocksOuterAuthor),
+                },
+                failed: pair_nodes,
+            }
         );
     }
 }

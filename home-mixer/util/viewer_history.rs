@@ -8,6 +8,7 @@ const COL_AUTHOR_ID: &str = "authorId";
 const COL_ACTION_NAME_MULTI_HOT: &str = "actionNameMultiHot";
 const COL_IMPRESSED_TIME_MS: &str = "impressedTimeMs";
 const COL_SEMANTIC_ID: &str = "semanticId";
+const COL_POST_LANGUAGE_CODE: &str = "postLanguageCode";
 
 const POSITIVE_ENGAGEMENTS: [ActionName; 18] = [
     ActionName::ServerTweetFav,
@@ -66,6 +67,7 @@ pub fn engaged_history_topics(
         StreamReader::try_new(std::io::Cursor::new(columnar_sequence.as_ref()), None).ok()?;
     let mut l1_counts: HashMap<u32, u32> = HashMap::new();
     let mut l2_counts: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut language_counts: HashMap<i32, u32> = HashMap::new();
     let mut engaged_rows = 0;
     let mut sid_rows = 0;
     let mut oldest_row_ms: Option<i64> = None;
@@ -86,6 +88,9 @@ pub fn engaged_history_topics(
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
         let sid_values = sids.and_then(|s| s.values().as_any().downcast_ref::<Int32Array>());
         let sid_width = sids.map_or(0, |s| s.value_length() as usize);
+        let languages = batch
+            .column_by_name(COL_POST_LANGUAGE_CODE)
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
         for row in 0..batch.num_rows() {
             if impressed_ms.is_null(row) || impressed_ms.value(row) <= 0 {
                 continue;
@@ -96,6 +101,12 @@ pub fn engaged_history_topics(
                 continue;
             }
             engaged_rows += 1;
+            if let Some(languages) = languages
+                && languages.is_valid(row)
+                && languages.value(row) > 0
+            {
+                *language_counts.entry(languages.value(row)).or_default() += 1;
+            }
             let (Some(sids), Some(values)) = (sids, sid_values) else {
                 continue;
             };
@@ -123,6 +134,7 @@ pub fn engaged_history_topics(
         engaged_rows,
         sid_rows,
         oldest_row_ms,
+        language_counts,
     })
 }
 

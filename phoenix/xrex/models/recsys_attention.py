@@ -264,11 +264,11 @@ class CutedslRankerVarlenAttention(CustomAttention):
         cap = self.config.attn_logit_cap if has_cap else -1.0
         cap_method = self.config.attn_logit_cap_method
 
+        from xrex.cutedsl.ranker_attention_varlen_candidate_packed_fa4 import (
+            ranker_attention_varlen_candidate_packed_fa4,
+        )
         from xrex.cutedsl.ranker_attention_varlen_fa4 import (
             ranker_attention_varlen_fa4,
-        )
-        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
-            ranker_candidate_attention_fa4,
         )
 
         def sharded_mha(
@@ -313,13 +313,12 @@ class CutedslRankerVarlenAttention(CustomAttention):
             )
             if candidate_region_args:
                 assert cap <= 0, (
-                    "attn_logit_cap is not wired into the compact candidate layout "
-                    "(ranker_candidate_attention_fa4); use the regular packed layout"
+                    "attn_logit_cap is not supported with seqpack_candidate_packing=True"
                 )
                 candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
                     candidate_region_args
                 )
-                attn_out = ranker_candidate_attention_fa4(
+                attn_out = ranker_attention_varlen_candidate_packed_fa4(
                     q,
                     k,
                     v,

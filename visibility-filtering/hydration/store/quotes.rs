@@ -1,4 +1,4 @@
-use super::RequestTweet;
+use super::RequestRow;
 use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery};
 use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
 use crate::hydration::decode::author::DecodedAuthor;
@@ -27,7 +27,7 @@ pub(super) struct Quotes {
 }
 
 pub(super) struct Pairing<'s> {
-    request_tweets: &'s [RequestTweet],
+    rows: &'s [RequestRow],
     pure_cores: &'s Fetcher<PureCore>,
     authors: &'s Fetcher<DecodedAuthor>,
     author_by_tweet: OnceCell<FxHashMap<TweetId, Option<AuthorId>>>,
@@ -35,12 +35,12 @@ pub(super) struct Pairing<'s> {
 
 impl<'s> Pairing<'s> {
     pub(super) fn new(
-        request_tweets: &'s [RequestTweet],
+        rows: &'s [RequestRow],
         pure_cores: &'s Fetcher<PureCore>,
         authors: &'s Fetcher<DecodedAuthor>,
     ) -> Self {
         Self {
-            request_tweets,
+            rows,
             pure_cores,
             authors,
             author_by_tweet: OnceCell::new(),
@@ -50,10 +50,10 @@ impl<'s> Pairing<'s> {
     fn quoted_author(&self, inner: TweetId) -> Option<AuthorId> {
         let author_by_tweet = self.author_by_tweet.get_or_init(|| {
             let mut author_by_tweet = FxHashMap::default();
-            for request_tweet in self.request_tweets {
-                author_by_tweet
-                    .entry(request_tweet.tweet_id)
-                    .or_insert(request_tweet.author);
+            for row in self.rows {
+                if let Some(tweet_id) = row.tweet_id() {
+                    author_by_tweet.entry(tweet_id).or_insert(row.author);
+                }
             }
             author_by_tweet
         });
@@ -119,16 +119,12 @@ impl Quotes {
         &self.outers_to_fetch
     }
 
-    pub(super) fn join_outers(&mut self, request_tweets: &[RequestTweet]) {
+    pub(super) fn join_outers(&mut self, rows: &[RequestRow]) {
         let mut outers: Vec<TweetId> = self
             .entries
             .iter()
             .map(|quote| quote.outer)
-            .filter(|&outer| {
-                !request_tweets
-                    .iter()
-                    .any(|request_tweet| request_tweet.tweet_id == outer)
-            })
+            .filter(|&outer| !rows.iter().any(|row| row.tweet_id() == Some(outer)))
             .collect();
         outers.sort_unstable();
         outers.dedup();

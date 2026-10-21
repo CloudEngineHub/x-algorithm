@@ -454,7 +454,7 @@ fn record_stored_scores(outcome: &str) {
     }
 }
 
-fn insert_cluster_scores(
+pub(crate) fn insert_cluster_scores(
     prediction_scores: &mut HashMap<String, f64>,
     cluster_name: &str,
     s: &PhoenixScores,
@@ -495,7 +495,7 @@ fn insert_cluster_scores(
     }
 }
 
-fn build_logged_scored_candidate(
+pub(crate) fn build_logged_scored_candidate(
     candidate: &PostCandidate,
     user_id: u64,
     request_id: u64,
@@ -525,6 +525,7 @@ fn build_logged_scored_candidate(
             .as_deref()
             .map(|lc| language_code_string_to_enum(lc) as i32),
         video_duration_ms: candidate.min_video_duration_ms,
+        carousel_position: None,
     }
 }
 

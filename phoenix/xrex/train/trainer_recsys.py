@@ -382,8 +382,8 @@ class RecsysTrainer(Trainer):
 
     seqpack_empty_history_min_slot: bool = False
     seqpack_fixed_length: bool = False
-    seqpack_drop_empty_candidates: bool = False
-    seqpack_candidate_tokens_per_user: list[int] = field(default_factory=lambda: [32, 128])
+    seqpack_candidate_packing: bool = False
+    seqpack_candidate_count: list[int] = field(default_factory=list)
 
     use_async_emb: bool = False
 
@@ -426,6 +426,7 @@ class RecsysTrainer(Trainer):
     )
     _post_table_ids_generation: int | None = field(default=None, init=False, repr=False)
     _post_table_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
+    _eval_lookup_jit: typing.Any = field(default=None, init=False, repr=False)
     dense_params_ema_decay: float = 0.0
     dense_params_ema_in_checkpoint: bool = False
     _dense_params_ema: typing.Any = field(default=None, init=False, repr=False)
@@ -534,15 +535,11 @@ class RecsysTrainer(Trainer):
     def _history_mean_len(self, candidate_tokens_per_user: int) -> int:
         assert self.seqpack_distribution is not None
         return self.seqpack_distribution.mean_len - (
-            candidate_tokens_per_user - self.seqpack_candidate_tokens_per_user[0]
+            candidate_tokens_per_user - self.seqpack_candidate_count[0]
         )
 
-    @property
-    def _candidate_region_sizes(self) -> list[int]:
-        return self.seqpack_candidate_tokens_per_user if self.seqpack_drop_empty_candidates else []
-
     def _history_lookup_len(self, hashes_per_token: int) -> int | None:
-        if not self.seqpack_drop_empty_candidates:
+        if not self.seqpack_candidate_packing:
             return None
         assert self.seqpack_distribution is not None
         return self.seqpack_distribution.mean_len * hashes_per_token
@@ -552,9 +549,10 @@ class RecsysTrainer(Trainer):
     ) -> int | None:
         from jax._src.distributed import global_state as jax_distributed
 
-        sizes = self._candidate_region_sizes
-        if len(sizes) < 2:
-            return sizes[0] if sizes else None
+        if not self.seqpack_candidate_packing:
+            return None
+        if len(self.seqpack_candidate_count) == 1:
+            return self.seqpack_candidate_count[0]
         num_devices = self.parallel_config.num_devices_per_process
         needed = max(candidate_tokens_per_user_needed(b, num_devices) for b in microbatches)
         needed = max_over_processes(
@@ -565,7 +563,10 @@ class RecsysTrainer(Trainer):
             _CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS,
         )
         self._candidate_size_round += 1
-        return next((size for size in sizes if size >= needed), sizes[-1])
+        return next(
+            (size for size in self.seqpack_candidate_count if size >= needed),
+            self.seqpack_candidate_count[-1],
+        )
 
     def _pack_batch(
         self,
@@ -577,10 +578,8 @@ class RecsysTrainer(Trainer):
             self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
         )
         dist = self.seqpack_distribution
-        if self.seqpack_drop_empty_candidates:
-            candidate_tokens_per_user = (
-                candidate_tokens_per_user or self.seqpack_candidate_tokens_per_user[0]
-            )
+        if self.seqpack_candidate_packing:
+            candidate_tokens_per_user = candidate_tokens_per_user or self.seqpack_candidate_count[0]
             assert dist is not None
             dist = replace(dist, mean_len=self._history_mean_len(candidate_tokens_per_user))
         batch = pack_batch(
@@ -1968,7 +1967,7 @@ class RecsysTrainer(Trainer):
         new_rce_ema = stats.pop("_rce_ema", state.rce_ema)
         new_calib_ema = stats.pop("_calib_ema", state.calib_ema)
         metrics.update(**stats)
-        if self.seqpack_drop_empty_candidates:
+        if self.seqpack_candidate_packing:
             metrics.update(self._candidate_region_metrics(data, grad_update_done_pin))
         metrics["offset_zero_values"] = jnp.sum(state.offset_values == 0)
         metrics = jax.tree.map(lambda x: x.astype(jnp.float32), metrics)
@@ -2013,7 +2012,7 @@ class RecsysTrainer(Trainer):
         assert self._batch_pipeline.reserve is not None
         try:
             if self._async_emb_lookup_pin is None:
-                if len(self._candidate_region_sizes) > 1:
+                if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:
                     self._reserve_small_buffer_region()
                 state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(
                     state, self._lookup_hash_fields(data)
@@ -2101,7 +2100,7 @@ class RecsysTrainer(Trainer):
         }
 
     def _candidate_region_len(self, data: tuple[RecsysFeaturesBatch, ...]) -> int:
-        if not self.seqpack_drop_empty_candidates:
+        if not self.seqpack_candidate_packing:
             return 0
         layout = data[0]["packing_layout"]
         assert layout is not None and layout.candidate_token_to_slot is not None
@@ -2282,10 +2281,10 @@ class RecsysTrainer(Trainer):
             compiler_options=compiler_options,
         )
 
-        sizes = self._candidate_region_sizes
+        sizes = self.seqpack_candidate_count if self.seqpack_candidate_packing else []
         if sizes and sizes[-1] <= self._total_candidate_seq_len():
             rank_logger.warning(
-                "seqpack_candidate_tokens_per_user ends at %d, not above the %d candidate slots, so "
+                "seqpack_candidate_count ends at %d, not above the %d candidate slots, so "
                 "batches whose users fill nearly every slot drop candidates "
                 "(train/seqpack_dropped_candidate_slots)",
                 sizes[-1],
@@ -2358,29 +2357,41 @@ class RecsysTrainer(Trainer):
                 raise ValueError(
                     "num_microbatch > 1 does not support empty_history_augmentation_rate"
                 )
-        if self.seqpack_drop_empty_candidates:
-            sizes = self.seqpack_candidate_tokens_per_user
-            if not (isinstance(self.model_config, RecsysAggregatedModelConfig) and self.using_fa4):
+        if self.seqpack_candidate_packing:
+            if not isinstance(self.model_config, RecsysAggregatedModelConfig):
+                raise ValueError("seqpack_candidate_packing supports only the ranker")
+            if not self.using_seqpack:
+                raise ValueError("seqpack_candidate_packing requires use_seqpack=True")
+            if not self.using_fa4:
                 raise ValueError(
-                    "seqpack_drop_empty_candidates needs a seqpack ranker on "
-                    "cutedsl_ranker_varlen_attn"
+                    "seqpack_candidate_packing requires attn_impl=cutedsl_ranker_varlen_attn"
                 )
+            attn_config = self.model_config.model_config.attn_config
+            assert attn_config is not None
+            if attn_config.attn_logit_cap > 0 and attn_config.attn_logit_cap_method != "none":
+                raise ValueError("seqpack_candidate_packing does not support attn_logit_cap")
             if self.seqpack_distribution is None:
-                raise ValueError("seqpack_drop_empty_candidates needs seqpack_distribution")
-            if not sizes or list(sizes) != sorted(set(sizes)):
+                raise ValueError("seqpack_candidate_packing requires seqpack_distribution")
+            if not self.seqpack_candidate_count:
+                raise ValueError("seqpack_candidate_packing requires seqpack_candidate_count")
+            if list(self.seqpack_candidate_count) != sorted(set(self.seqpack_candidate_count)):
                 raise ValueError(
-                    f"seqpack_candidate_tokens_per_user must be ascending and unique: {sizes}"
+                    "seqpack_candidate_count must be ascending and unique: "
+                    f"{self.seqpack_candidate_count}"
                 )
             if not self.use_async_emb:
-                raise ValueError("seqpack_drop_empty_candidates needs use_async_emb=True")
+                raise ValueError("seqpack_candidate_packing requires use_async_emb=True")
             users_per_microbatch = int(self.bs_per_device) // self.num_microbatch
-            if any(users_per_microbatch * size % PACK_BLOCK_SIZE for size in sizes):
+            if any(
+                users_per_microbatch * size % PACK_BLOCK_SIZE
+                for size in self.seqpack_candidate_count
+            ):
                 raise ValueError(
-                    f"every seqpack_candidate_tokens_per_user times the {users_per_microbatch} "
+                    f"every seqpack_candidate_count times the {users_per_microbatch} "
                     f"users per device and microbatch must be a multiple of {PACK_BLOCK_SIZE}: "
-                    f"{sizes}"
+                    f"{self.seqpack_candidate_count}"
                 )
-            shortest_mean_history = self._history_mean_len(sizes[-1])
+            shortest_mean_history = self._history_mean_len(self.seqpack_candidate_count[-1])
             if shortest_mean_history < self.seqpack_distribution.min_len:
                 raise ValueError(
                     f"the largest candidate size leaves a mean history of {shortest_mean_history} "
@@ -2393,8 +2404,8 @@ class RecsysTrainer(Trainer):
         ):
             if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):
                 raise ValueError("page_rl needs a dataset with page_records=True")
-            if self.seqpack_drop_empty_candidates:
-                raise ValueError("page_rl does not support seqpack_drop_empty_candidates")
+            if self.seqpack_candidate_packing:
+                raise ValueError("page_rl does not support seqpack_candidate_packing")
 
         self._init_shmem_write_pool()
         self._free_ports()
@@ -4046,11 +4057,31 @@ class RecsysTrainer(Trainer):
     def maybe_build_gen_recs_post_embeddings(self) -> None:
         pass
 
+    def _eval_embeddings_fn(
+        self,
+    ) -> typing.Callable[[RecsysFeaturesBatch], RecsysEmbeddingsParameter]:
+        if self._eval_lookup_jit is None:
+            embedding_param = replace(self.state.emb_table, x=None)
+
+            def lookup(table, batch):
+                return self.get_recsys_embeddings(batch, replace(embedding_param, x=table))
+
+            self._eval_lookup_jit = jax.jit(lookup, out_shardings=self.data_sharding)
+        last: list[typing.Any] = []
+
+        def embeddings(batch: RecsysFeaturesBatch) -> RecsysEmbeddingsParameter:
+            if not last or last[0] is not batch:
+                last[:] = [batch, self._eval_lookup_jit(self.state.emb_table.x, batch)]
+            return last[1]
+
+        return embeddings
+
     def eval_two_tower(self, soft_step: int):
         assert isinstance(self.state, RecsysTrainingState)
         assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         rank_logger.info("Running evals at %s", soft_step)
         rng, _new_rng = jax.random.split(self.state.rng)
+        eval_embeddings = self._eval_embeddings_fn()
 
         def _two_tower_eval_forward_fn(
             query_head_weights,
@@ -4061,14 +4092,7 @@ class RecsysTrainer(Trainer):
             target_dataset_types,
             eval_bs_per_device=0,
         ):
-            recsys_embeddings_parameter = self.get_recsys_embeddings(
-                batch,
-                self.state.emb_table,
-            )
-            recsys_embeddings = get_recsys_embed_param_to_jax_array(recsys_embeddings_parameter)
-            recsys_embeddings = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings
-            )
+            recsys_embeddings = get_recsys_embed_param_to_jax_array(eval_embeddings(batch))
             return self.two_tower_forward_jit(
                 self.state.params,
                 rng,
@@ -4119,21 +4143,10 @@ class RecsysTrainer(Trainer):
         _candidate_tower_eval_forward_fn = _make_candidate_tower_eval_fn(0)
 
         def _loss_fn(batch: RecsysFeaturesBatch):
-            recsys_embeddings_param: RecsysEmbeddingsParameter = self.get_recsys_embeddings(
-                batch,
-                self.state.emb_table,
-            )
-            recsys_embeddings_param = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings_param
-            )
-            return self.loss_fn_eval_jit(self.state.params, rng, batch, recsys_embeddings_param)
+            return self.loss_fn_eval_jit(self.state.params, rng, batch, eval_embeddings(batch))
 
         def _user_emb_fn(batch: RecsysFeaturesBatch):
-            recsys_embeddings_param = self.get_recsys_embeddings(batch, self.state.emb_table)
-            recsys_embeddings_param = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, self.data_sharding), recsys_embeddings_param
-            )
-            return self.user_forward_jit(self.state.params, rng, batch, recsys_embeddings_param)
+            return self.user_forward_jit(self.state.params, rng, batch, eval_embeddings(batch))
 
         all_eval_metrics = {}
         if self.state.post_embeddings is None or self.state.post_embeddings.post_ids is None:

@@ -4,10 +4,11 @@ use crate::params::{
     EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,
     PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
     PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
-    PhoenixXdsRetrievalMaxRetries,
+    PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,
 };
 use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
+    retrieval_value_model_weights,
 };
 use std::sync::Arc;
 use tonic::async_trait;
@@ -134,6 +135,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 vec![],
                 Self::seen_post_exclusions(query),
+                retrieval_value_model_weights(&query.params.get(RetrievalValueModelWeights)),
             )
             .await
             .map_err(|e| format!("PhoenixSource: {e}"))?;

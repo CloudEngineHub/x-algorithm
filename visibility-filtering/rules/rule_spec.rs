@@ -112,6 +112,9 @@ pub(crate) enum RuleId {
     CommunityTweetViewerRemoved,
     LocalTweet,
     ReadOnlyViewer,
+
+    NotFound,
+    LookupFailed,
 }
 
 pub(super) mod conditions;
@@ -134,6 +137,7 @@ pub use features::{
 pub use predicates::Predicate;
 pub(in crate::rules) use predicates::*;
 
+#[cfg(test)]
 impl RuleId {
     pub(crate) fn of_rule_name(name: &str) -> Option<Self> {
         name.split('/').next()?.parse().ok()

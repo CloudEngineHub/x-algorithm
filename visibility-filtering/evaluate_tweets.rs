@@ -1,10 +1,9 @@
 use crate::caller_identity::Endpoint;
-use crate::filter_tweets::normalize_viewer_id;
 use crate::metrics::{self as ft_metrics, Rpc};
 use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId, Verdict};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
-use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
+use crate::post_evaluator::{normalize_viewer_id, PostBatch, PostEvaluation, PostEvaluator};
 use crate::quote::{Passes, QuotePassMode, QuotePassRunner};
 use crate::result_label::{label, state_label, Class, Label, NONE};
 use crate::rules::{QuoteEntries, SafetyLevel};
@@ -318,6 +317,7 @@ mod tests {
     use crate::models::{TweetFeatures, VerifyBlurSupport};
     use crate::retweet;
     use crate::rules::RuleEngine;
+    use crate::rules::RuleId;
     use std::collections::HashMap;
     use xai_core_entities::entities::{
         GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
@@ -839,10 +839,7 @@ mod tests {
                 rpc,
             };
             let counted = [
-                post_evaluator
-                    .run(request(Rpc::FilterTweets))
-                    .await
-                    .outcomes,
+                post_evaluator.run(request(Rpc::FilterTweets)).await,
                 retweet::evaluate_merging_sources(&post_evaluator, request(Rpc::EvaluateTweets))
                     .await,
             ];
@@ -917,10 +914,12 @@ mod tests {
             notice: None,
             media: Some(Decided {
                 value: MediaRestriction::NsfwInterstitial,
+                id: RuleId::FilterAll,
                 by: "nsfw_rule",
             }),
             engagement: Some(Decided {
                 value: LimitedEngagement::new(ConversationControl),
+                id: RuleId::FilterAll,
                 by: "rule",
             }),
         };

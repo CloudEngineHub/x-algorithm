@@ -294,6 +294,8 @@ message RetrieveTopKCandidatesRequest {
   repeated ExcludedPostsBloomFilter excluded_posts_bloom_filters = 15;
 
   repeated uint64 excluded_post_ids = 16;
+
+  map<string, float> value_model_weights = 17;
 }
 
 message ExcludedPostsBloomFilter {

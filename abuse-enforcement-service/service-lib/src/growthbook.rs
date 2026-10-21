@@ -134,6 +134,39 @@ impl DynamicConfig {
         Ok(dc)
     }
 
+    pub fn from_static(
+        config: Value,
+        dry_run_default: bool,
+        max_user_enforcements_default: u32,
+        max_post_enforcements_default: u32,
+        sliding_user: Option<SlidingWindowLimiter>,
+        sliding_post: Option<SlidingWindowLimiter>,
+    ) -> Self {
+        Self {
+            client: None,
+            snapshot: Arc::new(RwLock::new(Arc::new(ConfigSnapshot {
+                config: Some(config),
+                rules_user: None,
+                rules_post: None,
+            }))),
+            dry_run_default,
+            user_cap: EntityCap {
+                sliding: sliding_user,
+                default_max: max_user_enforcements_default,
+                gb_keys: &[MAX_USER_ENFORCEMENTS_KEY, MAX_ENFORCEMENTS_KEY],
+            },
+            post_cap: EntityCap {
+                sliding: sliding_post,
+                default_max: max_post_enforcements_default,
+                gb_keys: &[MAX_POST_ENFORCEMENTS_KEY],
+            },
+        }
+    }
+
+    pub fn reads_growthbook(&self) -> bool {
+        self.client.is_some()
+    }
+
     pub fn refresh(&self) {
         let Some(client) = self.client.as_ref() else {
             return;
@@ -245,10 +278,6 @@ impl DynamicConfig {
 
     pub fn action_control_config(&self) -> crate::action_control::ControlConfig {
         crate::action_control::ControlConfig::from_config(self.snapshot().config.as_ref())
-    }
-
-    pub fn backfill_config(&self) -> crate::backfill::BackfillConfig {
-        crate::backfill::BackfillConfig::from_config(self.snapshot().config.as_ref())
     }
 
     pub fn confidence_config(&self) -> crate::confidence::ConfidenceConfig {

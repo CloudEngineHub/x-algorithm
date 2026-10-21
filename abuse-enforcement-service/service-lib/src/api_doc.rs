@@ -75,6 +75,8 @@ pub struct AllowlistDeleteResponse {
         service::handle_backfill_run_get,
         service::handle_backfill_run_start,
         service::handle_backfill_run_change,
+        service::handle_backfill_settings_get,
+        service::handle_backfill_settings_put,
     ),
     components(schemas(
         xai_abuse_enforcement_types::action_control::ActionControlRecord,
@@ -118,6 +120,10 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::backfill::RunSource,
         xai_abuse_enforcement_types::backfill::PausedReason,
         xai_abuse_enforcement_types::backfill::RunTransition,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsRecord,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsChange,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsRequest,
+        xai_abuse_enforcement_types::backfill::BackfillSettingsResponse,
         ApiError,
         DryRunStatus,
         RateLimitStats,
@@ -180,6 +186,8 @@ mod tests {
         ("/backfill_runs/budget", "get", true),
         ("/backfill_runs/{run_id}", "get", true),
         ("/backfill_runs/{run_id}/{change}", "post", true),
+        ("/backfill_settings", "get", true),
+        ("/backfill_settings", "put", true),
     ];
 
     #[test]

@@ -27,34 +27,51 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
     from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 
-    if arch != 90:
-        raise NotImplementedError("ranker candidate attention: only SM90 (H100) is supported")
-    from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90
-    from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+    if arch not in (90, 100):
+        raise NotImplementedError(
+            "ranker candidate attention: only SM90 (H100) and SM100 (GB200/GB300) are supported"
+        )
 
     qpk = num_q_heads // num_kv_heads
     tile_n = 128
-    bwd_tile_m = 64
+    bwd_tile_m = 64 if arch == 90 else 128
     hdr = ((head_dim + 31) // 32) * 32
     total_q_padded = (total_q + num_seqs * bwd_tile_m + bwd_tile_m - 1) // bwd_tile_m * bwd_tile_m
     total_k_padded = (total_k + num_seqs * tile_n + tile_n - 1) // tile_n * tile_n
 
-    fa_fwd = FlashAttentionForwardSm90(
-        cutlass.BFloat16,
-        head_dim,
-        head_dim,
-        qpk,
-        is_causal=False,
-        is_local=False,
-        pack_gqa=qpk > 1,
-        tile_m=128,
-        tile_n=tile_n,
-        num_stages=2,
-        num_threads=384,
-        Q_in_regs=False,
-        intra_wg_overlap=True,
-        mma_pv_is_rs=True,
-    )
+    if arch == 90:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+        fa_fwd = FlashAttentionForwardSm90(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            qpk,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=qpk > 1,
+            tile_m=128,
+            tile_n=tile_n,
+            num_stages=2,
+            num_threads=384,
+            Q_in_regs=False,
+            intra_wg_overlap=True,
+            mma_pv_is_rs=True,
+        )
+    else:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
+
+        fa_fwd = FlashAttentionForwardSm100(
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            qhead_per_kvhead=qpk,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=qpk > 1 and 128 % qpk == 0,
+            q_stage=1,
+            is_persistent=False,
+            is_varlen_q=True,
+        )
 
     @cute.jit
     def launch_fwd(
@@ -98,28 +115,44 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         use_static_tensors=False,
     )
 
-    bwd_atom_layout_dkv = 2
-    fa_bwd = FlashAttentionBackwardSm90(
-        cutlass.BFloat16,
-        head_dim,
-        head_dim,
-        qpk,
-        False,
-        is_local=False,
-        deterministic=False,
-        tile_m=bwd_tile_m,
-        tile_n=tile_n,
-        Q_stage=2,
-        dO_stage=2,
-        PdS_stage=2,
-        SdP_swapAB=True,
-        dKV_swapAB=False,
-        dQ_swapAB=False,
-        AtomLayoutMSdP=1,
-        AtomLayoutNdKV=bwd_atom_layout_dkv,
-        AtomLayoutMdQ=1,
-        num_threads=384,
-    )
+    if arch == 90:
+        from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90
+
+        bwd_atom_layout_dkv = 2
+        fa_bwd = FlashAttentionBackwardSm90(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            qpk,
+            False,
+            is_local=False,
+            deterministic=False,
+            tile_m=bwd_tile_m,
+            tile_n=tile_n,
+            Q_stage=2,
+            dO_stage=2,
+            PdS_stage=2,
+            SdP_swapAB=True,
+            dKV_swapAB=False,
+            dQ_swapAB=False,
+            AtomLayoutMSdP=1,
+            AtomLayoutNdKV=bwd_atom_layout_dkv,
+            AtomLayoutMdQ=1,
+            num_threads=384,
+        )
+        post_threads = 256
+    else:
+        from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100
+
+        bwd_atom_layout_dkv = 1
+        fa_bwd = FlashAttentionBackwardSm100(
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            qhead_per_kvhead=qpk,
+            is_causal=False,
+            is_local=False,
+        )
+        post_threads = 128
     dkv_postprocess = qpk > 1
     dkv_out = jax.ShapeDtypeStruct(
         (num_kv_heads, total_k_padded * hdr)
@@ -182,7 +215,7 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
             head_dim,
             arch,
             tile_m=tile_m,
-            num_threads=256,
+            num_threads=post_threads,
             AtomLayoutMdQ=atom_layout,
         )
 
@@ -292,7 +325,7 @@ def _candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
     return forward, backward
 
 
-def ranker_candidate_attention_fa4(
+def ranker_attention_varlen_candidate_packed_fa4(
     q,
     k,
     v,

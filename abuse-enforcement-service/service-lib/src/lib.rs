@@ -1065,7 +1065,7 @@ async fn final_checks(
         return Ok(None);
     }
     if let Some((bf, run, nonce)) = run {
-        return run_checks(bf, dynamic_config, run, nonce, facts, score).await;
+        return run_checks(bf, run, nonce, facts, score).await;
     }
     if !dynamic_config.try_enforce(facts.entity_type).await {
         warn!(
@@ -1085,7 +1085,6 @@ async fn final_checks(
 
 async fn run_checks(
     bf: &backfill::Backfill,
-    dynamic_config: &DynamicConfig,
     run: &backfill::BackfillRunRecord,
     nonce: i64,
     facts: &Facts,
@@ -1119,7 +1118,7 @@ async fn run_checks(
         }
         _ => {}
     }
-    let budget = dynamic_config.backfill_config().budget(facts.entity_type);
+    let budget = bf.config().budget(facts.entity_type);
     match claims.take(&key, nonce, budget, bf.pod()).await? {
         backfill_claims::Take::Taken => Ok(None),
         backfill_claims::Take::Held => skip(backfill::STATUS_CLAIM_TAKEN),
@@ -2137,6 +2136,91 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
         None => (None, None),
     };
 
+    let backfill_release = cfg
+        .backfill_topic
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    let rules_cache = rules::RulesCache::new();
+    let (dynamic_config, growthbook_writer) = if backfill_release {
+        backfill_release_config(&cfg, sliding_user, sliding_post)?
+    } else {
+        live_config(&cfg, &rules_cache, sliding_user, sliding_post).await?
+    };
+
+    let boot_config = dynamic_config.config().unwrap_or(serde_json::Value::Null);
+
+    let kafka_producers = build_kafka_producers(&cfg, &boot_config).await;
+    if backfill_release && kafka_producers.decisions().is_none() {
+        anyhow::bail!(
+            "the backfill release publishes no decision outcomes: \
+             BACKFILL_SERVICE_CONFIG_JSON needs an enabled kafka.producer.decisions"
+        );
+    }
+
+    finish_state(
+        cfg,
+        ais_client,
+        limiter,
+        mh_client,
+        mh_tenant,
+        dedup_cache,
+        allowlist,
+        dynamic_config,
+        rules_cache,
+        growthbook_writer,
+        boot_config,
+        kafka_producers,
+    )
+    .await
+}
+
+fn backfill_release_config(
+    cfg: &Config,
+    sliding_user: Option<sliding_window::SlidingWindowLimiter>,
+    sliding_post: Option<sliding_window::SlidingWindowLimiter>,
+) -> Result<(DynamicConfig, Option<GrowthBookWriter>)> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if set(&cfg.growthbook_url) || set(&cfg.growthbook_key) || set(&cfg.growthbook_admin_api_key) {
+        anyhow::bail!(
+            "the backfill release reads no GrowthBook: unset GROWTHBOOK_URL, GROWTHBOOK_KEY \
+             and GROWTHBOOK_ADMIN_API_KEY (its config is BACKFILL_SERVICE_CONFIG_JSON)"
+        );
+    }
+    let raw = cfg
+        .backfill_service_config_json
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("BACKFILL_TOPIC is set but BACKFILL_SERVICE_CONFIG_JSON is not")
+        })?;
+    let config: serde_json::Value =
+        serde_json::from_str(raw).context("BACKFILL_SERVICE_CONFIG_JSON is not JSON")?;
+    if !config.is_object() {
+        anyhow::bail!("BACKFILL_SERVICE_CONFIG_JSON must be a JSON object");
+    }
+    info!(
+        config = %config,
+        "backfill release: config from BACKFILL_SERVICE_CONFIG_JSON; no GrowthBook client, rules are the baked-in mirror"
+    );
+    Ok((
+        DynamicConfig::from_static(
+            config,
+            cfg.dry_run,
+            cfg.max_enforcements_per_day,
+            cfg.max_post_enforcements_per_day,
+            sliding_user,
+            sliding_post,
+        ),
+        None,
+    ))
+}
+
+async fn live_config(
+    cfg: &Config,
+    rules_cache: &rules::RulesCache,
+    sliding_user: Option<sliding_window::SlidingWindowLimiter>,
+    sliding_post: Option<sliding_window::SlidingWindowLimiter>,
+) -> Result<(DynamicConfig, Option<GrowthBookWriter>)> {
     if cfg
         .growthbook_url
         .as_deref()
@@ -2166,7 +2250,6 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    let rules_cache = rules::RulesCache::new();
     let user_rules_yaml = dynamic_config
         .enforcement_rules_yaml(EntityType::User)
         .filter(|s| !s.trim().is_empty());
@@ -2221,11 +2304,24 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
     if growthbook_writer.is_none() {
         info!("GROWTHBOOK_ADMIN_API_KEY not set — admin config-mutation endpoints will return 503");
     }
+    Ok((dynamic_config, growthbook_writer))
+}
 
-    let boot_config = dynamic_config.config().unwrap_or(serde_json::Value::Null);
-
-    let kafka_producers = build_kafka_producers(&cfg, &boot_config).await;
-
+#[allow(clippy::too_many_arguments)]
+async fn finish_state(
+    cfg: Config,
+    ais_client: ais_client::AisClient,
+    limiter: Option<limiter::LimiterClient>,
+    mh_client: Arc<xai_manhattan::NativeManhattanClient>,
+    mh_tenant: xai_manhattan::Tenant,
+    dedup_cache: Option<dedup_cache::ManhattanDedupCache>,
+    allowlist: Option<allowlist::ManhattanAllowlist>,
+    dynamic_config: DynamicConfig,
+    rules_cache: rules::RulesCache,
+    growthbook_writer: Option<GrowthBookWriter>,
+    boot_config: serde_json::Value,
+    kafka_producers: KafkaProducers,
+) -> Result<(Arc<service::AppState>, Config)> {
     let startup_probe =
         overturn_hold::startup_probe_requested(cfg.overturn_hold_startup_probe.as_deref());
     let hold_gate = Arc::new(overturn_hold::HoldGate::from_url(
@@ -2299,14 +2395,33 @@ pub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)
             Some(Arc::new(backfill_claims::PgClaimStore::new(dsn, &env)?))
         }
     };
-    let backfill = Arc::new(backfill::Backfill::new(
-        Arc::new(action_control::ManhattanControlStore::new(
-            mh_client.clone(),
-            mh_tenant.clone(),
+    let release = claims.is_some();
+    let backfill = Arc::new(
+        backfill::Backfill::new(
+            Arc::new(action_control::ManhattanControlStore::new(
+                mh_client.clone(),
+                mh_tenant.clone(),
+            )),
+            claims,
+            std::env::var("HOSTNAME").unwrap_or_default(),
+        )
+        .with_access(backfill::BackfillAccess::new(
+            &cfg.backfill_page_keys,
+            &cfg.backfill_sender_keys,
+            cfg.backfill_max_rate_per_sec,
         )),
-        claims,
-        std::env::var("HOSTNAME").unwrap_or_default(),
-    ));
+    );
+    if release {
+        let access = backfill.access();
+        info!(
+            page_keys = ?access.page_keys,
+            sender_keys = ?access.sender_keys,
+            max_rate_ceiling = access.max_rate_ceiling,
+            "backfill runs: keys and speed ceiling from the Helm values; budgets and speed limit from {}",
+            backfill::SETTINGS_PKEY
+        );
+        backfill.spawn_settings_refresh();
+    }
 
     let state = Arc::new(AppState {
         ais_client,
@@ -2395,6 +2510,10 @@ pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) 
             "/backfill_runs/{run_id}/{change}",
             post(service::handle_backfill_run_change),
         )
+        .route(
+            "/backfill_settings",
+            get(service::handle_backfill_settings_get).put(service::handle_backfill_settings_put),
+        )
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             api_keys,
@@ -2449,6 +2568,7 @@ fn consumer_error_total(watched: &HashSet<String>) -> f64 {
         .sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn health_decision(
     consumed_once: bool,
     stale: Duration,
@@ -2457,10 +2577,12 @@ fn health_decision(
     stale_self_delete_after: Duration,
     error_self_delete_after: Duration,
     error_bad_now: bool,
+    quiet_topic: bool,
 ) -> (bool, bool) {
-    let ready = consumed_once && stale < stale_after && !error_bad_now;
-    let should_self_delete =
-        stale >= stale_self_delete_after || error_bad_for >= error_self_delete_after;
+    let progress_ok = quiet_topic || (consumed_once && stale < stale_after);
+    let ready = progress_ok && !error_bad_now;
+    let stale_bad = !quiet_topic && stale >= stale_self_delete_after;
+    let should_self_delete = stale_bad || error_bad_for >= error_self_delete_after;
     (ready, should_self_delete)
 }
 
@@ -2472,6 +2594,7 @@ struct WatchdogConfig {
     error_self_delete_after: Duration,
     self_delete_enabled: bool,
             error_topics: HashSet<String>,
+        quiet_topic: bool,
 }
 
 async fn kafka_health_watchdog(
@@ -2515,6 +2638,7 @@ async fn kafka_health_watchdog(
             cfg.stale_self_delete_after,
             cfg.error_self_delete_after,
             error_bad_now,
+            cfg.quiet_topic,
         );
 
         if kafka_ready.swap(healthy, Ordering::Relaxed) != healthy {
@@ -2628,6 +2752,11 @@ pub fn service_ready(state: &service::AppState) -> bool {
             &state.action_control,
             &state.dynamic_config,
         )
+        && backfill_settings_loaded(&state.backfill)
+}
+
+fn backfill_settings_loaded(backfill: &backfill::Backfill) -> bool {
+    backfill.claims().is_none() || backfill.settings_loaded()
 }
 
 pub fn switch_lists_loaded(
@@ -2714,6 +2843,13 @@ pub async fn start_kafka_consumers(
         &state.dynamic_config,
     )
     .await;
+    if !backfill_settings_loaded(&state.backfill) {
+        warn!("waiting for the first read of the backfill runs' settings before taking Kafka work");
+        while !backfill_settings_loaded(&state.backfill) {
+            tokio::time::sleep(SWITCH_LISTS_POLL).await;
+        }
+        info!("backfill runs' settings read; starting the Kafka consumers");
+    }
     let cancel = CancellationToken::new();
     if !cfg.kafka_consumer_enabled {
         info!("KAFKA_CONSUMER_ENABLED=false — Kafka consumer disabled");
@@ -3131,6 +3267,7 @@ pub async fn start_kafka_consumers(
                 ),
                 self_delete_enabled: cfg.kafka_self_delete_enabled,
                 error_topics,
+                quiet_topic: backfill_topic,
             },
         ));
     }
@@ -4327,6 +4464,123 @@ mod off_switch_hook_tests {
         )
     }
 
+    const RELEASE_JSON: &str = r#"--backfill-service-config-json={"kafka":{"producer":{"decisions":{"enabled":true,"topic":"t"}}},"action_control":{"enabled":true}}"#;
+
+    fn release_cfg(extra: &[&str]) -> Config {
+        use clap::Parser;
+        let mut args = vec![
+            "xai-abuse-enforcement-service",
+            "--backfill-topic=abuse.enforcement.backfill.v1",
+        ];
+        if !extra
+            .iter()
+            .any(|a| a.starts_with("--backfill-service-config-json"))
+        {
+            args.push(RELEASE_JSON);
+        }
+        args.extend_from_slice(extra);
+        Config::parse_from(args)
+    }
+
+    #[test]
+    fn the_backfill_release_reads_no_growthbook() {
+        let (dc, writer) = backfill_release_config(&release_cfg(&[]), None, None).unwrap();
+        assert!(!dc.reads_growthbook());
+        assert!(writer.is_none());
+        assert!(dc.action_control_config().enabled, "from the Helm JSON");
+        assert_eq!(
+            dc.enforcement_rules_yaml(EntityType::User),
+            None,
+            "baked-in rules"
+        );
+        assert!(growthbook::kafka_producers_from_config(dc.config().as_ref())["decisions"].enabled);
+        dc.refresh();
+        assert!(
+            dc.action_control_config().enabled,
+            "a refresh changes nothing"
+        );
+
+        for flag in [
+            "--growthbook-url=https://cdn.growthbook.io",
+            "--growthbook-key=sdk-key",
+            "--growthbook-admin-api-key=admin-key",
+        ] {
+            let err = backfill_release_config(&release_cfg(&[flag]), None, None)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} accepted"));
+            assert!(
+                err.to_string().contains("reads no GrowthBook"),
+                "{flag}: {err}"
+            );
+        }
+        for bad in [
+            "--backfill-service-config-json=",
+            "--backfill-service-config-json=not json",
+            "--backfill-service-config-json=[1]",
+        ] {
+            assert!(
+                backfill_release_config(&release_cfg(&[bad]), None, None).is_err(),
+                "{bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backfill_keys_and_ceiling_come_from_the_helm_env() {
+        use clap::Parser;
+        let live = Config::parse_from(["xai-abuse-enforcement-service"]);
+        let access = backfill::BackfillAccess::new(
+            &live.backfill_page_keys,
+            &live.backfill_sender_keys,
+            live.backfill_max_rate_per_sec,
+        );
+        assert_eq!(
+            access,
+            backfill::BackfillAccess::default(),
+            "live pods: nobody"
+        );
+        let cfg = release_cfg(&[
+            "--backfill-page-keys=dev",
+            "--backfill-sender-keys=backfill_sender",
+            "--backfill-max-rate-per-sec=1000",
+        ]);
+        let access = backfill::BackfillAccess::new(
+            &cfg.backfill_page_keys,
+            &cfg.backfill_sender_keys,
+            cfg.backfill_max_rate_per_sec,
+        );
+        assert!(access.page_keys.contains("dev") && access.page_keys.len() == 1);
+        assert!(access.sender_keys.contains("backfill_sender"));
+        assert_eq!(access.max_rate_ceiling, 1_000);
+    }
+
+    #[tokio::test]
+    async fn backfill_readiness_waits_for_the_first_settings_read_only_on_the_backfill_pods() {
+        let store = Arc::new(action_control::test_support::MemControlStore::default());
+        let live = backfill::Backfill::new(store.clone(), None, String::new());
+        assert!(
+            backfill_settings_loaded(&live),
+            "live pods never read the settings"
+        );
+        let claims: Arc<dyn backfill_claims::ClaimStore> =
+            Arc::new(backfill_claims::test_support::MemClaimStore::default());
+        let pod = backfill::Backfill::new(store.clone(), Some(claims), String::new());
+        assert!(!backfill_settings_loaded(&pod));
+        store.fail_get.store(true, Ordering::Relaxed);
+        assert!(pod.refresh_settings().await.is_err());
+        assert!(
+            !backfill_settings_loaded(&pod),
+            "a failed read is not a load"
+        );
+        store.fail_get.store(false, Ordering::Relaxed);
+        pod.refresh_settings().await.unwrap();
+        assert!(
+            backfill_settings_loaded(&pod),
+            "no record is a completed read (budget 0)"
+        );
+        assert_eq!(pod.config().budget(EntityType::User), 0);
+    }
+
     #[tokio::test]
     async fn readiness_waits_for_the_first_read_of_both_lists() {
         let (sw, sw_store, ac, ac_store) = lists_for_test();
@@ -5170,7 +5424,8 @@ mod health_tests {
 
     #[test]
     fn fresh_consumer_is_ready() {
-        let (ready, del) = health_decision(true, S5, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(true, S5, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(ready);
         assert!(!del);
     }
@@ -5178,7 +5433,8 @@ mod health_tests {
     #[test]
     fn stale_under_threshold_is_notready_not_deleted() {
         let s = Duration::from_secs(130);
-        let (ready, del) = health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(!ready);
         assert!(!del);
     }
@@ -5186,7 +5442,8 @@ mod health_tests {
     #[test]
     fn fully_dead_no_progress_self_deletes_at_stale_window() {
         let s = Duration::from_secs(241);
-        let (ready, del) = health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false);
+        let (ready, del) =
+            health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, false);
         assert!(!ready);
         assert!(del);
     }
@@ -5201,6 +5458,7 @@ mod health_tests {
             STALE_DELETE,
             ERR_DELETE,
             true,
+            false,
         );
         assert!(!ready);
         assert!(del);
@@ -5212,6 +5470,7 @@ mod health_tests {
             STALE_DELETE,
             ERR_DELETE,
             true,
+            false,
         );
         assert!(!ready);
         assert!(!del);
@@ -5226,6 +5485,51 @@ mod health_tests {
             STALE,
             STALE_DELETE,
             ERR_DELETE,
+            true,
+            false,
+        );
+        assert!(!ready);
+        assert!(!del);
+    }
+
+    #[test]
+    fn backfill_pod_on_an_empty_topic_is_ready_and_stays() {
+        for s in [Z, Duration::from_secs(241), Duration::from_secs(86_400)] {
+            let (ready, del) =
+                health_decision(false, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, true);
+            assert!(ready, "not ready after {s:?} of silence");
+            assert!(!del, "self-deleted after {s:?} of silence");
+        }
+        let s = Duration::from_secs(3_600);
+        let (ready, del) =
+            health_decision(true, s, Z, STALE, STALE_DELETE, ERR_DELETE, false, true);
+        assert!(ready);
+        assert!(!del);
+    }
+
+    #[test]
+    fn backfill_pod_still_leaves_on_an_error_flood() {
+        let s = Duration::from_secs(86_400);
+        let (ready, del) = health_decision(
+            false,
+            s,
+            Duration::from_secs(61),
+            STALE,
+            STALE_DELETE,
+            ERR_DELETE,
+            true,
+            true,
+        );
+        assert!(!ready);
+        assert!(del);
+        let (ready, del) = health_decision(
+            false,
+            s,
+            Duration::from_secs(10),
+            STALE,
+            STALE_DELETE,
+            ERR_DELETE,
+            true,
             true,
         );
         assert!(!ready);

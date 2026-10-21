@@ -17,7 +17,7 @@ use crate::metrics::Rpc;
 use crate::models::{ClientCapability, Evaluation, PlacedCandidate, RawCandidate, TweetId};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
-use crate::post_evaluator::{PostBatch, PostEvaluations, PostEvaluator};
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
@@ -146,8 +146,6 @@ pub(crate) struct Serving {
     pub(crate) client_switches: ClientSwitches,
     pub(crate) country_lists: Arc<CountryLists>,
     pub(crate) limited_actions_copy: LimitedActionsCopy,
-    pub(crate) author_cache_capacity: Option<usize>,
-    pub(crate) tweet_cache_capacity: Option<usize>,
 }
 
 #[expect(
@@ -203,8 +201,6 @@ pub(crate) async fn serving(
         client_switches,
         country_lists,
         limited_actions_copy,
-        author_cache_capacity,
-        tweet_cache_capacity,
     }
 }
 
@@ -218,8 +214,6 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         client_switches,
         country_lists,
         limited_actions_copy,
-        author_cache_capacity,
-        tweet_cache_capacity,
     } = serving(
         datacenter,
         metadata,
@@ -228,7 +222,6 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
     )
     .await;
     let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
-    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
     let post_evaluator = Arc::new(PostEvaluator::new(
         Arc::new(sources),
         rule_engine,
@@ -236,15 +229,6 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
     ));
 
     warm_post_evaluator(&post_evaluator).await;
-
-    info!(
-        hydrator_count = 5,
-        author_cache_capacity = author_cache_capacity.unwrap_or(0),
-        tweet_cache_capacity = tweet_cache_capacity.unwrap_or(0),
-        home_rule_count,
-        recommendations_rule_count,
-        "VFServer initialized with prod clients"
-    );
 
     ServerDeps {
         init_deadline,
@@ -613,17 +597,14 @@ fn warm_filter_tweets_request() -> PostBatch {
     }
 }
 
-fn filter_tweets_response_is_warm(response: &PostEvaluations) -> bool {
-    response
-        .outcomes
-        .iter()
-        .all(|outcome| match outcome.evaluation {
-            Evaluation::NotFound(lookup) | Evaluation::Failed(lookup) => match lookup {
-                Lookup::Tweet => false,
-                Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
-            },
-            Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
-        })
+fn filter_tweets_response_is_warm(outcomes: &[PostEvaluation]) -> bool {
+    outcomes.iter().all(|outcome| match outcome.evaluation {
+        Evaluation::NotFound(lookup) | Evaluation::Failed(lookup) => match lookup {
+            Lookup::Tweet => false,
+            Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
+        },
+        Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
+    })
 }
 
 async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
@@ -632,8 +613,8 @@ async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
     let mut consecutive_warm = 0u32;
     while start.elapsed() < WARM_FILTER_TWEETS_DEADLINE {
         attempts += 1;
-        let response = post_evaluator.run(warm_filter_tweets_request()).await;
-        if filter_tweets_response_is_warm(&response) {
+        let outcomes = post_evaluator.run(warm_filter_tweets_request()).await;
+        if filter_tweets_response_is_warm(&outcomes) {
             consecutive_warm += 1;
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {
                 info!(

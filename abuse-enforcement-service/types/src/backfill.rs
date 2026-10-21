@@ -146,6 +146,61 @@ pub struct BackfillRunListResponse {
     pub runs: Vec<BackfillRunRecord>,
 }
 
+pub const BACKFILL_SETTINGS_RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BackfillSettingsRecord {
+    pub v: u32,
+    pub max_user_decisions_per_day: u64,
+    pub max_post_decisions_per_day: u64,
+    pub max_rate_per_sec: u32,
+    pub reason: String,
+    pub updated_by: String,
+    pub updated_by_key: String,
+    pub updated_at_ms: i64,
+    pub version: u64,
+    #[serde(default)]
+    pub write_nonce: u64,
+    #[serde(default)]
+    pub history: Vec<BackfillSettingsChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BackfillSettingsChange {
+    pub at_ms: i64,
+    pub by: String,
+    pub version: u64,
+    pub max_user_decisions_per_day: u64,
+    pub max_post_decisions_per_day: u64,
+    pub max_rate_per_sec: u32,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BackfillSettingsRequest {
+    pub max_user_decisions_per_day: u64,
+    pub max_post_decisions_per_day: u64,
+    pub max_rate_per_sec: u32,
+    pub reason: String,
+    #[serde(default)]
+    pub expected_version: Option<u64>,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BackfillSettingsResponse {
+    pub settings: Option<BackfillSettingsRecord>,
+    pub max_rate_ceiling: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,24 +4,25 @@ use crate::hydration::decode::author::{AuthorNotFound, DecodedAuthor};
 use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::execute::Reply;
 use crate::hydration::fetcher::{AnyFetcher, Fetcher};
-use crate::hydration::hydrator::{arm_starts_conversation_root_select, Edge, KeyOrigin};
+use crate::hydration::hydrator::{
+    Edge, KeyOrigin, RequestRows, arm_starts_conversation_root_select,
+};
 use crate::hydration::inventory::{Batch, MissPolicy, Source};
 use crate::hydration::metrics::record_unasked_keys;
 use crate::hydration::plan::Group;
 use crate::hydration::{
-    candidate_count_by_key, Cause, HydratedTweet, Hydration, HydrationPlan, HydrationRequest,
-    Hydrator, Hydrators, QuoteEntry,
+    Cause, HydratedTweet, HydratedUser, Hydration, HydrationPlan, HydrationRequest, Hydrator,
+    Hydrators, QuoteEntry, candidate_count_by_key,
 };
 use crate::models::{
-    ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, ConversationControlFeatures,
-    PostCandidate, PostEntity, PureCore, RawCandidate, SafetyLabelMap, TweetFeatures, TweetId,
-    UserEntity, Viewer, ViewerFeatures, ViewerRelationship,
+    ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, PureCore, RawCandidate,
+    TweetFeatures, TweetId, Viewer, ViewerFeatures,
 };
 use conversation_root::ConversationRootAuthor;
 use quotes::{Pairing, Quotes};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,10 +34,33 @@ mod conversation_root;
 mod quotes;
 mod resolve;
 
-struct RequestTweet {
-    tweet_id: TweetId,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSubject {
+    Post(TweetId),
+    User,
+}
+
+struct RequestRow {
+    subject: RowSubject,
     request_author: Option<AuthorId>,
     author: Option<AuthorId>,
+}
+
+impl RequestRow {
+    fn user(user: AuthorId) -> Self {
+        Self {
+            subject: RowSubject::User,
+            request_author: Some(user),
+            author: Some(user),
+        }
+    }
+
+    fn tweet_id(&self) -> Option<TweetId> {
+        match self.subject {
+            RowSubject::Post(tweet_id) => Some(tweet_id),
+            RowSubject::User => None,
+        }
+    }
 }
 
 pub(super) struct CallRequest<'p> {
@@ -48,7 +72,7 @@ pub(super) struct CallRequest<'p> {
     pub(super) community_posts: Vec<CommunityPost>,
     pub(super) viewer_id: Option<u64>,
     pub(super) batch_size: Option<usize>,
-    pub(super) candidate_count_by_claimed_key: FxHashMap<u64, usize>,
+        pub(super) candidate_count_by_claimed_key: FxHashMap<u64, usize>,
 }
 
 fn claimed<'a>(keys: &'a [u64], queries: &'a [EdgeQuery]) -> impl Iterator<Item = u64> + 'a {
@@ -66,7 +90,8 @@ pub(super) enum Landing {
 pub(super) struct Store {
     viewer_id: Option<u64>,
     client_capability: ClientCapability,
-    request_tweets: Vec<RequestTweet>,
+    rows: Vec<RequestRow>,
+    request_rows: RequestRows,
     requested: usize,
     quotes: Quotes,
     is_expanding_retweet_sources: bool,
@@ -105,14 +130,15 @@ impl Store {
             client_capability,
             requested: raw.len(),
             is_expanding_retweet_sources,
-            request_tweets: raw
+            rows: raw
                 .iter()
-                .map(|candidate| RequestTweet {
-                    tweet_id: candidate.tweet_id,
+                .map(|candidate| RequestRow {
+                    subject: RowSubject::Post(candidate.tweet_id),
                     request_author: candidate.request_author_id.map(AuthorId),
                     author: None,
                 })
                 .collect(),
+            request_rows: plan.rows(),
             callable: plan.callable(viewer_id),
             author_not_found: plan.level().spec().author_not_found,
             has_called: vec![false; plan.groups().count()],
@@ -125,49 +151,62 @@ impl Store {
         self
     }
 
+    pub(super) fn with_users(mut self, users: &[AuthorId]) -> Self {
+        self.rows
+            .extend(users.iter().copied().map(RequestRow::user));
+        self.requested = self.rows.len();
+        self
+    }
+
+    fn origin(&self, node: Hydrator) -> KeyOrigin {
+        node.key_at(self.request_rows)
+    }
+
     fn candidate_count(&self) -> usize {
-        self.request_tweets
+        self.rows
             .iter()
             .take(self.requested)
-            .filter(|request_tweet| request_tweet.author.is_some())
+            .filter(|row| row.author.is_some())
             .count()
     }
 
     fn has_joined_sources(&self) -> bool {
-        self.request_tweets.len() > self.requested
+        self.rows.len() > self.requested
     }
 
     fn pairing(&self) -> Pairing<'_> {
-        Pairing::new(&self.request_tweets, &self.pure_cores, &self.authors)
+        Pairing::new(&self.rows, &self.pure_cores, &self.authors)
     }
 
     fn controls(&self) -> impl Iterator<Item = &ConversationControl> {
-        self.request_tweets
-            .iter()
-            .filter_map(|request_tweet| self.control(request_tweet))
+        self.rows.iter().filter_map(|row| self.control(row))
     }
 
-    fn control(&self, request_tweet: &RequestTweet) -> Option<&ConversationControl> {
-        self.controls.get(request_tweet.tweet_id.0)
+    fn control(&self, row: &RequestRow) -> Option<&ConversationControl> {
+        self.controls.get(row.tweet_id()?.0)
     }
 
     fn source_tweet_id(&self, tweet_id: TweetId) -> Option<TweetId> {
         self.pure_cores.get(tweet_id.0)?.source_tweet_id
     }
 
-    fn key(&self, origin: KeyOrigin, request_tweet: &RequestTweet) -> Option<u64> {
+    fn key(&self, origin: KeyOrigin, row: &RequestRow) -> Option<u64> {
         match origin {
-            KeyOrigin::RequestTweets => Some(request_tweet.tweet_id.0),
+            KeyOrigin::RequestTweets => row.tweet_id().map(|tweet_id| tweet_id.0),
+            KeyOrigin::RequestUsers => match row.subject {
+                RowSubject::User => row.author.map(AuthorId::get),
+                RowSubject::Post(_) => None,
+            },
             KeyOrigin::Viewer => self.viewer_id,
             KeyOrigin::ViewerForCoAllowedList => self
                 .viewer_id
-                .filter(|_| self.control(request_tweet).is_some_and(lists_countries)),
-            KeyOrigin::PureCoreAuthor => request_tweet.author.map(AuthorId::get),
+                .filter(|_| self.control(row).is_some_and(lists_countries)),
+            KeyOrigin::PureCoreAuthor => row.tweet_id().and(row.author).map(AuthorId::get),
             KeyOrigin::PureCoreRetweeter => self
-                .source_tweet_id(request_tweet.tweet_id)
-                .and(request_tweet.author)
+                .source_tweet_id(row.tweet_id()?)
+                .and(row.author)
                 .map(AuthorId::get),
-            KeyOrigin::PureCoreReplyRoot => match self.conversation_root_author(request_tweet)? {
+            KeyOrigin::PureCoreReplyRoot => match self.conversation_root_author(row)? {
                 ConversationRootAuthor::PureCore(author) => Some(author.get()),
                 ConversationRootAuthor::ConversationControl(_)
                 | ConversationRootAuthor::RootPost(_)
@@ -176,24 +215,24 @@ impl Store {
             },
             KeyOrigin::ExclusiveConversationAuthor => {
                 self.tweets
-                    .get(request_tweet.tweet_id.0)?
+                    .get(row.tweet_id()?.0)?
                     .exclusive_conversation_author_id
             }
             KeyOrigin::TweetArticle => self
                 .tweets
-                .get(request_tweet.tweet_id.0)?
+                .get(row.tweet_id()?.0)?
                 .article_id
                 .map(NonZeroU64::get),
             KeyOrigin::ConversationRoot(arms) => self
-                .control(request_tweet)
+                .control(row)
                 .filter(|control| arms.contains(&control.arm))
                 .map(|control| control.conversation_tweet_author_id),
             KeyOrigin::ConversationControlBlockAuthor => {
-                let control = self.control(request_tweet)?;
+                let control = self.control(row)?;
                 if arm_starts_conversation_root_select(control.arm) {
                     return Some(control.conversation_tweet_author_id);
                 }
-                match self.conversation_root_author(request_tweet)? {
+                match self.conversation_root_author(row)? {
                     ConversationRootAuthor::ConversationControl(author) => Some(author.get()),
                     ConversationRootAuthor::PureCore(_)
                     | ConversationRootAuthor::RootPost(_)
@@ -201,35 +240,29 @@ impl Store {
                     | ConversationRootAuthor::Unresolved => None,
                 }
             }
-            KeyOrigin::ConversationRootToFetch => {
-                match self.conversation_root_author(request_tweet)? {
-                    ConversationRootAuthor::RootPost(root) => Some(root.0),
-                    ConversationRootAuthor::PureCore(_)
-                    | ConversationRootAuthor::ConversationControl(_)
-                    | ConversationRootAuthor::RootPureCoreFailed
-                    | ConversationRootAuthor::Unresolved => None,
+            KeyOrigin::ConversationRootToFetch => match self.conversation_root_author(row)? {
+                ConversationRootAuthor::RootPost(root) => Some(root.0),
+                ConversationRootAuthor::PureCore(_)
+                | ConversationRootAuthor::ConversationControl(_)
+                | ConversationRootAuthor::RootPureCoreFailed
+                | ConversationRootAuthor::Unresolved => None,
+            },
+            KeyOrigin::ConversationRootPostAuthor => match self.conversation_root_author(row)? {
+                ConversationRootAuthor::RootPost(root) => {
+                    self.root_authors.get(root.0).map(|author| author.get())
                 }
-            }
-            KeyOrigin::ConversationRootPostAuthor => {
-                match self.conversation_root_author(request_tweet)? {
-                    ConversationRootAuthor::RootPost(root) => {
-                        self.root_authors.get(root.0).map(|author| author.get())
-                    }
-                    ConversationRootAuthor::PureCore(_)
-                    | ConversationRootAuthor::ConversationControl(_)
-                    | ConversationRootAuthor::RootPureCoreFailed
-                    | ConversationRootAuthor::Unresolved => None,
-                }
-            }
+                ConversationRootAuthor::PureCore(_)
+                | ConversationRootAuthor::ConversationControl(_)
+                | ConversationRootAuthor::RootPureCoreFailed
+                | ConversationRootAuthor::Unresolved => None,
+            },
             KeyOrigin::MyNetworkRootNotFollowingViewer => self
-                .control(request_tweet)
+                .control(row)
                 .and_then(|control| self.root_not_following_viewer(control)),
-            KeyOrigin::CommunityPost => {
-                self.community_post(request_tweet).map(|post| post.tweet_id)
-            }
+            KeyOrigin::CommunityPost => self.community_post(row).map(|post| post.tweet_id),
             KeyOrigin::ModeratedCommunity => self
                 .viewer_id
-                .and_then(|_| self.community_post(request_tweet))
+                .and_then(|_| self.community_post(row))
                 .filter(|post| {
                     self.community_moderations
                         .get(post.tweet_id)
@@ -241,51 +274,44 @@ impl Store {
                 .filter(|_| self.client_capability.community_viewer_removed_limits)
                 .and(
                     self.tweets
-                        .get(request_tweet.tweet_id.0)?
+                        .get(row.tweet_id()?.0)?
                         .community_id
                         .map(NonZeroU64::get),
                 ),
             KeyOrigin::TrustedFriendsList => {
-                self.tweets
-                    .get(request_tweet.tweet_id.0)?
-                    .trusted_friends_list_id
+                self.tweets.get(row.tweet_id()?.0)?.trusted_friends_list_id
             }
-            KeyOrigin::NarrowcastPlace => {
-                self.tweets
-                    .get(request_tweet.tweet_id.0)?
-                    .narrowcast_place_id
+            KeyOrigin::NarrowcastPlace => self.tweets.get(row.tweet_id()?.0)?.narrowcast_place_id,
+            KeyOrigin::OuterOfMissingQuote => {
+                let tweet_id = row.tweet_id()?;
+                self.quotes
+                    .outer_of(tweet_id)
+                    .filter(|_| self.pure_cores.miss(tweet_id.0) == Some(Cause::NotFound))
+                    .map(|outer| outer.0)
             }
-            KeyOrigin::OuterOfMissingQuote => self
-                .quotes
-                .outer_of(request_tweet.tweet_id)
-                .filter(|_| self.pure_cores.miss(request_tweet.tweet_id.0) == Some(Cause::NotFound))
-                .map(|outer| outer.0),
             KeyOrigin::QuotedAuthorToQuotingAuthor
             | KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => None,
         }
     }
 
-    fn community_post(&self, request_tweet: &RequestTweet) -> Option<CommunityPost> {
-        let author_id = request_tweet.author?.get();
+        fn community_post(&self, row: &RequestRow) -> Option<CommunityPost> {
+        let tweet_id = row.tweet_id()?.0;
+        let author_id = row.author?.get();
         if self.viewer_id == Some(author_id) {
             return None;
         }
         Some(CommunityPost {
-            tweet_id: request_tweet.tweet_id.0,
+            tweet_id,
             author_id,
-            community_id: self
-                .tweets
-                .get(request_tweet.tweet_id.0)?
-                .community_id?
-                .get(),
+            community_id: self.tweets.get(tweet_id)?.community_id?.get(),
         })
     }
 
     fn community_posts(&self, tweet_ids: &[u64]) -> Vec<CommunityPost> {
         let mut posts: Vec<CommunityPost> = self
-            .request_tweets
+            .rows
             .iter()
-            .filter_map(|request_tweet| self.community_post(request_tweet))
+            .filter_map(|row| self.community_post(row))
             .filter(|post| tweet_ids.binary_search(&post.tweet_id).is_ok())
             .collect();
         posts.sort_unstable_by_key(|post| post.tweet_id);
@@ -296,11 +322,11 @@ impl Store {
     fn keys(&self, nodes: Hydrators) -> Vec<u64> {
         let mut keys = Vec::new();
         for (position, node) in nodes.iter().enumerate() {
-            let origin = node.spec().key;
+            let origin = self.origin(node);
             if nodes
                 .iter()
                 .take(position)
-                .any(|earlier| earlier.spec().key == origin)
+                .any(|earlier| self.origin(earlier) == origin)
             {
                 continue;
             }
@@ -309,6 +335,7 @@ impl Store {
                 KeyOrigin::QuotedAuthorToQuotingAuthor
                 | KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => {}
                 KeyOrigin::RequestTweets
+                | KeyOrigin::RequestUsers
                 | KeyOrigin::PureCoreAuthor
                 | KeyOrigin::PureCoreRetweeter
                 | KeyOrigin::PureCoreReplyRoot
@@ -325,11 +352,9 @@ impl Store {
                 | KeyOrigin::TweetCommunity
                 | KeyOrigin::TrustedFriendsList
                 | KeyOrigin::NarrowcastPlace
-                | KeyOrigin::OuterOfMissingQuote => keys.extend(
-                    self.request_tweets
-                        .iter()
-                        .filter_map(|request_tweet| self.key(origin, request_tweet)),
-                ),
+                | KeyOrigin::OuterOfMissingQuote => {
+                    keys.extend(self.rows.iter().filter_map(|row| self.key(origin, row)));
+                }
             }
         }
         if nodes.contains(Hydrator::PureCore) {
@@ -407,12 +432,10 @@ impl Store {
     }
 
     fn candidate_count_by_key(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
-        match nodes.iter().next().map(|node| node.spec().key) {
+        match nodes.iter().next().map(|node| self.origin(node)) {
             Some(KeyOrigin::RequestTweets) => {
                 return candidate_count_by_key(
-                    self.request_tweets
-                        .iter()
-                        .map(|request_tweet| request_tweet.tweet_id.0),
+                    self.rows.iter().filter_map(|row| Some(row.tweet_id()?.0)),
                 );
             }
             Some(KeyOrigin::Viewer | KeyOrigin::ViewerForCoAllowedList) => {
@@ -431,7 +454,8 @@ impl Store {
                     .candidate_count_by_quoted_author(nodes, &self.pairing());
             }
             Some(
-                KeyOrigin::PureCoreAuthor
+                KeyOrigin::RequestUsers
+                | KeyOrigin::PureCoreAuthor
                 | KeyOrigin::PureCoreRetweeter
                 | KeyOrigin::PureCoreReplyRoot
                 | KeyOrigin::ExclusiveConversationAuthor
@@ -453,21 +477,21 @@ impl Store {
         let is_tweet_keyed = nodes
             .iter()
             .next()
-            .is_some_and(|node| node.input() == Some(Hydrator::Tweet));
+            .is_some_and(|node| node.input_at(self.request_rows) == Some(Hydrator::Tweet));
         let mut counts = FxHashMap::default();
-        for request_tweet in self
-            .request_tweets
+        for row in self
+            .rows
             .iter()
-            .filter(|request_tweet| is_tweet_keyed || request_tweet.author.is_some())
+            .filter(|row| is_tweet_keyed || row.author.is_some())
         {
             for (position, node) in nodes.iter().enumerate() {
-                let Some(key) = self.key(node.spec().key, request_tweet) else {
+                let Some(key) = self.key(self.origin(node), row) else {
                     continue;
                 };
                 let counted = nodes
                     .iter()
                     .take(position)
-                    .any(|earlier| self.key(earlier.spec().key, request_tweet) == Some(key));
+                    .any(|earlier| self.key(self.origin(earlier), row) == Some(key));
                 if !counted {
                     *counts.entry(key).or_default() += 1;
                 }
@@ -491,7 +515,7 @@ impl Store {
                 destination_ids: self.claim(nodes),
             })
             .collect();
-        let pairing = Pairing::new(&self.request_tweets, &self.pure_cores, &self.authors);
+        let pairing = Pairing::new(&self.rows, &self.pure_cores, &self.authors);
         queries.extend(self.quotes.claim_pairs(group.nodes, &pairing));
         let keys = if queries.is_empty() {
             self.claim(group.nodes)
@@ -582,7 +606,7 @@ impl Store {
                         self.join_retweet_sources();
                     }
                     if self.callable.contains(Hydrator::AuthorBlocksOuterAuthor) {
-                        self.quotes.join_outers(&self.request_tweets);
+                        self.quotes.join_outers(&self.rows);
                     }
                     if self.has_joined_sources() || !self.quotes.outers_to_fetch().is_empty() {
                         return Landing::KeysJoined;
@@ -637,36 +661,33 @@ impl Store {
 
     fn land_authors(&mut self) {
         let (pure_cores, quotes) = (&self.pure_cores, &self.quotes);
-        for request_tweet in &mut self.request_tweets {
-            request_tweet.author = request_tweet
+        for row in &mut self.rows {
+            row.author = row
                 .request_author
-                .or_else(|| Some(pure_cores.get(request_tweet.tweet_id.0)?.author_id))
-                .or_else(|| quotes.quoted_author(request_tweet.tweet_id));
+                .or_else(|| Some(pure_cores.get(row.tweet_id()?.0)?.author_id))
+                .or_else(|| quotes.quoted_author(row.tweet_id()?));
         }
     }
 
     fn join_retweet_sources(&mut self) {
-        let mut known: FxHashSet<TweetId> = self
-            .request_tweets
+        let mut known: FxHashSet<TweetId> =
+            self.rows.iter().filter_map(RequestRow::tweet_id).collect();
+        let sources: Vec<RequestRow> = self
+            .rows
             .iter()
-            .map(|request_tweet| request_tweet.tweet_id)
-            .collect();
-        let sources: Vec<RequestTweet> = self
-            .request_tweets
-            .iter()
-            .filter_map(|request_tweet| {
-                let core = self.pure_cores.get(request_tweet.tweet_id.0)?;
+            .filter_map(|row| {
+                let core = self.pure_cores.get(row.tweet_id()?.0)?;
                 let source = core
                     .source_tweet_id
                     .filter(|&source| known.insert(source))?;
-                Some(RequestTweet {
-                    tweet_id: source,
+                Some(RequestRow {
+                    subject: RowSubject::Post(source),
                     request_author: None,
                     author: core.source_author_id,
                 })
             })
             .collect();
-        self.request_tweets.extend(sources);
+        self.rows.extend(sources);
     }
 
     pub(super) fn assemble(mut self, request: HydrationRequest<'_>) -> Hydration {
@@ -680,22 +701,35 @@ impl Store {
             .fold(self.quotes.incomplete(self.callable), Hydrators::with);
         let mut unclaimed = Vec::new();
         let mut tweet_misses: FxHashMap<TweetId, Option<Cause>> =
-            FxHashMap::with_capacity_and_hasher(self.request_tweets.len(), Default::default());
-        for request_tweet in &self.request_tweets {
-            if let Entry::Vacant(entry) = tweet_misses.entry(request_tweet.tweet_id) {
-                entry.insert(self.tweet_miss(request_tweet.tweet_id, &mut unclaimed));
+            FxHashMap::with_capacity_and_hasher(self.rows.len(), Default::default());
+        for tweet_id in self.rows.iter().filter_map(RequestRow::tweet_id) {
+            if let Entry::Vacant(entry) = tweet_misses.entry(tweet_id) {
+                entry.insert(self.tweet_miss(tweet_id, &mut unclaimed));
             }
         }
         let mut tweets: FxHashMap<TweetId, HydratedTweet> =
-            FxHashMap::with_capacity_and_hasher(self.request_tweets.len(), Default::default());
-        for request_tweet in &self.request_tweets {
-            if let Entry::Vacant(entry) = tweets.entry(request_tweet.tweet_id) {
-                entry.insert(self.hydrated_tweet(
-                    request_tweet,
-                    &tweet_misses,
-                    incomplete,
-                    &mut unclaimed,
-                ));
+            FxHashMap::with_capacity_and_hasher(self.rows.len(), Default::default());
+        let mut users: FxHashMap<AuthorId, HydratedUser> = FxHashMap::default();
+        for row in &self.rows {
+            match row.subject {
+                RowSubject::Post(tweet_id) => {
+                    if let Entry::Vacant(entry) = tweets.entry(tweet_id) {
+                        entry.insert(self.hydrated_tweet(
+                            row,
+                            tweet_id,
+                            &tweet_misses,
+                            incomplete,
+                            &mut unclaimed,
+                        ));
+                    }
+                }
+                RowSubject::User => {
+                    if let Some(user) = row.author
+                        && let Entry::Vacant(entry) = users.entry(user)
+                    {
+                        entry.insert(self.hydrated_user(row, user, incomplete, &mut unclaimed));
+                    }
+                }
             }
         }
         for ((client, method), keys) in unclaimed_keys_by_label(unclaimed) {
@@ -736,6 +770,7 @@ impl Store {
             planned: self.callable,
             incomplete,
             tweets,
+            users,
             quotes,
             has_fetched_sources: self.has_joined_sources(),
         }
@@ -743,7 +778,7 @@ impl Store {
 
     fn failed(
         &self,
-        request_tweet: &RequestTweet,
+        row: &RequestRow,
         incomplete: Hydrators,
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> Hydrators {
@@ -755,7 +790,7 @@ impl Store {
         };
         let mut answered_incompletely = Hydrators::empty();
         for node in checked.iter() {
-            let Some(key) = self.key(node.spec().key, request_tweet) else {
+            let Some(key) = self.key(self.origin(node), row) else {
                 continue;
             };
             let Some(fetcher) = self.fetcher(node) else {
@@ -774,7 +809,7 @@ impl Store {
             }
         }
         if self.callable.contains(Hydrator::BlockedByReplyRoot)
-            && self.conversation_root_author(request_tweet)
+            && self.conversation_root_author(row)
                 == Some(ConversationRootAuthor::RootPureCoreFailed)
         {
             answered_incompletely = answered_incompletely.with(Hydrator::BlockedByReplyRoot);
@@ -784,115 +819,17 @@ impl Store {
         }
         self.callable
             .iter()
-            .fold(answered_incompletely, |failed, node| match node.input() {
-                Some(input_node)
-                    if failed.contains(input_node)
-                        && self.key(node.spec().key, request_tweet).is_none() =>
-                {
-                    failed.with(node)
+            .fold(answered_incompletely, |failed, node| {
+                match node.input_at(self.request_rows) {
+                    Some(input_node)
+                        if failed.contains(input_node)
+                            && self.key(self.origin(node), row).is_none() =>
+                    {
+                        failed.with(node)
+                    }
+                    _ => failed,
                 }
-                _ => failed,
             })
-    }
-
-    fn candidate(
-        &self,
-        request_tweet: &RequestTweet,
-        author_id: AuthorId,
-        incomplete: Hydrators,
-        unclaimed: &mut Vec<(Hydrator, u64)>,
-    ) -> PostCandidate {
-        let id = request_tweet.tweet_id.0;
-        let (author_features, author_labels) = self
-            .authors
-            .get(author_id.get())
-            .copied()
-            .unwrap_or_default();
-        let (viewer_relationship, post_edges) = self
-            .callable
-            .iter()
-            .filter(|&node| {
-                node.edge()
-                    .and_then(|edge| {
-                        let key = self.key(node.spec().key, request_tweet)?;
-                        self.edge_fetcher(edge)?.get(key).copied()
-                    })
-                    .unwrap_or(false)
-            })
-            .fold(
-                (ViewerRelationship::default(), Hydrators::empty()),
-                |(mut relationship, mut post), node| {
-                    if let Some(slot) = relationship.slot(node) {
-                        *slot = true;
-                    } else {
-                        post = post.with(node);
-                    }
-                    (relationship, post)
-                },
-            );
-        debug_assert!(post_edges
-            .iter()
-            .all(|node| viewer_relationship.get(node).is_none()));
-        PostCandidate {
-            author: UserEntity::new(author_id.get(), author_features, author_labels),
-            viewer_relationship,
-            post: PostEntity {
-                tweet_id: id,
-                source_tweet_id: self
-                    .source_tweet_id(request_tweet.tweet_id)
-                    .map(|source| source.0),
-                is_reply: self
-                    .pure_cores
-                    .get(id)
-                    .is_some_and(|core| core.reply_to.is_some()),
-                tweet_features: TweetFeatures::default(),
-                safety_labels: self
-                    .labels
-                    .get(id)
-                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))
-                    .unwrap_or_default(),
-                edges: post_edges,
-                conversation_control: self.control(request_tweet).cloned().map(|control| {
-                    ConversationControlFeatures {
-                        viewer_country: self
-                            .viewer_id
-                            .filter(|_| control.arm == ConversationControlArm::Co)
-                            .and_then(|viewer_id| self.viewer_country.get(viewer_id))
-                            .cloned(),
-                        control,
-                    }
-                }),
-                community_moderation: self
-                    .community_moderations
-                    .get(id)
-                    .copied()
-                    .unwrap_or_default(),
-                viewer_is_community_moderator: self
-                    .key(KeyOrigin::ModeratedCommunity, request_tweet)
-                    .and_then(|community_id| self.community_moderators.get(community_id))
-                    .copied(),
-                viewer_is_removed_from_community: self
-                    .key(KeyOrigin::TweetCommunity, request_tweet)
-                    .and_then(|community_id| self.community_viewer_removals.get(community_id))
-                    .copied()
-                    .unwrap_or_default(),
-                article_has_media_entities: self
-                    .key(KeyOrigin::TweetArticle, request_tweet)
-                    .and_then(|article_id| self.article_media_entities.get(article_id))
-                    .copied()
-                    .unwrap_or_default(),
-                article_has_cover_media: self
-                    .key(KeyOrigin::TweetArticle, request_tweet)
-                    .and_then(|article_id| self.article_cover_media.get(article_id))
-                    .copied()
-                    .unwrap_or_default(),
-                article_lifecycle: self
-                    .key(KeyOrigin::TweetArticle, request_tweet)
-                    .and_then(|article_id| self.article_lifecycles.get(article_id))
-                    .copied(),
-            },
-            failed: self.failed(request_tweet, incomplete, unclaimed),
-        }
     }
 }
 
@@ -943,9 +880,9 @@ mod tests {
         );
         store.land(&call, Reply::PureCores(pure_cores), Duration::ZERO);
         let resolved: Vec<(TweetId, u64)> = store
-            .request_tweets
+            .rows
             .iter()
-            .filter_map(|request_tweet| Some((request_tweet.tweet_id, request_tweet.author?.get())))
+            .filter_map(|row| Some((row.tweet_id()?, row.author?.get())))
             .collect();
         assert_eq!(
             resolved,
@@ -975,10 +912,15 @@ mod tests {
             Landing::KeysJoined
         );
         let mut unclaimed = Vec::new();
-        let source = &store.request_tweets[1];
+        let source = &store.rows[1];
         for _ in 0..2 {
-            let candidate =
-                store.candidate(source, AuthorId(20), Hydrators::empty(), &mut unclaimed);
+            let candidate = store.candidate(
+                source,
+                TweetId(5),
+                AuthorId(20),
+                Hydrators::empty(),
+                &mut unclaimed,
+            );
             assert_eq!(candidate.failed, Hydrators::of(Hydrator::PureCore));
         }
         assert_eq!(

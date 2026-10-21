@@ -564,6 +564,7 @@ mod tests {
     use super::*;
     use crate::metrics::Rpc;
     use crate::rules::fixtures::{appealed, limited_for, noticed};
+    use crate::rules::RuleId;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::graphql_results::resolve_blurred_image_interstitial;
     use xai_visibility_filtering::models::{KeywordMatch, SafetyResult};
@@ -580,6 +581,7 @@ mod tests {
     fn dropped(reason: FilteredReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(reason)),
+            id: RuleId::FilterAll,
             by: "rule",
         })
     }
@@ -587,6 +589,7 @@ mod tests {
     fn tombstoned(reason: TombstoneReason) -> Verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Tombstone(reason),
+            id: RuleId::FilterAll,
             by: "rule",
         })
     }
@@ -624,6 +627,7 @@ mod tests {
                 reason,
                 prompt,
             }),
+            id: RuleId::FilterAll,
             by: "blur_rule",
         }
     }
@@ -635,6 +639,7 @@ mod tests {
     fn legacy_interstitial() -> Decided<MediaRestriction> {
         Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: RuleId::FilterAll,
             by: "fallback_rule",
         }
     }
@@ -684,6 +689,7 @@ mod tests {
     fn limit() -> Decided<LimitedEngagement> {
         Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+            id: RuleId::FilterAll,
             by: "limit_rule",
         }
     }
@@ -733,6 +739,7 @@ mod tests {
             (
                 Verdict::Withheld(Decided {
                     value: Withholding::Drop(DropReason::NsfwViewer(reason)),
+                    id: RuleId::FilterAll,
                     by: "rule",
                 }),
                 Projected {
@@ -1178,10 +1185,12 @@ mod tests {
         };
         let limited = Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
+            id: RuleId::FilterAll,
             by: "limit_rule",
         };
         let nsfw = Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: RuleId::FilterAll,
             by: "nsfw_rule",
         };
         let mut cases = vec![
@@ -1212,6 +1221,7 @@ mod tests {
             dropped(FilteredReason::ExclusiveTweet),
             Verdict::Withheld(Decided {
                 value: Withholding::Drop(DropReason::NsfwViewer(NsfwViewerDropReason::IsUnderage)),
+                id: RuleId::FilterAll,
                 by: "rule",
             }),
             tombstoned(TombstoneReason::LocalRegulations),

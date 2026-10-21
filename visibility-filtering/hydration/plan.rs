@@ -1,5 +1,5 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-use crate::hydration::hydrator::{Edge, Part};
+use crate::hydration::hydrator::{Edge, Part, RequestRows};
 use crate::hydration::inventory::Source;
 use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
 use crate::rules::SafetyLevel;
@@ -10,6 +10,7 @@ use xai_core_entities::gizmoduck_client::QueryFields;
 
 pub(crate) struct HydrationPlan {
     level: SafetyLevel,
+    rows: RequestRows,
     groups: Vec<Group>,
     nodes: Hydrators,
     logged_out_nodes: Hydrators,
@@ -29,12 +30,16 @@ pub(super) struct Group {
 
 impl HydrationPlan {
     pub(crate) fn new(level: SafetyLevel, hydrators: Hydrators) -> Self {
-        let nodes = hydrators.closed();
+        Self::with_rows(level, level.spec().rows, hydrators)
+    }
+
+    pub(crate) fn with_rows(level: SafetyLevel, rows: RequestRows, hydrators: Hydrators) -> Self {
+        let nodes = hydrators.closed(rows);
         let mut groups: Vec<Group> = Vec::new();
         for node in nodes.iter() {
             let spec = node.spec();
             let (client, method) = spec.label;
-            let input = node.input();
+            let input = node.input_at(rows);
             match groups
                 .iter_mut()
                 .find(|group| group.source == spec.source && group.input == input)
@@ -65,7 +70,7 @@ impl HydrationPlan {
             .iter()
             .map(|group| {
                 group.nodes.iter().fold(Hydrators::empty(), |reads, node| {
-                    reads.union(node.spec().key.reads())
+                    reads.union(node.key_at(rows).reads())
                 })
             })
             .collect();
@@ -87,6 +92,7 @@ impl HydrationPlan {
         }
         Self {
             level,
+            rows,
             groups,
             nodes,
             logged_out_nodes: nodes
@@ -98,6 +104,16 @@ impl HydrationPlan {
 
     pub(crate) fn level(&self) -> SafetyLevel {
         self.level
+    }
+
+    pub(crate) fn rows(&self) -> RequestRows {
+        self.rows
+    }
+
+    pub(crate) fn keys_only_user_rows_or_viewer(&self) -> bool {
+        self.nodes
+            .iter()
+            .all(|node| node.key_at(self.rows).keys_user_rows())
     }
 
     pub(super) fn reads_viewer_profile(&self) -> bool {
@@ -235,7 +251,7 @@ impl fmt::Display for HydrationPlan {
                 };
                 let keys: Vec<String> = nodes
                     .iter()
-                    .map(|node| node.spec().key.to_string())
+                    .map(|node| node.key_at(self.rows).to_string())
                     .collect();
                 write!(
                     f,
@@ -247,7 +263,7 @@ impl fmt::Display for HydrationPlan {
             for node in group.nodes.iter() {
                 if let Some(edge) = node.pair_edge() {
                     let graph: &str = edge.graph().into();
-                    write!(f, " {graph}-fwd[{}]", node.spec().key)?;
+                    write!(f, " {graph}-fwd[{}]", node.key_at(self.rows))?;
                 }
             }
             if group.nodes.iter().all(Hydrator::needs_viewer) {
@@ -264,6 +280,8 @@ impl fmt::Display for HydrationPlan {
 
 #[cfg(test)]
 mod tests {
+    use super::{HydrationPlan, RequestRows};
+    use crate::hydration::{Hydrator, Hydrators};
     use crate::rules::{RuleEngine, SafetyLevel};
     use strum::VariantArray;
 
@@ -342,5 +360,25 @@ tes/get_quoted_tweets after: pure_core nodes: quoted_tweet timeout: 300ms
             .map(|&level| engine.plan(level).to_string())
             .collect();
         assert_eq!(plans, PLANS);
+    }
+
+    #[test]
+    fn a_level_of_user_rows_plans_no_pure_core_and_keys_author_lookups_by_user() {
+        let nodes = Hydrators::of(Hydrator::ViewerProfile)
+            .with(Hydrator::AuthorSafety)
+            .with(Hydrator::Follows)
+            .with(Hydrator::Blocks);
+        let plan =
+            HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes);
+        assert_eq!(
+            plan.to_string(),
+            "\
+quoted_tweet_rules: 3 calls
+gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
+gizmoduck/get_users after: - nodes: author_safety fields: SAFETY|LABELS
+socialgraph/batch_check_relationships after: - nodes: follows,blocks follows-fwd[users] blocks-fwd[users] (skipped logged out)
+"
+        );
+        assert!(plan.keys_only_user_rows_or_viewer());
     }
 }

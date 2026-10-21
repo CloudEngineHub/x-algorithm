@@ -3,10 +3,14 @@ use crate::safety_label_source::metrics::{self, BatchStage};
 use crate::safety_label_source::types::FailureKind;
 use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
+use prost::bytes::BufMut;
+use prost::encoding::{hash_map, message, uint64};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tonic::codec::{Codec, EncodeBuf, Encoder};
 use tonic::{Request, Response, Status};
+use tonic_prost::ProstDecoder;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct GetSafetyLabelsEndpoint {
@@ -23,7 +27,7 @@ impl GetSafetyLabelsEndpoint {
     pub async fn handle(
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
-    ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
+    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
         crate::metrics::observe_request(Endpoint::GetSafetyLabels, request, |request, _| {
             self.handle_inner(request)
         })
@@ -33,7 +37,7 @@ impl GetSafetyLabelsEndpoint {
     async fn handle_inner(
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
-    ) -> Result<Response<vf_pb::GetSafetyLabelsResponse>, Status> {
+    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
         let req = request.into_inner();
 
         let unique_ids: Vec<u64> = req
@@ -53,7 +57,7 @@ impl GetSafetyLabelsEndpoint {
             metrics::record_lookup_failures(kind, count);
         }
 
-        Ok(Response::new(vf_pb::GetSafetyLabelsResponse {
+        Ok(Response::new(CachedGetSafetyLabelsResponse {
             results: outcome.results,
             failed_ids: outcome.failed_ids,
         }))
@@ -61,9 +65,64 @@ impl GetSafetyLabelsEndpoint {
 }
 
 #[derive(Debug)]
+pub(crate) struct CachedGetSafetyLabelsResponse {
+    results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,
+    failed_ids: Vec<u64>,
+}
+
+impl CachedGetSafetyLabelsResponse {
+    fn encode(&self, buf: &mut impl BufMut) {
+        hash_map::encode(
+            uint64::encode,
+            uint64::encoded_len,
+            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>, buf| {
+                message::encode(tag, &**label_map, buf);
+            },
+            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>| message::encoded_len(tag, &**label_map),
+            1,
+            &self.results,
+            buf,
+        );
+        uint64::encode_packed(2, &self.failed_ids, buf);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GetSafetyLabelsCodec;
+
+impl Codec for GetSafetyLabelsCodec {
+    type Encode = CachedGetSafetyLabelsResponse;
+    type Decode = vf_pb::GetSafetyLabelsRequest;
+    type Encoder = Self;
+    type Decoder = ProstDecoder<vf_pb::GetSafetyLabelsRequest>;
+
+    fn encoder(&mut self) -> Self {
+        *self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ProstDecoder::default()
+    }
+}
+
+impl Encoder for GetSafetyLabelsCodec {
+    type Item = CachedGetSafetyLabelsResponse;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        response: CachedGetSafetyLabelsResponse,
+        buf: &mut EncodeBuf<'_>,
+    ) -> Result<(), Status> {
+        response.encode(buf);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GetSafetyLabelsOutcome {
     requested_count: usize,
-    pub(crate) results: HashMap<u64, vf_pb::SafetyLabelMap>,
+    pub(crate) results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,
     pub(crate) failed_ids: Vec<u64>,
     pub(crate) failures: EnumMap<FailureKind, usize>,
 }
@@ -80,7 +139,7 @@ impl GetSafetyLabelsOutcome {
         for (id, lookup_result) in resolved {
             match lookup_result {
                 Ok(label_map) => {
-                    results.insert(id, Arc::unwrap_or_clone(label_map));
+                    results.insert(id, label_map);
                 }
                 Err(e) => {
                     failed_ids.push(id);
@@ -125,6 +184,7 @@ impl GetSafetyLabelsOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use tonic::Code;
 
     fn labels_with_entry(type_id: i32) -> vf_pb::SafetyLabelMap {
@@ -170,6 +230,80 @@ mod tests {
         assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 1);
         assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 1);
         assert_eq!(outcome.failure_count(), 2);
+    }
+
+    fn prod_shaped_label_map(id: u64) -> vf_pb::SafetyLabelMap {
+        let label_count = 3 + i32::try_from(id % 4).unwrap();
+        vf_pb::SafetyLabelMap {
+            labels: (0..label_count)
+                .map(|i| {
+                    let msec = (1_i64 << 40) + i64::from(i);
+                    let label = vf_pb::SafetyLabel {
+                        score: Some(f64::from(i) / 7.0),
+                        applicable_users: Vec::new(),
+                        holdback_experiment: None,
+                        source: Some(format!("botmaker_rule_source_{id:04}_{i:02}")),
+                        created_at_msec: Some(msec),
+                        expires_at_msec: Some(msec + (1 << 30)),
+                        applicable_countries: if i % 3 == 0 {
+                            vec!["us".to_owned(), "de".to_owned()]
+                        } else {
+                            Vec::new()
+                        },
+                        safety_label_source: Some(
+                            vf_pb::safety_label::SafetyLabelSource::BotmakerAction(
+                                vf_pb::BotmakerAction { rule_id: msec },
+                            ),
+                        ),
+                    };
+                    (i * 7 + 1, label)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn cached_response_encodes_the_generated_bytes() {
+        let hasher = std::hash::RandomState::new();
+        let cases = [
+            ("empty", Vec::new(), Vec::new()),
+            ("failed only", Vec::new(), vec![3, 1 << 40]),
+            (
+                "empty label map",
+                vec![(5, vf_pb::SafetyLabelMap::default())],
+                Vec::new(),
+            ),
+            ("id zero", vec![(0, prod_shaped_label_map(0))], Vec::new()),
+            ("single", vec![(7, prod_shaped_label_map(7))], vec![8]),
+            (
+                "multi",
+                (1..=50)
+                    .map(|id| (id, prod_shaped_label_map(id)))
+                    .chain([(51, vf_pb::SafetyLabelMap::default())])
+                    .collect(),
+                vec![52, 53],
+            ),
+        ];
+        for (name, label_maps, failed_ids) in cases {
+            let mut generated = HashMap::with_hasher(hasher.clone());
+            let mut cached = HashMap::with_hasher(hasher.clone());
+            for (id, label_map) in label_maps {
+                cached.insert(id, Arc::new(label_map.clone()));
+                generated.insert(id, label_map);
+            }
+            let generated_bytes = vf_pb::GetSafetyLabelsResponse {
+                results: generated,
+                failed_ids: failed_ids.clone(),
+            }
+            .encode_to_vec();
+            let mut cached_bytes = Vec::new();
+            CachedGetSafetyLabelsResponse {
+                results: cached,
+                failed_ids,
+            }
+            .encode(&mut cached_bytes);
+            assert_eq!(cached_bytes, generated_bytes, "{name}");
+        }
     }
 
     #[test]

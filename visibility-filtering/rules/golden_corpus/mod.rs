@@ -37,10 +37,7 @@ use prost::Message;
 use std::collections::BTreeSet;
 use std::iter::once;
 use strum::VariantArray;
-use SafetyLevel::{
-    FilterAll, ImmersiveExpandedRecommendations, QuotedTweetRules, TimelineHome,
-    TimelineHomeHydration, TimelineHomeRecommendations,
-};
+use SafetyLevel::{QuotedTweetRules, TimelineHomeHydration};
 
 enum Role {
     NonFollower,
@@ -401,17 +398,10 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
 #[test]
 fn every_wired_rule_decides_a_corpus_case() {
     let rule_engine = RuleEngine::for_tests();
-    let wired: BTreeSet<&'static str> = [
-        FilterAll,
-        TimelineHome,
-        TimelineHomeRecommendations,
-        TimelineHomeHydration,
-        ImmersiveExpandedRecommendations,
-        QuotedTweetRules,
-    ]
-    .into_iter()
-    .flat_map(|level| rule_engine.wired_rule_names(level))
-    .collect();
+    let wired: BTreeSet<&'static str> = SafetyLevel::VARIANTS
+        .iter()
+        .flat_map(|&level| rule_engine.wired_rule_names(level))
+        .collect();
     let deciders: BTreeSet<&'static str> = corpus()
         .iter()
         .flat_map(|c| deciders(&c.expected))

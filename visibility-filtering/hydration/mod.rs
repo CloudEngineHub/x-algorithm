@@ -13,14 +13,15 @@ mod store;
 pub mod tweet_source;
 
 use crate::models::{
-    ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures, TweetId,
-    ViewerFeatures,
+    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures,
+    TweetId, UserEntity, ViewerFeatures, ViewerRelationship,
 };
 pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
+pub(crate) use hydrator::RequestRows;
 pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
 use rustc_hash::FxHashMap;
@@ -53,6 +54,7 @@ pub(crate) struct HydrationRequest<'a> {
     country_code: Option<String>,
     client_capability: ClientCapability,
     raw_candidates: Vec<RawCandidate>,
+    users: Vec<AuthorId>,
     quotes: Vec<QuoteEntry>,
     is_expanding_retweet_sources: bool,
     fallback_caches: &'a FallbackCaches,
@@ -77,9 +79,31 @@ impl<'a> HydrationRequest<'a> {
             country_code,
             client_capability,
             raw_candidates,
+            users: Vec::new(),
             quotes: Vec::new(),
             is_expanding_retweet_sources: false,
             fallback_caches,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "remove once a served level takes user rows")
+    )]
+    pub(crate) fn for_users(
+        viewer_id: u64,
+        users: Vec<AuthorId>,
+        fallback_caches: &'a FallbackCaches,
+    ) -> Self {
+        Self {
+            users,
+            ..Self::new(
+                Some(viewer_id),
+                None,
+                ClientCapability::default(),
+                Vec::new(),
+                fallback_caches,
+            )
         }
     }
 
@@ -94,9 +118,7 @@ impl<'a> HydrationRequest<'a> {
     }
 }
 
-pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
-    keys: impl Iterator<Item = K>,
-) -> FxHashMap<K, usize> {
+fn candidate_count_by_key<K: Eq + Hash>(keys: impl Iterator<Item = K>) -> FxHashMap<K, usize> {
     let mut candidate_count_by_key =
         FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());
     for key in keys {
@@ -111,8 +133,22 @@ pub(crate) struct Hydration {
     planned: Hydrators,
     incomplete: Hydrators,
     tweets: FxHashMap<TweetId, HydratedTweet>,
+    users: FxHashMap<AuthorId, HydratedUser>,
     quotes: FxHashMap<QuoteEntry, Quoted>,
     has_fetched_sources: bool,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "remove once a served level takes user rows")
+)]
+pub(crate) enum HydratedUser {
+    Resolved {
+        user: UserEntity,
+        viewer_relationship: ViewerRelationship,
+        failed: Hydrators,
+    },
+    Unresolved(Cause),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,6 +176,10 @@ impl Hydration {
 
     pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {
         self.tweets.get(&id)
+    }
+
+    pub(crate) fn user(&self, id: AuthorId) -> Option<&HydratedUser> {
+        self.users.get(&id)
     }
 
     pub(crate) fn quoted(&self, id: TweetId, placement: Placement) -> Quoted {

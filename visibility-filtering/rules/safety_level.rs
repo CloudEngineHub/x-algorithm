@@ -1,4 +1,4 @@
-use crate::hydration::AuthorNotFound;
+use crate::hydration::{AuthorNotFound, RequestRows};
 use crate::metrics::Rpc;
 use crate::rules::levels;
 use crate::rules::levels::LevelRules;
@@ -27,6 +27,7 @@ pub(crate) struct LevelSpec {
     pub(crate) unspecified_drop_is_exact: bool,
     pub(crate) quote_entries: QuoteEntries,
     pub(crate) author_not_found: AuthorNotFound,
+    pub(crate) rows: RequestRows,
 }
 
 pub(crate) enum QuoteEntries {
@@ -82,6 +83,7 @@ impl SafetyLevel {
                 unspecified_drop_is_exact: true,
                 quote_entries: QuoteEntries::NotJudged,
                 author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Posts,
             },
             SafetyLevel::TimelineHome => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::TimelineHome),
@@ -91,6 +93,7 @@ impl SafetyLevel {
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
                 author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Posts,
             },
             SafetyLevel::TimelineHomeRecommendations => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::TimelineHomeRecommendations),
@@ -100,6 +103,7 @@ impl SafetyLevel {
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
                 author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Posts,
             },
             SafetyLevel::TimelineHomeHydration => LevelSpec {
                 proto: None,
@@ -111,6 +115,7 @@ impl SafetyLevel {
                     rerenders: &TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS,
                 },
                 author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Posts,
             },
             SafetyLevel::ImmersiveExpandedRecommendations => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::ImmersiveExpandedRecommendations),
@@ -120,6 +125,7 @@ impl SafetyLevel {
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
                 author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Posts,
             },
             SafetyLevel::QuotedTweetRules => LevelSpec {
                 proto: None,
@@ -129,6 +135,7 @@ impl SafetyLevel {
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
                 author_not_found: AuthorNotFound::ReadsErased,
+                rows: RequestRows::Posts,
             },
         }
     }
@@ -145,10 +152,6 @@ impl SafetyLevel {
             let spec = variant.spec();
             spec.on_evaluate_tweets && spec.thrift == Some(level)
         })
-    }
-
-    pub fn thrift_number(self) -> Option<i32> {
-        self.spec().thrift.map(|thrift| thrift.0)
     }
 
     pub(crate) fn is_carried_by(self, rpc: Rpc) -> bool {
@@ -216,7 +219,7 @@ mod tests {
     fn every_level_reports_the_number_the_thrift_enum_gives_it() {
         let numbers: Vec<_> = SafetyLevel::VARIANTS
             .iter()
-            .map(|level| level.thrift_number())
+            .map(|level| level.spec().thrift.map(|thrift| thrift.0))
             .collect();
         assert_eq!(
             numbers,

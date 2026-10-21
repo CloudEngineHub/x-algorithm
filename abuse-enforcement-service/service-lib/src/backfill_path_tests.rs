@@ -6,7 +6,7 @@ use xai_abuse_proto::enforcement::ScoreResult;
 
 use super::*;
 use crate::action_control::test_support::record;
-use crate::action_control::{ControlMode, Lifetime, PageAction};
+use crate::action_control::{ControlMode, ControlStore, Lifetime, PageAction};
 use crate::backfill::test_support::put_running;
 use crate::backfill::RunState;
 use crate::backfill_claims::{ClaimKey, ClaimStore, ItemClaim, STALE_AFTER};
@@ -23,29 +23,70 @@ const SHR7: PageAction = PageAction::SpamHighRecall {
 const BB1: (&str, &str) = HEADS[0];
 const RUN: &str = "run-00000001";
 
-fn run_config(dry_run: bool, budget: u64) -> serde_json::Value {
-    let mut c = on_config(dry_run, None);
-    c["overturn_hold_gate"] = serde_json::json!({"mode": "enforce", "on_probe_error": "allow"});
-    c["backfill_runs"] = serde_json::json!({
-        "page_keys": ["page"],
-        "max_user_decisions_per_day": budget,
-        "max_post_decisions_per_day": budget,
-    });
-    c
+#[derive(Clone)]
+struct RunConfig {
+    config: serde_json::Value,
+    budget: u64,
 }
 
-async fn bed(
-    config: serde_json::Value,
-    records: Vec<action_control::ActionControlRecord>,
-) -> TestBed {
-    TestBed::new(BedConfig {
+fn run_config(dry_run: bool, budget: u64) -> RunConfig {
+    let mut config = on_config(dry_run, None);
+    config["overturn_hold_gate"] =
+        serde_json::json!({"mode": "enforce", "on_probe_error": "allow"});
+    RunConfig { config, budget }
+}
+
+async fn set_budget(
+    store: &action_control::test_support::MemControlStore,
+    bf: &backfill::Backfill,
+    budget: u64,
+) {
+    let rec = backfill::BackfillSettingsRecord {
+        v: backfill::BACKFILL_SETTINGS_RECORD_VERSION,
+        max_user_decisions_per_day: budget,
+        max_post_decisions_per_day: budget,
+        max_rate_per_sec: 200,
+        reason: "test".into(),
+        updated_by: "operator@example.com".into(),
+        updated_by_key: "page".into(),
+        updated_at_ms: now_millis(),
+        version: 1,
+        write_nonce: 1,
+        history: vec![],
+    };
+    store
+        .put(
+            backfill::SETTINGS_PKEY,
+            backfill::SETTINGS_LKEY,
+            serde_json::to_vec(&rec).unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    bf.refresh_settings().await.unwrap();
+}
+
+async fn pod_backfill(
+    b: &TestBed,
+    claims: Arc<dyn ClaimStore>,
+    pod: &str,
+) -> Arc<backfill::Backfill> {
+    let bf = backfill::Backfill::new(b.backfill_store.clone(), Some(claims), pod.into());
+    bf.refresh_settings().await.unwrap();
+    Arc::new(bf)
+}
+
+async fn bed(run: RunConfig, records: Vec<action_control::ActionControlRecord>) -> TestBed {
+    let b = TestBed::new(BedConfig {
         user_rules: BAKED_USER_RULES,
         post_rules: BAKED_POST_RULES,
-        config,
+        config: run.config,
         off_switches: vec![switched_off()],
         control_records: records,
     })
-    .await
+    .await;
+    set_budget(&b.backfill_store, &b.ctx.backfill, run.budget).await;
+    b
 }
 
 fn with_run(mut s: ScoreResult, run_id: &str) -> ScoreResult {
@@ -258,7 +299,7 @@ async fn a_run_decision_takes_every_live_step_with_the_runs_actions() {
 async fn a_full_live_cap_does_not_stop_a_run() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let mut cfg = run_config(false, 10);
-    cfg["max_user_enforcements_per_day"] = 0.into();
+    cfg.config["max_user_enforcements_per_day"] = 0.into();
     let b = bed(cfg, vec![]).await;
     put_running(
         &b.backfill_store,
@@ -529,7 +570,8 @@ async fn the_hold_lookup_fails_closed_for_run_decisions_only() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     for mode in ["shadow", "off"] {
         let mut cfg = run_config(false, 10);
-        cfg["overturn_hold_gate"] = serde_json::json!({"mode": mode, "on_probe_error": "allow"});
+        cfg.config["overturn_hold_gate"] =
+            serde_json::json!({"mode": mode, "on_probe_error": "allow"});
         let mut live = bed(
             cfg.clone(),
             vec![record(BB1.0, None, None, ControlMode::Live, vec![SUSPEND])],
@@ -565,7 +607,7 @@ async fn the_hold_lookup_fails_closed_for_run_decisions_only() {
         assert!(runs.claim(RUN, EntityType::User, Account::Clean.user_id()) == ItemClaim::Free);
     }
     let mut cfg = run_config(false, 10);
-    cfg["overturn_hold_gate"] = serde_json::json!({"mode": "off"});
+    cfg.config["overturn_hold_gate"] = serde_json::json!({"mode": "off"});
     let runs = bed(cfg, vec![]).await;
     put_running(
         &runs.backfill_store,
@@ -688,7 +730,7 @@ async fn messages_the_run_does_not_cover_are_skipped() {
 async fn a_run_records_only_where_a_live_record_would() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let mut off = run_config(false, 10);
-    off["action_control"] = serde_json::json!({"enabled": false});
+    off.config["action_control"] = serde_json::json!({"enabled": false});
     let b = bed(off, vec![]).await;
     put_running(
         &b.backfill_store,
@@ -740,11 +782,7 @@ async fn two_pods_racing_on_one_pair_act_once() {
     );
     let score = bb1(Account::Clean);
     let mut pod2 = b.ctx.clone();
-    pod2.backfill = Arc::new(backfill::Backfill::new(
-        b.backfill_store.clone(),
-        Some(b.claims.clone()),
-        "pod-2".into(),
-    ));
+    pod2.backfill = pod_backfill(&b, b.claims.clone(), "pod-2").await;
     *b.claims.state_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));
     let decision = |nonce: i64| DecisionContext {
         control: resolve_run_control(&b.ctx, &score, EntityType::User, &rec),
@@ -832,11 +870,7 @@ async fn two_pods_share_the_budget_exactly_from_a_cold_start() {
         vec![LevelRow::Missing],
     );
     let mut pod2 = b.ctx.clone();
-    pod2.backfill = Arc::new(backfill::Backfill::new(
-        b.backfill_store.clone(),
-        Some(b.claims.clone()),
-        "pod-2".into(),
-    ));
+    pod2.backfill = pod_backfill(&b, b.claims.clone(), "pod-2").await;
     let decide = |ctx: EnforcementCtx, account: Account, nonce: i64| {
         let score = bb1(account);
         let decision = DecisionContext {
@@ -871,11 +905,7 @@ async fn a_pair_missing_from_the_frozen_list_is_not_in_the_run() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     let mut b = bed(run_config(false, 10), vec![]).await;
     let strict = Arc::new(crate::backfill_claims::test_support::MemClaimStore::default());
-    b.ctx.backfill = Arc::new(backfill::Backfill::new(
-        b.backfill_store.clone(),
-        Some(strict.clone()),
-        String::new(),
-    ));
+    b.ctx.backfill = pod_backfill(&b, strict.clone(), "").await;
     put_running(
         &b.backfill_store,
         RUN,

@@ -28,6 +28,7 @@ use crate::side_effects::served_event_kafka_side_effect::ServedEventKafkaSideEff
 use crate::side_effects::truncate_served_history_side_effect::TruncateServedHistorySideEffect;
 use crate::side_effects::update_past_request_timestamps_side_effect::UpdatePastRequestTimestampsSideEffect;
 use crate::side_effects::update_served_history_side_effect::UpdateServedHistorySideEffect;
+use crate::side_effects::video_carousel_candidates_kafka_side_effect::VideoCarouselCandidatesKafkaSideEffect;
 use crate::sources::ads_source::AdsSource;
 use crate::sources::feed_survey_source::FeedSurveySource;
 use crate::sources::jetfuel_frame_source::JetfuelFrameSource;
@@ -78,6 +79,7 @@ impl ForYouCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -99,6 +101,7 @@ impl ForYouCandidatePipeline {
             ServedCandidatesKafkaSideEffect::prod(),
             ClientEventsKafkaSideEffect::prod(),
             ServedEventKafkaSideEffect::prod(),
+            VideoCarouselCandidatesKafkaSideEffect::prod(),
             async {
                 Arc::new(
                     ProdServedHistoryClient::new(datacenter)
@@ -160,6 +163,7 @@ impl ForYouCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -180,6 +184,7 @@ impl ForYouCandidatePipeline {
         served_candidates: ServedCandidatesKafkaSideEffect,
         client_events: ClientEventsKafkaSideEffect,
         served_event: ServedEventKafkaSideEffect,
+        video_carousel_candidates: VideoCarouselCandidatesKafkaSideEffect,
         served_history_client: Arc<dyn ServedHistoryClient>,
         who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
         prompts_client: Arc<dyn PromptsClient + Send + Sync>,
@@ -226,6 +231,7 @@ impl ForYouCandidatePipeline {
                 Box::new(served_candidates),
                 Box::new(client_events),
                 Box::new(served_event),
+                Box::new(video_carousel_candidates),
                 Box::new(ResponseStatsSideEffect),
                 Box::new(UpdatePastRequestTimestampsSideEffect::new(
                     past_request_timestamps_client,
@@ -260,6 +266,8 @@ impl ForYouCandidatePipeline {
         let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_event = ServedEventKafkaSideEffect::new(Arc::clone(&mock_kafka));
+        let video_carousel_candidates =
+            VideoCarouselCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_history_client: Arc<dyn ServedHistoryClient> = Arc::new(MockServedHistoryClient);
         let who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync> =
             Arc::new(MockWhoToFollowClient);
@@ -280,6 +288,7 @@ impl ForYouCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,

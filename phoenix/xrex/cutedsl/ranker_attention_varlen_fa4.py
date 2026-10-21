@@ -354,19 +354,17 @@ def varlen_kernels(
     hdr = ((head_dim + 31) // 32) * 32
     sr_q = ((packed_S + block_size - 1) // block_size) * block_size
     sr_k = sr_q
+    dKV_postprocess = qpk > 1
     if arch == 80:
         assert packed_S % block_size == 0, (
             "SM80 cutedsl ranker varlen attention requires packed_S % 128 == 0"
         )
         assert score_mod is None, "SM80 rejects score_mod with block sparsity; use cap <= 0"
         bwd_tile_m = 64
-        dKV_postprocess = qpk > 1
     elif arch == 90:
         bwd_tile_m = 64
-        dKV_postprocess = qpk > 1
     else:
         bwd_tile_m = block_size
-        dKV_postprocess = True
     use_pack_gqa = qpk > 1 and (block_size % qpk == 0)
 
     fwd_bs, _ = block_sparse_layout

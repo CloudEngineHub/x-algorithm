@@ -1,9 +1,8 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tracing::{error, warn};
+use tracing::warn;
 use xai_abuse_enforcement_types::action_control::{ControlEntity, LevelRow, PageAction};
 pub use xai_abuse_enforcement_types::backfill::*;
 use xai_abuse_proto::enforcement as abuse_proto;
@@ -26,10 +25,13 @@ pub fn is_backfill_topic(topic: &str) -> bool {
 pub const RUN_PKEY: &str = "backfill_run";
 pub const HOLD_PKEY: &str = "backfill_run_hold";
 pub const STOP_PKEY: &str = "backfill_run_stop";
-pub const CONFIG_KEY: &str = "backfill_runs";
+pub const SETTINGS_PKEY: &str = "backfill_settings";
+pub const SETTINGS_LKEY: &str = "current";
+pub const SETTINGS_REFRESH: std::time::Duration = crate::action_control::REFRESH_INTERVAL;
+pub const SETTINGS_STALE_AFTER: std::time::Duration = crate::action_control::STALE_AFTER;
+pub const MAX_DECISIONS_PER_DAY: u64 = 10_000_000;
 pub const RUN_TTL_SECS: u64 = 10 * 365 * 86_400;
 pub const HOLD_TTL_SECS: u64 = RUN_TTL_SECS;
-pub const DEFAULT_MAX_RATE_PER_SEC: u32 = 200;
 pub const HARD_MAX_RATE_PER_SEC: u32 = 1_000;
 const MAX_REASON_LEN: usize = 1_000;
 const MAX_HISTORY: usize = 200;
@@ -73,103 +75,49 @@ pub fn leaves_claim(status: &str) -> bool {
 }
 
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackfillConfig {
-        pub page_keys: HashSet<String>,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillAccess {
+            pub page_keys: HashSet<String>,
         pub sender_keys: HashSet<String>,
-    pub max_rate_per_sec: u32,
-    pub max_user_decisions_per_day: u64,
-    pub max_post_decisions_per_day: u64,
+    pub max_rate_ceiling: u32,
 }
 
-impl Default for BackfillConfig {
-    fn default() -> Self {
+impl BackfillAccess {
+    pub fn new(page_keys: &[String], sender_keys: &[String], max_rate_ceiling: u32) -> Self {
+        let set = |keys: &[String]| -> HashSet<String> {
+            keys.iter()
+                .map(|k| k.trim())
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
         Self {
-            page_keys: HashSet::new(),
-            sender_keys: HashSet::new(),
-            max_rate_per_sec: DEFAULT_MAX_RATE_PER_SEC,
-            max_user_decisions_per_day: 0,
-            max_post_decisions_per_day: 0,
+            page_keys: set(page_keys),
+            sender_keys: set(sender_keys),
+            max_rate_ceiling: max_rate_ceiling.min(HARD_MAX_RATE_PER_SEC),
         }
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillConfig {
+    pub page_keys: HashSet<String>,
+    pub sender_keys: HashSet<String>,
+        pub max_rate_per_sec: u32,
+    pub max_user_decisions_per_day: u64,
+    pub max_post_decisions_per_day: u64,
+}
+
 impl BackfillConfig {
-                pub fn from_config(config: Option<&Value>) -> Self {
-        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);
-        let mut out = Self::default();
-        let Some(v) = config
-            .and_then(|c| c.get(CONFIG_KEY))
-            .filter(|v| !v.is_null())
-        else {
-            return out;
-        };
-        let mut bad = Vec::new();
-        if !v.is_object() {
-            bad.push(v.to_string());
+    pub fn new(access: &BackfillAccess, settings: Option<&BackfillSettingsRecord>) -> Self {
+        Self {
+            page_keys: access.page_keys.clone(),
+            sender_keys: access.sender_keys.clone(),
+            max_rate_per_sec: settings
+                .map_or(0, |s| s.max_rate_per_sec.min(access.max_rate_ceiling)),
+            max_user_decisions_per_day: settings.map_or(0, |s| s.max_user_decisions_per_day),
+            max_post_decisions_per_day: settings.map_or(0, |s| s.max_post_decisions_per_day),
         }
-        let keys = |name: &str, bad: &mut Vec<String>| -> HashSet<String> {
-            match v.get(name) {
-                None | Some(Value::Null) => HashSet::new(),
-                Some(Value::Array(arr)) => {
-                    let parsed: Option<HashSet<String>> = arr
-                        .iter()
-                        .map(|k| {
-                            k.as_str()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_owned)
-                        })
-                        .collect();
-                    parsed.unwrap_or_else(|| {
-                        bad.push(format!("{name}={}", v[name]));
-                        HashSet::new()
-                    })
-                }
-                Some(other) => {
-                    bad.push(format!("{name}={other}"));
-                    HashSet::new()
-                }
-            }
-        };
-        out.page_keys = keys("page_keys", &mut bad);
-        out.sender_keys = keys("sender_keys", &mut bad);
-        match v.get("max_rate_per_sec") {
-            None | Some(Value::Null) => {}
-            Some(x) => match x.as_u64() {
-                Some(n) if n >= 1 => {
-                    out.max_rate_per_sec = n.min(u64::from(HARD_MAX_RATE_PER_SEC)) as u32
-                }
-                _ => bad.push(format!("max_rate_per_sec={x}")),
-            },
-        }
-        for (name, slot) in [
-            (
-                "max_user_decisions_per_day",
-                &mut out.max_user_decisions_per_day,
-            ),
-            (
-                "max_post_decisions_per_day",
-                &mut out.max_post_decisions_per_day,
-            ),
-        ] {
-            match v.get(name) {
-                None | Some(Value::Null) => {}
-                Some(x) => match x.as_u64() {
-                    Some(n) => *slot = n,
-                    None => bad.push(format!("{name}={x}")),
-                },
-            }
-        }
-        if !bad.is_empty() {
-            let bad = bad.join(", ");
-            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());
-            if last.as_deref() != Some(bad.as_str()) {
-                error!(value = %bad, "GrowthBook {CONFIG_KEY} is malformed; the bad parts read as their closed defaults");
-                *last = Some(bad);
-            }
-        }
-        out
     }
 
         pub fn budget(&self, entity: EntityType) -> u64 {
@@ -340,6 +288,7 @@ pub enum RunError {
         Invalid(&'static str, String),
         NotFound,
         Conflict(&'static str, String, Option<Box<BackfillRunRecord>>),
+        SettingsConflict(&'static str, String, Option<Box<BackfillSettingsRecord>>),
         Store(String),
 }
 
@@ -368,6 +317,14 @@ pub struct Backfill {
     claims: Option<Arc<dyn ClaimStore>>,
         pub key_locks: KeyLocks,
     pod: String,
+    access: BackfillAccess,
+        settings: std::sync::RwLock<Option<SettingsCopy>>,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsCopy {
+    record: Option<BackfillSettingsRecord>,
+    read_at: std::time::Instant,
 }
 
 impl Backfill {
@@ -381,7 +338,250 @@ impl Backfill {
             claims,
             key_locks: KeyLocks::default(),
             pod,
+            access: BackfillAccess::default(),
+            settings: std::sync::RwLock::new(None),
         }
+    }
+
+    pub fn with_access(mut self, access: BackfillAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    pub fn access(&self) -> &BackfillAccess {
+        &self.access
+    }
+
+
+    async fn stored_settings(&self) -> anyhow::Result<Option<BackfillSettingsRecord>> {
+        match self.store.get(SETTINGS_PKEY, SETTINGS_LKEY).await? {
+            None => Ok(None),
+            Some(b) => {
+                let rec: BackfillSettingsRecord = serde_json::from_slice(&b)?;
+                if rec.v > BACKFILL_SETTINGS_RECORD_VERSION {
+                    anyhow::bail!("settings record v{} is newer than this build reads", rec.v);
+                }
+                Ok(Some(rec))
+            }
+        }
+    }
+
+    fn keep_settings(&self, record: Option<BackfillSettingsRecord>) {
+        *self.settings.write().unwrap_or_else(|p| p.into_inner()) = Some(SettingsCopy {
+            record,
+            read_at: std::time::Instant::now(),
+        });
+    }
+
+            pub async fn refresh_settings(&self) -> anyhow::Result<()> {
+        let record = self.stored_settings().await?;
+        self.keep_settings(record);
+        Ok(())
+    }
+
+            fn current_settings(&self) -> Option<BackfillSettingsRecord> {
+        let copy = self.settings.read().unwrap_or_else(|p| p.into_inner());
+        copy.as_ref()
+            .filter(|c| c.read_at.elapsed() <= SETTINGS_STALE_AFTER)
+            .and_then(|c| c.record.clone())
+    }
+
+        pub fn settings_loaded(&self) -> bool {
+        self.settings
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+        pub fn config(&self) -> BackfillConfig {
+        BackfillConfig::new(&self.access, self.current_settings().as_ref())
+    }
+
+        pub async fn config_fresh(&self) -> Result<BackfillConfig, RunError> {
+        let record = self
+            .stored_settings()
+            .await
+            .map_err(|e| RunError::Store(e.to_string()))?;
+        self.keep_settings(record.clone());
+        Ok(BackfillConfig::new(&self.access, record.as_ref()))
+    }
+
+        pub async fn settings(&self) -> Result<BackfillSettingsResponse, RunError> {
+        let record = self
+            .stored_settings()
+            .await
+            .map_err(|e| RunError::Store(e.to_string()))?;
+        self.keep_settings(record.clone());
+        Ok(BackfillSettingsResponse {
+            settings: record,
+            max_rate_ceiling: self.access.max_rate_ceiling,
+        })
+    }
+
+            pub async fn set_settings(
+        &self,
+        req: BackfillSettingsRequest,
+        who: Option<&str>,
+        key_id: &str,
+        now_ms: i64,
+    ) -> Result<BackfillSettingsResponse, RunError> {
+        if !self.access.page_keys.contains(key_id) {
+            return Err(RunError::Forbidden(
+                "not_page_key",
+                format!("key {key_id} may not change the runs' budgets or speed limit"),
+            ));
+        }
+        let Some(who) = who else {
+            return Err(RunError::Forbidden(
+                "person_required",
+                "the X-Updated-By header must name the signed-in person".into(),
+            ));
+        };
+        let reason = req.reason.trim();
+        if reason.is_empty() || reason.len() > MAX_REASON_LEN {
+            return Err(RunError::Invalid(
+                "bad_reason",
+                "say why, in at most 1000 bytes".into(),
+            ));
+        }
+        if req.max_user_decisions_per_day > MAX_DECISIONS_PER_DAY
+            || req.max_post_decisions_per_day > MAX_DECISIONS_PER_DAY
+        {
+            return Err(RunError::Invalid(
+                "bad_budget",
+                format!("a daily budget is 0 to {MAX_DECISIONS_PER_DAY}"),
+            ));
+        }
+        if req.max_rate_per_sec > self.access.max_rate_ceiling {
+            return Err(RunError::Invalid(
+                "bad_rate",
+                format!(
+                    "the speed limit is 0 to {} decisions a second",
+                    self.access.max_rate_ceiling
+                ),
+            ));
+        }
+        let current = self
+            .stored_settings()
+            .await
+            .map_err(|e| RunError::Store(e.to_string()))?;
+        if req.expected_version != current.as_ref().map(|c| c.version) {
+            return Err(RunError::SettingsConflict(
+                "version_conflict",
+                "the budgets or speed limit changed since you looked; read them again".into(),
+                current.map(Box::new),
+            ));
+        }
+        let raises = match &current {
+            None => {
+                req.max_user_decisions_per_day > 0
+                    || req.max_post_decisions_per_day > 0
+                    || req.max_rate_per_sec > 0
+            }
+            Some(c) => {
+                req.max_user_decisions_per_day > c.max_user_decisions_per_day
+                    || req.max_post_decisions_per_day > c.max_post_decisions_per_day
+                    || req.max_rate_per_sec > c.max_rate_per_sec
+            }
+        };
+        if raises && req.confirm.as_deref() != Some(CONFIRM_WORD) {
+            return Err(RunError::Invalid(
+                "confirm_required",
+                format!("raising a budget or the speed limit needs confirm: \"{CONFIRM_WORD}\""),
+            ));
+        }
+        let version = current.as_ref().map_or(0, |c| c.version) + 1;
+        let mut history = current.map(|c| c.history).unwrap_or_default();
+        history.push(BackfillSettingsChange {
+            at_ms: now_ms,
+            by: who.to_owned(),
+            version,
+            max_user_decisions_per_day: req.max_user_decisions_per_day,
+            max_post_decisions_per_day: req.max_post_decisions_per_day,
+            max_rate_per_sec: req.max_rate_per_sec,
+            reason: reason.to_owned(),
+        });
+        if history.len() > MAX_HISTORY {
+            history.drain(..history.len() - MAX_HISTORY);
+        }
+        let next = BackfillSettingsRecord {
+            v: BACKFILL_SETTINGS_RECORD_VERSION,
+            max_user_decisions_per_day: req.max_user_decisions_per_day,
+            max_post_decisions_per_day: req.max_post_decisions_per_day,
+            max_rate_per_sec: req.max_rate_per_sec,
+            reason: reason.to_owned(),
+            updated_by: who.to_owned(),
+            updated_by_key: key_id.to_owned(),
+            updated_at_ms: now_ms,
+            version,
+            write_nonce: crate::action_control::new_nonce(),
+            history,
+        };
+        self.store
+            .put(
+                SETTINGS_PKEY,
+                SETTINGS_LKEY,
+                serde_json::to_vec(&next).unwrap_or_default(),
+                RUN_TTL_SECS,
+            )
+            .await
+            .map_err(|e| RunError::Store(e.to_string()))?;
+        let back = self
+            .stored_settings()
+            .await
+            .map_err(|e| RunError::Store(e.to_string()))?;
+        match back {
+            Some(b) if b.write_nonce == next.write_nonce => {
+                self.keep_settings(Some(b.clone()));
+                Ok(BackfillSettingsResponse {
+                    settings: Some(b),
+                    max_rate_ceiling: self.access.max_rate_ceiling,
+                })
+            }
+            other => Err(RunError::SettingsConflict(
+                "lost_race",
+                "another change to the settings landed at the same moment; read them and try again"
+                    .into(),
+                other.map(Box::new),
+            )),
+        }
+    }
+
+        pub fn spawn_settings_refresh(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SETTINGS_REFRESH);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut failing = false;
+            loop {
+                tick.tick().await;
+                match this.refresh_settings().await {
+                    Ok(()) => {
+                        if failing {
+                            tracing::info!("backfill settings: read ok again");
+                        }
+                        failing = false;
+                    }
+                    Err(e) => {
+                        if !failing {
+                            warn!(
+                                "backfill settings: read failed; runs act on nothing once the copy is {}s old: {e}",
+                                SETTINGS_STALE_AFTER.as_secs()
+                            );
+                        }
+                        failing = true;
+                    }
+                }
+            }
+        })
+    }
+
+                pub fn as_served(&self, mut rec: BackfillRunRecord) -> BackfillRunRecord {
+        let limit = self.config().max_rate_per_sec;
+        if limit > 0 && rec.rate_per_sec > limit {
+            rec.rate_per_sec = limit;
+        }
+        rec
     }
 
             pub fn claims(&self) -> Option<&Arc<dyn ClaimStore>> {
@@ -528,7 +728,7 @@ impl Backfill {
         if !cfg.page_keys.contains(key_id) {
             return Err(RunError::Forbidden(
                 "not_page_key",
-                format!("key {key_id} is not in GrowthBook {CONFIG_KEY}.page_keys"),
+                format!("key {key_id} is not one of this service's page keys"),
             ));
         }
         let Some(who) = who else {
@@ -1086,6 +1286,13 @@ fn validate_start(
             "a lighter-action run covers accounts only".into(),
         );
     }
+    if cfg.max_rate_per_sec == 0 {
+        return Err(RunError::Conflict(
+            "settings_not_set",
+            "the runs' speed limit is 0 or not set; set it on /enforcements first".into(),
+            None,
+        ));
+    }
     if req.rate_per_sec == 0 || req.rate_per_sec > cfg.max_rate_per_sec {
         return bad(
             "bad_rate",
@@ -1298,24 +1505,310 @@ mod tests {
         .await
     }
 
+    fn settings_bf(store: &Arc<MemControlStore>) -> Backfill {
+        Backfill::new(store.clone(), None, "pod-0".into()).with_access(BackfillAccess::new(
+            &["page".into(), " ".into()],
+            &["sender".into()],
+            1_000,
+        ))
+    }
+
+    fn settings_req(
+        user: u64,
+        post: u64,
+        rate: u32,
+        expected_version: Option<u64>,
+    ) -> BackfillSettingsRequest {
+        BackfillSettingsRequest {
+            max_user_decisions_per_day: user,
+            max_post_decisions_per_day: post,
+            max_rate_per_sec: rate,
+            reason: "first runs".into(),
+            expected_version,
+            confirm: Some(CONFIRM_WORD.into()),
+        }
+    }
+
     #[test]
-    fn config_is_closed_by_default_and_on_bad_values() {
-        let d = BackfillConfig::from_config(None);
-        assert!(d.page_keys.is_empty() && d.sender_keys.is_empty());
-        assert_eq!((d.max_rate_per_sec, d.max_user_decisions_per_day), (200, 0));
-        let c = BackfillConfig::from_config(Some(&serde_json::json!({CONFIG_KEY: {
-            "page_keys": ["pv2"], "sender_keys": ["sender"], "max_rate_per_sec": 5000,
-            "max_user_decisions_per_day": 1000, "max_post_decisions_per_day": "lots"
-        }})));
-        assert!(c.page_keys.contains("pv2"));
-        assert!(c.sender_keys.contains("sender"));
-        assert_eq!(c.max_rate_per_sec, HARD_MAX_RATE_PER_SEC);
-        assert_eq!(c.max_user_decisions_per_day, 1000);
-        assert_eq!(c.max_post_decisions_per_day, 0, "malformed reads as closed");
-        let bad = BackfillConfig::from_config(Some(&serde_json::json!({CONFIG_KEY: {
-            "page_keys": "pv2"
-        }})));
-        assert!(bad.page_keys.is_empty());
+    fn access_comes_from_the_helm_values_and_is_closed_by_default() {
+        let none = BackfillAccess::default();
+        assert!(none.page_keys.is_empty() && none.sender_keys.is_empty());
+        assert_eq!(none.max_rate_ceiling, 0);
+        let a = BackfillAccess::new(
+            &["dev".into(), "".into(), " dev ".into()],
+            &["backfill_sender".into()],
+            5_000,
+        );
+        assert_eq!(a.page_keys, HashSet::from(["dev".to_owned()]));
+        assert_eq!(a.sender_keys, HashSet::from(["backfill_sender".to_owned()]));
+        assert_eq!(a.max_rate_ceiling, HARD_MAX_RATE_PER_SEC);
+    }
+
+    #[tokio::test]
+    async fn no_settings_means_budget_zero_and_no_run_starts() {
+        let (_, _, ac, sw) = parts();
+        let store = Arc::new(MemControlStore::default());
+        let bf = settings_bf(&store);
+        assert!(!bf.settings_loaded());
+        let c = bf.config();
+        assert_eq!(
+            (
+                c.budget(EntityType::User),
+                c.budget(EntityType::Post),
+                c.max_rate_per_sec
+            ),
+            (0, 0, 0)
+        );
+        bf.refresh_settings().await.unwrap();
+        assert!(bf.settings_loaded(), "an absent record is a completed read");
+        assert_eq!(bf.config().budget(EntityType::User), 0);
+        let cfg = bf.config_fresh().await.unwrap();
+        let err = bf
+            .start(
+                start_request("run-00000001", "H", NOW),
+                Some("a@example.com"),
+                "page",
+                &cfg,
+                &ac,
+                &ControlConfig::default(),
+                &sw,
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RunError::Conflict("settings_not_set", ..)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_page_key_with_a_named_person_sets_the_settings() {
+        let store = Arc::new(MemControlStore::default());
+        let bf = settings_bf(&store);
+        for (key, who, code) in [
+            ("sender", Some("a@example.com"), "not_page_key"),
+            ("pv2", Some("a@example.com"), "not_page_key"),
+            (" ", Some("a@example.com"), "not_page_key"),
+            ("page", None, "person_required"),
+        ] {
+            let err = bf
+                .set_settings(settings_req(5, 5, 100, None), who, key, NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RunError::Forbidden(c, _) if c == code),
+                "{key}: {err:?}"
+            );
+        }
+        assert!(store.rows.lock().unwrap().is_empty(), "nothing written");
+        let live = Backfill::new(store.clone(), None, String::new());
+        let err = live
+            .set_settings(
+                settings_req(5, 5, 100, None),
+                Some("a@example.com"),
+                "page",
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RunError::Forbidden("not_page_key", _)),
+            "no Helm keys = nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_writes_check_the_version_and_confirm_raises() {
+        let store = Arc::new(MemControlStore::default());
+        let bf = settings_bf(&store);
+        let who = Some("a@example.com");
+        let mut unconfirmed = settings_req(5, 0, 100, None);
+        unconfirmed.confirm = None;
+        assert!(matches!(
+            bf.set_settings(unconfirmed, who, "page", NOW).await,
+            Err(RunError::Invalid("confirm_required", _))
+        ));
+        assert!(matches!(
+            bf.set_settings(settings_req(5, 0, 1_001, None), who, "page", NOW)
+                .await,
+            Err(RunError::Invalid("bad_rate", _))
+        ));
+        assert!(matches!(
+            bf.set_settings(
+                settings_req(MAX_DECISIONS_PER_DAY + 1, 0, 1, None),
+                who,
+                "page",
+                NOW
+            )
+            .await,
+            Err(RunError::Invalid("bad_budget", _))
+        ));
+        let mut no_reason = settings_req(5, 0, 1, None);
+        no_reason.reason = "  ".into();
+        assert!(matches!(
+            bf.set_settings(no_reason, who, "page", NOW).await,
+            Err(RunError::Invalid("bad_reason", _))
+        ));
+
+        let first = bf
+            .set_settings(settings_req(5, 3, 100, None), who, "page", NOW)
+            .await
+            .unwrap();
+        let rec = first.settings.unwrap();
+        assert_eq!((rec.version, rec.updated_by.as_str()), (1, "a@example.com"));
+        assert_eq!(first.max_rate_ceiling, 1_000);
+        let c = bf.config();
+        assert_eq!(
+            (c.budget(EntityType::User), c.budget(EntityType::Post)),
+            (5, 3)
+        );
+        assert_eq!(c.max_rate_per_sec, 100);
+
+        let stale = bf
+            .set_settings(settings_req(9, 3, 100, None), who, "page", NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&stale, RunError::SettingsConflict("version_conflict", _, Some(cur)) if cur.version == 1),
+            "{stale:?}"
+        );
+        let stale = bf
+            .set_settings(settings_req(9, 3, 100, Some(7)), who, "page", NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            RunError::SettingsConflict("version_conflict", ..)
+        ));
+
+        let mut lower = settings_req(0, 0, 50, Some(1));
+        lower.confirm = None;
+        let second = bf.set_settings(lower, who, "page", NOW + 1).await.unwrap();
+        let rec = second.settings.unwrap();
+        assert_eq!(rec.version, 2, "lowering needs no typed word");
+        assert_eq!(rec.history.len(), 2);
+        assert_eq!(bf.config().budget(EntityType::User), 0);
+    }
+
+    #[tokio::test]
+    async fn a_settings_write_that_loses_its_race_is_refused() {
+        let store = Arc::new(MemControlStore::default());
+        let bf = settings_bf(&store);
+        struct Clobber(Arc<MemControlStore>);
+        #[async_trait::async_trait]
+        impl ControlStore for Clobber {
+            async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+                self.0.scan(pkey).await
+            }
+            async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                self.0.get(pkey, lkey).await
+            }
+            async fn put(&self, p: &str, l: &str, v: Vec<u8>, t: u64) -> anyhow::Result<()> {
+                let mut other: BackfillSettingsRecord = serde_json::from_slice(&v).unwrap();
+                other.write_nonce ^= 1;
+                self.0
+                    .put(p, l, serde_json::to_vec(&other).unwrap(), t)
+                    .await
+            }
+            async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {
+                self.0.delete(pkey, lkey).await
+            }
+        }
+        let racing = Backfill::new(Arc::new(Clobber(store.clone())), None, String::new())
+            .with_access(bf.access().clone());
+        let err = racing
+            .set_settings(
+                settings_req(5, 5, 100, None),
+                Some("a@example.com"),
+                "page",
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RunError::SettingsConflict("lost_race", ..)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_pod_picks_up_new_settings_on_its_refresh_and_a_stale_copy_acts_on_nothing() {
+        let store = Arc::new(MemControlStore::default());
+        let writer = settings_bf(&store);
+        let pod = settings_bf(&store);
+        pod.refresh_settings().await.unwrap();
+        writer
+            .set_settings(
+                settings_req(7, 2, 300, None),
+                Some("a@example.com"),
+                "page",
+                NOW,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pod.config().budget(EntityType::User), 0, "not read yet");
+        pod.refresh_settings().await.unwrap();
+        assert_eq!(pod.config().budget(EntityType::User), 7);
+        assert_eq!(pod.config().max_rate_per_sec, 300);
+
+        store
+            .fail_get
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(pod.refresh_settings().await.is_err());
+        assert_eq!(
+            pod.config().budget(EntityType::User),
+            7,
+            "a fresh copy survives one failed read"
+        );
+        assert!(matches!(pod.config_fresh().await, Err(RunError::Store(_))));
+        if let Some(old) = std::time::Instant::now()
+            .checked_sub(SETTINGS_STALE_AFTER + std::time::Duration::from_secs(1))
+        {
+            pod.settings.write().unwrap().as_mut().unwrap().read_at = old;
+            let c = pod.config();
+            assert_eq!(
+                (
+                    c.budget(EntityType::User),
+                    c.budget(EntityType::Post),
+                    c.max_rate_per_sec
+                ),
+                (0, 0, 0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lower_speed_limit_slows_a_run_already_going() {
+        let store = Arc::new(MemControlStore::default());
+        let bf = settings_bf(&store);
+        let rec = put_running(
+            &store,
+            "run-00000001",
+            "H",
+            vec![PageAction::Suspend {}],
+            vec![],
+        );
+        assert_eq!(
+            bf.as_served(rec.clone()).rate_per_sec,
+            rec.rate_per_sec,
+            "no limit read"
+        );
+        bf.set_settings(
+            settings_req(5, 5, 50, None),
+            Some("a@example.com"),
+            "page",
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(rec.rate_per_sec > 50);
+        assert_eq!(bf.as_served(rec.clone()).rate_per_sec, 50);
+        let slow = BackfillRunRecord {
+            rate_per_sec: 10,
+            ..rec
+        };
+        assert_eq!(bf.as_served(slow).rate_per_sec, 10);
     }
 
     #[test]
@@ -2085,7 +2578,7 @@ mod tests {
 
         struct TtlStore {
         inner: Arc<MemControlStore>,
-        ttls: Mutex<Vec<(String, u64)>>,
+        ttls: std::sync::Mutex<Vec<(String, u64)>>,
     }
 
     #[async_trait::async_trait]
@@ -2116,7 +2609,7 @@ mod tests {
         let (store, _, ac, sw) = parts();
         let ttl_store = Arc::new(TtlStore {
             inner: store,
-            ttls: Mutex::new(Vec::new()),
+            ttls: std::sync::Mutex::new(Vec::new()),
         });
         let bf = Backfill::new(ttl_store.clone(), None, "pod-0".into());
         let req = start_request("run-00000001", "H", NOW);

@@ -2470,7 +2470,7 @@ pub async fn handle_action_controls_pod(State(state): State<Arc<AppState>>) -> i
 
 use crate::backfill::{
     BackfillRunChangeRequest, BackfillRunListResponse, BackfillRunRecord, BackfillRunStartRequest,
-    Change as RunChange, RunError, RunState,
+    BackfillSettingsRequest, BackfillSettingsResponse, Change as RunChange, RunError, RunState,
 };
 
 fn run_person(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -2497,6 +2497,10 @@ fn run_error_response(e: RunError) -> (StatusCode, Json<Value>) {
             Json(json!({"error": "not_found", "detail": "no run has this id"})),
         ),
         RunError::Conflict(code, detail, current) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": code, "detail": detail, "current": current})),
+        ),
+        RunError::SettingsConflict(code, detail, current) => (
             StatusCode::CONFLICT,
             Json(json!({"error": code, "detail": detail, "current": current})),
         ),
@@ -2580,6 +2584,7 @@ pub async fn handle_backfill_runs_list(
                 && q.entity.as_deref().is_none_or(|e| e == r.entity.as_str())
                 && q.head.as_deref().is_none_or(|h| h == r.head)
         })
+        .map(|r| state.backfill.as_served(r))
         .collect();
     (
         StatusCode::OK,
@@ -2592,18 +2597,112 @@ pub async fn handle_backfill_runs_list(
     path = "/backfill_runs/budget",
     tag = "backfill_runs",
     security(("BearerAuth" = [])),
-    responses((status = 200, description = "Budget per entity")),
+    responses(
+        (status = 200, description = "Budget per entity and the speed limit"),
+        (status = 503, description = "Store unreachable"),
+    ),
 )]
 #[tracing::instrument(skip_all)]
 pub async fn handle_backfill_runs_budget(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = state.dynamic_config.backfill_config();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "user": cfg.budget(EntityType::User),
-            "post": cfg.budget(EntityType::Post),
-        })),
-    )
+    match state.backfill.config_fresh().await {
+        Ok(cfg) => (
+            StatusCode::OK,
+            Json(json!({
+                "user": cfg.budget(EntityType::User),
+                "post": cfg.budget(EntityType::Post),
+                "max_rate_per_sec": cfg.max_rate_per_sec,
+            })),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "The settings", body = BackfillSettingsResponse),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.backfill.settings().await {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/backfill_settings",
+    tag = "backfill_runs",
+    security(("BearerAuth" = [])),
+    request_body = BackfillSettingsRequest,
+    responses(
+        (status = 200, description = "The settings after the change", body = BackfillSettingsResponse),
+        (status = 400, description = "confirm_required, bad_rate, bad_budget or bad_reason"),
+        (status = 403, description = "not_page_key or person_required"),
+        (status = 409, description = "version_conflict or lost_race, with the current settings"),
+        (status = 503, description = "Store unreachable"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_backfill_settings_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackfillSettingsRequest>,
+) -> impl IntoResponse {
+    let who = run_person(&headers);
+    info!(
+        who = who.as_deref().unwrap_or(""),
+        key_id = %actor.0,
+        user = req.max_user_decisions_per_day,
+        post = req.max_post_decisions_per_day,
+        rate = req.max_rate_per_sec,
+        "PUT /api/backfill_settings"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .backfill
+        .set_settings(req, who.as_deref(), &actor.0, crate::now_millis())
+        .await;
+    if !matches!(result, Err(RunError::Invalid(..))) {
+        let (success, error) = match &result {
+            Ok(_) => (true, String::new()),
+            Err(e) => (false, format!("{e:?}")),
+        };
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &AdminActionEvent {
+                occurred_at_ms: crate::now_millis(),
+                action: AdminAction::Unspecified as i32,
+                actor_key_id: actor.0,
+                environment: AUDIT_ENVIRONMENT.clone(),
+                http_method: method.to_string(),
+                http_path: uri.path().to_string(),
+                success,
+                error,
+                request_json,
+                ..Default::default()
+            },
+        );
+    }
+    match result {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(s).unwrap_or_default()),
+        ),
+        Err(e) => run_error_response(e),
+    }
 }
 
 #[utoipa::path(
@@ -2626,7 +2725,7 @@ pub async fn handle_backfill_run_get(
     match state.backfill.run(&run_id).await {
         Ok(Some(rec)) => (
             StatusCode::OK,
-            Json(serde_json::to_value(rec).unwrap_or_default()),
+            Json(serde_json::to_value(state.backfill.as_served(rec)).unwrap_or_default()),
         ),
         Ok(None) => run_error_response(RunError::NotFound),
         Err(e) => run_error_response(RunError::Store(e.to_string())),
@@ -2644,7 +2743,7 @@ pub async fn handle_backfill_run_get(
         (status = 200, description = "The same run, already started", body = BackfillRunRecord),
         (status = 400, description = "Invalid request: {error: code, detail}"),
         (status = 403, description = "not_page_key or person_required"),
-        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off or lost_race"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off, settings_not_set or lost_race"),
         (status = 503, description = "Store unreachable"),
     ),
 )]
@@ -2667,19 +2766,24 @@ pub async fn handle_backfill_run_start(
         "POST /api/backfill_runs"
     );
     let request_json = serde_json::to_string(&req).unwrap_or_default();
-    let result = state
-        .backfill
-        .start(
-            req,
-            who.as_deref(),
-            &actor.0,
-            &state.dynamic_config.backfill_config(),
-            &state.action_control,
-            &state.dynamic_config.action_control_config(),
-            &state.off_switch,
-            crate::now_millis(),
-        )
-        .await;
+    let result = match state.backfill.config_fresh().await {
+        Ok(cfg) => {
+            state
+                .backfill
+                .start(
+                    req,
+                    who.as_deref(),
+                    &actor.0,
+                    &cfg,
+                    &state.action_control,
+                    &state.dynamic_config.action_control_config(),
+                    &state.off_switch,
+                    crate::now_millis(),
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
     if !matches!(result, Err(RunError::Invalid(..))) {
         publish_admin_action_event(
             state.kafka_producers.admin_actions(),
@@ -2758,7 +2862,7 @@ pub async fn handle_backfill_run_change(
             req,
             who.as_deref(),
             &actor.0,
-            &state.dynamic_config.backfill_config(),
+            &state.backfill.config(),
             &state.action_control,
             &state.dynamic_config.action_control_config(),
             &state.off_switch,

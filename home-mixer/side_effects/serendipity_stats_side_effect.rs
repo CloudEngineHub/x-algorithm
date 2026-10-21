@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_feature_switches::ExperimentBucket;
+use xai_recsys_proto::{language_code_string_to_enum, LanguageCode};
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets, StatsReceiverExt};
 use xai_vm_ranker_proto::experiment::HistoryTopics;
 
@@ -15,6 +16,17 @@ const METRIC_PREFIX: &str = "Serendipity";
 const DEFAULT_SAMPLING_RATE: f64 = 0.05;
 const TOP_POSITIONS: usize = 10;
 const MS_PER_DAY: f64 = 86_400_000.0;
+const MIN_USER_LANGUAGE_SHARE: f64 = 0.05;
+const NON_LINGUISTIC: [LanguageCode; 8] = [
+    LanguageCode::LangUnknown,
+    LanguageCode::LangUnd,
+    LanguageCode::LangZxx,
+    LanguageCode::LangQme,
+    LanguageCode::LangQst,
+    LanguageCode::LangQht,
+    LanguageCode::LangQct,
+    LanguageCode::LangQam,
+];
 
 pub struct SerendipityStatsSideEffect;
 
@@ -56,7 +68,12 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for SerendipityStatsSideEffect 
                 .partial_cmp(&a.score.unwrap_or(f64::NEG_INFINITY))
                 .unwrap_or(Ordering::Equal)
         });
-        let observations = observations(history, &final_order, input.query.request_time_ms);
+        let observations = observations(
+            history,
+            &final_order,
+            input.query.request_time_ms,
+            &input.query.language_code,
+        );
         for bucket in &buckets {
             record(receiver.as_ref(), &observations, bucket);
         }
@@ -116,10 +133,53 @@ fn share(numerator: usize, denominator: usize) -> Option<f64> {
     (denominator > 0).then(|| numerator as f64 / denominator as f64)
 }
 
+fn is_linguistic(code: i32) -> bool {
+    !NON_LINGUISTIC.iter().any(|c| *c as i32 == code)
+}
+
+fn post_language(candidate: &PostCandidate) -> Option<i32> {
+    let code = language_code_string_to_enum(candidate.language_code.as_deref()?) as i32;
+    is_linguistic(code).then_some(code)
+}
+
+fn user_languages(history: &HistoryTopics, app_language: &str) -> HashSet<i32> {
+    let known: u32 = history
+        .language_counts
+        .iter()
+        .filter(|(code, _)| is_linguistic(**code))
+        .map(|(_, n)| *n)
+        .sum();
+    let mut languages: HashSet<i32> = history
+        .language_counts
+        .iter()
+        .filter(|(code, n)| {
+            is_linguistic(**code) && f64::from(**n) >= MIN_USER_LANGUAGE_SHARE * f64::from(known)
+        })
+        .map(|(code, _)| *code)
+        .collect();
+    let app = language_code_string_to_enum(app_language) as i32;
+    if is_linguistic(app) {
+        languages.insert(app);
+    }
+    languages
+}
+
+fn cross_language_share(posts: &[&PostCandidate], user_languages: &HashSet<i32>) -> Option<f64> {
+    let languages: Vec<i32> = posts.iter().filter_map(|c| post_language(c)).collect();
+    share(
+        languages
+            .iter()
+            .filter(|l| !user_languages.contains(l))
+            .count(),
+        languages.len(),
+    )
+}
+
 fn observations(
     history: &HistoryTopics,
     page: &[&PostCandidate],
     request_time_ms: i64,
+    app_language: &str,
 ) -> Vec<(&'static str, f64, Scale)> {
     let topics: Vec<(u32, Option<u32>)> = page.iter().filter_map(|c| topic(c)).collect();
     let served_l1: HashSet<u32> = topics.iter().map(|t| t.0).collect();
@@ -166,6 +226,40 @@ fn observations(
             Scale::Small,
         ));
     }
+    let languages = user_languages(history, app_language);
+    let linguistic_rows: u32 = history
+        .language_counts
+        .iter()
+        .filter(|(code, _)| is_linguistic(**code))
+        .map(|(_, n)| *n)
+        .sum();
+    out.push(("UserLanguages", languages.len() as f64, Scale::Small));
+    out.push((
+        "CandidateLanguageCoverage",
+        page.iter().filter(|c| post_language(c).is_some()).count() as f64 / page.len() as f64,
+        Scale::Share,
+    ));
+    if history.engaged_rows > 0 {
+        out.push((
+            "HistoryLanguageCoverage",
+            f64::from(linguistic_rows) / f64::from(history.engaged_rows),
+            Scale::Share,
+        ));
+    }
+    if !languages.is_empty() {
+        let top = &page[..TOP_POSITIONS.min(page.len())];
+        for (name, value) in [
+            ("CrossLanguageShare", cross_language_share(page, &languages)),
+            (
+                "CrossLanguageShareTop10",
+                cross_language_share(top, &languages),
+            ),
+        ] {
+            if let Some(value) = value {
+                out.push((name, value, Scale::Share));
+            }
+        }
+    }
     if history.sid_rows > 0 {
         let sets = HistorySets::new(history);
         let top = &page[..TOP_POSITIONS.min(page.len())];
@@ -173,6 +267,7 @@ fn observations(
             ("NewTopicShareL1", new_l1_share(page, &sets)),
             ("NewTopicShareL2", new_l2_share(page, &sets)),
             ("NewTopicShareL1Top10", new_l1_share(top, &sets)),
+            ("NewTopicShareL2Top10", new_l2_share(top, &sets)),
         ] {
             if let Some(value) = value {
                 out.push((name, value, Scale::Share));

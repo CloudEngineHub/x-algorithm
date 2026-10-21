@@ -18,13 +18,14 @@ pub use crate::rules::{
 };
 
 use crate::evaluate_tweets::{Sends, evaluate_tweets_request};
+use crate::filter_tweets::filter_tweets_request;
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Sources, test_users_metadata};
 use crate::hydration::{HydratedTweet, Hydration, request_context};
 use crate::models::{EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, Viewer};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
-use crate::post_evaluator::{HydratedRequest, PostBatch, PostEvaluator};
+use crate::post_evaluator::{HydratedRequest, PostEvaluator};
 use crate::result_label::{Class, NONE, label, state_label};
 use crate::retweet;
 use crate::rules::RuleEngine;
@@ -123,7 +124,7 @@ impl<const N: usize> Explanation<N> {
 #[non_exhaustive]
 pub struct LevelOutcome {
     pub route: Route,
-        pub capability: ClientCapability,
+            pub capability: ClientCapability,
     pub judgement: Judgement,
     pub provenance: Provenance,
 }
@@ -365,14 +366,13 @@ impl Explainer {
         let (context, request) = match route.rpc {
             Rpc::FilterTweets => (
                 None,
-                PostBatch {
+                filter_tweets_request(
+                    &self.client_switches,
                     viewer_id,
-                    country_code: ask.country.clone(),
-                    client_capability: ClientCapability::default(),
-                    safety_level: route.level,
+                    ask.country.clone(),
+                    route.level,
                     candidates,
-                    rpc: Rpc::FilterTweets,
-                },
+                ),
             ),
             Rpc::EvaluateTweets => {
                 let context = ask.client.context(viewer_id, ask.country.as_deref());
@@ -569,6 +569,7 @@ mod tests {
     use super::*;
     use crate::clients::socialgraph_client::Graph;
     use crate::evaluate_tweets::EvaluateTweetsEndpoint;
+    use crate::filter_tweets::FilterTweetsEndpoint;
     use crate::hydration::HydratedTweet;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources, control, suspended};
@@ -658,16 +659,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_tweets_routes_take_the_default_capability_and_evaluate_tweets_the_clients() {
-        let explainer = explainer(
-            InMemorySources::default().tweet(1, 10).authors(&[10]),
+    async fn each_route_takes_the_capability_its_handler_builds() {
+        let switches = ClientSwitches::for_tests_with(&[&format!(
+            "soft_nsfw:\n  parameters:\n    soft_nsfw_tweet_label_new_user_rule_enabled: {{type: boolean, default: false}}\n  rules:\n  - query: \"[user_id in {VIEWER}]\"\n    values: {{soft_nsfw_tweet_label_new_user_rule_enabled: true}}\n"
+        )]);
+        let outcomes = Explainer::new(
+            Arc::new(InMemorySources::default().tweet(1, 10).authors(&[10])),
+            FallbackCaches::default(),
+            Arc::new(CountryLists::starting_at_default()),
+            switches.clone(),
             no_copy(),
-        );
-        let outcomes = explainer
-            .explain(&ask(VIEWER, 1, Client::IosOutdated))
-            .await
-            .levels;
-        let resolved = ClientSwitches::for_tests().resolve(
+        )
+        .explain(&ask(VIEWER, 1, Client::IosOutdated))
+        .await
+        .levels;
+        let post_evaluator = Arc::new(PostEvaluator::new(
+            Arc::new(InMemorySources::default()),
+            RuleEngine::for_tests(),
+            Arc::default(),
+        ));
+        let endpoint =
+            FilterTweetsEndpoint::new(Arc::clone(&post_evaluator), switches.clone(), None);
+        for level in [
+            vf_pb::SafetyLevel::TimelineHome,
+            vf_pb::SafetyLevel::TimelineHomeRecommendations,
+        ] {
+            endpoint
+                .handle(tonic::Request::new(vf_pb::VisibilityFilterRequest {
+                    safety_level: level.into(),
+                    tweets: vec![vf_pb::TweetInput {
+                        tweet_id: 1,
+                        author_id: None,
+                    }],
+                    viewer_id: Some(VIEWER),
+                    country_code: Some("us".to_owned()),
+                }))
+                .await
+                .unwrap();
+        }
+        let handler_capabilities = post_evaluator.client_capabilities.lock().unwrap();
+        assert!(handler_capabilities[1].soft_nsfw_new_user_drop);
+        let resolved = switches.resolve(
             Some(&Client::IosOutdated.context(Some(VIEWER), Some("us"))),
             Some(VIEWER),
             Some("us"),
@@ -678,20 +710,8 @@ mod tests {
         );
         assert_eq!(
             outcomes.map(|outcome| outcome.capability),
-            [
-                ClientCapability::default(),
-                ClientCapability::default(),
-                resolved
-            ]
+            [handler_capabilities[0], handler_capabilities[1], resolved]
         );
-        let mut hydrated_with = explainer
-            .post_evaluator
-            .client_capabilities
-            .lock()
-            .unwrap()
-            .clone();
-        hydrated_with.retain(|&capability| capability == resolved);
-        assert_eq!(hydrated_with, [resolved]);
     }
 
     #[tokio::test]
@@ -1388,14 +1408,13 @@ mod tests {
             request_author_id: None,
         })];
         let request = match route.rpc() {
-            Rpc::FilterTweets => PostBatch {
-                viewer_id: Some(VIEWER),
-                country_code: Some("us".to_owned()),
-                client_capability: ClientCapability::default(),
-                safety_level: route.level(),
+            Rpc::FilterTweets => filter_tweets_request(
+                &ClientSwitches::for_tests(),
+                Some(VIEWER),
+                Some("us".to_owned()),
+                route.level(),
                 candidates,
-                rpc: Rpc::FilterTweets,
-            },
+            ),
             Rpc::EvaluateTweets => evaluate_tweets_request(
                 &ClientSwitches::for_tests(),
                 Some(&Client::Web.context(Some(VIEWER), Some("us"))),

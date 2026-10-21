@@ -60,6 +60,18 @@ pub struct Config {
     #[arg(long, env = "BACKFILL_CLAIMS_PG_DSN", hide_env_values = true)]
     pub backfill_claims_pg_dsn: Option<String>,
 
+    #[arg(long, env = "BACKFILL_PAGE_KEYS", value_delimiter = ',')]
+    pub backfill_page_keys: Vec<String>,
+
+    #[arg(long, env = "BACKFILL_SENDER_KEYS", value_delimiter = ',')]
+    pub backfill_sender_keys: Vec<String>,
+
+    #[arg(long, default_value_t = 0, env = "BACKFILL_MAX_RATE_PER_SEC")]
+    pub backfill_max_rate_per_sec: u32,
+
+    #[arg(long, env = "BACKFILL_SERVICE_CONFIG_JSON")]
+    pub backfill_service_config_json: Option<String>,
+
     #[arg(long, env = "KAFKA_CONSUMER_GROUP_ID")]
     pub kafka_consumer_group_id: Option<String>,
 
