@@ -1,6 +1,7 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
 use crate::hydration::hydrator::{Edge, Part, RequestRows};
 use crate::hydration::inventory::Source;
+use crate::hydration::relation::{Relation, Role};
 use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
 use crate::rules::SafetyLevel;
 use std::fmt;
@@ -70,7 +71,7 @@ impl HydrationPlan {
             .iter()
             .map(|group| {
                 group.nodes.iter().fold(Hydrators::empty(), |reads, node| {
-                    reads.union(node.key_at(rows).reads())
+                    reads.union(node.reads_at(rows))
                 })
             })
             .collect();
@@ -135,6 +136,25 @@ impl HydrationPlan {
         self.groups.iter()
     }
 
+    fn relations(&self) -> impl Iterator<Item = Relation> + '_ {
+        Relation::VARIANTS
+            .iter()
+            .copied()
+            .filter(|&relation| match relation.spec().role {
+                Role::Judged { rpc } => {
+                    self.level.is_carried_by(rpc)
+                        && !self
+                            .nodes
+                            .intersection(relation.spec().trigger.reads())
+                            .is_empty()
+                }
+                Role::Read => self
+                    .nodes
+                    .iter()
+                    .any(|node| node.spec().relation == Some(relation)),
+            })
+    }
+
     pub(super) fn readers<'a>(&'a self, landed: &'a Group) -> impl Iterator<Item = &'a Group> {
         landed
             .readers
@@ -150,6 +170,10 @@ impl Group {
         } else {
             BEST_EFFORT_HYDRATION_TIMEOUT
         }
+    }
+
+    pub(super) fn reads_relation(&self) -> bool {
+        self.nodes.iter().any(|node| node.spec().relation.is_some())
     }
 
     pub(super) fn label(&self) -> (String, String) {
@@ -173,7 +197,6 @@ fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
             .filter(|node| node.spec().source == source)
             .fold(Hydrators::empty(), Hydrators::with),
         Source::TesPureCoreData
-        | Source::TesConversationRoot
         | Source::TesTweet
         | Source::TesConversationControl
         | Source::TesQuotedTweet
@@ -274,6 +297,9 @@ impl fmt::Display for HydrationPlan {
             }
             writeln!(f)?;
         }
+        for relation in self.relations() {
+            writeln!(f, "{relation}")?;
+        }
         Ok(())
     }
 }
@@ -285,73 +311,6 @@ mod tests {
     use crate::rules::{RuleEngine, SafetyLevel};
     use strum::VariantArray;
 
-    const PLANS: &str = "\
-filter_all: 1 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-timeline_home: 10 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-article/get_media_entities after: tweet nodes: article_media_entities
-article/get_cover_media after: tweet nodes: article_cover_media
-trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-timeline_home_recommendations: 10 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-article/get_media_entities after: tweet nodes: article_media_entities
-article/get_cover_media after: tweet nodes: article_cover_media
-trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-timeline_home_hydration: 21 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-conversation_control/get_conversation_controls after: - nodes: conversation_control timeout: 300ms
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile,viewer_labels fields: ACCOUNT|EXTENDED_PROFILE|SAFETY|LABELS (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph+blocked_by/batch_check_relationships+batch_check_blocked_by after: pure_core nodes: follows,blocked_by_author,blocked_by_reply_root follows-fwd[author] blocks-rev[author,reply_root] (skipped logged out) timeout: 300ms
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-conversation_control/batch_check_followed_by+batch_check_super_follows+batch_check_blocked_by after: conversation_control nodes: root_follows_viewer,super_follows_root,blocked_by_conversation_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] blocks-rev[control_root_author] (skipped logged out) timeout: 300ms
-conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out) timeout: 300ms
-conversation_root/get_tweet_core_datas after: pure_core nodes: conversation_root_post (skipped logged out) timeout: 300ms
-conversation_root/batch_check_blocked_by after: conversation_root_post nodes: blocked_by_conversation_root_post blocks-rev[conversation_root_post_author] (skipped logged out) timeout: 300ms
-conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out) timeout: 300ms
-communities/moderation_state after: tweet nodes: community_moderation
-communities/visibility_features after: community_moderation nodes: community_moderator (skipped logged out)
-communities/is_removed after: tweet nodes: community_viewer_removed (skipped logged out) timeout: 300ms
-article/get_lifecycles after: tweet nodes: article_lifecycle
-article/get_media_entities after: tweet nodes: article_media_entities
-article/get_cover_media after: tweet nodes: article_cover_media
-trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-geoduck/user_location after: tweet nodes: outside_narrowcast_place (skipped logged out) timeout: 300ms
-immersive_expanded_recommendations: 10 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-article/get_media_entities after: tweet nodes: article_media_entities
-article/get_cover_media after: tweet nodes: article_cover_media
-trusted_friends/is_member_or_owner after: tweet nodes: trusted_friends (skipped logged out)
-quoted_tweet_rules: 6 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes follows-fwd[author] blocks-fwd[author] mutes-fwd[author] (skipped logged out)
-socialgraph/batch_check_user_pairs after: pure_core nodes: author_blocks_outer_author blocks-fwd[quoted_author>quoting_author]
-socialgraph/batch_check_user_pairs after: author_safety nodes: outer_author_follows_author follows-fwd[quoting_author>protected_quoted_author] timeout: 300ms
-tes/get_quoted_tweets after: pure_core nodes: quoted_tweet timeout: 300ms
-";
-
     #[test]
     fn each_level_plans_these_calls() {
         let engine = RuleEngine::for_tests();
@@ -359,7 +318,7 @@ tes/get_quoted_tweets after: pure_core nodes: quoted_tweet timeout: 300ms
             .iter()
             .map(|&level| engine.plan(level).to_string())
             .collect();
-        assert_eq!(plans, PLANS);
+        crate::pinned::assert_pinned("tests/fixtures/plans.txt", &plans);
     }
 
     #[test]

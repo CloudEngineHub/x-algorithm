@@ -86,11 +86,6 @@ pub(crate) type Answered<X, V> = Observed<X, RawHydrationBatch<V>>;
 pub(crate) trait Sources: Send + Sync {
     async fn pure_cores(&self, tweet_ids: &[u64]) -> Answered<exchange::TesPureCoreData, PureCore>;
 
-    async fn conversation_roots(
-        &self,
-        root_ids: &[u64],
-    ) -> Answered<exchange::TesConversationRoot, PureCore>;
-
     async fn tweets(&self, tweet_ids: &[u64]) -> Answered<exchange::TesTweet, TweetFeatures>;
 
     async fn conversation_controls(
@@ -394,19 +389,6 @@ impl<O: Observer> Sources for ProdSources<O> {
             .get_tweet_core_datas(tweet_ids.to_vec())
             .await;
         self.relay::<exchange::TesPureCoreData, _>(tweet_ids.iter().copied(), cores)
-            .map(core_batch)
-    }
-
-    async fn conversation_roots(
-        &self,
-        root_ids: &[u64],
-    ) -> Answered<exchange::TesConversationRoot, PureCore> {
-        let cores = self
-            .backends
-            .tes
-            .get_tweet_core_datas(root_ids.to_vec())
-            .await;
-        self.relay::<exchange::TesConversationRoot, _>(root_ids.iter().copied(), cores)
             .map(core_batch)
     }
 

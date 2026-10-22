@@ -173,6 +173,21 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         Hydrator::BlockedByAuthor,
         "only a subscriber the author blocked sees the exclusive post",
     ),
+    (
+        "original_tweet_adult_media_propagation/blur/sensitive",
+        Hydrator::ReactedToPostSafetyLabels,
+        "the default shows the reaction post unblurred, as Tweetypie does on a failed lookup",
+    ),
+    (
+        "original_tweet_gore_media_propagation/blur/violence",
+        Hydrator::ReactedToPostSafetyLabels,
+        "the default shows the reaction post unblurred, as Tweetypie does on a failed lookup",
+    ),
+    (
+        "protected_original_author/drop",
+        Hydrator::ReactedToAuthorSafety,
+        "the default shows the reaction post, as Tweetypie does on a failed lookup",
+    ),
 ];
 
 #[test]
@@ -528,6 +543,8 @@ fn every_post_rule_reads_the_post() {
         | Predicate::ArticleStage(_)
         | Predicate::CommunityModerator(_)
         | Predicate::CommunityViewerRemoved(_)
+        | Predicate::ReactedToPostSafetyLabels(_)
+        | Predicate::ReactedToAuthorSafety(_)
         | Predicate::Edge(_)
         | Predicate::Compound(_) => true,
     };

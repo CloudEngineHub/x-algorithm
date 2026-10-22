@@ -1,6 +1,6 @@
 use crate::hydration::fallback_cache::{Column, FallbackCache};
 use crate::models::{
-    AuthorId, MediaFeature, NsfwFeature, PureCore, ReplyTo, TweetFeatures, TweetId,
+    AuthorId, MediaFeature, NsfwFeature, PureCore, ReactionContext, ReplyTo, TweetFeatures, TweetId,
 };
 use std::num::NonZeroU64;
 use xai_core_entities::entities::{EditControl, EditControlInitial, PureCoreData, TakedownReason};
@@ -111,15 +111,16 @@ pub(crate) struct CachedTweetRow {
     latest_edit_tweet_id: Option<NonZeroU64>,
     exclusive_conversation_author_id: Option<NonZeroU64>,
     article_id: Option<NonZeroU64>,
-    restrictions: Option<Box<Restrictions>>,
+    sparse: Option<Box<Sparse>>,
 }
 
 #[derive(Clone, Default)]
-struct Restrictions {
+struct Sparse {
     geo_allow_list: Vec<String>,
     geo_deny_list: Vec<String>,
     takedown_reasons: Vec<TakedownReason>,
     narrowcast_place_id: Option<u64>,
+    reaction_context: Option<ReactionContext>,
 }
 
 impl CachedTweetRow {
@@ -142,11 +143,13 @@ impl CachedTweetRow {
             exclusive_conversation_author_id,
             article_id,
             narrowcast_place_id,
+            reaction_context,
         } = tweet;
-        let restricted = !(geo_allow_list.is_empty()
+        let is_sparse = !(geo_allow_list.is_empty()
             && geo_deny_list.is_empty()
             && takedown_reasons.is_empty()
-            && narrowcast_place_id.is_none());
+            && narrowcast_place_id.is_none()
+            && reaction_context.is_none());
         Self {
             has_media: *has_media,
             has_uploaded_media: *has_uploaded_media,
@@ -160,24 +163,26 @@ impl CachedTweetRow {
             latest_edit_tweet_id: tweet.latest_edit_tweet_id().map(stored_id),
             exclusive_conversation_author_id: exclusive_conversation_author_id.map(stored_id),
             article_id: *article_id,
-            restrictions: restricted.then(|| {
-                Box::new(Restrictions {
+            sparse: is_sparse.then(|| {
+                Box::new(Sparse {
                     geo_allow_list: geo_allow_list.clone(),
                     geo_deny_list: geo_deny_list.clone(),
                     takedown_reasons: takedown_reasons.clone(),
                     narrowcast_place_id: *narrowcast_place_id,
+                    reaction_context: *reaction_context,
                 })
             }),
         }
     }
 
     fn features(&self) -> TweetFeatures {
-        let Restrictions {
+        let Sparse {
             geo_allow_list,
             geo_deny_list,
             takedown_reasons,
             narrowcast_place_id,
-        } = self.restrictions.as_deref().cloned().unwrap_or_default();
+            reaction_context,
+        } = self.sparse.as_deref().cloned().unwrap_or_default();
         TweetFeatures {
             media: MediaFeature {
                 has_media: self.has_media,
@@ -205,6 +210,7 @@ impl CachedTweetRow {
             exclusive_conversation_author_id: self.exclusive_conversation_author_id.map(read_id),
             article_id: self.article_id,
             narrowcast_place_id,
+            reaction_context,
         }
     }
 }
@@ -308,12 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_row_keeps_the_place_of_a_local_post_with_no_other_restriction() {
+    fn a_cached_row_keeps_a_place_or_a_reaction_context_set_alone() {
         let local = TweetFeatures {
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
             ..Default::default()
         };
+        let reaction = crate::scenario::reaction_to(9, 10);
         assert_eq!(CachedTweetRow::new(&local).features(), local);
+        assert_eq!(CachedTweetRow::new(&reaction).features(), reaction);
     }
 
     #[test]
@@ -388,6 +396,10 @@ mod tests {
             exclusive_conversation_author_id: Some(7),
             article_id: NonZeroU64::new(8),
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
+            reaction_context: Some(ReactionContext {
+                reacted_to_post_id: 9,
+                reacted_to_user_id: 10,
+            }),
         };
 
         let cached = CachedTweetRow::new(&tweet).features();

@@ -1074,10 +1074,6 @@ mod tests {
                     let keys = [TWEET, MISSING, FAILED, ABSENT];
                     shown(&sources.pure_cores(&keys).await.into_inner(), &keys)
                 }
-                Source::TesConversationRoot => {
-                    let keys = [TWEET, MISSING, FAILED, ABSENT];
-                    shown(&sources.conversation_roots(&keys).await.into_inner(), &keys)
-                }
                 Source::TesTweet => {
                     let keys = [TWEET, SECOND_TWEET, MISSING, FAILED, ABSENT];
                     shown(&sources.tweets(&keys).await.into_inner(), &keys)
@@ -1369,11 +1365,7 @@ mod tests {
         #[tokio::test]
         async fn the_recording_matches_recording_shape_txt() {
             let (_, recording) = answered().await;
-            crate::hydration::assert_blessed(
-                "recording_shape.txt",
-                include_str!("../../tests/fixtures/recording_shape.txt"),
-                &shape(&recording),
-            );
+            crate::pinned::assert_pinned("tests/fixtures/recording_shape.txt", &shape(&recording));
         }
 
         #[tokio::test]

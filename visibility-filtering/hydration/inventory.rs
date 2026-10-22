@@ -3,16 +3,9 @@ use strum::VariantArray;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MissPolicy {
-    Unresolves(Subject),
+    Unresolves,
     FailsNode,
-    ReadsNoEdge,
-    ReadsNotFound,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Subject {
-    Tweet,
-    Author,
+    Reads,
 }
 
 pub(super) struct Row {
@@ -30,7 +23,6 @@ pub(super) enum Batch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
 pub(crate) enum Source {
     TesPureCoreData,
-    TesConversationRoot,
     TesTweet,
     TesConversationControl,
     TesQuotedTweet,
@@ -55,15 +47,11 @@ impl Source {
     pub(super) const fn row(self) -> Row {
         match self {
             Source::TesPureCoreData => Row {
-                miss: MissPolicy::Unresolves(Subject::Tweet),
-                batch: Batch::Keys,
-            },
-            Source::TesConversationRoot => Row {
-                miss: MissPolicy::FailsNode,
+                miss: MissPolicy::Unresolves,
                 batch: Batch::Keys,
             },
             Source::TesTweet => Row {
-                miss: MissPolicy::Unresolves(Subject::Tweet),
+                miss: MissPolicy::Unresolves,
                 batch: Batch::Unrecorded,
             },
             Source::TesConversationControl => Row {
@@ -83,7 +71,7 @@ impl Source {
                 batch: Batch::Unrecorded,
             },
             Source::GizmoduckAuthor => Row {
-                miss: MissPolicy::Unresolves(Subject::Author),
+                miss: MissPolicy::Unresolves,
                 batch: Batch::Keys,
             },
             Source::Flock => Row {
@@ -99,7 +87,7 @@ impl Source {
                 batch: Batch::Unrecorded,
             },
             Source::Wingman => Row {
-                miss: MissPolicy::ReadsNoEdge,
+                miss: MissPolicy::Reads,
                 batch: Batch::Requested,
             },
             Source::CommunityModeration => Row {
@@ -119,15 +107,15 @@ impl Source {
                 batch: Batch::Keys,
             },
             Source::ArticleMediaEntities => Row {
-                miss: MissPolicy::ReadsNotFound,
+                miss: MissPolicy::Reads,
                 batch: Batch::Keys,
             },
             Source::ArticleCoverMedia => Row {
-                miss: MissPolicy::ReadsNotFound,
+                miss: MissPolicy::Reads,
                 batch: Batch::Keys,
             },
             Source::TrustedFriends => Row {
-                miss: MissPolicy::ReadsNoEdge,
+                miss: MissPolicy::Reads,
                 batch: Batch::Keys,
             },
             Source::UserLocation => Row {
@@ -144,7 +132,6 @@ impl Source {
     pub(super) const fn scope(self) -> Scope {
         match self {
             Source::TesPureCoreData => <exchange::TesPureCoreData as Exchange>::SCOPE,
-            Source::TesConversationRoot => <exchange::TesConversationRoot as Exchange>::SCOPE,
             Source::TesTweet => <exchange::TesTweet as Exchange>::SCOPE,
             Source::TesConversationControl => <exchange::TesConversationControl as Exchange>::SCOPE,
             Source::TesQuotedTweet => <exchange::TesQuotedTweet as Exchange>::SCOPE,
@@ -169,7 +156,6 @@ impl Source {
     pub(crate) fn visit(self, visitor: &mut impl Visit) {
         match self {
             Source::TesPureCoreData => visitor.exchange::<exchange::TesPureCoreData>(),
-            Source::TesConversationRoot => visitor.exchange::<exchange::TesConversationRoot>(),
             Source::TesTweet => visitor.exchange::<exchange::TesTweet>(),
             Source::TesConversationControl => {
                 visitor.exchange::<exchange::TesConversationControl>()

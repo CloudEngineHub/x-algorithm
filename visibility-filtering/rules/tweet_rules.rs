@@ -905,6 +905,27 @@ pub(super) const GORE_AND_VIOLENCE_REPORTED_HEURISTICS_LEGACY_INTERSTITIAL: Rule
     action: legacy_nsfw_interstitial(),
 };
 
+pub(super) const ORIGINAL_TWEET_ADULT_MEDIA_PROPAGATION_BLUR_SENSITIVE: Rule = Rule {
+    id: RuleId::OriginalTweetAdultMediaPropagation,
+    audience: Everyone,
+    when: all![ReactedToPostHasLabel(SafetyLabelType::NSFW_HIGH_PRECISION)],
+    action: blur(InterstitialReason::Sensitive(true)),
+};
+
+pub(super) const ORIGINAL_TWEET_GORE_MEDIA_PROPAGATION_BLUR_VIOLENCE: Rule = Rule {
+    id: RuleId::OriginalTweetGoreMediaPropagation,
+    audience: Everyone,
+    when: all![REACTED_TO_POST_HAS_GORE_MEDIA_LABEL],
+    action: blur(InterstitialReason::Violence(true)),
+};
+
+pub(super) const PROTECTED_ORIGINAL_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::ProtectedOriginalAuthor,
+    audience: Everyone,
+    when: all![ReactedToAuthorIsProtected],
+    action: drop_post(DropAs::AuthorIsProtected),
+};
+
 pub(super) const DMCA_MEDIA_DROP_UNSPECIFIED: Rule = Rule {
     id: RuleId::DmcaMedia,
     audience: Everyone,

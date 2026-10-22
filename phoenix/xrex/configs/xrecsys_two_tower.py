@@ -368,6 +368,7 @@ def _immersive_only_base() -> dict:
         "eval_bs_per_device": 8,
         "eval_every_n": 1000,
         "target_dataset_type": RetrievalDataset.IMMERSIVE2Day,
+        "extra_eval_dataset_types": ["IMMERSIVE4Day", "EVERGREEN", "IMMERSIVENSFW"],
         "checkpoint_dataset_names": [
             "IMMERSIVE4Day",
             "IMMERSIVE2Day",

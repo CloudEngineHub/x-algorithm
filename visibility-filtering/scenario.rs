@@ -3,20 +3,51 @@ use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
 use crate::metrics::{RetweetSources, Rpc};
 use crate::models::{
-    ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, TweetId,
-    ViewerFeatures,
+    ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
+    SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
 };
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::retweet::hydrate_and_evaluate;
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState};
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) fn raw(tweet_id: u64, request_author_id: Option<u64>) -> RawCandidate {
     RawCandidate {
         tweet_id: TweetId(tweet_id),
         request_author_id,
+    }
+}
+
+pub(crate) fn reaction_to(reacted_to_post_id: u64, reacted_to_user_id: u64) -> TweetFeatures {
+    TweetFeatures {
+        reaction_context: Some(ReactionContext {
+            reacted_to_post_id,
+            reacted_to_user_id,
+        }),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn label_map(label: SafetyLabelType) -> vf_pb::SafetyLabelMap {
+    vf_pb::SafetyLabelMap {
+        labels: HashMap::from([(label.0, vf_pb::SafetyLabel::default())]),
+    }
+}
+
+pub(crate) fn protected_user(user_id: u64) -> GizmoduckUserResult {
+    GizmoduckUserResult {
+        user: Some(GizmoduckUser {
+            user_id,
+            safety: Safety {
+                is_protected: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        response_state: Some(UserResponseState::Found),
     }
 }
 
@@ -106,8 +137,7 @@ impl<S: Sources + 'static> Scenario<S> {
         raw: &[RawCandidate],
     ) -> InRequestOrder {
         let mut request = self.request(raw);
-        let is_evaluate_tweets = self.rpc == Rpc::EvaluateTweets;
-        let request = request.hydration_request(is_evaluate_tweets, &self.fallback_caches);
+        let request = request.hydration_request(Some(self.rpc), &self.fallback_caches);
         let hydration = plan.hydrate(&*self.sources, request).await;
         InRequestOrder::of(&hydration, raw)
     }

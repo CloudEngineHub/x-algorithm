@@ -9,7 +9,9 @@ use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetI
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
 use crate::post_evaluator::{PostEvaluation, PostEvaluator};
 use crate::quote::QuotePass;
-use crate::result_label::{Class, Failure, Label, NONE, failed, label, quote_label, state_label};
+use crate::result_label::{
+    Class, Failure, Label, NONE, failed, label, quote_label, renders_alike, state_label,
+};
 use crate::retweet;
 use crate::rules::SafetyLevel;
 use crate::server_deps::init_client_with_retry;
@@ -97,10 +99,11 @@ struct Bucket {
     vf_rule: &'static str,
     quoted_tweet_rule: &'static str,
     quote_pass: &'static str,
+    renders_alike: bool,
 }
 
 impl Bucket {
-    fn counter_labels<'a>(&'a self, build_sha: &'a str) -> [(&'static str, &'a str); 10] {
+    fn counter_labels<'a>(&'a self, build_sha: &'a str) -> [(&'static str, &'a str); 11] {
         [
             ("safety_level", SAFETY_LEVEL.into()),
             ("placement", self.lens.into()),
@@ -111,6 +114,10 @@ impl Bucket {
             ("vf_rule", self.vf_rule),
             ("quoted_tweet_rule", self.quoted_tweet_rule),
             ("quote_pass", self.quote_pass),
+            (
+                "renders_alike",
+                if self.renders_alike { "true" } else { "false" },
+            ),
             ("build_sha", build_sha),
         ]
     }
@@ -434,6 +441,7 @@ impl Compared<'_> {
             .unwrap_or(NONE);
         Bucket {
             lens: self.lens,
+            renders_alike: renders_alike(&vf, &tp),
             tp,
             vf,
             vf_rule,
@@ -479,6 +487,7 @@ impl Compared<'_> {
             "vf_rules": vf_rules,
             "quoted_tweet_rule": bucket.quoted_tweet_rule,
             "quote_pass": bucket.quote_pass,
+            "renders_alike": bucket.renders_alike,
             "labels": labels,
         })
     }
@@ -701,6 +710,7 @@ mod tests {
                 vf_rule: NONE,
                 quoted_tweet_rule: NONE,
                 quote_pass: NONE,
+                renders_alike: true,
             }
         );
         let suspended = outcome(Verdict::Withheld(Decided {

@@ -15,6 +15,7 @@ pub mod ineligible_subscription_filter;
 pub mod invalid_conversation_module_filter;
 pub mod inventory_holdout_filter;
 pub mod new_user_min_engagement_filter;
+pub mod new_user_soft_nsfw_filter;
 pub mod oon_nsfw_simclusters_filter;
 pub mod oon_retweet_reply_filter;
 pub mod previously_seen_posts_backup_filter;

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 from collections import abc
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 import haiku as hk
 import jax
@@ -32,28 +32,22 @@ def rms_norm_fn(
     return x
 
 
-def all_heads_qk_norm_fn(
-    x: jax.Array,
+def all_heads_qk_norm(
     name: str,
     lr_multiplier: float = 1.0,
     eps: float = 1e-5,
     create_scale: bool = True,
     weight_decay_mask: float = 0.0,
-) -> jax.Array:
-    x_shape = x.shape
-    x = jnp.reshape(x, (x_shape[0], x_shape[1], -1))
-
-    x = RMSNorm(
+) -> Callable[[jax.Array], jax.Array]:
+    norm = RMSNorm(
         axis=-1,
         create_scale=create_scale,
-        pspec=P(None),
         lr_multiplier=lr_multiplier,
         name=name,
         eps=eps,
         weight_decay_mask=weight_decay_mask,
-    )(x)
-    x = jnp.reshape(x, x_shape)
-    return x
+    )
+    return lambda x: jnp.reshape(norm(jnp.reshape(x, (*x.shape[:2], -1))), x.shape)
 
 
 class RMSNorm(hk.Module):

@@ -114,6 +114,7 @@ class MediaHydrationConfig(BaseModel):
     enable_motion_reveal: bool = False
     enable_local_broadcast_frame_extraction: bool = False
     enable_video_preview_image: bool = False
+    highest_video_bitrate: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600

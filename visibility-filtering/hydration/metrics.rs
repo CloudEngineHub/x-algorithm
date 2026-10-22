@@ -520,7 +520,7 @@ mod tests {
             tweet_id: TweetId(1),
             request_author_id: None,
         }];
-        let mut store = Store::new(plan, Some(50), ClientCapability::default(), &raw, false);
+        let mut store = Store::new(plan, Some(50), ClientCapability::default(), &raw, None);
         let group = |source| plan.groups().find(|group| group.source == source).unwrap();
         let tweets = store.offer(group(Source::TesTweet)).unwrap();
         let circle = TweetFeatures {

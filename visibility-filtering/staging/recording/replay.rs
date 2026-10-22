@@ -111,14 +111,6 @@ impl Sources for Replay {
             .map(core_batch)
     }
 
-    async fn conversation_roots(
-        &self,
-        root_ids: &[u64],
-    ) -> Answered<exchange::TesConversationRoot, PureCore> {
-        self.batch::<exchange::TesConversationRoot>(root_ids.iter().copied())
-            .map(core_batch)
-    }
-
     async fn tweets(&self, tweet_ids: &[u64]) -> Answered<exchange::TesTweet, TweetFeatures> {
         let tweets = self.found::<exchange::TesTweet>(tweet_ids);
         Observed::quiet(tweet_batch(tweet_ids, tweets))

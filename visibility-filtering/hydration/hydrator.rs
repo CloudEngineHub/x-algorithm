@@ -1,9 +1,9 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-use crate::hydration::inventory::{MissPolicy, Source, Subject};
+use crate::hydration::inventory::Source;
+use crate::hydration::relation::Relation;
 use crate::hydration::sources::Scope;
-use std::fmt;
+use crate::hydration::store::KeyOrigin;
 use strum::VariantArray;
-use xai_core_entities::entities::ConversationControlArm;
 use xai_core_entities::gizmoduck_client::QueryFields;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -43,6 +43,8 @@ pub enum Hydrator {
     AuthorBlocksOuterAuthor,
     OuterAuthorFollowsAuthor,
     QuotedTweet,
+    ReactedToPostSafetyLabels,
+    ReactedToAuthorSafety,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -171,126 +173,13 @@ pub(crate) struct UserPair {
     pub(crate) destination: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum KeyOrigin {
-    RequestTweets,
-    RequestUsers,
-    Viewer,
-    PureCoreAuthor,
-    PureCoreRetweeter,
-    PureCoreReplyRoot,
-    ExclusiveConversationAuthor,
-    TweetArticle,
-    ConversationRoot(&'static [ConversationControlArm]),
-    ConversationControlBlockAuthor,
-    ConversationRootToFetch,
-    ConversationRootPostAuthor,
-    ViewerForCoAllowedList,
-    MyNetworkRootNotFollowingViewer,
-    CommunityPost,
-    ModeratedCommunity,
-    TweetCommunity,
-    TrustedFriendsList,
-    NarrowcastPlace,
-    QuotedAuthorToQuotingAuthor,
-    QuotingAuthorToProtectedQuotedAuthor,
-    OuterOfMissingQuote,
-}
-
-const COMMUNITY_OR_MY_NETWORK: &[ConversationControlArm] = &[
-    ConversationControlArm::Community,
-    ConversationControlArm::MyNetwork,
-];
-const SUBSCRIBERS: &[ConversationControlArm] = &[ConversationControlArm::Subscribers];
-
-pub(super) fn arm_starts_conversation_root_select(arm: ConversationControlArm) -> bool {
-    [COMMUNITY_OR_MY_NETWORK, SUBSCRIBERS]
-        .into_iter()
-        .any(|arms| arms.contains(&arm))
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NodeSpec {
     pub(super) source: Source,
     pub(super) part: Part,
     pub(super) key: KeyOrigin,
     pub(super) label: (&'static str, &'static str),
-}
-
-impl KeyOrigin {
-    const fn input(self) -> Option<Hydrator> {
-        match self {
-            KeyOrigin::RequestTweets | KeyOrigin::RequestUsers | KeyOrigin::Viewer => None,
-            KeyOrigin::PureCoreAuthor
-            | KeyOrigin::PureCoreRetweeter
-            | KeyOrigin::PureCoreReplyRoot
-            | KeyOrigin::ConversationRootToFetch
-            | KeyOrigin::QuotedAuthorToQuotingAuthor
-            | KeyOrigin::OuterOfMissingQuote => Some(Hydrator::PureCore),
-            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => Some(Hydrator::AuthorSafety),
-            KeyOrigin::ConversationRootPostAuthor => Some(Hydrator::ConversationRootPost),
-            KeyOrigin::ExclusiveConversationAuthor
-            | KeyOrigin::CommunityPost
-            | KeyOrigin::TweetCommunity
-            | KeyOrigin::TweetArticle
-            | KeyOrigin::TrustedFriendsList
-            | KeyOrigin::NarrowcastPlace => Some(Hydrator::Tweet),
-            KeyOrigin::ConversationRoot(_)
-            | KeyOrigin::ConversationControlBlockAuthor
-            | KeyOrigin::ViewerForCoAllowedList => Some(Hydrator::ConversationControl),
-            KeyOrigin::MyNetworkRootNotFollowingViewer => Some(Hydrator::RootFollowsViewer),
-            KeyOrigin::ModeratedCommunity => Some(Hydrator::CommunityModeration),
-        }
-    }
-
-    pub(super) const fn at(self, rows: RequestRows) -> Self {
-        match (rows, self) {
-            (RequestRows::Users, KeyOrigin::PureCoreAuthor) => KeyOrigin::RequestUsers,
-            _ => self,
-        }
-    }
-
-    pub(super) const fn keys_user_rows(self) -> bool {
-        matches!(self, KeyOrigin::RequestUsers | KeyOrigin::Viewer)
-    }
-
-    pub(super) fn reads(self) -> Hydrators {
-        let input = match self.input() {
-            Some(input) => Hydrators::of(input),
-            None => Hydrators::empty(),
-        };
-        match self {
-            KeyOrigin::MyNetworkRootNotFollowingViewer | KeyOrigin::ConversationRootToFetch => {
-                input.with(Hydrator::ConversationControl)
-            }
-            KeyOrigin::CommunityPost | KeyOrigin::ConversationControlBlockAuthor => {
-                input.with(Hydrator::PureCore)
-            }
-            KeyOrigin::ConversationRootPostAuthor => input
-                .with(Hydrator::PureCore)
-                .with(Hydrator::ConversationControl),
-            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => {
-                input.with(Hydrator::PureCore).with(Hydrator::QuotedTweet)
-            }
-            KeyOrigin::PureCoreAuthor | KeyOrigin::QuotedAuthorToQuotingAuthor => {
-                input.with(Hydrator::QuotedTweet)
-            }
-            KeyOrigin::RequestTweets
-            | KeyOrigin::RequestUsers
-            | KeyOrigin::Viewer
-            | KeyOrigin::PureCoreRetweeter
-            | KeyOrigin::PureCoreReplyRoot
-            | KeyOrigin::ExclusiveConversationAuthor
-            | KeyOrigin::TweetArticle
-            | KeyOrigin::ConversationRoot(_)
-            | KeyOrigin::ViewerForCoAllowedList
-            | KeyOrigin::ModeratedCommunity
-            | KeyOrigin::TweetCommunity
-            | KeyOrigin::TrustedFriendsList
-            | KeyOrigin::NarrowcastPlace
-            | KeyOrigin::OuterOfMissingQuote => input,
-        }
-    }
+    pub(super) relation: Option<Relation>,
 }
 
 impl Hydrator {
@@ -309,6 +198,13 @@ impl Hydrator {
                 part,
                 key,
                 label,
+                relation: None,
+            }
+        }
+        const fn reads(relation: Relation, node: NodeSpec) -> NodeSpec {
+            NodeSpec {
+                relation: Some(relation),
+                ..node
             }
         }
         const RELATIONSHIPS: (&str, &str) = ("socialgraph", "batch_check_relationships");
@@ -412,7 +308,7 @@ impl Hydrator {
             H::RootFollowsViewer => node(
                 S::Flock,
                 Part::Edge(Edge::FollowedBy),
-                K::ConversationRoot(COMMUNITY_OR_MY_NETWORK),
+                K::CommunityOrMyNetworkRoot,
                 ("conversation_control", "batch_check_followed_by"),
             ),
             H::RootFollowsViewerSecondDegree => node(
@@ -424,7 +320,7 @@ impl Hydrator {
             H::SuperFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::SuperFollows),
-                K::ConversationRoot(SUBSCRIBERS),
+                K::SubscribersRoot,
                 ("conversation_control", "batch_check_super_follows"),
             ),
             H::BlockedByConversationRoot => node(
@@ -433,17 +329,23 @@ impl Hydrator {
                 K::ConversationControlBlockAuthor,
                 ("conversation_control", "batch_check_blocked_by"),
             ),
-            H::ConversationRootPost => node(
-                S::TesConversationRoot,
-                Part::Column,
-                K::ConversationRootToFetch,
-                ("conversation_root", "get_tweet_core_datas"),
+            H::ConversationRootPost => reads(
+                Relation::ConversationRoot,
+                node(
+                    S::TesPureCoreData,
+                    Part::Column,
+                    K::RelatedTweet,
+                    ("conversation_root", "get_tweet_core_datas"),
+                ),
             ),
-            H::BlockedByConversationRootPost => node(
-                S::Flock,
-                Part::Edge(Edge::BlockedBy),
-                K::ConversationRootPostAuthor,
-                ("conversation_root", "batch_check_blocked_by"),
+            H::BlockedByConversationRootPost => reads(
+                Relation::ConversationRoot,
+                node(
+                    S::Flock,
+                    Part::Edge(Edge::BlockedBy),
+                    K::ConversationRootPostAuthor,
+                    ("conversation_root", "batch_check_blocked_by"),
+                ),
             ),
             H::ViewerCountry => node(
                 S::ViewerCountry,
@@ -517,6 +419,24 @@ impl Hydrator {
                 K::OuterOfMissingQuote,
                 ("tes", "get_quoted_tweets"),
             ),
+            H::ReactedToPostSafetyLabels => reads(
+                Relation::ReactedTo,
+                node(
+                    S::SafetyLabels,
+                    Part::Column,
+                    K::RelatedTweet,
+                    ("safety_labels", "get"),
+                ),
+            ),
+            H::ReactedToAuthorSafety => reads(
+                Relation::ReactedTo,
+                node(
+                    S::GizmoduckAuthor,
+                    Part::Fields(&[QueryFields::SAFETY]),
+                    K::RelatedAuthor,
+                    ("gizmoduck", "get_users"),
+                ),
+            ),
         }
     }
 
@@ -537,7 +457,9 @@ impl Hydrator {
             | H::CommunityViewerRemoved
             | H::OutsideNarrowcastPlace
             | H::OuterAuthorFollowsAuthor
-            | H::QuotedTweet => true,
+            | H::QuotedTweet
+            | H::ReactedToPostSafetyLabels
+            | H::ReactedToAuthorSafety => true,
             H::PureCore
             | H::Tweet
             | H::TweetSafetyLabels
@@ -560,7 +482,7 @@ impl Hydrator {
     }
 
     pub(super) const fn input(self) -> Option<Hydrator> {
-        self.spec().key.input()
+        self.input_at(RequestRows::Posts)
     }
 
     pub(super) const fn key_at(self, rows: RequestRows) -> KeyOrigin {
@@ -568,7 +490,23 @@ impl Hydrator {
     }
 
     pub(super) const fn input_at(self, rows: RequestRows) -> Option<Hydrator> {
-        self.key_at(rows).input()
+        let input = self.key_at(rows).input();
+        match (input, self.spec().relation) {
+            (None, Some(relation)) => relation.spec().trigger.input(),
+            _ => input,
+        }
+    }
+
+    pub(super) const fn precedes_author(self, rows: RequestRows) -> bool {
+        matches!(self.input_at(rows), None | Some(Hydrator::Tweet))
+    }
+
+    pub(super) const fn reads_at(self, rows: RequestRows) -> Hydrators {
+        let reads = self.key_at(rows).reads();
+        match self.spec().relation {
+            Some(relation) => reads.union(relation.spec().trigger.reads()),
+            None => reads,
+        }
     }
 
     pub(super) const fn edge(self) -> Option<Edge> {
@@ -590,15 +528,12 @@ impl Hydrator {
     }
 
     pub(crate) const fn needs_viewer(self) -> bool {
-        self.is_edge()
-            || matches!(
-                self.spec().key,
-                KeyOrigin::Viewer
-                    | KeyOrigin::ConversationRootToFetch
-                    | KeyOrigin::ViewerForCoAllowedList
-                    | KeyOrigin::ModeratedCommunity
-                    | KeyOrigin::TweetCommunity
-            )
+        let spec = self.spec();
+        let joins_for_viewer = match spec.relation {
+            Some(relation) => relation.spec().trigger.needs_viewer(),
+            None => false,
+        };
+        self.is_edge() || spec.key.needs_viewer() || joins_for_viewer
     }
 }
 
@@ -651,27 +586,6 @@ const fn best_effort_inputs_key_only_best_effort_nodes() -> bool {
     true
 }
 
-const fn miss_policies_fit_their_nodes() -> bool {
-    let mut rest = Hydrator::VARIANTS;
-    while let [node, tail @ ..] = rest {
-        let spec = node.spec();
-        let fits = match spec.source.miss_policy() {
-            MissPolicy::Unresolves(Subject::Tweet) => matches!(spec.key, KeyOrigin::RequestTweets),
-            MissPolicy::Unresolves(Subject::Author) => {
-                matches!(spec.key, KeyOrigin::PureCoreAuthor)
-            }
-            MissPolicy::FailsNode => true,
-            MissPolicy::ReadsNoEdge => node.is_edge(),
-            MissPolicy::ReadsNotFound => !node.is_edge(),
-        };
-        if !fits {
-            return false;
-        }
-        rest = tail;
-    }
-    true
-}
-
 const fn viewer_scopes_fit_their_nodes() -> bool {
     let mut rest = Hydrator::VARIANTS;
     while let [node, tail @ ..] = rest {
@@ -691,7 +605,6 @@ const fn viewer_scopes_fit_their_nodes() -> bool {
 
 const _: () = assert!(inputs_precede_nodes());
 const _: () = assert!(best_effort_inputs_key_only_best_effort_nodes());
-const _: () = assert!(miss_policies_fit_their_nodes());
 const _: () = assert!(viewer_scopes_fit_their_nodes());
 const _: () = assert!(Hydrator::VARIANTS.len() <= u64::BITS as usize);
 
@@ -711,6 +624,9 @@ impl Hydrators {
             {
                 closed = closed.with(input);
             }
+            if node.spec().relation.is_some() && closed.contains(*node) {
+                closed = closed.union(node.reads_at(rows));
+            }
             rest = head;
         }
         closed
@@ -721,41 +637,5 @@ impl Hydrators {
             .iter()
             .copied()
             .filter(move |&node| self.contains(node))
-    }
-}
-
-impl fmt::Display for KeyOrigin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            KeyOrigin::RequestTweets => f.write_str("tweets"),
-            KeyOrigin::RequestUsers => f.write_str("users"),
-            KeyOrigin::Viewer => f.write_str("viewer"),
-            KeyOrigin::PureCoreAuthor => f.write_str("author"),
-            KeyOrigin::PureCoreRetweeter => f.write_str("retweeter"),
-            KeyOrigin::PureCoreReplyRoot => f.write_str("reply_root"),
-            KeyOrigin::ExclusiveConversationAuthor => f.write_str("exclusive_author"),
-            KeyOrigin::TweetArticle => f.write_str("article"),
-            KeyOrigin::ConversationRoot(arms) => {
-                let arms: Vec<String> = arms.iter().map(|arm| format!("{arm:?}")).collect();
-                write!(f, "root:{}", arms.join("|"))
-            }
-            KeyOrigin::ConversationControlBlockAuthor => f.write_str("control_root_author"),
-            KeyOrigin::ConversationRootToFetch => f.write_str("conversation_root_to_fetch"),
-            KeyOrigin::ConversationRootPostAuthor => f.write_str("conversation_root_post_author"),
-            KeyOrigin::ViewerForCoAllowedList => f.write_str("viewer:co_allowed_list"),
-            KeyOrigin::MyNetworkRootNotFollowingViewer => {
-                f.write_str("root:MyNetwork:not_followed")
-            }
-            KeyOrigin::CommunityPost => f.write_str("community_post"),
-            KeyOrigin::ModeratedCommunity => f.write_str("moderated_community"),
-            KeyOrigin::TweetCommunity => f.write_str("tweet_community"),
-            KeyOrigin::TrustedFriendsList => f.write_str("trusted_friends_list"),
-            KeyOrigin::NarrowcastPlace => f.write_str("narrowcast_place"),
-            KeyOrigin::QuotedAuthorToQuotingAuthor => f.write_str("quoted_author>quoting_author"),
-            KeyOrigin::QuotingAuthorToProtectedQuotedAuthor => {
-                f.write_str("quoting_author>protected_quoted_author")
-            }
-            KeyOrigin::OuterOfMissingQuote => f.write_str("outer_of_missing_quote"),
-        }
     }
 }

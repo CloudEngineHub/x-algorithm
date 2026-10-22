@@ -1206,57 +1206,35 @@ country_specific_nsfw_content_gating:
         }
     }
 
-    const PINNED_POLICIES: [(SafetyLevel, &str); 6] = [
-        (
-            SafetyLevel::FilterAll,
-            include_str!("../../tests/fixtures/policy/filter_all.txt"),
-        ),
-        (
-            SafetyLevel::TimelineHome,
-            include_str!("../../tests/fixtures/policy/timeline_home.txt"),
-        ),
-        (
-            SafetyLevel::TimelineHomeRecommendations,
-            include_str!("../../tests/fixtures/policy/timeline_home_recommendations.txt"),
-        ),
-        (
-            SafetyLevel::TimelineHomeHydration,
-            include_str!("../../tests/fixtures/policy/timeline_home_hydration.txt"),
-        ),
-        (
-            SafetyLevel::ImmersiveExpandedRecommendations,
-            include_str!("../../tests/fixtures/policy/immersive_expanded_recommendations.txt"),
-        ),
-        (
-            SafetyLevel::QuotedTweetRules,
-            include_str!("../../tests/fixtures/policy/quoted_tweet_rules.txt"),
-        ),
-    ];
-
     #[test]
     fn each_level_evaluates_its_pinned_policy() {
         let rule_engine = RuleEngine::for_tests();
-        let mut stale = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            let file = format!("{}.txt", <&str>::from(level));
-            let table = rule_engine
-                .policy(level)
-                .legacy_table()
-                .unwrap_or_else(|error| panic!("{level:?} has no legacy table: {error:?}"));
-            let pinned = PINNED_POLICIES
-                .iter()
-                .find(|&&(pinned_level, _)| pinned_level == level)
-                .map(|&(_, pinned)| pinned);
-            if pinned != Some(table.as_str()) {
-                if let Ok(dir) = std::env::var("TEST_UNDECLARED_OUTPUTS_DIR") {
-                    std::fs::write(std::path::Path::new(&dir).join(&file), &table).unwrap();
-                }
-                stale.push(file);
-            }
-        }
+        let tables: Vec<(String, String)> = SafetyLevel::VARIANTS
+            .iter()
+            .map(|&level| {
+                let table = rule_engine
+                    .policy(level)
+                    .legacy_table()
+                    .unwrap_or_else(|error| panic!("{level:?} has no legacy table: {error:?}"));
+                (
+                    format!("tests/fixtures/policy/{}.txt", <&str>::from(level)),
+                    table,
+                )
+            })
+            .collect();
+        let orphans: Vec<String> =
+            std::fs::read_dir(crate::pinned::crate_path("tests/fixtures/policy"))
+                .unwrap()
+                .map(|entry| {
+                    let name = entry.unwrap().file_name();
+                    format!("tests/fixtures/policy/{}", name.to_string_lossy())
+                })
+                .filter(|path| !tables.iter().any(|(table, _)| table == path))
+                .collect();
+        crate::pinned::assert_all_pinned(tables);
         assert!(
-            stale.is_empty(),
-            "tests/fixtures/policy/{stale:?} differ from the evaluated policies: run scripts/bless-policy and review the diff"
+            orphans.is_empty(),
+            "no level renders {orphans:?}: delete them"
         );
     }
 
@@ -2436,6 +2414,7 @@ country_specific_nsfw_content_gating:
                 Some("us".into()),
                 ClientCapability::default(),
                 raw,
+                None,
                 &caches,
             );
             plan.hydrate(&sources, request).await
@@ -2536,6 +2515,7 @@ country_specific_nsfw_content_gating:
                 None,
                 ClientCapability::default(),
                 vec![raw(1, None)],
+                None,
                 &caches,
             )
             .with_quotes(vec![QuoteEntry {

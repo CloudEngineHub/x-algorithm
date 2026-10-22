@@ -77,6 +77,10 @@ pub(crate) enum RuleId {
     NsfwReportedHeuristics,
     GoreAndViolenceReportedHeuristics,
 
+    OriginalTweetAdultMediaPropagation,
+    OriginalTweetGoreMediaPropagation,
+    ProtectedOriginalAuthor,
+
     DmcaMedia,
     GeoRestrictedMedia,
     NsfwUserAuthor,
@@ -131,8 +135,8 @@ pub(in crate::rules) use features::leaves;
 pub use features::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, EdgeLeaf, PostFactsLeaf, PostModerationLeaf,
-    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, TweetLeaf,
-    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
+    ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf, RelationshipLeaf, ReplyControlLeaf,
+    RequestLeaf, SourceTweetIdLeaf, TweetLeaf, TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
 pub use predicates::Predicate;
 pub(in crate::rules) use predicates::*;

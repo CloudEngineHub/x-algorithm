@@ -14,6 +14,7 @@ pub mod in_network_candidate_hydrator;
 pub mod language_code_hydrator;
 pub mod media_info_hydrator;
 pub mod mutual_follow_jaccard_hydrator;
+pub mod new_user_soft_nsfw_label_hydrator;
 pub mod phoenix_reply_ancestors_hydrator;
 pub mod post_engagers_hydrator;
 pub mod quote_hydrator;

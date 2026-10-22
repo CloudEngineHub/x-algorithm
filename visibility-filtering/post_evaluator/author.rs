@@ -22,7 +22,7 @@ impl PostEvaluator {
             .plan(level)
             .hydrate(
                 &*self.sources,
-                request.hydration_request(false, &FallbackCaches::default()),
+                request.hydration_request(None, &FallbackCaches::default()),
             )
             .await;
         let admitted = self

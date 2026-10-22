@@ -17,6 +17,7 @@ mod community;
 mod compound;
 mod edges;
 mod post;
+mod reaction;
 mod request;
 mod tweet;
 mod viewer;
@@ -27,6 +28,7 @@ pub use community::{CommunityModeratorLeaf, CommunityViewerRemovedLeaf, PostMode
 pub use compound::CompoundLeaf;
 pub use edges::{EdgeLeaf, PairEdgeLeaf, RelationshipLeaf};
 pub use post::{PostFactsLeaf, ReplyControlLeaf, SourceTweetIdLeaf, TweetSafetyLabelsLeaf};
+pub use reaction::{ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf};
 pub use request::RequestLeaf;
 pub use tweet::TweetLeaf;
 pub use viewer::ViewerAccountLeaf;
@@ -45,6 +47,8 @@ pub(in crate::rules) mod leaves {
     pub(in crate::rules) use super::PairEdgeLeaf::*;
     pub(in crate::rules) use super::PostFactsLeaf::*;
     pub(in crate::rules) use super::PostModerationLeaf::*;
+    pub(in crate::rules) use super::ReactedToAuthorSafetyLeaf::*;
+    pub(in crate::rules) use super::ReactedToPostSafetyLabelsLeaf::*;
     pub(in crate::rules) use super::RelationshipLeaf::*;
     pub(in crate::rules) use super::ReplyControlLeaf::*;
     pub(in crate::rules) use super::RequestLeaf::*;

@@ -53,6 +53,18 @@ def _read_metadata_table(path: Path, columns: List[str]) -> pd.DataFrame:
     return _metadata_cache[1]
 
 
+def target_slice_membership(
+    table_dataset_types: np.ndarray,
+    post_indices: np.ndarray,
+    target_dataset_type: RetrievalDataset,
+) -> np.ndarray:
+    stored_types = np.asarray(table_dataset_types).reshape(-1)
+    in_table = post_indices != -1
+    stored = stored_types[np.where(in_table, post_indices, 0)]
+    slice_values = np.asarray(RetrievalDataset.mask_values(target_dataset_type.value))
+    return in_table & np.isin(stored, slice_values)
+
+
 def _weighted_slot_scores(
     users: np.ndarray, cands: np.ndarray, slot_weights: Optional[Tuple[float, ...]]
 ) -> np.ndarray:
@@ -165,6 +177,9 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
             )
             dataset_types = jnp.where(is_home_slice, RetrievalDataset.HOME.value, dataset_types)
         assert all_post_embeddings is not None and all_post_ids is not None
+        table_dataset_types_np = (
+            None if dataset_types is None else np.asarray(jax.device_get(dataset_types))
+        )
         sorted_post_ids, post_id_sort_idx = build_post_id_sorter(all_post_ids)
         _force_validate = os.environ.get("XAI_EVAL_VALIDATE_MEMBERSHIP") == "1"
         if self.metrics is None:
@@ -278,6 +293,12 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                     )
                 missing_mask = in_batch_post_indices == -1
                 is_in_global_posts = ~missing_mask
+                if table_dataset_types_np is not None:
+                    is_in_target_slice = target_slice_membership(
+                        table_dataset_types_np, in_batch_post_indices, self.target_dataset_type
+                    )
+                else:
+                    is_in_target_slice = is_in_global_posts
                 in_batch_post_indices_global = multihost_utils.host_local_array_to_global_array(
                     in_batch_post_indices.astype(np.int32),
                     mesh,
@@ -339,10 +360,14 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                     global_recall_is_in = is_in_global_posts.reshape(
                         _local_experts, _users_per_expert, self.candidate_seq_len
                     )[:, :_eval_bs].reshape(_gr_n, self.candidate_seq_len)
+                    global_recall_in_slice = is_in_target_slice.reshape(
+                        _local_experts, _users_per_expert, self.candidate_seq_len
+                    )[:, :_eval_bs].reshape(_gr_n, self.candidate_seq_len)
                 else:
                     global_recall_target_post_ids = target_post_ids[:_gr_n]
                     global_recall_actions = actions[:_gr_n]
                     global_recall_is_in = is_in_global_posts[:_gr_n]
+                    global_recall_in_slice = is_in_target_slice[:_gr_n]
 
                 columns = ["post_id"] + self.metadata_stats
                 for attempt in range(3):
@@ -368,11 +393,13 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 )
                 positive_mask = has_positive_actions & real_candidate_mask
                 positive_in_index_mask = positive_mask & in_index_mask
+                positive_in_slice_mask = positive_mask & is_in_target_slice
 
                 num_real_candidates = float(real_candidate_mask.sum())
                 num_candidates_in_index = float(in_index_mask.sum())
                 num_positives = float(positive_mask.sum())
                 num_positives_in_index = float(positive_in_index_mask.sum())
+                num_positives_in_slice = float(positive_in_slice_mask.sum())
 
                 for key, metric in self.metrics:
                     if key == "loss":
@@ -390,6 +417,12 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                     elif key == "num_positives_in_index":
                         assert isinstance(metric, RecsysSumMetrics)
                         metric.add(num_positives_in_index)
+                    elif key == "positive_in_slice_frac":
+                        assert isinstance(metric, RecsysRecallMetrics)
+                        metric.add_ratio_counts(num_positives_in_slice, num_positives)
+                    elif key == "num_positives_in_slice":
+                        assert isinstance(metric, RecsysSumMetrics)
+                        metric.add(num_positives_in_slice)
                     elif key == "num_candidates":
                         assert isinstance(metric, RecsysSumMetrics)
                         metric.add(num_real_candidates)
@@ -417,6 +450,19 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                             self.implicit_negative_actions + self.explicit_negative_actions,
                             global_post_ids=all_post_ids,
                             is_in_global_posts=global_recall_is_in,
+                        )
+
+                    elif key.startswith("slice_recall@"):
+                        assert isinstance(metric, RecsysRecallMetrics)
+                        slice_top_k_ids = global_top_large_k_ids[:, : int(key.split("@")[1])]
+                        metric.run_batch_global_recall(
+                            slice_top_k_ids,
+                            global_recall_target_post_ids,
+                            global_recall_actions,
+                            self.positive_actions,
+                            self.implicit_negative_actions + self.explicit_negative_actions,
+                            global_post_ids=all_post_ids,
+                            is_in_global_posts=global_recall_in_slice,
                         )
 
                     elif key.startswith("implicit_negative_global_recall@"):
@@ -565,6 +611,8 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 ("num_candidates_in_index", RecsysSumMetrics()),
                 ("num_positives", RecsysSumMetrics()),
                 ("num_positives_in_index", RecsysSumMetrics()),
+                ("positive_in_slice_frac", RecsysRecallMetrics(k=1, ema_half_life_reports=ema_hl)),
+                ("num_positives_in_slice", RecsysSumMetrics()),
             ):
                 if isinstance(metric, RecsysRecallMetrics):
                     metric.initialize()
@@ -577,10 +625,14 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 metrics.append((f"in_batch_recall@{k}", recall_metric))
 
         if "global_recall" in self.metric_groups:
-            for k in [10, 100, 1_000]:
+            for k in [10, 100, 600, 1_000]:
                 recall_metric = RecsysRecallMetrics(k, ema_half_life_reports=ema_hl)
                 recall_metric.initialize()
                 metrics.append((f"global_recall@{k}", recall_metric))
+
+                slice_recall_metric = RecsysRecallMetrics(k, ema_half_life_reports=ema_hl)
+                slice_recall_metric.initialize()
+                metrics.append((f"slice_recall@{k}", slice_recall_metric))
 
                 implicit_negative_recall_metric = RecsysRecallMetrics(
                     k, ema_half_life_reports=ema_hl

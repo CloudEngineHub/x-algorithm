@@ -229,7 +229,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
                     tags: tweet.tags,
                     tweetypie: tp.label,
                     vf: vf.label.clone(),
-                    vf_rule: vf.rule.map(str::to_owned),
+                    vf_rule: vf.rule.map(|(_, rule)| rule.to_owned()),
                 })
             })
             .collect();

@@ -932,6 +932,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 remat_policy=mparams.get("remat_policy", RematType.WHOLE),
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
+                candidate_only_layers=tuple(mparams.get("candidate_only_layers", ())),
                 output_vocab_size=mparams["output_vocab_size"],
             ),
             hash_table=hash_table,

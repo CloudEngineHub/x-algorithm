@@ -467,6 +467,17 @@ impl CandidateBuilder {
         self
     }
 
+    pub(crate) fn with_reacted_to_post_labels(mut self, labels: &[SafetyLabelType]) -> Self {
+        self.candidate.post.reacted_to_post_safety_labels =
+            SafetyLabelMap::new(labels.iter().copied().collect());
+        self
+    }
+
+    pub(crate) fn with_protected_reacted_to_author(mut self) -> Self {
+        self.candidate.post.reacted_to_author_is_protected = true;
+        self
+    }
+
     pub(crate) fn build(self) -> PostCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {

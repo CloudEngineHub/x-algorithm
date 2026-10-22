@@ -1,7 +1,7 @@
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{
-    Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, QuoteEntry, Unresolved,
+    Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, QuoteEntry, Relation, Unresolved,
 };
 use crate::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
 use crate::models::{
@@ -31,7 +31,7 @@ pub struct PostBatch {
 impl PostBatch {
     pub(crate) fn hydration_request<'a>(
         &mut self,
-        is_expanding_retweet_sources: bool,
+        posts_judged_for: Option<Rpc>,
         fallback_caches: &'a FallbackCaches,
     ) -> HydrationRequest<'a> {
         HydrationRequest::new(
@@ -42,6 +42,7 @@ impl PostBatch {
                 .iter()
                 .map(|placed| placed.candidate)
                 .collect(),
+            posts_judged_for,
             fallback_caches,
         )
         .with_quotes(
@@ -56,7 +57,6 @@ impl PostBatch {
                 })
                 .collect(),
         )
-        .with_retweet_sources(is_expanding_retweet_sources)
     }
 }
 
@@ -106,22 +106,14 @@ impl PostEvaluator {
     }
 
     pub async fn run(&self, request: PostBatch) -> Vec<PostEvaluation> {
-        let hydrated = self.hydrate(request).await;
+        let hydrated = self.hydrate(request, None).await;
         self.evaluate_in_request_order(&hydrated, &mut NoTrace)
     }
 
-    pub(crate) async fn hydrate(&self, request: PostBatch) -> HydratedRequest {
-        self.hydrate_request(request, false).await
-    }
-
-    pub(crate) async fn hydrate_with_retweet_sources(&self, request: PostBatch) -> HydratedRequest {
-        self.hydrate_request(request, true).await
-    }
-
-    async fn hydrate_request(
+    pub(crate) async fn hydrate(
         &self,
         mut request: PostBatch,
-        is_expanding_retweet_sources: bool,
+        posts_judged_for: Option<Rpc>,
     ) -> HydratedRequest {
         #[cfg(test)]
         self.client_capabilities
@@ -133,13 +125,13 @@ impl PostEvaluator {
         let hydration = plan
             .hydrate(
                 &*self.sources,
-                request.hydration_request(is_expanding_retweet_sources, &self.fallback_caches),
+                request.hydration_request(posts_judged_for, &self.fallback_caches),
             )
             .await;
         let hydrated_at = Instant::now();
-        let retweet_sources = if !is_expanding_retweet_sources {
+        let retweet_sources = if !hydration.is_on(Relation::RetweetSource) {
             RetweetSources::NoSource
-        } else if hydration.has_fetched_sources() {
+        } else if hydration.has_fetched_retweet_sources() {
             RetweetSources::Fetched
         } else if request.candidates.iter().any(|candidate| {
             hydration
@@ -159,7 +151,6 @@ impl PostEvaluator {
         HydratedRequest {
             safety_level: request.safety_level,
             rpc: request.rpc,
-            is_expanding_retweet_sources,
             retweet_sources,
             candidates: request.candidates,
             hydration,
@@ -246,7 +237,8 @@ impl PostEvaluator {
             tweet_id,
             placement,
         } = key;
-        let copied = hydrated.is_expanding_retweet_sources && placement != Placement::RetweetSource;
+        let copied = hydrated.hydration.is_on(Relation::RetweetSource)
+            && placement != Placement::RetweetSource;
         let tweet = hydrated.hydration.tweet(tweet_id);
         let post = admitted.and_then(|admitted| admitted.post(tweet_id, copied, placement));
         let evaluation = match (tweet, post) {
@@ -308,7 +300,6 @@ impl PostObserver for HashMap<EvaluationKey, PolicyTrace> {
 pub(crate) struct HydratedRequest {
     safety_level: SafetyLevel,
     rpc: Rpc,
-    is_expanding_retweet_sources: bool,
     retweet_sources: RetweetSources,
     candidates: Vec<PlacedCandidate>,
     hydration: Hydration,
@@ -441,13 +432,17 @@ mod tests {
                 ]],
                 "{delayed:?}"
             );
+            let requested = vec![1, 2, 3, 4, 7, 8, 100, 201];
             assert_eq!(
-                sources.keys(Source::TesConversationRoot),
-                [vec![500]],
+                sources.keys(Source::TesPureCoreData),
+                [requested.clone(), vec![500]],
                 "{delayed:?}"
             );
-            let root_keys = logged_out.sources().keys(Source::TesConversationRoot);
-            assert!(root_keys.is_empty(), "{delayed:?}");
+            assert_eq!(
+                logged_out.sources().keys(Source::TesPureCoreData),
+                [requested],
+                "{delayed:?}"
+            );
         }
     }
 
@@ -480,10 +475,10 @@ mod tests {
                 Evaluation::Failed(Lookup::Tweet),
             ]
         );
-        assert!(scenario
-            .sources()
-            .keys(Source::TesConversationRoot)
-            .is_empty());
+        assert_eq!(
+            scenario.sources().keys(Source::TesPureCoreData),
+            [vec![1, 2, 100, 200]]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -622,19 +617,18 @@ mod tests {
             let sources = scenario.sources();
             assert_eq!(evaluations, [Evaluation::complete(verdict)], "{name}");
             assert_eq!(sources.selects(), selects, "{name}");
-            assert_eq!(
-                sources.keys(Source::TesConversationRoot),
-                root_keys,
-                "{name}"
-            );
+            let mut requested_keys = sources.keys(Source::TesPureCoreData);
+            let fetched_root_keys = requested_keys.split_off(1);
+            assert_eq!(requested_keys, [vec![2]], "{name}");
+            assert_eq!(fetched_root_keys, root_keys, "{name}");
             let starts: Vec<Duration> = sources
-                .starts(Source::TesConversationRoot)
+                .starts(Source::TesPureCoreData)
                 .into_iter()
+                .skip(1)
                 .map(|start| start - started)
                 .collect();
             assert_eq!(starts, root_starts, "{name}");
             for source in [
-                Source::TesPureCoreData,
                 Source::TesTweet,
                 Source::TesConversationControl,
                 Source::SafetyLabels,

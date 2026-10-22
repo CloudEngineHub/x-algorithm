@@ -1,4 +1,4 @@
-use crate::models::{MediaFeature, NsfwFeature, TweetFeatures};
+use crate::models::{MediaFeature, NsfwFeature, ReactionContext, TweetFeatures};
 use crate::thrift_read::{read_fields, skip_elements, SKIP_DEPTH};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -68,6 +68,7 @@ struct Tweet {
     has_card_reference: bool,
     article_id: Option<NonZeroU64>,
     narrowcast_place_id: Option<u64>,
+    reaction_context: Option<ReactionContext>,
 }
 
 #[derive(Default)]
@@ -113,6 +114,7 @@ impl Tweet {
                 .map(|control| control.conversation_author_id),
             article_id: self.article_id,
             narrowcast_place_id: self.narrowcast_place_id,
+            reaction_context: self.reaction_context,
         })
     }
 }
@@ -171,6 +173,7 @@ impl StratoRead for Tweet {
                         Ok(u64::from_str_radix(&proto.read_string()?, 16).ok())
                     })?;
                 }
+                Some(178) => tweet.reaction_context = read_reaction_context(proto)?,
                 Some(32766) => tweet.has_media_keys = skip_list_non_empty(proto)?,
                 _ => return Ok(false),
             }
@@ -289,6 +292,24 @@ fn read_first_community_id(proto: &mut MValProtocol<'_>) -> thrift::Result<Optio
     Ok(first)
 }
 
+fn read_reaction_context(proto: &mut MValProtocol<'_>) -> thrift::Result<Option<ReactionContext>> {
+    let (mut post, mut user) = (None, None);
+    read_fields(proto, |proto, field| {
+        match field.id {
+            Some(1) => post = Some(proto.read_i64()?.cast_unsigned()),
+            Some(2) => user = Some(proto.read_i64()?.cast_unsigned()),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    Ok(post
+        .zip(user)
+        .map(|(reacted_to_post_id, reacted_to_user_id)| ReactionContext {
+            reacted_to_post_id,
+            reacted_to_user_id,
+        }))
+}
+
 fn read_id_field<T>(
     proto: &mut MValProtocol<'_>,
     read: impl Fn(&mut MValProtocol<'_>) -> thrift::Result<Option<T>>,
@@ -330,6 +351,8 @@ mod tests {
     const TRUSTED_FRIENDS_LIST_ID: i64 = 9001;
     const ARTICLE_ID: i64 = 9002;
     const PHOTO_REPLY_ID: i64 = 20_000;
+    const REACTED_TO_POST_ID: i64 = 9003;
+    const REACTED_TO_USER_ID: i64 = 7004;
 
     fn exclusive_conversation() -> (i16, Thrift) {
         (155, Struct(vec![(1, I64(CONVERSATION_AUTHOR_ID))]))
@@ -664,6 +687,13 @@ mod tests {
                 (162, non_empty_list(true)),
                 (170, Struct(vec![(1, I64(ARTICLE_ID))])),
                 narrowcast_place("7f00000000000001"),
+                (
+                    178,
+                    Struct(vec![
+                        (1, I64(REACTED_TO_POST_ID)),
+                        (2, I64(REACTED_TO_USER_ID)),
+                    ]),
+                ),
                 (32766, non_empty_list(true)),
             ],
         );
@@ -695,8 +725,33 @@ mod tests {
                 exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
                 article_id: NonZeroU64::new(ARTICLE_ID as u64),
                 narrowcast_place_id: Some(0x7f00_0000_0000_0001),
+                reaction_context: Some(ReactionContext {
+                    reacted_to_post_id: REACTED_TO_POST_ID as u64,
+                    reacted_to_user_id: REACTED_TO_USER_ID as u64,
+                }),
             }
         );
+    }
+
+    #[test]
+    fn a_reaction_context_missing_either_id_is_no_reaction() {
+        for (name, ids) in [
+            ("post only", vec![(1, I64(REACTED_TO_POST_ID))]),
+            ("user only", vec![(2, I64(REACTED_TO_USER_ID))]),
+            ("neither", vec![]),
+        ] {
+            let bytes = encode_tweet(
+                vec![],
+                vec![(178, Struct(ids)), (32766, non_empty_list(true))],
+            );
+
+            let features = decode_fixture(&bytes);
+            assert_eq!(features.reaction_context, None, "{name}");
+            assert!(
+                features.media.has_uploaded_media,
+                "{name}: the field after the reaction context did not decode"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
+use super::key_origin::{KeyOrigin, Names};
 use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
-use crate::hydration::hydrator::KeyOrigin;
-use crate::hydration::inventory::{MissPolicy, Subject};
+use crate::hydration::inventory::MissPolicy;
+use crate::hydration::relation::Relation;
 use crate::hydration::{
     Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,
 };
@@ -16,6 +17,7 @@ impl Store {
     pub(super) fn hydrated_tweet(
         &self,
         row: &RequestRow,
+        position: usize,
         id: TweetId,
         tweet_misses: &FxHashMap<TweetId, Option<Cause>>,
         incomplete: Hydrators,
@@ -24,7 +26,7 @@ impl Store {
         let safety_labels = self.labels.get(id.0).cloned();
         match self.resolve(row, id, tweet_misses) {
             Ok(author_id) => {
-                let candidate = self.candidate(row, id, author_id, incomplete, unclaimed);
+                let candidate = self.candidate(row, position, id, author_id, incomplete, unclaimed);
                 HydratedTweet::Resolved {
                     candidate,
                     source_tweet_id: self.source_tweet_id(id),
@@ -41,6 +43,7 @@ impl Store {
     pub(super) fn hydrated_user(
         &self,
         row: &RequestRow,
+        position: usize,
         user: AuthorId,
         incomplete: Hydrators,
         unclaimed: &mut Vec<(Hydrator, u64)>,
@@ -49,8 +52,8 @@ impl Store {
             Some(cause) => HydratedUser::Unresolved(cause),
             None => HydratedUser::Resolved {
                 user: self.author(user),
-                viewer_relationship: self.edges(row).0,
-                failed: self.failed(row, incomplete, unclaimed),
+                viewer_relationship: self.edges(row, position).0,
+                failed: self.failed(row, position, incomplete, unclaimed),
             },
         }
     }
@@ -101,7 +104,7 @@ impl Store {
         let core = self
             .pure_cores
             .get(tweet_id.0)
-            .filter(|_| self.is_expanding_retweet_sources)?;
+            .filter(|_| self.is_on(Relation::RetweetSource))?;
         let source_id = core.source_tweet_id?;
         let shared_tweet = *tweet_misses.get(&source_id)?;
         let shared_author = core.source_author_id.or_else(|| {
@@ -116,13 +119,13 @@ impl Store {
         ))
     }
 
-    fn unresolving(
-        &self,
-        subject: Subject,
-    ) -> impl Iterator<Item = (Hydrator, &dyn AnyFetcher)> + '_ {
+    fn unresolving(&self, names: Names) -> impl Iterator<Item = (Hydrator, &dyn AnyFetcher)> + '_ {
         self.callable
             .iter()
-            .filter(move |node| node.spec().source.miss_policy() == MissPolicy::Unresolves(subject))
+            .filter(move |&node| {
+                node.spec().source.miss_policy() == MissPolicy::Unresolves
+                    && self.origin(node).names() == names
+            })
             .filter_map(|node| Some((node, self.fetcher(node)?)))
     }
 
@@ -132,10 +135,10 @@ impl Store {
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> Option<Cause> {
         let key = tweet_id.0;
-        let has_joined_sources = self.has_joined_sources();
-        self.unresolving(Subject::Tweet)
+        let has_joined_retweet_sources = self.has_joined_retweet_sources;
+        self.unresolving(Names::Post)
             .filter_map(|(node, fetcher)| {
-                if has_joined_sources && !fetcher.is_claimed(key) {
+                if has_joined_retweet_sources && !fetcher.is_claimed(key) {
                     unclaimed.push((node, key));
                 }
                 fetcher.miss(key)
@@ -144,7 +147,7 @@ impl Store {
     }
 
     fn author_miss(&self, author_id: AuthorId) -> Option<Cause> {
-        self.unresolving(Subject::Author)
+        self.unresolving(Names::Author)
             .filter_map(|(_, fetcher)| fetcher.miss(author_id.get()))
             .min()
     }
@@ -158,14 +161,14 @@ impl Store {
         UserEntity::new(author_id.get(), author_features, author_labels)
     }
 
-    fn edges(&self, row: &RequestRow) -> (ViewerRelationship, Hydrators) {
+    fn edges(&self, row: &RequestRow, position: usize) -> (ViewerRelationship, Hydrators) {
         let (viewer_relationship, post_edges) = self
             .callable
             .iter()
             .filter(|&node| {
                 node.edge()
                     .and_then(|edge| {
-                        let key = self.key(self.origin(node), row)?;
+                        let key = self.parent_key(node, row, position)?;
                         self.edge_fetcher(edge)?.get(key).copied()
                     })
                     .unwrap_or(false)
@@ -190,13 +193,14 @@ impl Store {
     pub(super) fn candidate(
         &self,
         row: &RequestRow,
+        position: usize,
         tweet_id: TweetId,
         author_id: AuthorId,
         incomplete: Hydrators,
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> PostCandidate {
         let id = tweet_id.0;
-        let (viewer_relationship, post_edges) = self.edges(row);
+        let (viewer_relationship, post_edges) = self.edges(row, position);
         PostCandidate {
             author: self.author(author_id),
             viewer_relationship,
@@ -252,8 +256,17 @@ impl Store {
                     .key(KeyOrigin::TweetArticle, row)
                     .and_then(|article_id| self.article_lifecycles.get(article_id))
                     .copied(),
+                reacted_to_post_safety_labels: self
+                    .read_key(Hydrator::ReactedToPostSafetyLabels, position)
+                    .and_then(|post_id| self.labels.get(post_id))
+                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))
+                    .unwrap_or_default(),
+                reacted_to_author_is_protected: self
+                    .read_key(Hydrator::ReactedToAuthorSafety, position)
+                    .and_then(|user_id| self.authors.get(user_id))
+                    .is_some_and(|(author, _)| author.is_protected),
             },
-            failed: self.failed(row, incomplete, unclaimed),
+            failed: self.failed(row, position, incomplete, unclaimed),
         }
     }
 }

@@ -12,9 +12,10 @@ pub use crate::retweet::MergeSelection;
 pub use crate::rules::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
-    PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, RelationshipLeaf, ReplyControlLeaf,
-    RequestLeaf, RowTrace, SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf,
-    TweetSafetyLabelsLeaf, ViewerAccountLeaf, Witness,
+    PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf,
+    ReactedToPostSafetyLabelsLeaf, RelationshipLeaf, ReplyControlLeaf, RequestLeaf, RowTrace,
+    SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf, TweetSafetyLabelsLeaf,
+    ViewerAccountLeaf, Witness,
 };
 
 use crate::evaluate_tweets::{Sends, evaluate_tweets_request};

@@ -157,19 +157,6 @@ impl Exchange for TesPureCoreData {
     }
 }
 
-pub(crate) struct TesConversationRoot;
-
-impl Exchange for TesConversationRoot {
-    const NAME: &'static str = "conversation_roots";
-    const SCOPE: Scope = Scope::Shared;
-    type Key = u64;
-    type Wire = PureCoreData;
-
-    fn ids(root_id: &u64, core: Option<&PureCoreData>) -> anyhow::Result<Vec<Id>> {
-        TesPureCoreData::ids(root_id, core)
-    }
-}
-
 pub(crate) struct TesTweet;
 
 impl Exchange for TesTweet {

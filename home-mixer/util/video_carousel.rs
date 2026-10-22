@@ -12,12 +12,14 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)
         && query.video_carousel_eligible
+        && !query.is_bottom_request
 }
 
 pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)
         && query.params.get(VideoCarouselImmersiveVqvWeight) != 0.0
+        && !query.is_bottom_request
 }
 
 pub(crate) fn select_videos<'a>(

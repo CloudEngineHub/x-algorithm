@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-20T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-10-21T16:00:32Z
 use xai_feature_switches::param;
 
 param!(
@@ -98,7 +98,7 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec![]
+    vec!["Experiment18Fou:0.5".to_string()]
 );
 param!(
     ShadowTrafficPhoenixClusterAggregationTypes,
@@ -802,6 +802,18 @@ param!(
     1800
 );
 param!(
+    EnableNewUserSoftNsfwFilter,
+    bool,
+    "rust_home_mixer_enable_new_user_soft_nsfw_filter",
+    false
+);
+param!(
+    NewUserSoftNsfwFilterMaxAccountAgeSecs,
+    u64,
+    "rust_home_mixer_new_user_soft_nsfw_filter_max_account_age_secs",
+    86400
+);
+param!(
     NewUserMinEngagementFilterMaxResurrectionAgeSecs,
     u64,
     "rust_home_mixer_new_user_min_engagement_filter_max_resurrection_age_secs",
@@ -1151,7 +1163,7 @@ param!(
     EnableVideoCarouselCandidatesLogging,
     bool,
     "rust_home_mixer_enable_video_carousel_candidates_logging",
-    false
+    true
 );
 param!(
     VideoCarouselVideoOpenWeight,
@@ -1195,5 +1207,5 @@ param!(
     EnableFairShareRanking,
     bool,
     "rust_home_mixer_enable_fair_share_ranking",
-    false
+    true
 );

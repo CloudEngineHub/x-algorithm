@@ -994,6 +994,10 @@ class RecsysAggregatedModelConfig(Config):
                 isinstance(attn_config, RecsysAttentionConfig)
                 and attn_config.num_user_prefix_tokens == self.num_user_prefix_tokens
             )
+        if self.model_config.candidate_only_layers:
+            assert not (self.transformer_output_only or self.page_rl.enabled), (
+                "transformer_output_only and page_rl read tokens that candidate-only blocks freeze"
+            )
 
         validate_continuous_action_losses(self.continuous_action_losses)
 

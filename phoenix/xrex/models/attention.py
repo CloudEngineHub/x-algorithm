@@ -39,6 +39,7 @@ class AttentionConfig(Config):
 
 class Attention(hk.Module):
     window_size: int = -1
+    supports_candidate_only: bool = False
 
     def __init__(
         self,

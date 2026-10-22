@@ -49,6 +49,8 @@ use xai_candidate_pipeline::selector::Selector;
 use xai_candidate_pipeline::side_effect::SideEffect;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto::FeedItem;
+use xai_visibility_filtering::tweet_safety_label::TweetSafetyLabelClient;
+use xai_visibility_filtering::vf_client::VfClient;
 
 pub struct FollowingCandidatePipeline {
     query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>>,
@@ -61,7 +63,11 @@ pub struct FollowingCandidatePipeline {
 }
 
 impl FollowingCandidatePipeline {
-    pub async fn new(datacenter: &str) -> Self {
+    pub async fn new(
+        datacenter: &str,
+        xai_vf_client: Arc<dyn VfClient + Send + Sync>,
+        vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
+    ) -> Self {
         let (
             ad_index_client,
             served_history_client,
@@ -110,7 +116,7 @@ impl FollowingCandidatePipeline {
                     .expect("Failed to create flock SocialGraphClient"),
                 ) as Arc<dyn SocialGraphClientOps>
             },
-            ReverseChronPostsPipeline::new(datacenter),
+            ReverseChronPostsPipeline::new(datacenter, xai_vf_client, vf_safety_labels_client),
             async {
                 Arc::new(
                     ProdWhoToFollowClient::new(datacenter)

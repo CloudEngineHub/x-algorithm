@@ -118,6 +118,8 @@ impl Engine for UserEngine {
             | Predicate::ArticleStage(Absent(never, _))
             | Predicate::CommunityModerator(Absent(never, _))
             | Predicate::CommunityViewerRemoved(Absent(never, _))
+            | Predicate::ReactedToPostSafetyLabels(Absent(never, _))
+            | Predicate::ReactedToAuthorSafety(Absent(never, _))
             | Predicate::Edge(Absent(never, _))
             | Predicate::Compound(Absent(never, _)) => match never {},
         }

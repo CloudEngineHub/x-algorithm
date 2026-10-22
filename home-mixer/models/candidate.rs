@@ -106,6 +106,8 @@ pub struct PostCandidate {
     pub nsfw_author: Option<bool>,
     pub nsfw_author_ads: Option<bool>,
     pub nsfw_author_phoenix: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_nsfw: Option<bool>,
     #[serde(default)]
     pub safety_labels: Vec<SafetyLabelInfo>,
     #[serde(default)]

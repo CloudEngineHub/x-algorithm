@@ -41,6 +41,10 @@ impl<V, K: Copy + Eq + Hash> Fetcher<V, K> {
         }
     }
 
+    pub(super) fn has_landed(&self, key: K) -> bool {
+        matches!(self.states.get(&key), Some(State::Landed(_)))
+    }
+
     pub(super) fn get(&self, key: K) -> Option<&V> {
         match self.states.get(&key)? {
             State::Landed(answer) => answer.value(),

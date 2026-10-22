@@ -8,10 +8,12 @@ mod hydrator;
 pub(crate) mod inventory;
 pub mod metrics;
 pub(crate) mod plan;
+mod relation;
 pub(crate) mod sources;
 mod store;
 pub mod tweet_source;
 
+use crate::metrics::Rpc;
 use crate::models::{
     AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures,
     TweetId, UserEntity, ViewerFeatures, ViewerRelationship,
@@ -24,6 +26,7 @@ use fallback_cache::FallbackCaches;
 pub(crate) use hydrator::RequestRows;
 pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
+pub(crate) use relation::Relation;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::hash::Hash;
@@ -56,7 +59,7 @@ pub(crate) struct HydrationRequest<'a> {
     raw_candidates: Vec<RawCandidate>,
     users: Vec<AuthorId>,
     quotes: Vec<QuoteEntry>,
-    is_expanding_retweet_sources: bool,
+    posts_judged_for: Option<Rpc>,
     fallback_caches: &'a FallbackCaches,
 }
 
@@ -72,6 +75,7 @@ impl<'a> HydrationRequest<'a> {
         country_code: Option<String>,
         client_capability: ClientCapability,
         raw_candidates: Vec<RawCandidate>,
+        posts_judged_for: Option<Rpc>,
         fallback_caches: &'a FallbackCaches,
     ) -> Self {
         Self {
@@ -81,7 +85,7 @@ impl<'a> HydrationRequest<'a> {
             raw_candidates,
             users: Vec::new(),
             quotes: Vec::new(),
-            is_expanding_retweet_sources: false,
+            posts_judged_for,
             fallback_caches,
         }
     }
@@ -102,6 +106,7 @@ impl<'a> HydrationRequest<'a> {
                 None,
                 ClientCapability::default(),
                 Vec::new(),
+                None,
                 fallback_caches,
             )
         }
@@ -109,11 +114,6 @@ impl<'a> HydrationRequest<'a> {
 
     pub(crate) fn with_quotes(mut self, quotes: Vec<QuoteEntry>) -> Self {
         self.quotes = quotes;
-        self
-    }
-
-    pub(crate) fn with_retweet_sources(mut self, is_expanding_retweet_sources: bool) -> Self {
-        self.is_expanding_retweet_sources = is_expanding_retweet_sources;
         self
     }
 }
@@ -135,7 +135,8 @@ pub(crate) struct Hydration {
     tweets: FxHashMap<TweetId, HydratedTweet>,
     users: FxHashMap<AuthorId, HydratedUser>,
     quotes: FxHashMap<QuoteEntry, Quoted>,
-    has_fetched_sources: bool,
+    has_fetched_retweet_sources: bool,
+    posts_judged_for: Option<Rpc>,
 }
 
 #[cfg_attr(
@@ -193,6 +194,10 @@ impl Hydration {
         }
     }
 
+    pub(crate) fn is_on(&self, relation: Relation) -> bool {
+        relation.is_on(self.posts_judged_for, self.planned)
+    }
+
             pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {
         let tweet = self.tweet(id)?;
         let candidate = tweet.candidate()?;
@@ -226,8 +231,8 @@ impl Hydration {
         candidate.failed.union(source)
     }
 
-    pub(crate) fn has_fetched_sources(&self) -> bool {
-        self.has_fetched_sources
+    pub(crate) fn has_fetched_retweet_sources(&self) -> bool {
+        self.has_fetched_retweet_sources
     }
 }
 
@@ -325,22 +330,6 @@ impl HydratedTweet {
             }
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn assert_blessed(fixture: &str, blessed: &str, rendered: &str) {
-    if std::env::var_os("VF_BLESS").is_some() {
-        let outputs = std::env::var("TEST_UNDECLARED_OUTPUTS_DIR").expect("bless under bazel test");
-        std::fs::write(std::path::Path::new(&outputs).join(fixture), rendered).unwrap();
-        return;
-    }
-    assert!(
-        blessed == rendered,
-        "{fixture} changed. Bless it with `bazel test --test_env=VF_BLESS=1 \
-         --nozip_undeclared_test_outputs --test_arg=<test> <this target>`, then copy \
-         `bazel-testlogs/<this target>/test.outputs/{fixture}` to tests/fixtures.\n\
-         --- blessed\n{blessed}--- rendered\n{rendered}"
-    );
 }
 
 #[cfg(test)]

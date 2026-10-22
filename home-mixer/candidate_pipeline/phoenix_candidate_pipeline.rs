@@ -12,6 +12,7 @@ use crate::candidate_hydrators::in_network_candidate_hydrator::InNetworkCandidat
 use crate::candidate_hydrators::language_code_hydrator::LanguageCodeHydrator;
 use crate::candidate_hydrators::media_info_hydrator::MediaInfoHydrator;
 use crate::candidate_hydrators::mutual_follow_jaccard_hydrator::MutualFollowJaccardHydrator;
+use crate::candidate_hydrators::new_user_soft_nsfw_label_hydrator::NewUserSoftNsfwLabelHydrator;
 use crate::candidate_hydrators::phoenix_reply_ancestors_hydrator::PhoenixReplyAncestorsHydrator;
 use crate::candidate_hydrators::post_engagers_hydrator::PostEngagersHydrator;
 use crate::candidate_hydrators::quote_hydrator::QuoteHydrator;
@@ -72,6 +73,7 @@ use crate::filters::fav_holdout_filter::FavHoldoutFilter;
 use crate::filters::ineligible_subscription_filter::IneligibleSubscriptionFilter;
 use crate::filters::inventory_holdout_filter::InventoryHoldoutFilter;
 use crate::filters::new_user_min_engagement_filter::NewUserMinEngagementFilter;
+use crate::filters::new_user_soft_nsfw_filter::NewUserSoftNsfwFilter;
 use crate::filters::oon_nsfw_simclusters_filter::OONNsfwSimclustersFilter;
 use crate::filters::oon_retweet_reply_filter::OONRetweetReplyFilter;
 use crate::filters::previously_seen_posts_backup_filter::PreviouslySeenPostsBackupFilter;
@@ -206,9 +208,9 @@ use xai_feature_switches::FeatureSwitches;
 use xai_geo_ip::GeoIpLocationClient;
 use xai_redis_client::{XdsRedisClient, XdsRedisConfig};
 use xai_visibility_filtering::tweet_safety_label::{
-    MockTweetSafetyLabelClient, ProdTweetSafetyLabelClient, TweetSafetyLabelClient,
+    MockTweetSafetyLabelClient, TweetSafetyLabelClient,
 };
-use xai_visibility_filtering::vf_client::{MockVfClient, StratoVfClient, VfClient, XaiVfClient};
+use xai_visibility_filtering::vf_client::{MockVfClient, StratoVfClient, VfClient};
 use xai_x_rpc::wily_lookup_service::ShardCoordinate;
 
 pub struct PhoenixCandidatePipeline {
@@ -396,6 +398,9 @@ impl PhoenixCandidatePipeline {
             Box::new(EngagementCountsHydrator::new(engagement_counts_client).await),
             Box::new(PostEngagersHydrator::new(post_engagers_client)),
             Box::new(SemanticIdHydrator::new(sid_client)),
+            Box::new(NewUserSoftNsfwLabelHydrator {
+                client: vf_safety_labels_client.clone(),
+            }),
         ];
 
         let author_rules = Arc::new(xai_feature_switches::AuthorRulesEvaluator::new(
@@ -408,6 +413,7 @@ impl PhoenixCandidatePipeline {
                 author_rules: author_rules.clone(),
             }),
             Box::new(CoreDataHydrationFilter),
+            Box::new(NewUserSoftNsfwFilter),
             Box::new(AgeFilter::new(Duration::from_secs(params::MAX_POST_AGE))),
             Box::new(SelfTweetFilter),
             Box::new(OONRetweetReplyFilter),
@@ -541,6 +547,8 @@ impl PhoenixCandidatePipeline {
         feature_switches: Arc<FeatureSwitches>,
         phoenix_xds: &super::PhoenixXdsConfig,
         vm_ranker_xds: &super::VmRankerXdsConfig,
+        xai_vf_client: Arc<dyn VfClient + Send + Sync>,
+        vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
     ) -> PhoenixCandidatePipeline {
         let local_cache_eds = format!("");
         let atla_phoenix_cache_eds = "";
@@ -560,7 +568,6 @@ impl PhoenixCandidatePipeline {
             media_info_cache_client,
             gizmoduck_client,
             strato_vf_client,
-            xai_vf_client,
             redis_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
@@ -569,7 +576,6 @@ impl PhoenixCandidatePipeline {
             reranking_kafka_client,
             retrieval_candidates_kafka_client,
             vm_ranker_client,
-            vf_safety_labels_client,
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,
@@ -684,13 +690,6 @@ impl PhoenixCandidatePipeline {
             },
             async {
                 Arc::new(
-                    XaiVfClient::connect(datacenter)
-                        .await
-                        .expect("Failed to create XAI VF client"),
-                ) as Arc<dyn VfClient + Send + Sync>
-            },
-            async {
-                Arc::new(
                     XdsRedisClient::new(XdsRedisConfig {
                         eds_resource_name: local_cache_eds.clone(),
                     })
@@ -750,15 +749,6 @@ impl PhoenixCandidatePipeline {
                         .await
                         .expect("Failed to create VMRanker client"),
                 ) as Arc<dyn VMRankerClient>
-            },
-            async {
-                Arc::new(
-                    ProdTweetSafetyLabelClient::new(datacenter)
-                        .await
-                        .expect("Failed to create VF SafetyLabels client")
-                        .with_timeout_ms(500)
-                        .with_max_batch_size(50),
-                ) as Arc<dyn TweetSafetyLabelClient>
             },
             async {
                 Arc::new(

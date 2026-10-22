@@ -418,7 +418,8 @@ class MediaLoader:
                     video.videoInfo.get_highest_variant_within(
                         duration_ms, _VIDEO_MAX_ESTIMATED_BYTES
                     )
-                    if is_main_post and is_high_fav
+                    if (is_main_post and is_high_fav)
+                    or grox_config.media_hydration.highest_video_bitrate
                     else video.videoInfo.get_best_variant()
                 )
                 if best_variant and best_variant.url:

@@ -36,6 +36,13 @@ pub struct TweetFeatures {
     pub exclusive_conversation_author_id: Option<u64>,
     pub article_id: Option<NonZeroU64>,
     pub narrowcast_place_id: Option<u64>,
+    pub reaction_context: Option<ReactionContext>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReactionContext {
+    pub reacted_to_post_id: u64,
+    pub reacted_to_user_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

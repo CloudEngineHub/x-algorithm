@@ -15,6 +15,7 @@ mod oon_media;
 mod oon_tweet_label;
 mod oon_user_label;
 mod quoted_tweet_rules;
+mod reaction_video;
 mod relationship;
 mod takedown;
 mod trusted_friends;
@@ -458,6 +459,7 @@ fn rows() -> Vec<Row> {
         oon_media::rows(),
         oon_tweet_label::rows(),
         oon_user_label::rows(),
+        reaction_video::rows(),
     ]
     .into_iter()
     .flatten()

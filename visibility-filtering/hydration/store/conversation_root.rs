@@ -36,12 +36,7 @@ impl Store {
             (Some(control), _) => ConversationRootAuthor::ConversationControl(AuthorId(
                 control.conversation_tweet_author_id,
             )),
-            (None, Some(Cause::NotFound))
-                if !self
-                    .rows
-                    .iter()
-                    .any(|row| row.tweet_id() == Some(conversation_id)) =>
-            {
+            (None, Some(Cause::NotFound)) if !self.row_tweet_ids.contains(&conversation_id) => {
                 ConversationRootAuthor::RootPost(conversation_id)
             }
             (None, Some(Cause::NotFound))
@@ -59,10 +54,14 @@ impl Store {
         conversation_id: TweetId,
         parent_id: TweetId,
     ) -> Option<AuthorId> {
-        self.pure_cores
-            .get(conversation_id.0)
+        let row_core = |id: TweetId| {
+            self.pure_cores
+                .get(id.0)
+                .filter(|_| self.row_tweet_ids.contains(&id))
+        };
+        row_core(conversation_id)
             .map(|root| root.author_id)
-            .or_else(|| match self.pure_cores.get(parent_id.0)?.reply_to? {
+            .or_else(|| match row_core(parent_id)?.reply_to? {
                 ReplyTo::Root {
                     conversation_id: parent_conversation_id,
                     root_author_id,

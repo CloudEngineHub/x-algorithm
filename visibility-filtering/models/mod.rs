@@ -9,7 +9,10 @@ pub mod viewer;
 pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
-pub use tweet::{ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, TweetFeatures};
+pub use tweet::{
+    ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, ReactionContext,
+    TweetFeatures,
+};
 pub use verdict::{
     Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement, LimitedEngagementReason,
     MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
@@ -241,7 +244,9 @@ impl ViewerRelationship {
             | Hydrator::OutsideNarrowcastPlace
             | Hydrator::AuthorBlocksOuterAuthor
             | Hydrator::OuterAuthorFollowsAuthor
-            | Hydrator::QuotedTweet => None,
+            | Hydrator::QuotedTweet
+            | Hydrator::ReactedToPostSafetyLabels
+            | Hydrator::ReactedToAuthorSafety => None,
         }
     }
 
@@ -266,4 +271,6 @@ pub struct PostEntity {
     pub article_lifecycle: Option<ArticleLifecycle>,
     pub article_has_media_entities: bool,
     pub article_has_cover_media: bool,
+    pub reacted_to_post_safety_labels: SafetyLabelMap,
+    pub reacted_to_author_is_protected: bool,
 }

@@ -26,8 +26,9 @@ pub(crate) use rule_spec::RuleId;
 pub use rule_spec::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,
-    PostModerationLeaf, Predicate, RelationshipLeaf, ReplyControlLeaf, RequestLeaf,
-    SourceTweetIdLeaf, Truth, TweetLeaf, TweetSafetyLabelsLeaf, ViewerAccountLeaf,
+    PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf,
+    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
+    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
 pub(crate) use safety_level::QuoteEntries;
 pub use safety_level::SafetyLevel;

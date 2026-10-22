@@ -62,6 +62,8 @@ pub(crate) mod hydration;
 pub(crate) mod metrics;
 pub(crate) mod models;
 pub mod params;
+#[cfg(test)]
+mod pinned;
 pub(crate) mod post_card;
 pub(crate) mod post_evaluator;
 pub(crate) mod quote;

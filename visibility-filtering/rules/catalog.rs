@@ -64,7 +64,7 @@ pub(super) fn catalog() -> String {
 
     let mut doc = String::from(
         "# Policy catalog\n\n\
-         Generated from the rules in `src/rules/` by `scripts/bless-policy`, which\n\
+         Generated from the rules in `src/rules/` by `scripts/bless`, which\n\
          `rules::catalog::tests::the_policy_catalog_is_printed_from_the_rules` checks. Edit the\n\
          rules, not this file.\n\n\
          ## Precedence\n\n\
@@ -103,17 +103,9 @@ pub(super) fn catalog() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use std::{env, fs};
 
     #[test]
     fn the_policy_catalog_is_printed_from_the_rules() {
-        let catalog = catalog();
-        if catalog != include_str!("../../docs/policy-catalog.md") {
-            if let Ok(dir) = env::var("TEST_UNDECLARED_OUTPUTS_DIR") {
-                fs::write(Path::new(&dir).join("policy-catalog.md"), &catalog).unwrap();
-            }
-            panic!("docs/policy-catalog.md differs from the rules: run scripts/bless-policy");
-        }
+        crate::pinned::assert_pinned("docs/policy-catalog.md", &catalog());
     }
 }

@@ -68,13 +68,18 @@ pub(crate) struct QuotePass {
 }
 
 impl QuotePass {
-    pub(crate) fn decided_by(&self, served_rule: Option<&'static str>) -> Option<&'static str> {
+    pub(crate) fn decided_by(
+        &self,
+        served_rule: Option<(SafetyLevel, &'static str)>,
+    ) -> Option<(SafetyLevel, &'static str)> {
         match self.outcome.rendering() {
             QuoteRendering::Rerendered(_) => self
                 .author
                 .as_ref()
-                .and_then(|author| treatment::decided_by(author.verdict())),
-            QuoteRendering::Served | QuoteRendering::Omitted => served_rule,
+                .and_then(|author| treatment::decided_by(author.verdict()))
+                .map(|rule| (SafetyLevel::QuotedTweetRules, rule)),
+            QuoteRendering::Served => served_rule,
+            QuoteRendering::Omitted => None,
         }
     }
 }

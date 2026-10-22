@@ -456,14 +456,6 @@ impl Sources for InMemorySources {
         Observed::quiet(cores.await.map(|core| pure_core(&core)))
     }
 
-    async fn conversation_roots(
-        &self,
-        root_ids: &[u64],
-    ) -> Answered<exchange::TesConversationRoot, PureCore> {
-        let cores = self.keyed(Source::TesConversationRoot, root_ids, &self.pure_cores);
-        Observed::quiet(cores.await.map(|core| pure_core(&core)))
-    }
-
     async fn tweets(&self, tweet_ids: &[u64]) -> Answered<exchange::TesTweet, TweetFeatures> {
         Observed::quiet(self.keyed(Source::TesTweet, tweet_ids, &self.tweets).await)
     }

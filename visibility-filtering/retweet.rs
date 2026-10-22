@@ -16,7 +16,9 @@ pub(crate) async fn evaluate_merging_sources(
     post_evaluator: &PostEvaluator,
     request: PostBatch,
 ) -> Vec<PostEvaluation> {
-    let hydrated = post_evaluator.hydrate_with_retweet_sources(request).await;
+    let hydrated = post_evaluator
+        .hydrate(request, Some(Rpc::EvaluateTweets))
+        .await;
     without_selections(merge_sources(post_evaluator, &hydrated, &mut NoTrace))
 }
 
@@ -74,7 +76,7 @@ async fn hydrate_and_select<O: PostObserver>(
 ) -> (HydratedRequest, Vec<(PostEvaluation, MergeSelection)>) {
     match request.rpc {
         Rpc::FilterTweets => {
-            let hydrated = post_evaluator.hydrate(request).await;
+            let hydrated = post_evaluator.hydrate(request, None).await;
             let selected = post_evaluator
                 .evaluate_in_request_order(&hydrated, observer)
                 .into_iter()
@@ -83,7 +85,9 @@ async fn hydrate_and_select<O: PostObserver>(
             (hydrated, selected)
         }
         Rpc::EvaluateTweets => {
-            let hydrated = post_evaluator.hydrate_with_retweet_sources(request).await;
+            let hydrated = post_evaluator
+                .hydrate(request, Some(Rpc::EvaluateTweets))
+                .await;
             let selected = merge_sources(post_evaluator, &hydrated, observer);
             (hydrated, selected)
         }
@@ -1135,6 +1139,29 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
     }
 
     #[tokio::test]
+    async fn a_retweet_of_a_reaction_post_carries_the_reactions_blur() {
+        use crate::rules::fixtures::blurred;
+        use crate::scenario::{label_map, reaction_to};
+        let adult = Evaluation::complete(blurred(
+            InterstitialReason::Sensitive(true),
+            "original_tweet_adult_media_propagation/blur/sensitive",
+        ));
+        for tweet_ids in [&[1, 5][..], &[1]] {
+            let sources = InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .tweet(5, 20)
+                .tweet_features(5, reaction_to(7, 70))
+                .labels(7, label_map(SafetyLabelType::NSFW_HIGH_PRECISION))
+                .authors(&[10, 20, 70]);
+            let evaluations = evaluate_tweets(sources)
+                .evaluate(&requested(tweet_ids))
+                .await
+                .evaluations();
+            assert_eq!(evaluations[0], adult, "{tweet_ids:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_viewer_removed_from_the_community_is_limited_on_any_retweet_of_its_post() {
         let limits = ClientCapability {
             community_viewer_removed_limits: true,
@@ -1233,7 +1260,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         assert_eq!(
             batches(sources),
             "\
-TesPureCoreData [[5], [2]]
+TesPureCoreData [[5], [2], [100]]
 TesTweet [[5], [2]]
 TesConversationControl [[5], [2]]
 SafetyLabels [[5], [2]]
@@ -1242,7 +1269,40 @@ GizmoduckAuthor [[20, 40]]
 Flock follows-fwd[20, 40] blocks-rev[20, 40]
 Flock blocks-rev[30]"
         );
-        assert_eq!(sources.keys(Source::TesConversationRoot), [vec![100]]);
+    }
+
+    #[tokio::test]
+    async fn a_fetched_source_that_names_a_source_joins_it_and_its_miss_makes_the_retweet_partial()
+    {
+        let world = || {
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .retweet(5, 20, 7, Some(70))
+                .authors(&[10, 20, 70])
+        };
+        let source_incomplete = Evaluation::Partial {
+            verdict: allow(),
+            fail_open_defaults: Hydrators::empty(),
+        };
+        let rows = [
+            ("found", world().tweet(7, 70), Evaluation::complete(allow())),
+            ("not found", world(), source_incomplete.clone()),
+            (
+                "fails",
+                world().tweet(7, 70).fail_key(Source::TesPureCoreData, 7),
+                source_incomplete,
+            ),
+        ];
+        for (name, sources, expected) in rows {
+            let scenario = evaluate_tweets(sources);
+            let evaluated = scenario.evaluate(&requested(&[1])).await;
+            assert_eq!(evaluated.evaluations(), [expected], "{name}");
+            assert_eq!(
+                scenario.sources().keys(Source::TesPureCoreData),
+                [vec![1], vec![5], vec![7]],
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

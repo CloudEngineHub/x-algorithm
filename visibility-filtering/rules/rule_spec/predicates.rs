@@ -2,9 +2,9 @@ use super::features::Feature;
 use super::features::{
     truth, ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf,
     CommunityModeratorLeaf, CommunityViewerRemovedLeaf, CompoundLeaf, EdgeLeaf, EvaluateFeature,
-    Leaf, PairEdgeLeaf, PostFactsLeaf, PostModerationLeaf, Reads, RelationshipLeaf,
-    ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Spelling, TweetLeaf, TweetSafetyLabelsLeaf,
-    ViewerAccountLeaf,
+    Leaf, PairEdgeLeaf, PostFactsLeaf, PostModerationLeaf, ReactedToAuthorSafetyLeaf,
+    ReactedToPostSafetyLabelsLeaf, Reads, RelationshipLeaf, ReplyControlLeaf, RequestLeaf,
+    SourceTweetIdLeaf, Spelling, TweetLeaf, TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
 use super::*;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine};
@@ -25,6 +25,8 @@ pub enum Predicate<E: Engine = PostEngine> {
     ArticleStage(E::PostOnly<ArticleStageLeaf>),
     CommunityModerator(E::PostOnly<CommunityModeratorLeaf>),
     CommunityViewerRemoved(E::PostOnly<CommunityViewerRemovedLeaf>),
+    ReactedToPostSafetyLabels(E::PostOnly<ReactedToPostSafetyLabelsLeaf>),
+    ReactedToAuthorSafety(E::PostOnly<ReactedToAuthorSafetyLeaf>),
     ViewerAccount(ViewerAccountLeaf),
     AuthorFacts(AuthorFactsLeaf),
     AuthorSafety(AuthorSafetyLeaf),
@@ -60,6 +62,8 @@ impl<E: Engine> Predicate<E> {
             Self::ArticleStage(leaf) => visitor.post(leaf),
             Self::CommunityModerator(leaf) => visitor.post(leaf),
             Self::CommunityViewerRemoved(leaf) => visitor.post(leaf),
+            Self::ReactedToPostSafetyLabels(leaf) => visitor.post(leaf),
+            Self::ReactedToAuthorSafety(leaf) => visitor.post(leaf),
             Self::ViewerAccount(leaf) => visitor.leaf(leaf),
             Self::AuthorFacts(leaf) => visitor.leaf(leaf),
             Self::AuthorSafety(leaf) => visitor.leaf(leaf),
