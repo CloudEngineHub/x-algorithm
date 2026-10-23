@@ -17,7 +17,7 @@ use xai_visibility_filtering_proto as vf_pb;
 
 mod author;
 
-pub(crate) use author::UserEvaluation;
+pub(crate) use author::{AuthorJudgement, UserResult};
 
 pub struct PostBatch {
     pub viewer_id: Option<u64>,
@@ -432,15 +432,20 @@ mod tests {
                 ]],
                 "{delayed:?}"
             );
-            let requested = vec![1, 2, 3, 4, 7, 8, 100, 201];
+            let requested = [vec![1, 2, 3, 4, 7, 8, 100, 201]];
             assert_eq!(
                 sources.keys(Source::TesPureCoreData),
-                [requested.clone(), vec![500]],
+                requested,
+                "{delayed:?}"
+            );
+            assert_eq!(
+                sources.keys((Relation::ConversationRoot, Source::TesPureCoreData)),
+                [vec![500]],
                 "{delayed:?}"
             );
             assert_eq!(
                 logged_out.sources().keys(Source::TesPureCoreData),
-                [requested],
+                requested,
                 "{delayed:?}"
             );
         }
@@ -515,6 +520,7 @@ mod tests {
             vec![
                 EdgeQuery::reverse(Graph::Follows, followed_by),
                 EdgeQuery::forward(Graph::SuperFollows, vec![]),
+                EdgeQuery::forward(Graph::Follows, vec![]),
                 EdgeQuery::reverse(Graph::Blocks, vec![30]),
             ]
         };
@@ -617,14 +623,15 @@ mod tests {
             let sources = scenario.sources();
             assert_eq!(evaluations, [Evaluation::complete(verdict)], "{name}");
             assert_eq!(sources.selects(), selects, "{name}");
-            let mut requested_keys = sources.keys(Source::TesPureCoreData);
-            let fetched_root_keys = requested_keys.split_off(1);
-            assert_eq!(requested_keys, [vec![2]], "{name}");
-            assert_eq!(fetched_root_keys, root_keys, "{name}");
+            assert_eq!(sources.keys(Source::TesPureCoreData), [vec![2]], "{name}");
+            assert_eq!(
+                sources.keys((Relation::ConversationRoot, Source::TesPureCoreData)),
+                root_keys,
+                "{name}"
+            );
             let starts: Vec<Duration> = sources
-                .starts(Source::TesPureCoreData)
+                .starts((Relation::ConversationRoot, Source::TesPureCoreData))
                 .into_iter()
-                .skip(1)
                 .map(|start| start - started)
                 .collect();
             assert_eq!(starts, root_starts, "{name}");
@@ -751,6 +758,46 @@ mod tests {
                 shown(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn my_network_posts_limit_viewers_outside_the_root_authors_network_or_its_failed_lookup()
+    {
+        let world = || {
+            InMemorySources::default()
+                .tweet(1, 10)
+                .control(1, control(ConversationControlArm::MyNetwork, 10, &[]))
+                .authors(&[10])
+        };
+        let shown = || Evaluation::complete(allow());
+        let network_limit = || {
+            Evaluation::complete(limited(
+                LimitedEngagementReason::ConversationControl,
+                "limit_replies_my_network/limited_engagement/conversation_control",
+            ))
+        };
+        let home = |sources: InMemorySources| {
+            Scenario::new(sources, SafetyLevel::TimelineHomeHydration).viewer(Some(50))
+        };
+        let raw = [raw(1, None)];
+
+        let second_degree = home(world().second_degree_path(10, 50));
+        assert_eq!(second_degree.evaluate(&raw).await.evaluations(), [shown()]);
+        assert_eq!(second_degree.sources().keys(Source::Wingman), [vec![10]]);
+
+        let followed = home(world().edge(Graph::Follows, 10, 50));
+        assert_eq!(followed.evaluate(&raw).await.evaluations(), [shown()]);
+        assert!(followed.sources().keys(Source::Wingman).is_empty());
+
+        let failed = world()
+            .second_degree_path(10, 50)
+            .fault(Source::Wingman, Fault::Fails);
+        for outside in [world(), failed] {
+            assert_eq!(
+                home(outside).evaluate(&raw).await.evaluations(),
+                [network_limit()]
+            );
+        }
     }
 
     #[tokio::test]

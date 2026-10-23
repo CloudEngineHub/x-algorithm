@@ -1,11 +1,13 @@
 use crate::clients::socialgraph_client::{EdgeFrom, EdgeQuery};
 use crate::hydration::community_source::CommunityPost;
-use crate::hydration::decode::author::{AuthorNotFound, DecodedAuthor};
+use crate::hydration::decode::author::{AuthorNotFound, DecodedActor, DecodedAuthor};
 use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::execute::Reply;
-use crate::hydration::fetcher::{AnyFetcher, Fetcher};
-use crate::hydration::hydrator::{Edge, RequestRows};
-use crate::hydration::inventory::{Batch, MissPolicy, Source};
+use crate::hydration::fetcher::{AnyFetcher, Fetcher, FetcherId, Fetchers, Owner};
+use crate::hydration::hydrator::{Edge, NodeSpec, PairEdge, RequestRows};
+use crate::hydration::inventory::{
+    Answer, Batch, Effect, Source, Stake, claimed_answer_fails, classify,
+};
 use crate::hydration::metrics::record_unasked_keys;
 use crate::hydration::plan::Group;
 use crate::hydration::relation::{Related, Relation, Role, Trigger};
@@ -15,13 +17,12 @@ use crate::hydration::{
 };
 use crate::metrics::Rpc;
 use crate::models::{
-    ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, PureCore, RawCandidate,
-    TweetFeatures, TweetId, Viewer, ViewerFeatures,
+    ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, NotificationFilters,
+    PureCore, RawCandidate, TweetFeatures, TweetId, Viewer, ViewerFeatures,
 };
 use conversation_root::ConversationRootAuthor;
-pub(super) use key_origin::KeyOrigin;
-use key_origin::Names;
-use quotes::{Pairing, Quotes};
+pub(super) use key_origin::{KeyOrigin, Names};
+use quotes::Quotes;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -71,6 +72,7 @@ pub(super) struct CallRequest<'p> {
     pub(super) keys: Vec<u64>,
     pub(super) key_count: usize,
     pub(super) queries: Vec<EdgeQuery>,
+    pair_edges: Vec<PairEdge>,
     pub(super) community_posts: Vec<CommunityPost>,
     pub(super) viewer_id: Option<u64>,
     pub(super) batch_size: Option<usize>,
@@ -94,20 +96,24 @@ pub(super) struct Store {
     client_capability: ClientCapability,
     rows: Vec<RequestRow>,
     related: FxHashMap<(Relation, usize), TweetId>,
-    row_tweet_ids: FxHashSet<TweetId>,
+    paired: Vec<(usize, TweetId)>,
+        requested_tweet_ids: FxHashSet<TweetId>,
+        joined_tweet_ids: FxHashSet<TweetId>,
     request_rows: RequestRows,
     requested: usize,
     quotes: Quotes,
     posts_judged_for: Option<Rpc>,
-    has_joined_retweet_sources: bool,
     callable: Hydrators,
-    pure_cores: Fetcher<PureCore>,
+    pure_cores: Fetchers<PureCore>,
     tweets: Fetcher<TweetFeatures>,
     controls: Fetcher<ConversationControl>,
-    labels: Fetcher<Arc<vf_pb::SafetyLabelMap>>,
+    labels: Fetchers<Arc<vf_pb::SafetyLabelMap>>,
     viewer: Fetcher<DecodedViewer>,
-    authors: Fetcher<DecodedAuthor>,
+    authors: Fetchers<DecodedAuthor>,
     author_not_found: AuthorNotFound,
+    actors: Fetcher<DecodedActor>,
+    actor_emails: Fetcher<bool>,
+    actor_phones: Fetcher<bool>,
     edges: [Fetcher<bool>; Edge::VARIANTS.len()],
     has_called: Vec<bool>,
     viewer_country: Fetcher<Arc<str>>,
@@ -142,7 +148,7 @@ impl Store {
                     author: None,
                 })
                 .collect(),
-            row_tweet_ids: raw.iter().map(|candidate| candidate.tweet_id).collect(),
+            requested_tweet_ids: raw.iter().map(|candidate| candidate.tweet_id).collect(),
             request_rows: plan.rows(),
             callable: plan.callable(viewer_id),
             author_not_found: plan.level().spec().author_not_found,
@@ -163,8 +169,33 @@ impl Store {
         self
     }
 
+    fn spec(&self, node: Hydrator) -> NodeSpec {
+        node.spec_at(self.request_rows)
+    }
+
+    fn stake(&self, node: Hydrator) -> Stake {
+        self.spec(node).stake()
+    }
+
+    pub(super) fn existence_miss(&self, node: Hydrator, key: u64) -> Option<Cause> {
+        match classify(self.stake(node), self.fetcher(node)?.answer(key)) {
+            Effect::Unresolves(cause) => Some(cause),
+            Effect::Value | Effect::Absent | Effect::Fails => None,
+        }
+    }
+
+    fn owner(&self, node: Hydrator) -> Owner {
+        self.spec(node).fetcher().owner
+    }
+
     fn origin(&self, node: Hydrator) -> KeyOrigin {
         node.key_at(self.request_rows)
+    }
+
+    fn viewer_filters(&self, filters: impl FnOnce(NotificationFilters) -> bool) -> bool {
+        self.viewer_id
+            .and_then(|viewer_id| self.viewer.get(viewer_id))
+            .is_some_and(|viewer| filters(viewer.profile.notification_filters))
     }
 
     fn candidate_count(&self) -> usize {
@@ -175,24 +206,23 @@ impl Store {
             .count()
     }
 
+    fn has_joined_retweet_sources(&self) -> bool {
+        !self.joined_tweet_ids.is_empty()
+    }
+
     fn is_on(&self, relation: Relation) -> bool {
         relation.is_on(self.posts_judged_for, self.callable)
     }
 
     fn named(&self, relation: Relation, parent: &RequestRow) -> Option<Related> {
         match relation.spec().trigger {
-            Trigger::PureCore(named) => named(self.pure_cores.get(parent.tweet_id()?.0)?),
-            Trigger::Tweet(named) => {
-                let tweet_id = parent.tweet_id()?.0;
-                if !self.pure_cores.has_landed(tweet_id) {
-                    return None;
-                }
-                named(self.tweets.get(tweet_id)?)
-            }
+            Trigger::PureCore(named) => named(self.pure_cores.request().get(parent.tweet_id()?.0)?),
+            Trigger::Tweet(named) => named(self.tweets.get(parent.tweet_id()?.0)?),
             Trigger::Key(origin) => Some(Related {
                 tweet_id: TweetId(self.key(origin, parent)?),
                 author: None,
             }),
+            Trigger::QuoteEntry => None,
         }
     }
 
@@ -221,10 +251,6 @@ impl Store {
         }
     }
 
-    fn pairing(&self) -> Pairing<'_> {
-        Pairing::new(&self.rows, &self.pure_cores, &self.authors)
-    }
-
     fn controls(&self) -> impl Iterator<Item = &ConversationControl> {
         self.rows.iter().filter_map(|row| self.control(row))
     }
@@ -233,21 +259,8 @@ impl Store {
         self.controls.get(row.tweet_id()?.0)
     }
 
-    fn related_authors_wait_for_pending_authors(&self, group: &Group) -> bool {
-        group
-            .nodes
-            .iter()
-            .any(|node| self.origin(node) == KeyOrigin::RelatedAuthor)
-            && self.rows.iter().any(|row| {
-                row.author.is_none()
-                    && row
-                        .tweet_id()
-                        .is_some_and(|tweet_id| !self.pure_cores.has_landed(tweet_id.0))
-            })
-    }
-
     fn source_tweet_id(&self, tweet_id: TweetId) -> Option<TweetId> {
-        self.pure_cores.get(tweet_id.0)?.source_tweet_id
+        self.pure_cores.request().get(tweet_id.0)?.source_tweet_id
     }
 
         fn community_post(&self, row: &RequestRow) -> Option<CommunityPost> {
@@ -289,7 +302,7 @@ impl Store {
             keys.extend(self.node_keys(node));
         }
         if nodes.contains(Hydrator::PureCore) {
-            keys.extend(self.quotes.outers_to_fetch().iter().map(|outer| outer.0));
+            keys.extend(self.paired.iter().map(|&(_, tweet_id)| tweet_id.0));
         }
         keys.sort_unstable();
         keys.dedup();
@@ -313,14 +326,31 @@ impl Store {
     }
 
     fn fetcher(&self, node: Hydrator) -> Option<&dyn AnyFetcher> {
-        let fetcher: &dyn AnyFetcher = match node.spec().source {
-            Source::TesPureCoreData => &self.pure_cores,
+        match node.edge() {
+            Some(edge) => Some(self.edge_fetcher(edge)?),
+            None => self.fetcher_by_id(self.spec(node).fetcher()),
+        }
+    }
+
+    fn fetcher_mut(&mut self, node: Hydrator) -> Option<&mut dyn AnyFetcher> {
+        match node.edge() {
+            Some(edge) => Some(self.edge_fetcher_mut(edge)?),
+            None => self.fetcher_by_id_mut(self.spec(node).fetcher()),
+        }
+    }
+
+    fn fetcher_by_id(&self, FetcherId { source, owner }: FetcherId) -> Option<&dyn AnyFetcher> {
+        let fetcher: &dyn AnyFetcher = match source {
+            Source::TesPureCoreData => self.pure_cores.of(owner),
             Source::TesTweet => &self.tweets,
             Source::TesConversationControl => &self.controls,
             Source::TesQuotedTweet => &self.quotes.quoted_tweets,
-            Source::SafetyLabels => &self.labels,
+            Source::SafetyLabels => self.labels.of(owner),
             Source::GizmoduckViewer => &self.viewer,
-            Source::GizmoduckAuthor => &self.authors,
+            Source::GizmoduckAuthor => self.authors.of(owner),
+            Source::GizmoduckActor => &self.actors,
+            Source::ActorEmails => &self.actor_emails,
+            Source::ActorPhones => &self.actor_phones,
             Source::ViewerCountry => &self.viewer_country,
             Source::CommunityModeration => &self.community_moderations,
             Source::CommunityModerator => &self.community_moderators,
@@ -328,23 +358,30 @@ impl Store {
             Source::ArticleLifecycle => &self.article_lifecycles,
             Source::ArticleMediaEntities => &self.article_media_entities,
             Source::ArticleCoverMedia => &self.article_cover_media,
-            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
-                self.edge_fetcher(node.edge()?)?
-            }
-            Source::FlockUserPair => return None,
+            Source::Flock
+            | Source::Wingman
+            | Source::TrustedFriends
+            | Source::UserLocation
+            | Source::FlockUserPair => return None,
         };
         Some(fetcher)
     }
 
-    fn fetcher_mut(&mut self, node: Hydrator) -> Option<&mut dyn AnyFetcher> {
-        let fetcher: &mut dyn AnyFetcher = match node.spec().source {
-            Source::TesPureCoreData => &mut self.pure_cores,
+    fn fetcher_by_id_mut(
+        &mut self,
+        FetcherId { source, owner }: FetcherId,
+    ) -> Option<&mut dyn AnyFetcher> {
+        let fetcher: &mut dyn AnyFetcher = match source {
+            Source::TesPureCoreData => self.pure_cores.of_mut(owner),
             Source::TesTweet => &mut self.tweets,
             Source::TesConversationControl => &mut self.controls,
             Source::TesQuotedTweet => &mut self.quotes.quoted_tweets,
-            Source::SafetyLabels => &mut self.labels,
+            Source::SafetyLabels => self.labels.of_mut(owner),
             Source::GizmoduckViewer => &mut self.viewer,
-            Source::GizmoduckAuthor => &mut self.authors,
+            Source::GizmoduckAuthor => self.authors.of_mut(owner),
+            Source::GizmoduckActor => &mut self.actors,
+            Source::ActorEmails => &mut self.actor_emails,
+            Source::ActorPhones => &mut self.actor_phones,
             Source::ViewerCountry => &mut self.viewer_country,
             Source::CommunityModeration => &mut self.community_moderations,
             Source::CommunityModerator => &mut self.community_moderators,
@@ -352,18 +389,17 @@ impl Store {
             Source::ArticleLifecycle => &mut self.article_lifecycles,
             Source::ArticleMediaEntities => &mut self.article_media_entities,
             Source::ArticleCoverMedia => &mut self.article_cover_media,
-            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
-                self.edge_fetcher_mut(node.edge()?)?
-            }
-            Source::FlockUserPair => return None,
+            Source::Flock
+            | Source::Wingman
+            | Source::TrustedFriends
+            | Source::UserLocation
+            | Source::FlockUserPair => return None,
         };
         Some(fetcher)
     }
 
     fn candidate_count_by_key(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
-        let mut counts = self
-            .quotes
-            .candidate_count_by_quoted_author(nodes, &self.pairing());
+        let mut counts = self.candidate_count_by_pair(nodes);
         let (viewer_nodes, row_nodes): (Vec<Hydrator>, Vec<Hydrator>) = nodes
             .iter()
             .partition(|&node| self.origin(node).names() == Names::Viewer);
@@ -392,9 +428,6 @@ impl Store {
         if self.viewer_id.is_none() && group.nodes.iter().all(Hydrator::needs_viewer) {
             return None;
         }
-        if self.related_authors_wait_for_pending_authors(group) {
-            return None;
-        }
         let is_first = self.has_called.get(group.position) != Some(&true);
         let mut queries: Vec<EdgeQuery> = group
             .edges()
@@ -406,8 +439,9 @@ impl Store {
                 destination_ids: self.claim(nodes),
             })
             .collect();
-        let pairing = Pairing::new(&self.rows, &self.pure_cores, &self.authors);
-        queries.extend(self.quotes.claim_pairs(group.nodes, &pairing));
+        let (pair_edges, pair_queries): (Vec<PairEdge>, Vec<EdgeQuery>) =
+            self.claim_pairs(group.nodes).into_iter().unzip();
+        queries.extend(pair_queries);
         let keys = if queries.is_empty() {
             self.claim(group.nodes)
         } else {
@@ -417,7 +451,7 @@ impl Store {
         if key_count == 0 {
             return None;
         }
-        let community_posts = match group.source {
+        let community_posts = match group.fetcher.source {
             Source::CommunityModeration => self.community_posts(&keys),
             Source::TesPureCoreData
             | Source::TesTweet
@@ -436,7 +470,10 @@ impl Store {
             | Source::ArticleMediaEntities
             | Source::ArticleCoverMedia
             | Source::TrustedFriends
-            | Source::UserLocation => Vec::new(),
+            | Source::UserLocation
+            | Source::GizmoduckActor
+            | Source::ActorEmails
+            | Source::ActorPhones => Vec::new(),
         };
         if let Some(has_called) = self.has_called.get_mut(group.position) {
             *has_called = true;
@@ -454,23 +491,16 @@ impl Store {
             keys,
             key_count,
             queries,
+            pair_edges,
             community_posts,
         })
     }
 
     fn batch_size(&self, group: &Group, is_first: bool, key_count: usize) -> Option<usize> {
-        let size = match group.source.row().batch {
+        let size = match group.fetcher.spec().batch {
             Batch::Unrecorded => return None,
             Batch::Keys => key_count,
-            Batch::Requested
-                if !is_first
-                    || group
-                        .nodes
-                        .iter()
-                        .any(|node| self.origin(node) == KeyOrigin::RelatedTweet) =>
-            {
-                key_count
-            }
+            Batch::Requested if !is_first => key_count,
             Batch::Requested if group.input == Some(Hydrator::PureCore) => self.candidate_count(),
             Batch::Requested => self.requested,
         };
@@ -492,13 +522,14 @@ impl Store {
         elapsed: Duration,
     ) -> Landing {
         let keys = &call.keys;
+        let owner = call.group.fetcher.owner;
         let is_first_request_core = call.is_first && call.group.nodes.contains(Hydrator::PureCore);
         match reply {
             Reply::PureCores(pure_cores) => {
                 if is_first_request_core {
                     self.core_elapsed = elapsed;
                 }
-                self.pure_cores.land(keys, pure_cores);
+                self.pure_cores.of_mut(owner).land(keys, pure_cores);
                 self.land_authors();
             }
             Reply::Tweets(tweets) => {
@@ -512,9 +543,19 @@ impl Store {
                 self.quotes.quoted_tweets.land(keys, quoted_tweets);
                 self.land_authors();
             }
-            Reply::Labels(labels) => self.labels.land(keys, labels),
+            Reply::Labels(labels) => self.labels.of_mut(owner).land(keys, labels),
             Reply::Viewer(viewer) => self.viewer.land(keys, viewer),
-            Reply::Authors(authors) => self.authors.land(keys, self.author_not_found.read(authors)),
+            Reply::Authors(authors) => {
+                let authors = if owner == Owner::Request {
+                    self.author_not_found.read(authors)
+                } else {
+                    authors
+                };
+                self.authors.of_mut(owner).land(keys, authors);
+            }
+            Reply::Actors(actors) => self.actors.land(keys, actors),
+            Reply::ActorEmails(emails) => self.actor_emails.land(keys, emails),
+            Reply::ActorPhones(phones) => self.actor_phones.land(keys, phones),
             Reply::Select(answers) => {
                 let queries = call.group.edges().iter().zip(&call.queries);
                 for ((&(edge, ..), query), answer) in queries.zip(answers) {
@@ -528,7 +569,13 @@ impl Store {
                     fetcher.land(keys, answers);
                 }
             }
-            Reply::PairEdges(answers) => self.quotes.land_pairs(&call.queries, answers),
+            Reply::PairEdges(answers) => {
+                let viewer_edge_count = call.group.edges().len();
+                let pair_queries = call.queries.iter().skip(viewer_edge_count);
+                let pair_queries = call.pair_edges.iter().copied().zip(pair_queries);
+                let answers = answers.into_iter().skip(viewer_edge_count).collect();
+                self.quotes.land_pairs(pair_queries, answers);
+            }
             Reply::ViewerCountry(country) => self.viewer_country.land(keys, country),
             Reply::CommunityModerations(moderations) => {
                 self.community_moderations.land(keys, moderations);
@@ -543,14 +590,7 @@ impl Store {
             Reply::ArticleMediaEntities(rows) => self.article_media_entities.land(keys, rows),
             Reply::ArticleCoverMedia(rows) => self.article_cover_media.land(keys, rows),
         }
-        let has_joined = self.join(call.group.nodes);
-        if is_first_request_core && self.callable.contains(Hydrator::AuthorBlocksOuterAuthor) {
-            self.quotes.join_outers(&self.rows);
-            if !self.quotes.outers_to_fetch().is_empty() {
-                return Landing::KeysJoined;
-            }
-        }
-        if has_joined {
+        if self.join(call.group.nodes) {
             Landing::KeysJoined
         } else {
             Landing::Answered
@@ -558,12 +598,12 @@ impl Store {
     }
 
     fn land_authors(&mut self) {
-        let (pure_cores, quotes) = (&self.pure_cores, &self.quotes);
+        let (pure_cores, quotes) = (self.pure_cores.request(), &self.quotes);
         for row in &mut self.rows {
             row.author = row
                 .request_author
                 .or_else(|| Some(pure_cores.get(row.tweet_id()?.0)?.author_id))
-                .or_else(|| quotes.quoted_author(row.tweet_id()?));
+                .or_else(|| quotes.quoted_author(row.tweet_id()?).ok());
         }
     }
 
@@ -574,20 +614,34 @@ impl Store {
             if spec.trigger.reads().intersection(landed).is_empty() || !self.is_on(relation) {
                 continue;
             }
-            let named: Vec<(usize, Related)> = self
-                .rows
-                .iter()
-                .enumerate()
-                .filter_map(|(parent, row)| Some((parent, self.named(relation, row)?)))
-                .collect();
+            let named: Vec<(usize, Related)> = match spec.trigger {
+                Trigger::QuoteEntry => self.quote_outers(),
+                Trigger::PureCore(_) | Trigger::Tweet(_) | Trigger::Key(_) => self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(parent, row)| Some((parent, self.named(relation, row)?)))
+                    .collect(),
+            };
             for (parent, related) in named {
-                match spec.role {
-                    Role::Judged { .. } => {
-                        if !self.row_tweet_ids.insert(related.tweet_id) {
+                match (spec.trigger, spec.role) {
+                    (Trigger::QuoteEntry, _) => {
+                        let paired = (parent, related.tweet_id);
+                        if self.paired.contains(&paired) {
                             continue;
                         }
-                        if relation == Relation::RetweetSource {
-                            self.has_joined_retweet_sources = true;
+                        self.paired.push(paired);
+                        if self.requested_tweet_ids.contains(&related.tweet_id)
+                            || self.joined_tweet_ids.contains(&related.tweet_id)
+                        {
+                            continue;
+                        }
+                    }
+                    (_, Role::Judged { .. }) => {
+                        if self.requested_tweet_ids.contains(&related.tweet_id)
+                            || !self.joined_tweet_ids.insert(related.tweet_id)
+                        {
+                            continue;
                         }
                         self.rows.push(RequestRow {
                             subject: RowSubject::Post(related.tweet_id),
@@ -595,7 +649,7 @@ impl Store {
                             author: related.author,
                         });
                     }
-                    Role::Read => match self.related.entry((relation, parent)) {
+                    (_, Role::Read) => match self.related.entry((relation, parent)) {
                         Entry::Vacant(entry) => {
                             entry.insert(related.tweet_id);
                         }
@@ -609,14 +663,7 @@ impl Store {
     }
 
     pub(super) fn assemble(mut self, request: HydrationRequest<'_>) -> Hydration {
-        let incomplete = self
-            .callable
-            .iter()
-            .filter(|&node| {
-                self.fetcher(node)
-                    .is_some_and(|fetcher| fetcher.has_incomplete())
-            })
-            .fold(self.quotes.incomplete(self.callable), Hydrators::with);
+        let viewer_failed = self.viewer_failed();
         let mut unclaimed = Vec::new();
         let mut tweet_misses: FxHashMap<TweetId, Option<Cause>> =
             FxHashMap::with_capacity_and_hasher(self.rows.len(), Default::default());
@@ -637,7 +684,6 @@ impl Store {
                             position,
                             tweet_id,
                             &tweet_misses,
-                            incomplete,
                             &mut unclaimed,
                         ));
                     }
@@ -646,13 +692,7 @@ impl Store {
                     if let Some(user) = row.author
                         && let Entry::Vacant(entry) = users.entry(user)
                     {
-                        entry.insert(self.hydrated_user(
-                            row,
-                            position,
-                            user,
-                            incomplete,
-                            &mut unclaimed,
-                        ));
+                        entry.insert(self.hydrated_user(row, position, user, &mut unclaimed));
                     }
                 }
             }
@@ -684,7 +724,7 @@ impl Store {
                 (viewer, state)
             }
         };
-        let quotes = self.quotes.quoted(self.callable, &self.pairing());
+        let quotes = self.quoted();
         Hydration {
             viewer: ViewerFeatures::from_request(
                 viewer,
@@ -693,46 +733,54 @@ impl Store {
             ),
             viewer_state,
             planned: self.callable,
-            incomplete,
+            viewer_failed,
             tweets,
             users,
             quotes,
-            has_fetched_retweet_sources: self.has_joined_retweet_sources,
+            has_fetched_retweet_sources: self.has_joined_retweet_sources(),
             posts_judged_for: self.posts_judged_for,
         }
+    }
+
+    fn viewer_failed(&self) -> Hydrators {
+        let Some(viewer_id) = self.viewer_id else {
+            return Hydrators::empty();
+        };
+        self.callable
+            .iter()
+            .filter(|&node| self.origin(node).names() == Names::Viewer)
+            .filter(|&node| {
+                self.fetcher(node).is_some_and(|fetcher| {
+                    claimed_answer_fails(self.stake(node), fetcher.answer(viewer_id))
+                })
+            })
+            .fold(Hydrators::empty(), Hydrators::with)
     }
 
     fn failed(
         &self,
         row: &RequestRow,
         position: usize,
-        incomplete: Hydrators,
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> Hydrators {
-        let has_joined_retweet_sources = self.has_joined_retweet_sources;
-        let checked = if has_joined_retweet_sources {
-            self.callable
-        } else {
-            incomplete
-        };
+        let has_joined_retweet_sources = self.has_joined_retweet_sources();
         let mut answered_incompletely = Hydrators::empty();
-        for node in checked.iter() {
+        for node in self.callable.iter() {
             let Some(key) = self.parent_key(node, row, position) else {
                 continue;
             };
             let Some(fetcher) = self.fetcher(node) else {
                 continue;
             };
-            if has_joined_retweet_sources && !fetcher.is_claimed(key) {
-                unclaimed.push((node, key));
-                answered_incompletely = answered_incompletely.with(node);
-            } else if fetcher.is_incomplete(key) {
-                match node.spec().source.miss_policy() {
-                    MissPolicy::Unresolves | MissPolicy::FailsNode => {
-                        answered_incompletely = answered_incompletely.with(node);
-                    }
-                    MissPolicy::Reads => {}
+            let answer = fetcher.answer(key);
+            if answer == Answer::Unclaimed {
+                if !has_joined_retweet_sources {
+                    continue;
                 }
+                unclaimed.push((node, key));
+            }
+            if classify(self.stake(node), answer).fails_node() {
+                answered_incompletely = answered_incompletely.with(node);
             }
         }
         if self.callable.contains(Hydrator::BlockedByReplyRoot)
@@ -779,6 +827,43 @@ mod tests {
     use crate::rules::SafetyLevel;
 
     #[test]
+    fn every_fetcher_id_off_an_edge_has_a_fetcher_of_its_own() {
+        let mut store = Store::default();
+        let is_edge_only = |source: Source| {
+            let readers: Vec<&Hydrator> = Hydrator::VARIANTS
+                .iter()
+                .filter(|node| node.spec().source == source)
+                .collect();
+            !readers.is_empty()
+                && readers
+                    .iter()
+                    .all(|node| node.is_edge() || node.pair_edge().is_some())
+        };
+        let mut fetchers = Vec::new();
+        for id in FetcherId::all() {
+            let fetcher = store
+                .fetcher_by_id(id)
+                .map(|fetcher| std::ptr::from_ref(fetcher).cast::<()>());
+            let fetcher_mut = store
+                .fetcher_by_id_mut(id)
+                .map(|fetcher| std::ptr::from_mut(fetcher).cast_const().cast::<()>());
+            assert_eq!(fetcher, fetcher_mut, "{id:?}");
+            match fetcher {
+                Some(fetcher) => fetchers.push((id, fetcher)),
+                None => assert!(is_edge_only(id.source), "{id:?} has no fetcher"),
+            }
+        }
+        for (position, (id, fetcher)) in fetchers.iter().enumerate() {
+            for (other, other_fetcher) in fetchers.iter().skip(position + 1) {
+                assert_ne!(
+                    fetcher, other_fetcher,
+                    "{id:?} shares the fetcher of {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn authors_prefer_the_request_author_and_leave_unresolved_tweets_without_one() {
         let core = |author| PureCore {
             author_id: AuthorId(author),
@@ -814,6 +899,38 @@ mod tests {
     }
 
     #[test]
+    fn a_level_planning_only_the_follow_pair_edge_joins_its_quote_outers() {
+        let raw = [RawCandidate {
+            tweet_id: TweetId(1),
+            request_author_id: None,
+        }];
+        let plan = HydrationPlan::new(
+            SafetyLevel::FilterAll,
+            Hydrators::of(Hydrator::OuterAuthorFollowsAuthor),
+        );
+        let mut store = Store::new(&plan, None, ClientCapability::default(), &raw, None)
+            .with_quotes(&[QuoteEntry {
+                inner: TweetId(1),
+                outer: TweetId(9),
+            }]);
+        let pure_core = plan.groups().next().unwrap();
+        let call = store.offer(pure_core).unwrap();
+        let inner = PureCore {
+            author_id: AuthorId(10),
+            source_tweet_id: None,
+            source_author_id: None,
+            reply_to: None,
+        };
+        let cores =
+            HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(inner)))]));
+        assert_eq!(
+            store.land(&call, Reply::PureCores(cores), Duration::ZERO),
+            Landing::KeysJoined
+        );
+        assert_eq!(store.offer(pure_core).unwrap().keys, [9]);
+    }
+
+    #[test]
     fn a_key_no_call_claimed_fails_its_candidate_once_sources_joined() {
         let raw = [RawCandidate {
             tweet_id: TweetId(1),
@@ -843,14 +960,7 @@ mod tests {
         let mut unclaimed = Vec::new();
         let source = &store.rows[1];
         for _ in 0..2 {
-            let candidate = store.candidate(
-                source,
-                1,
-                TweetId(5),
-                AuthorId(20),
-                Hydrators::empty(),
-                &mut unclaimed,
-            );
+            let candidate = store.candidate(source, 1, TweetId(5), AuthorId(20), &mut unclaimed);
             assert_eq!(candidate.failed, Hydrators::of(Hydrator::PureCore));
         }
         assert_eq!(

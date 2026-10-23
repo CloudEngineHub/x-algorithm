@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use thrift::protocol::TInputProtocol;
+use thrift::protocol::{TInputProtocol, TType};
 use xai_core_entities::entities::{
     EditControl, ExclusiveTweetControl, TakedownReason, TrustedFriendsControl,
 };
@@ -173,7 +173,9 @@ impl StratoRead for Tweet {
                         Ok(u64::from_str_radix(&proto.read_string()?, 16).ok())
                     })?;
                 }
-                Some(178) => tweet.reaction_context = read_reaction_context(proto)?,
+                Some(178) if field.field_type == TType::Struct => {
+                    tweet.reaction_context = read_reaction_context(proto)?;
+                }
                 Some(32766) => tweet.has_media_keys = skip_list_non_empty(proto)?,
                 _ => return Ok(false),
             }
@@ -295,9 +297,9 @@ fn read_first_community_id(proto: &mut MValProtocol<'_>) -> thrift::Result<Optio
 fn read_reaction_context(proto: &mut MValProtocol<'_>) -> thrift::Result<Option<ReactionContext>> {
     let (mut post, mut user) = (None, None);
     read_fields(proto, |proto, field| {
-        match field.id {
-            Some(1) => post = Some(proto.read_i64()?.cast_unsigned()),
-            Some(2) => user = Some(proto.read_i64()?.cast_unsigned()),
+        match (field.id, field.field_type) {
+            (Some(1), TType::I64) => post = Some(proto.read_i64()?.cast_unsigned()),
+            (Some(2), TType::I64) => user = Some(proto.read_i64()?.cast_unsigned()),
             _ => return Ok(false),
         }
         Ok(true)
@@ -734,16 +736,29 @@ mod tests {
     }
 
     #[test]
-    fn a_reaction_context_missing_either_id_is_no_reaction() {
-        for (name, ids) in [
-            ("post only", vec![(1, I64(REACTED_TO_POST_ID))]),
-            ("user only", vec![(2, I64(REACTED_TO_USER_ID))]),
-            ("neither", vec![]),
+    fn a_reaction_context_missing_either_id_or_of_another_wire_type_is_no_reaction() {
+        let post = || (1, I64(REACTED_TO_POST_ID));
+        let user = || (2, I64(REACTED_TO_USER_ID));
+        for (name, context) in [
+            ("post only", Struct(vec![post()])),
+            ("user only", Struct(vec![user()])),
+            ("neither", Struct(vec![])),
+            ("an i64 context", I64(REACTED_TO_POST_ID)),
+            ("a string context", Str("reaction".into())),
+            (
+                "a list context",
+                List(TType::Struct, vec![Struct(vec![post(), user()])]),
+            ),
+            (
+                "a string post id",
+                Struct(vec![(1, Str("7".into())), user()]),
+            ),
+            (
+                "a struct user id",
+                Struct(vec![post(), (2, Struct(vec![user()]))]),
+            ),
         ] {
-            let bytes = encode_tweet(
-                vec![],
-                vec![(178, Struct(ids)), (32766, non_empty_list(true))],
-            );
+            let bytes = encode_tweet(vec![], vec![(178, context), (32766, non_empty_list(true))]);
 
             let features = decode_fixture(&bytes);
             assert_eq!(features.reaction_context, None, "{name}");
@@ -992,5 +1007,97 @@ mod tests {
         let without_core_data = found(Struct(vec![(1, I64(TWEET_ID))]));
         let error = decode_tweet(&without_core_data).unwrap_err();
         assert_eq!(error.to_string(), "tweet value without coreData");
+    }
+
+    fn recorded(name: &str) -> Vec<u8> {
+        let path = format!("tests/fixtures/tweet_for_visibility/{name}.hex");
+        let hex = std::fs::read_to_string(crate::pinned::crate_path(&path)).unwrap();
+        hex.trim()
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn recorded_answers_decode_the_features_rules_read() {
+        const STALE_EDIT: u64 = 1001;
+        const CREATOR_EXCLUSIVE_IMAGE: u64 = 1003;
+        const NSFW_ADMIN_IMAGE: u64 = 1004;
+        const NSFW_USER_IMAGE: u64 = 1005;
+        const LEGACY_MEDIA_POST: u64 = 1006;
+        const EXCLUSIVE: u64 = 1007;
+        const NSFW_ADMIN_TEXT: u64 = 1008;
+        const LINK_CARD: u64 = 1009;
+        const EXCLUSIVE_AUTHOR: u64 = 7002;
+        let uploaded = || MediaFeature {
+            has_media: true,
+            has_uploaded_media: true,
+            ..Default::default()
+        };
+        let nsfw = |user, admin| NsfwFeature { user, admin };
+        let rows = [
+            ("stale_original", STALE_EDIT, TweetFeatures::default()),
+            ("stale_edit", STALE_EDIT, TweetFeatures::default()),
+            (
+                "creator_exclusive_image",
+                CREATOR_EXCLUSIVE_IMAGE,
+                TweetFeatures {
+                    media: uploaded(),
+                    exclusive_conversation_author_id: Some(EXCLUSIVE_AUTHOR),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nsfw_admin_image",
+                NSFW_ADMIN_IMAGE,
+                TweetFeatures {
+                    media: uploaded(),
+                    nsfw: nsfw(false, true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nsfw_user_image",
+                NSFW_USER_IMAGE,
+                TweetFeatures {
+                    media: uploaded(),
+                    nsfw: nsfw(true, false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "legacy_media_post",
+                LEGACY_MEDIA_POST,
+                TweetFeatures {
+                    media: uploaded(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "exclusive",
+                EXCLUSIVE,
+                TweetFeatures {
+                    exclusive_conversation_author_id: Some(EXCLUSIVE_AUTHOR),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nsfw_admin_text",
+                NSFW_ADMIN_TEXT,
+                TweetFeatures {
+                    nsfw: nsfw(false, true),
+                    ..Default::default()
+                },
+            ),
+            ("link_card", LINK_CARD, TweetFeatures::default()),
+        ];
+        for (name, latest_edit, expected) in rows {
+            let mut features = decode_fixture(&recorded(name));
+            assert_eq!(features.latest_edit_tweet_id(), Some(latest_edit), "{name}");
+            features.edit_control = None;
+            assert_eq!(features, expected, "{name}");
+        }
+        assert_eq!(decode_tweet(&recorded("deleted")).unwrap(), None);
     }
 }

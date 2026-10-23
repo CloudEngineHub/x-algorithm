@@ -2,6 +2,7 @@ use crate::models::LimitedEngagementReason;
 use crate::params::limited_actions_copy::{Prompt, PromptCopy};
 use xai_feature_switches::FeatureSwitchResults;
 use xai_stats_receiver::StatsReceiverExt;
+use xai_stringcenter::DEFAULT_LANGUAGE;
 
 pub(super) const REASON_FIELD: &str = "LimitedEngagementReason";
 const LIMITED_ACTIONS_KEY: &str = "limited_actions_policy_limited_actions";
@@ -57,6 +58,7 @@ pub(crate) struct LimitedAction {
 #[derive(Default)]
 pub(crate) struct LimitedActionsPolicies {
     policies: Vec<(LimitedEngagementReason, Vec<LimitedAction>)>,
+    language: Option<String>,
 }
 
 impl LimitedActionsPolicies {
@@ -107,7 +109,19 @@ impl LimitedActionsPolicies {
             }
             policies.push((reason, actions));
         }
-        Self { policies }
+        Self {
+            policies,
+            language: None,
+        }
+    }
+
+    pub(super) fn in_language(mut self, language: Option<&str>) -> Self {
+        self.language = language.map(str::to_owned);
+        self
+    }
+
+    pub(crate) fn language(&self) -> &str {
+        self.language.as_deref().unwrap_or(DEFAULT_LANGUAGE)
     }
 
     pub(crate) fn actions(&self, reason: LimitedEngagementReason) -> &[LimitedAction] {
@@ -130,6 +144,7 @@ impl LimitedActionsPolicies {
                 .into_iter()
                 .map(|(reason, types)| (reason, types.into_iter().map(unprompted).collect()))
                 .collect(),
+            language: None,
         }
     }
 }
@@ -147,7 +162,7 @@ mod tests {
     use LimitedEngagementReason::{
         BlockedViewer, CommunityTweetCommunityDeleted, CommunityTweetCommunityNotFound,
         CommunityTweetCommunitySuspended, CommunityTweetHidden, CommunityTweetMemberRemoved,
-        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, ReadonlyViewer,
+        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, NonCompliant, ReadonlyViewer,
         RootAuthorBlockedViewer, StaleTweet,
     };
 
@@ -203,6 +218,23 @@ mod tests {
             .filter(|action| *action != T::RemoveFromCommunity)
             .collect();
         let expected = [
+            (
+                NonCompliant,
+                Some("NonCompliant"),
+                vec![
+                    T::Reply,
+                    T::Retweet,
+                    T::Like,
+                    T::React,
+                    T::SendViaDm,
+                    T::AddToBookmarks,
+                    T::AddToMoment,
+                    T::PinToProfile,
+                    T::ViewTweetActivity,
+                    T::ShareTweetVia,
+                    T::CopyLink,
+                ],
+            ),
             (ConversationControl, Some("LimitedReplies"), vec![T::Reply]),
             (
                 BlockedViewer,

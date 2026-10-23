@@ -1,43 +1,32 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
-
-use xai_visibility_filtering_proto as vf_pb;
+use xai_safety_label_store::mval_safety_label_map::decode_mval;
 use xai_x_thrift::servo_repo::{CachedValue, CachedValueStatus};
 
-use super::codec;
+use super::types::{FallbackReason, TwemcacheOutcome};
+use super::{codec, proto};
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum CacheLookup {
-    Hit(vf_pb::SafetyLabelMap),
-    NotFound,
-    Miss,
-    DecodeError,
-    DecodePanic,
+const DECODE_FAILED: TwemcacheOutcome = TwemcacheOutcome::FallThrough(FallbackReason::Decode);
+
+pub(crate) fn decode(bytes: &[u8]) -> TwemcacheOutcome {
+    codec::contain_decode_panic(|| decode_inner(bytes)).unwrap_or(DECODE_FAILED)
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> CacheLookup {
-    match catch_unwind(AssertUnwindSafe(|| decode_inner(bytes))) {
-        Ok(result) => result,
-        Err(_) => CacheLookup::DecodePanic,
-    }
-}
-
-fn decode_inner(bytes: &[u8]) -> CacheLookup {
+fn decode_inner(bytes: &[u8]) -> TwemcacheOutcome {
     let cv: CachedValue = match xai_x_thrift::deserialize_binary(bytes) {
         Ok(cv) => cv,
-        Err(_) => return CacheLookup::DecodeError,
+        Err(_) => return DECODE_FAILED,
     };
     match cv.status {
         Some(s) if s == CachedValueStatus::NOT_FOUND || s == CachedValueStatus::DELETED => {
-            CacheLookup::NotFound
+            TwemcacheOutcome::NotFound
         }
         Some(s) if s == CachedValueStatus::FOUND => match cv.value.as_deref() {
-            Some(value) => match codec::decode_mval_payload(value) {
-                Some(label_map) => CacheLookup::Hit(label_map),
-                None => CacheLookup::DecodeError,
+            Some(value) => match decode_mval(value) {
+                Some(labels) => TwemcacheOutcome::Hit(proto::label_map_to_proto(labels)),
+                None => DECODE_FAILED,
             },
-            None => CacheLookup::DecodeError,
+            None => DECODE_FAILED,
         },
-        _ => CacheLookup::Miss,
+        _ => TwemcacheOutcome::Miss,
     }
 }
 
@@ -45,6 +34,7 @@ fn decode_inner(bytes: &[u8]) -> CacheLookup {
 pub(crate) mod tests {
     use super::*;
     use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
+    use xai_visibility_filtering_proto as vf_pb;
     use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
     fn serialize_thrift<T: TSerializable>(val: &T) -> Vec<u8> {
@@ -90,24 +80,24 @@ pub(crate) mod tests {
     #[test]
     fn decode_status_selects_cache_disposition() {
         for (blob, expected) in [
-            (cached_value_not_found(), CacheLookup::NotFound),
-            (cached_value_deleted(), CacheLookup::NotFound),
-            (cached_value_do_not_cache(), CacheLookup::Miss),
+            (cached_value_not_found(), TwemcacheOutcome::NotFound),
+            (cached_value_deleted(), TwemcacheOutcome::NotFound),
+            (cached_value_do_not_cache(), TwemcacheOutcome::Miss),
         ] {
             assert_eq!(decode(&blob), expected);
         }
     }
 
     #[test]
-    fn decode_found_with_undecodable_mval_returns_decode_error() {
+    fn decode_found_with_undecodable_mval_falls_through() {
         let blob = cached_value_blob(CachedValueStatus::FOUND, Some(&[0xff; 8]));
-        assert!(matches!(decode(&blob), CacheLookup::DecodeError));
+        assert_eq!(decode(&blob), DECODE_FAILED);
     }
 
     #[test]
-    fn decode_found_with_no_value_returns_decode_error() {
+    fn decode_found_with_no_value_falls_through() {
         let blob = cached_value_blob(CachedValueStatus::FOUND, None);
-        assert!(matches!(decode(&blob), CacheLookup::DecodeError));
+        assert_eq!(decode(&blob), DECODE_FAILED);
     }
 
     #[test]
@@ -120,6 +110,6 @@ pub(crate) mod tests {
             )]),
         };
 
-        assert_eq!(decode(&blob), CacheLookup::Hit(expected));
+        assert_eq!(decode(&blob), TwemcacheOutcome::Hit(expected));
     }
 }

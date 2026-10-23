@@ -1,10 +1,9 @@
-use super::builders::labeled;
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::{
     ClientCapability, SafetyLabelType, TombstoneReason, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
-    allow, appealed, candidate, dropped, tombstoned, viewer_with_profile,
+    allow, appealed, candidate, dropped, labeled, tombstoned, viewer_with_profile,
 };
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations};
 use xai_visibility_filtering::models::{
@@ -33,7 +32,7 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "soft_nsfw_label",
-            post: labeled(SafetyLabelType::SOFT_NSFW),
+            subject: Subject::Post(labeled(SafetyLabelType::SOFT_NSFW)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -62,7 +61,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "for_emergency_use_only_label",
-            post: labeled(SafetyLabelType::FOR_EMERGENCY_USE_ONLY),
+            subject: Subject::Post(labeled(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)),
             expect: vec![
                 (
                     TimelineHome,
@@ -88,19 +87,12 @@ pub(super) fn rows() -> Vec<Row> {
                         "for_emergency_use_only/drop/unspecified",
                     ),
                 ),
-                (
-                    TimelineHomeHydration,
-                    Role::Author,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "for_emergency_use_only/drop/unspecified",
-                    ),
-                ),
+                (TimelineHomeHydration, Role::Author, allow()),
             ],
         },
         Row {
             name: "pdna_label",
-            post: labeled(SafetyLabelType::PDNA),
+            subject: Subject::Post(labeled(SafetyLabelType::PDNA)),
             expect: vec![
                 (
                     TimelineHome,
@@ -113,11 +105,17 @@ pub(super) fn rows() -> Vec<Row> {
                     dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::NonFollower,
+                    dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
+                ),
+                (TimelineHomeHydration, Role::Author, allow()),
             ],
         },
         Row {
             name: "bounce_label",
-            post: labeled(SafetyLabelType::BOUNCE),
+            subject: Subject::Post(labeled(SafetyLabelType::BOUNCE)),
             expect: vec![
                 (
                     TimelineHome,
@@ -155,7 +153,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "spam_label",
-            post: labeled(SafetyLabelType::SPAM),
+            subject: Subject::Post(labeled(SafetyLabelType::SPAM)),
             expect: vec![
                 (
                     TimelineHome,
@@ -172,10 +170,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "spam_and_bounce_labels",
-            post: candidate()
-                .with_label(SafetyLabelType::SPAM)
-                .with_label(SafetyLabelType::BOUNCE)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::SPAM)
+                    .with_label(SafetyLabelType::BOUNCE)
+                    .build(),
+            ),
             expect: vec![
                 (
                     TimelineHome,
@@ -191,7 +191,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_hateful_conduct_label",
-            post: labeled(SafetyLabelType::FOSNR_HATEFUL_CONDUCT),
+            subject: Subject::Post(labeled(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)),
             expect: vec![
                 (
                     TimelineHome,
@@ -225,7 +225,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_violent_speech_label",
-            post: labeled(SafetyLabelType::FOSNR_VIOLENT_SPEECH),
+            subject: Subject::Post(labeled(SafetyLabelType::FOSNR_VIOLENT_SPEECH)),
             expect: vec![
                 (
                     TimelineHome,
@@ -259,7 +259,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_label",
-            post: labeled(SafetyLabelType::FOSNR_ABUSE),
+            subject: Subject::Post(labeled(SafetyLabelType::FOSNR_ABUSE)),
             expect: vec![
                 (
                     TimelineHome,
@@ -278,6 +278,14 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_abuse/drop/undesirable",
+                    ),
+                ),
                 (
                     TimelineHomeHydration,
                     Role::Author,
@@ -293,7 +301,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_civic_integrity_label",
-            post: labeled(SafetyLabelType::FOSNR_CIVIC_INTEGRITY),
+            subject: Subject::Post(labeled(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)),
             expect: vec![
                 (
                     TimelineHome,
@@ -314,6 +322,14 @@ pub(super) fn rows() -> Vec<Row> {
                 (TimelineHome, Role::Author, allow()),
                 (
                     TimelineHomeHydration,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_civic_integrity/drop/undesirable",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
                     Role::Author,
                     appealed(
                         AppealablePolicy::CIVIC_INTEGRITY,
@@ -327,11 +343,13 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_level_3_and_level_1_labels",
-            post: candidate()
-                .with_label(SafetyLabelType::FOSNR_VIOLENT_SPEECH)
-                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
-                .with_agent_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::FOSNR_VIOLENT_SPEECH)
+                    .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                    .with_agent_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)
+                    .build(),
+            ),
             expect: vec![
                 (
                     TimelineHomeHydration,
@@ -356,10 +374,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_hateful_conduct_and_bounce_labels",
-            post: candidate()
-                .with_label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)
-                .with_label(SafetyLabelType::BOUNCE)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::FOSNR_HATEFUL_CONDUCT)
+                    .with_label(SafetyLabelType::BOUNCE)
+                    .build(),
+            ),
             expect: vec![
                 (
                     TimelineHome,
@@ -378,10 +398,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_insults_and_bounce_labels",
-            post: candidate()
-                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
-                .with_label(SafetyLabelType::BOUNCE)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                    .with_label(SafetyLabelType::BOUNCE)
+                    .build(),
+            ),
             expect: vec![
                 (
                     TimelineHomeHydration,

@@ -1,8 +1,9 @@
-use super::builders::{tweet_candidate, viewer_in_country};
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::{PostCandidate, TweetFeatures, ViewerFeatures};
-use crate::rules::fixtures::{allow, author_viewer, candidate, dropped};
-use crate::rules::SafetyLevel::TimelineHome;
+use crate::rules::fixtures::{
+    allow, author_viewer, candidate, dropped, tweet_candidate, viewer_in_country,
+};
+use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_core_entities::entities::TakedownReason;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -10,9 +11,9 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "legal_takedown_us",
-            post: takedown_candidate(TakedownReason::LegalRequest {
+            subject: Subject::Post(takedown_candidate(TakedownReason::LegalRequest {
                 country_code: "us".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,
@@ -28,13 +29,26 @@ pub(super) fn rows() -> Vec<Row> {
                     Role::As("in_fr", viewer_in_country("fr")),
                     allow(),
                 ),
+                (
+                    TimelineHomeHydration,
+                    Role::As("in_us", viewer_in_country("us")),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "legal_takedown/drop/unspecified",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::As("in_fr", viewer_in_country("fr")),
+                    allow(),
+                ),
             ],
         },
         Row {
             name: "legal_takedown_worldwide",
-            post: takedown_candidate(TakedownReason::LegalRequest {
+            subject: Subject::Post(takedown_candidate(TakedownReason::LegalRequest {
                 country_code: "xx".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,
@@ -56,16 +70,16 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "legal_takedown_copyright",
-            post: takedown_candidate(TakedownReason::LegalRequest {
+            subject: Subject::Post(takedown_candidate(TakedownReason::LegalRequest {
                 country_code: "xy".to_string(),
-            }),
+            })),
             expect: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "unspecified_takedown_worldwide",
-            post: takedown_candidate(TakedownReason::UnspecifiedReason {
+            subject: Subject::Post(takedown_candidate(TakedownReason::UnspecifiedReason {
                 country_code: "xx".to_string(),
-            }),
+            })),
             expect: vec![(
                 TimelineHome,
                 Role::NonFollower,
@@ -77,9 +91,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "unspecified_takedown_copyright",
-            post: takedown_candidate(TakedownReason::UnspecifiedReason {
+            subject: Subject::Post(takedown_candidate(TakedownReason::UnspecifiedReason {
                 country_code: "xy".to_string(),
-            }),
+            })),
             expect: vec![(
                 TimelineHome,
                 Role::NonFollower,
@@ -91,9 +105,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "local_laws_takedown_worldwide",
-            post: takedown_candidate(TakedownReason::BystanderReport {
+            subject: Subject::Post(takedown_candidate(TakedownReason::BystanderReport {
                 country_code: "xx".to_string(),
-            }),
+            })),
             expect: vec![(
                 TimelineHome,
                 Role::As("in_us", viewer_in_country("us")),
@@ -102,7 +116,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "dmca_takedown",
-            post: takedown_candidate(TakedownReason::Dmca),
+            subject: Subject::Post(takedown_candidate(TakedownReason::Dmca)),
             expect: vec![
                 (
                     TimelineHome,
@@ -117,9 +131,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "local_laws_takedown_de",
-            post: takedown_candidate(TakedownReason::BystanderReport {
+            subject: Subject::Post(takedown_candidate(TakedownReason::BystanderReport {
                 country_code: "de".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,
@@ -131,6 +145,19 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (
                     TimelineHome,
+                    Role::As("in_us", viewer_in_country("us")),
+                    allow(),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::As("in_de", viewer_in_country("de")),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "local_laws_takedown/drop/unspecified",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
                     Role::As("in_us", viewer_in_country("us")),
                     allow(),
                 ),
@@ -150,9 +177,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "non_country_takedown",
-            post: tweet_candidate(|t| {
+            subject: Subject::Post(tweet_candidate(|t| {
                 t.takedown_reasons = vec![TakedownReason::HatefulImagery, TakedownReason::Unknown]
-            }),
+            })),
             expect: vec![(
                 TimelineHome,
                 Role::As("in_de", viewer_in_country("de")),
@@ -161,9 +188,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "legal_takedown_uppercase_worldwide",
-            post: takedown_candidate(TakedownReason::LegalRequest {
+            subject: Subject::Post(takedown_candidate(TakedownReason::LegalRequest {
                 country_code: "XX".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,
@@ -185,9 +212,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "legal_takedown_uppercase_copyright",
-            post: takedown_candidate(TakedownReason::LegalRequest {
+            subject: Subject::Post(takedown_candidate(TakedownReason::LegalRequest {
                 country_code: "XY".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,
@@ -199,9 +226,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "local_laws_takedown_uppercase_copyright",
-            post: takedown_candidate(TakedownReason::BystanderReport {
+            subject: Subject::Post(takedown_candidate(TakedownReason::BystanderReport {
                 country_code: "XY".to_string(),
-            }),
+            })),
             expect: vec![
                 (
                     TimelineHome,

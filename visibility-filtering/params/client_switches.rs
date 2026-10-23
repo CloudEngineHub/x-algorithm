@@ -161,6 +161,7 @@ impl ClientSwitches {
             },
             stats,
         )
+        .in_language(language)
     }
 }
 

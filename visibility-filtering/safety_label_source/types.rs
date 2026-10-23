@@ -1,4 +1,3 @@
-use super::lookup::LookupError;
 use xai_visibility_filtering_proto as vf_pb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::IntoStaticStr)]
@@ -33,10 +32,4 @@ pub(crate) enum TwemcacheOutcome {
     NotFound,
     Miss,
     FallThrough(FallbackReason),
-}
-
-#[derive(Debug)]
-pub(crate) enum ManhattanOutcome {
-    Resolved(vf_pb::SafetyLabelMap),
-    Failure(LookupError),
 }

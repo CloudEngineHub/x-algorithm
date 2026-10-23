@@ -5,7 +5,6 @@ mod limited_actions_policy;
 use arc_swap::ArcSwap;
 use limited_actions_copy::DriftCheck;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -115,30 +114,6 @@ impl CountryLists {
         )]
         let codes = &self.lists.load()[list as usize];
         codes.iter().any(|c| c == country_code)
-    }
-
-    pub(crate) fn codes(&self) -> BTreeMap<CountryList, Vec<String>> {
-        CountryList::VARIANTS
-            .iter()
-            .copied()
-            .zip(self.lists.load().iter().cloned())
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_codes(codes: &BTreeMap<CountryList, Vec<String>>) -> anyhow::Result<Self> {
-        let lists = CountryList::VARIANTS
-            .iter()
-            .map(|list| {
-                codes
-                    .get(list)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("country_lists lacks {list:?}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Self {
-            lists: ArcSwap::from_pointee(lists),
-        })
     }
 
     pub fn refresh(&self, feature_switches: &FeatureSwitches) {

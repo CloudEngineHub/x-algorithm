@@ -1,6 +1,6 @@
 use super::conversation_root::ConversationRootAuthor;
 use super::{RequestRow, RowSubject, Store};
-use crate::hydration::fetcher::AnyFetcher;
+use crate::hydration::hydrator::PairEdge;
 use crate::hydration::relation::Related;
 use crate::hydration::{Cause, Hydrator, Hydrators, RequestRows};
 use crate::models::AuthorId;
@@ -20,6 +20,7 @@ pub(in crate::hydration) enum KeyOrigin {
     TweetArticle,
     CommunityOrMyNetworkRoot,
     SubscribersRoot,
+    FollowersRoot,
     ConversationControlBlockAuthor,
     ConversationRootToFetch,
     RelatedTweet,
@@ -32,13 +33,14 @@ pub(in crate::hydration) enum KeyOrigin {
     TweetCommunity,
     TrustedFriendsList,
     NarrowcastPlace,
-    QuotedAuthorToQuotingAuthor,
-    QuotingAuthorToProtectedQuotedAuthor,
+    Pair(PairEdge),
     OuterOfMissingQuote,
+    UserIfViewerFiltersNoConfirmedEmail,
+    UserIfViewerFiltersNoConfirmedPhone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Names {
+pub(in crate::hydration) enum Names {
     Post,
     Author,
     Viewer,
@@ -49,7 +51,7 @@ enum KeyedBy {
     Request(fn(&Store) -> Option<u64>),
     Row(fn(&Store, &RequestRow) -> Option<u64>),
     Related(fn(&Store, Related) -> Option<u64>),
-    QuoteEntry,
+    Pair,
 }
 
 struct Spec {
@@ -66,6 +68,7 @@ const COMMUNITY_OR_MY_NETWORK: &[ConversationControlArm] = &[
     ConversationControlArm::MyNetwork,
 ];
 const SUBSCRIBERS: &[ConversationControlArm] = &[ConversationControlArm::Subscribers];
+const FOLLOWERS: &[ConversationControlArm] = &[ConversationControlArm::Followers];
 
 impl KeyOrigin {
     const fn spec(self) -> Spec {
@@ -180,6 +183,14 @@ impl KeyOrigin {
                 needs_viewer: false,
                 keyed_by: KeyedBy::Row(|store, row| store.control_root_author(row, SUBSCRIBERS)),
             },
+            K::FollowersRoot => Spec {
+                label: "root:Followers",
+                input: Some(H::ConversationControl),
+                also_reads: NOTHING,
+                names: Names::Related,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| store.control_root_author(row, FOLLOWERS)),
+            },
             K::ConversationControlBlockAuthor => Spec {
                 label: "control_root_author",
                 input: Some(H::ConversationControl),
@@ -239,6 +250,7 @@ impl KeyOrigin {
                 keyed_by: KeyedBy::Related(|store, root| {
                     store
                         .pure_cores
+                        .of(store.owner(H::ConversationRootPost))
                         .get(root.tweet_id.0)
                         .map(|core| core.author_id.get())
                 }),
@@ -330,21 +342,21 @@ impl KeyOrigin {
                     store.tweets.get(row.tweet_id()?.0)?.narrowcast_place_id
                 }),
             },
-            K::QuotedAuthorToQuotingAuthor => Spec {
+            K::Pair(PairEdge::AuthorBlocksOuterAuthor) => Spec {
                 label: "quoted_author>quoting_author",
                 input: Some(H::PureCore),
                 also_reads: Hydrators::of(H::QuotedTweet),
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::QuoteEntry,
+                keyed_by: KeyedBy::Pair,
             },
-            K::QuotingAuthorToProtectedQuotedAuthor => Spec {
+            K::Pair(PairEdge::OuterAuthorFollowsAuthor) => Spec {
                 label: "quoting_author>protected_quoted_author",
                 input: Some(H::AuthorSafety),
                 also_reads: Hydrators::of(H::PureCore).with(H::QuotedTweet),
                 names: Names::Related,
                 needs_viewer: false,
-                keyed_by: KeyedBy::QuoteEntry,
+                keyed_by: KeyedBy::Pair,
             },
             K::OuterOfMissingQuote => Spec {
                 label: "outer_of_missing_quote",
@@ -357,8 +369,34 @@ impl KeyOrigin {
                     store
                         .quotes
                         .outer_of(tweet_id)
-                        .filter(|_| store.pure_cores.miss(tweet_id.0) == Some(Cause::NotFound))
+                        .filter(|_| {
+                            store.existence_miss(H::PureCore, tweet_id.0) == Some(Cause::NotFound)
+                        })
                         .map(|outer| outer.0)
+                }),
+            },
+            K::UserIfViewerFiltersNoConfirmedEmail => Spec {
+                label: "users:viewer_filters_no_confirmed_email",
+                input: Some(H::ViewerNotificationFilters),
+                also_reads: NOTHING,
+                names: Names::Author,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| {
+                    store
+                        .key(K::RequestUsers, row)
+                        .filter(|_| store.viewer_filters(|filters| filters.no_confirmed_email))
+                }),
+            },
+            K::UserIfViewerFiltersNoConfirmedPhone => Spec {
+                label: "users:viewer_filters_no_confirmed_phone",
+                input: Some(H::ViewerNotificationFilters),
+                also_reads: NOTHING,
+                names: Names::Author,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| {
+                    store
+                        .key(K::RequestUsers, row)
+                        .filter(|_| store.viewer_filters(|filters| filters.no_confirmed_phone))
                 }),
             },
         }
@@ -376,7 +414,7 @@ impl KeyOrigin {
         }
     }
 
-    pub(super) const fn names(self) -> Names {
+    pub(in crate::hydration) const fn names(self) -> Names {
         self.spec().names
     }
 
@@ -385,7 +423,15 @@ impl KeyOrigin {
     }
 
     pub(in crate::hydration) const fn keys_user_rows(self) -> bool {
-        self.input().is_none() && matches!(self.names(), Names::Author | Names::Viewer)
+        let after_at_most_the_viewer = match self.input() {
+            None => true,
+            Some(input) => matches!(input.spec().key.names(), Names::Viewer),
+        };
+        after_at_most_the_viewer && matches!(self.names(), Names::Author | Names::Viewer)
+    }
+
+    pub(in crate::hydration) const fn keys_only_user_rows(self) -> bool {
+        self.keys_user_rows() && matches!(self.names(), Names::Author)
     }
 
     pub(in crate::hydration) const fn at(self, rows: RequestRows) -> Self {
@@ -403,7 +449,7 @@ impl fmt::Display for KeyOrigin {
 }
 
 fn arm_starts_conversation_root_select(arm: ConversationControlArm) -> bool {
-    [COMMUNITY_OR_MY_NETWORK, SUBSCRIBERS]
+    [COMMUNITY_OR_MY_NETWORK, SUBSCRIBERS, FOLLOWERS]
         .into_iter()
         .any(|arms| arms.contains(&arm))
 }
@@ -421,7 +467,7 @@ impl Store {
         match spec.keyed_by {
             KeyedBy::Request(key) => key(self),
             KeyedBy::Row(key) => key(self, row),
-            KeyedBy::Related(_) | KeyedBy::QuoteEntry => None,
+            KeyedBy::Related(_) | KeyedBy::Pair => None,
         }
     }
 
@@ -432,7 +478,7 @@ impl Store {
         }
         match spec.keyed_by {
             KeyedBy::Related(key) => key(self, related),
-            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::QuoteEntry => None,
+            KeyedBy::Request(_) | KeyedBy::Row(_) | KeyedBy::Pair => None,
         }
     }
 
@@ -449,7 +495,7 @@ impl Store {
                     .filter_map(|related| key(self, related))
                     .collect()
             }),
-            KeyedBy::QuoteEntry => Vec::new(),
+            KeyedBy::Pair => Vec::new(),
         }
     }
 

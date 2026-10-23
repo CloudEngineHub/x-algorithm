@@ -279,6 +279,7 @@ class RetrievalDataset(Enum):
     )
     HOME_COLD = (13, *_sid_window("1fav_1day.parquet"))
     HOME_HOT = (14, *_sid_window("1fav_1day.parquet"))
+    IMMERSIVE32FavVideo14To30Day = (19, *_sid_window("32fav_video_14to30day.parquet"))
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)

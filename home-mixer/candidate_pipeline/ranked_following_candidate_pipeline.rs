@@ -13,6 +13,7 @@ use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
+use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -53,6 +54,7 @@ impl RankedFollowingCandidatePipeline {
             served_history_client,
             past_request_timestamps_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -81,6 +83,7 @@ impl RankedFollowingCandidatePipeline {
                 ) as Arc<dyn PastRequestTimestampsClient>
             },
             AdsInjectionLoggingSideEffect::prod(),
+            FunnelTraceSideEffect::prod(),
             ServedAdHistoryCacheSideEffect::prod(datacenter),
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
@@ -94,6 +97,7 @@ impl RankedFollowingCandidatePipeline {
             served_history_client,
             past_request_timestamps_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -109,6 +113,7 @@ impl RankedFollowingCandidatePipeline {
         served_history_client: Arc<dyn ServedHistoryClient>,
         past_request_timestamps_client: Arc<dyn PastRequestTimestampsClient>,
         ads_injection_logging: AdsInjectionLoggingSideEffect,
+        funnel_trace: FunnelTraceSideEffect,
         served_ad_history: ServedAdHistoryCacheSideEffect,
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
@@ -136,6 +141,7 @@ impl RankedFollowingCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> =
             Arc::new(vec![
                 Box::new(ads_injection_logging),
+                Box::new(funnel_trace),
                 Box::new(served_ad_history),
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
@@ -169,6 +175,7 @@ impl RankedFollowingCandidatePipeline {
             Arc::new(MockPastRequestTimestampsClient);
         let mock_kafka = Arc::new(MockKafkaPublisherClient) as Arc<dyn KafkaPublisherClient>;
         let ads_injection_logging = AdsInjectionLoggingSideEffect::new(Arc::clone(&mock_kafka));
+        let funnel_trace = FunnelTraceSideEffect::new(Arc::clone(&mock_kafka));
         let served_ad_history = ServedAdHistoryCacheSideEffect::new(Arc::new(
             xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
         ));
@@ -182,6 +189,7 @@ impl RankedFollowingCandidatePipeline {
             served_history_client,
             past_request_timestamps_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,

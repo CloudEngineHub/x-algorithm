@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-21T16:00:32Z
+// mirrored from config feature-switch defaults; last sync 2026-10-22T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -98,7 +98,7 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec!["Experiment18Fou:0.5".to_string()]
+    vec!["Experiment18Fou:0.3".to_string()]
 );
 param!(
     ShadowTrafficPhoenixClusterAggregationTypes,
@@ -725,6 +725,13 @@ param!(
 );
 
 param!(
+    EnableRecentSearchQueriesHydration,
+    bool,
+    "rust_home_mixer_enable_recent_search_queries_hydration",
+    false
+);
+
+param!(
     EnableUserInstalledAppsV2,
     bool,
     "rust_home_mixer_enable_user_installed_apps_v2",
@@ -855,6 +862,13 @@ param!(
     bool,
     "rust_home_mixer_enable_ads_injection_logging",
     true
+);
+
+param!(
+    EnableAdsFunnelTrace,
+    bool,
+    "rust_home_mixer_enable_ads_funnel_trace",
+    false
 );
 
 param!(

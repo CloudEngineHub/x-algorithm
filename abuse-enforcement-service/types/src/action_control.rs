@@ -1,7 +1,29 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 3;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 4;
+pub const ROWS_RECORD_VERSION: u32 = 3;
 pub const BAND_RECORD_VERSION: u32 = 1;
+
+pub const ROLLOUT_ALL_BP: u32 = 10_000;
+
+pub fn rollout_bucket(head: &str, author_id: i64) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let id = author_id.to_string();
+    for b in head.bytes().chain([b'/']).chain(id.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    (h % u64::from(ROLLOUT_ALL_BP)) as u32
+}
+
+pub fn in_rollout(rollout_bp: Option<u32>, head: &str, author_id: i64) -> bool {
+    rollout_bp.is_none_or(|bp| bp >= ROLLOUT_ALL_BP || rollout_bucket(head, author_id) < bp)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -170,6 +192,7 @@ pub enum PageAction {
         SpamHighRecall { lifetime: Lifetime },
             PhoenixSkip { lifetime: Lifetime },
         PostSpamHighRecall { lifetime: Lifetime },
+            HideReply { lifetime: Lifetime },
         SuspendAuthor {},
 }
 
@@ -197,13 +220,13 @@ impl PageAction {
             | PageAction::LivenessCheck {}
             | PageAction::SpamHighRecall { .. }
             | PageAction::PhoenixSkip { .. } => ControlEntity::User,
-            PageAction::PostSpamHighRecall { .. } | PageAction::SuspendAuthor {} => {
-                ControlEntity::Post
-            }
+            PageAction::PostSpamHighRecall { .. }
+            | PageAction::HideReply { .. }
+            | PageAction::SuspendAuthor {} => ControlEntity::Post,
         }
     }
 
-            pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
+                pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
         match entity {
             ControlEntity::User => vec![
                 PageAction::Suspend {},
@@ -232,6 +255,15 @@ impl PageAction {
                     lifetime: Lifetime::Days30,
                 },
                 PageAction::PostSpamHighRecall {
+                    lifetime: Lifetime::Permanent,
+                },
+                PageAction::HideReply {
+                    lifetime: Lifetime::Days7,
+                },
+                PageAction::HideReply {
+                    lifetime: Lifetime::Days30,
+                },
+                PageAction::HideReply {
                     lifetime: Lifetime::Permanent,
                 },
                 PageAction::SuspendAuthor {},
@@ -266,6 +298,7 @@ impl PageAction {
             PageAction::SpamHighRecall { .. } => "spam_high_recall",
             PageAction::PhoenixSkip { .. } => "phoenix_skip",
             PageAction::PostSpamHighRecall { .. } => "post_spam_high_recall",
+            PageAction::HideReply { .. } => "hide_reply",
             PageAction::SuspendAuthor {} => "suspend_author",
         }
     }
@@ -301,6 +334,10 @@ pub struct ActionControlRecord {
     pub evidence: Option<Box<ConfidenceEvidence>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_override: Option<Box<EvidenceOverride>>,
+                    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admit_unlisted_labels: bool,
+                        #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_bp: Option<u32>,
 }
 
 impl ActionControlRecord {
@@ -321,6 +358,8 @@ impl ActionControlRecord {
         "confidence",
         "evidence",
         "evidence_override",
+        "admit_unlisted_labels",
+        "rollout_bp",
     ];
 
             pub fn uses_confidence(&self) -> bool {
@@ -331,11 +370,17 @@ impl ActionControlRecord {
     }
 
                 pub fn schema_version(&self) -> u32 {
-        if self.uses_confidence() {
+        if self.rollout_bp.is_some() {
             ACTION_CONTROL_RECORD_VERSION
+        } else if self.uses_confidence() {
+            ROWS_RECORD_VERSION
         } else {
             BAND_RECORD_VERSION
         }
+    }
+
+            pub fn rollout_takes(&self, author_id: i64) -> bool {
+        in_rollout(self.rollout_bp, &self.head, author_id)
     }
 
             pub fn parse_strict(bytes: &[u8]) -> Result<Self, String> {
@@ -372,7 +417,7 @@ pub struct ActionControlView {
     pub scope: String,
     pub lkey: String,
         pub effective_mode: ControlMode,
-                #[serde(default)]
+            #[serde(default)]
     pub forced_recording_reason: Option<String>,
 }
 
@@ -405,6 +450,10 @@ pub struct ActionControlPutRequest {
     pub evidence_override: Option<EvidenceOverride>,
             #[serde(default)]
     pub rows: Option<RowsRequest>,
+            #[serde(default)]
+    pub admit_unlisted_labels: Option<bool>,
+            #[serde(default)]
+    pub rollout_bp: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,6 +494,8 @@ pub struct RowSetting {
     pub evidence_override: Option<EvidenceOverride>,
         #[serde(default)]
     pub expected_version: Option<u64>,
+        #[serde(default)]
+    pub rollout_bp: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -464,7 +515,7 @@ pub struct ActionControlSeen {
     pub classifier: String,
         pub band: String,
     pub entity_type: ControlEntity,
-        #[serde(default)]
+            #[serde(default)]
     pub factory: bool,
     pub last_seen_ms: i64,
         #[serde(default)]
@@ -563,6 +614,8 @@ pub struct RowView {
 pub struct ConfidenceView {
     pub rows: Vec<RowView>,
         pub evidence_max_age_ms: i64,
+        #[serde(default)]
+    pub factory_evidence_max_age_ms: i64,
             #[serde(default)]
     pub config_error: Option<String>,
 }
@@ -648,6 +701,32 @@ mod tests {
     }
 
     #[test]
+    fn hide_reply_is_a_post_label_with_every_lifetime() {
+        let a: Vec<PageAction> = serde_json::from_str(
+            r#"[{"kind":"hide_reply","lifetime":"7d"},
+                {"kind":"hide_reply","lifetime":"30d"},
+                {"kind":"hide_reply","lifetime":"permanent"}]"#,
+        )
+        .unwrap();
+        assert_eq!(a.len(), 3);
+        for x in &a {
+            assert_eq!(x.entity(), ControlEntity::Post);
+            assert_eq!(x.kind(), "hide_reply");
+            assert!(PageAction::menu(ControlEntity::Post).contains(x));
+            assert!(!PageAction::menu(ControlEntity::User).contains(x));
+        }
+        assert_ne!(
+            a[2].kind(),
+            PageAction::PostSpamHighRecall {
+                lifetime: Lifetime::Permanent
+            }
+            .kind(),
+            "a row may hide the reply and label it SpamHighRecall at once"
+        );
+        assert!(serde_json::from_str::<PageAction>(r#"{"kind":"hide_reply"}"#).is_err());
+    }
+
+    #[test]
     fn actions_outside_the_menu_do_not_parse() {
         for bad in [
             r#"{"kind":"suspend","perm":true}"#,
@@ -679,7 +758,8 @@ mod tests {
                 "actions":[{"kind":"suspend_author"}],"reason":"r","updated_by":"u","key_id":"k",
                 "updated_at_ms":5,"version":2,"write_nonce":9,"confidence":"high",
                 "evidence":{"precision_lower_bound":0.95,"reads":59,"humans":0,"read_at_ms":4,"link":"l"},
-                "evidence_override":{"by":"operator@example.com","reason":"seeded","expires_at_ms":6}}"#,
+                "evidence_override":{"by":"operator@example.com","reason":"seeded","expires_at_ms":6},
+                "admit_unlisted_labels":true,"rollout_bp":500}"#,
         )
         .unwrap();
         let keys: Vec<String> = serde_json::to_value(&r)
@@ -754,10 +834,100 @@ mod tests {
             "a row is refused by images that read v: 2 level records"
         );
         l.confidence = Some(LevelRow::Missing);
-        assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+        assert_eq!(l.schema_version(), ROWS_RECORD_VERSION);
         let mut d = r;
         d.mode = ControlMode::Rows;
-        assert_eq!(d.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+        assert_eq!(d.schema_version(), ROWS_RECORD_VERSION);
+        l.rollout_bp = Some(100);
+        assert_eq!(
+            l.schema_version(),
+            4,
+            "a row with a rollout is refused by images that read v: 3 rows"
+        );
+        assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+    }
+
+    #[test]
+    fn a_row_without_a_rollout_keeps_its_bytes_and_takes_every_account() {
+        let json = r#"{"v":3,"entity_type":"post","head":"H","classifier":null,"band":null,"mode":"live","actions":[{"kind":"hide_reply","lifetime":"permanent"}],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0,"confidence":"high"}"#;
+        let r = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
+        assert_eq!(r.rollout_bp, None);
+        assert_eq!(serde_json::to_string(&r).unwrap(), json);
+        assert_eq!(r.schema_version(), ROWS_RECORD_VERSION);
+        assert!((0..10_000).all(|id| r.rollout_takes(id)));
+    }
+
+    #[test]
+    fn an_image_before_rollouts_refuses_a_row_with_one() {
+        let new = r#"{"v":4,"entity_type":"post","head":"H","mode":"live","actions":[{"kind":"hide_reply","lifetime":"permanent"}],"version":2,"confidence":"high","rollout_bp":100}"#;
+        let mut fields: Vec<&str> = ActionControlRecord::FIELDS.to_vec();
+        fields.retain(|f| *f != "rollout_bp");
+        let value: serde_json::Value = serde_json::from_str(new).unwrap();
+        let unknown: Vec<&String> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !fields.contains(&k.as_str()))
+            .collect();
+        assert_eq!(unknown, ["rollout_bp"], "an older FIELDS list refuses it");
+        let r = ActionControlRecord::parse_strict(new.as_bytes()).unwrap();
+        assert!(
+            r.v > ROWS_RECORD_VERSION,
+            "and so does an older version bound"
+        );
+    }
+
+    #[test]
+    fn rollout_buckets_are_pinned() {
+        assert_eq!(rollout_bucket("GrokDistilledReplyAuthor", 0), 2_438);
+        assert_eq!(rollout_bucket("GrokDistilledReplyAuthor", 12), 9_745);
+        assert_eq!(
+            rollout_bucket("GrokDistilledReplyAuthor", 1_234_567_890_123_456_789),
+            2_051
+        );
+        assert_eq!(rollout_bucket("H", -1), 4_141);
+        assert!((0..1_000).all(|id| rollout_bucket("H", id) < ROLLOUT_ALL_BP));
+    }
+
+    #[test]
+    fn a_larger_rollout_keeps_every_account_of_a_smaller_one() {
+        let steps = [0, 100, 500, 3_000, 5_000, 10_000];
+        let n = 200_000i64;
+        let mut inside_before: Vec<bool> = vec![false; n as usize];
+        for bp in steps {
+            let mut count = 0usize;
+            for id in 0..n {
+                let inside = in_rollout(Some(bp), "GrokDistilledReplyAuthor", id * 7_919 + 1);
+                assert!(
+                    inside || !inside_before[id as usize],
+                    "account {id} left at {bp} bp"
+                );
+                inside_before[id as usize] = inside;
+                count += usize::from(inside);
+            }
+            let share = count as f64 / n as f64;
+            let want = f64::from(bp) / 10_000.0;
+            assert!((share - want).abs() < 0.004, "{bp} bp took {share}");
+        }
+        assert!(
+            (0..n).all(|id| !in_rollout(Some(0), "H", id)),
+            "0 takes nobody"
+        );
+        assert!(
+            (0..n).all(|id| in_rollout(None, "H", id)),
+            "absent takes everybody"
+        );
+    }
+
+    #[test]
+    fn heads_draw_their_rollouts_apart() {
+        let both = (0..100_000i64)
+            .filter(|&id| in_rollout(Some(1_000), "A", id) && in_rollout(Some(1_000), "B", id))
+            .count();
+        assert!(
+            (500..1_500).contains(&both),
+            "{both} of 100,000 in both 10% rollouts"
+        );
     }
 
     #[test]
@@ -835,5 +1005,22 @@ mod tests {
             !post(High).contains(&PageAction::SuspendAuthor {}),
             "a post default never suspends the author"
         );
+    }
+
+    #[test]
+    fn a_confidence_view_from_an_older_image_reads_without_the_factory_age() {
+        let view: ConfidenceView =
+            serde_json::from_value(serde_json::json!({"rows": [], "evidence_max_age_ms": 7}))
+                .unwrap();
+        assert_eq!(
+            (view.evidence_max_age_ms, view.factory_evidence_max_age_ms),
+            (7, 0)
+        );
+        let json = serde_json::to_value(ConfidenceView {
+            factory_evidence_max_age_ms: 9,
+            ..view
+        })
+        .unwrap();
+        assert_eq!(json["factory_evidence_max_age_ms"], 9);
     }
 }

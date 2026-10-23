@@ -1,10 +1,10 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, SafetyLabelMap,
-    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
-    Viewer, ViewerFeatures, ViewerProfile, Withholding,
+    DropReason, FosnrReason, LabelInterstitial, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity,
+    SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict,
+    VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::params::LimitedActionType;
 use crate::rules::RuleId;
@@ -147,6 +147,48 @@ pub(crate) fn allow() -> Verdict {
         notice: None,
         media: None,
         engagement: None,
+    }
+}
+
+pub(crate) fn label_interstitial(
+    interstitial: LabelInterstitial,
+    by: &'static str,
+    engagement: Option<(LimitedEngagementReason, &'static str)>,
+) -> Verdict {
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::LabelInterstitial(interstitial),
+            id: id_of(by),
+            by,
+        }),
+        media: None,
+        engagement: engagement.map(|(reason, by)| Decided {
+            value: LimitedEngagement::new(reason),
+            id: id_of(by),
+            by,
+        }),
+    }
+}
+
+pub(crate) fn with_label_interstitial(
+    shown: Verdict,
+    interstitial: LabelInterstitial,
+    by: &'static str,
+) -> Verdict {
+    let Verdict::Shown {
+        media, engagement, ..
+    } = shown
+    else {
+        panic!("a label interstitial joins a shown verdict");
+    };
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::LabelInterstitial(interstitial),
+            id: id_of(by),
+            by,
+        }),
+        media,
+        engagement,
     }
 }
 
@@ -369,6 +411,81 @@ pub(super) fn conversation_control(
     }
 }
 
+pub(super) fn author_candidate(set: fn(&mut AuthorFeatures)) -> PostCandidate {
+    let mut features = AuthorFeatures::default();
+    set(&mut features);
+    candidate().with_author_features(features).build()
+}
+
+pub(super) fn tweet_candidate(set: fn(&mut TweetFeatures)) -> PostCandidate {
+    let mut features = TweetFeatures::default();
+    set(&mut features);
+    candidate().with_tweet_features(features).build()
+}
+
+pub(super) fn labeled(label: SafetyLabelType) -> PostCandidate {
+    candidate().with_label(label).build()
+}
+
+pub(super) fn controlled_root(arm: ConversationControlArm) -> ConversationControlFeatures {
+    conversation_control(arm, AUTHOR_ID)
+}
+
+pub(super) fn viewer_in_country(code: &str) -> ViewerFeatures {
+    ViewerFeatures {
+        country_code: Some(code.to_string()),
+        ..viewer(VIEWER_ID)
+    }
+}
+
+pub(super) fn on_client(class_name: &str, country: &str, base: ViewerFeatures) -> ViewerFeatures {
+    let class = CLIENT_CLASSES
+        .iter()
+        .find(|class| class.name == class_name)
+        .unwrap_or_else(|| panic!("no client class {class_name}"));
+    ViewerFeatures {
+        country_code: Some(country.to_string()),
+        client_capability: class.capability,
+        ..base
+    }
+}
+
+pub(super) fn nsfw_high_precision_media() -> PostCandidate {
+    candidate()
+        .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
+        .with_media()
+        .build()
+}
+
+pub(super) fn viewer_with_age(age: ViewerAge) -> ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
+        viewer_age: age,
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn no_stated_age_viewer(account_country_code: &str) -> ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
+        viewer_age: ViewerAge::NotStated,
+        account_country_code: Some(account_country_code.to_string()),
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn read_only_viewer(id: u64) -> ViewerFeatures {
+    ViewerFeatures {
+        viewer: Viewer::LoggedIn {
+            id,
+            profile: ViewerProfile {
+                is_read_only: true,
+                ..ViewerProfile::default()
+            },
+            has_age_verified_18_label: false,
+        },
+        ..ViewerFeatures::default()
+    }
+}
+
 pub(crate) fn candidate() -> CandidateBuilder {
     CandidateBuilder {
         candidate: PostCandidate {
@@ -385,6 +502,7 @@ pub(crate) fn candidate() -> CandidateBuilder {
         },
         labels: HashSet::new(),
         agent_labels: HashSet::new(),
+        label_sources: Vec::new(),
     }
 }
 
@@ -392,6 +510,7 @@ pub(crate) struct CandidateBuilder {
     candidate: PostCandidate,
     labels: HashSet<SafetyLabelType>,
     agent_labels: HashSet<SafetyLabelType>,
+    label_sources: Vec<(SafetyLabelType, &'static str)>,
 }
 
 impl CandidateBuilder {
@@ -402,6 +521,16 @@ impl CandidateBuilder {
 
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
         self.labels.insert(label);
+        self
+    }
+
+    pub(crate) fn with_label_source(
+        mut self,
+        label: SafetyLabelType,
+        source: &'static str,
+    ) -> Self {
+        self.labels.insert(label);
+        self.label_sources.push((label, source));
         self
     }
 
@@ -421,11 +550,12 @@ impl CandidateBuilder {
     }
 
     pub(crate) fn with_author_features(mut self, features: AuthorFeatures) -> Self {
-        self.candidate.author = UserEntity::new(
-            self.candidate.author.id,
+        self.candidate.author = UserEntity {
+            id: self.candidate.author.id,
             features,
-            self.candidate.author.labels,
-        );
+            labels: self.candidate.author.labels,
+            ..UserEntity::default()
+        };
         self
     }
 
@@ -481,10 +611,14 @@ impl CandidateBuilder {
     pub(crate) fn build(self) -> PostCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.post.safety_labels = self.agent_labels.into_iter().fold(
+            let labels = self.label_sources.into_iter().fold(
                 SafetyLabelMap::new(self.labels),
-                SafetyLabelMap::assigned_by_agent,
+                |labels, (label, source)| labels.with_source(label, source),
             );
+            candidate.post.safety_labels = self
+                .agent_labels
+                .into_iter()
+                .fold(labels, SafetyLabelMap::assigned_by_agent);
         }
         candidate
     }

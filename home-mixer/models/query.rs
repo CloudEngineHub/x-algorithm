@@ -12,7 +12,7 @@ use xai_core_entities::entities::SubscriptionLevel;
 use xai_decider::Decider;
 use xai_feature_switches::Params;
 use xai_recsys_proto::gender_prediction::InferredGenderLabel;
-use xai_recsys_proto::{DeviceNetworkType, Timezone};
+use xai_recsys_proto::{DeviceNetworkType, RecentSearchQueries, Timezone};
 use xai_twittercontext_proto::{GetTwitterContextViewer, TwitterContextViewer};
 use xai_urt_thrift::cursor::UrtOrderedCursor;
 use xai_x_thrift::non_polling_timestamps::NonPollingTimestamps;
@@ -113,6 +113,8 @@ pub struct ScoredPostsQuery {
     pub implicit_engagement_signals: Option<EngagementSignalsByType>,
     #[serde(serialize_with = "serialize_debug")]
     pub user_installed_apps: Option<Vec<bool>>,
+    #[serde(skip)]
+    pub recent_search_queries: Option<RecentSearchQueries>,
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
     pub is_under_the_hood_request: bool,
@@ -234,6 +236,7 @@ impl ScoredPostsQuery {
             explicit_engagement_signals: None,
             implicit_engagement_signals: None,
             user_installed_apps: None,
+            recent_search_queries: None,
             subscription_level,
             is_shadow_traffic,
             is_under_the_hood_request: false,

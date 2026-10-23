@@ -143,6 +143,7 @@ pub fn build_user_context(query: &ScoredPostsQuery) -> Option<UserContext> {
                 .and_then(|l| l.zip_code.as_deref()),
         ) as i32,
         user_installed_apps: query.user_installed_apps.clone().unwrap_or_default(),
+        recent_search_queries: query.recent_search_queries.clone(),
         ..Default::default()
     })
 }

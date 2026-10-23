@@ -1,3 +1,4 @@
+use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
@@ -6,18 +7,32 @@ use crate::models::{
     ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
     SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
 };
+use crate::params::limited_actions_copy::tests::BUNDLE;
+use crate::params::limited_actions_copy::LimitedActionsCopy;
+use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
+use crate::quote::QuotePassMode;
 use crate::retweet::hydrate_and_evaluate;
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tonic::{Request, Status};
+use vf_pb::tweet_evaluation::Outcome;
 use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState};
+use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) fn raw(tweet_id: u64, request_author_id: Option<u64>) -> RawCandidate {
     RawCandidate {
         tweet_id: TweetId(tweet_id),
         request_author_id,
+    }
+}
+
+pub(crate) fn tweet_data(tweet_id: u64, outer_tweet_id: Option<u64>) -> vf_pb::TweetData {
+    vf_pb::TweetData {
+        tweet_id,
+        quote_context: outer_tweet_id.map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
     }
 }
 
@@ -174,6 +189,89 @@ impl<S: Sources + 'static> Scenario<S> {
                 .collect(),
             rpc: self.rpc,
         }
+    }
+}
+
+pub(crate) struct Wire {
+    post_evaluator: Arc<PostEvaluator>,
+    endpoint: EvaluateTweetsEndpoint,
+}
+
+impl Wire {
+    pub(crate) fn new(sources: Arc<dyn Sources>) -> Self {
+        Self::serving(sources, FallbackCaches::default(), None, QuotePassMode::Off)
+    }
+
+    pub(crate) fn serving(
+        sources: Arc<dyn Sources>,
+        fallback_caches: FallbackCaches,
+        comparator: Option<Box<dyn EntryComparator>>,
+        quote_pass: QuotePassMode,
+    ) -> Self {
+        let post_evaluator = Arc::new(PostEvaluator::new(
+            sources,
+            RuleEngine::for_tests(),
+            Arc::new(fallback_caches),
+        ));
+        let endpoint = EvaluateTweetsEndpoint::new(
+            Arc::clone(&post_evaluator),
+            ClientSwitches::for_tests(),
+            LimitedActionsCopy::from_json(BUNDLE),
+            comparator,
+            quote_pass,
+        );
+        Self {
+            post_evaluator,
+            endpoint,
+        }
+    }
+
+    pub(crate) fn quote_pass_permits(self, permits: usize) -> Self {
+        Self {
+            endpoint: self.endpoint.with_quote_pass_permits(permits),
+            ..self
+        }
+    }
+
+    pub(crate) fn post_evaluator(&self) -> &Arc<PostEvaluator> {
+        &self.post_evaluator
+    }
+
+    pub(crate) fn into_endpoint(self) -> EvaluateTweetsEndpoint {
+        self.endpoint
+    }
+
+    pub(crate) async fn send(
+        &self,
+        request: vf_pb::EvaluateTweetsRequest,
+    ) -> Result<Vec<Outcome>, Status> {
+        self.handle(Request::new(request)).await
+    }
+
+    pub(crate) async fn send_with_context(
+        &self,
+        context: &TwitterContextViewer,
+        request: vf_pb::EvaluateTweetsRequest,
+    ) -> Result<Vec<Outcome>, Status> {
+        let mut request = Request::new(request);
+        request.metadata_mut().insert(
+            "twittercontext",
+            xai_twittercontext::hydrate_twitter_context(context).unwrap(),
+        );
+        self.handle(request).await
+    }
+
+    async fn handle(
+        &self,
+        request: Request<vf_pb::EvaluateTweetsRequest>,
+    ) -> Result<Vec<Outcome>, Status> {
+        let response = self.endpoint.handle(request).await?;
+        Ok(response
+            .into_inner()
+            .results
+            .into_iter()
+            .map(|result| result.outcome.unwrap())
+            .collect())
     }
 }
 

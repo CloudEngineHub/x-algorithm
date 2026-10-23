@@ -12,10 +12,6 @@ const WARM_CHANNEL_CAPACITY: usize = 1024;
 const WARM_LINGER: Duration = Duration::from_millis(500);
 const WARM_FETCH_MAX_KEYS: usize = 50;
 
-pub(crate) trait Warmer: Send + Sync {
-    fn warm(&self, miss_ids: Vec<u64>);
-}
-
 #[async_trait]
 pub(crate) trait WarmFetcher: Send + Sync {
     async fn fetch(&self, ids: &[u64]) -> usize;
@@ -69,10 +65,8 @@ impl CacheWarmer {
         let (tx, rx) = mpsc::channel(capacity);
         (Self { tx }, rx)
     }
-}
 
-impl Warmer for CacheWarmer {
-    fn warm(&self, miss_ids: Vec<u64>) {
+    pub(crate) fn warm(&self, miss_ids: Vec<u64>) {
         metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());
         if miss_ids.is_empty() {
             return;

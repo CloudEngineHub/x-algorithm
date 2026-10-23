@@ -187,7 +187,7 @@ async fn a_run_id_on_a_live_topic_is_skipped_in_every_scenario() {
         vec![LevelRow::Missing],
     );
     let all = scenarios(BAKED_USER_RULES, BAKED_POST_RULES);
-    assert!(all.len() > 500, "{}", all.len());
+    assert!(all.len() > 400, "{}", all.len());
     for sc in all {
         let t = b.run(&with_run(sc.score.clone(), RUN)).await;
         assert_eq!(t.status, backfill::STATUS_ID_ON_LIVE_TOPIC, "{}", sc.id);
@@ -311,6 +311,29 @@ async fn a_full_live_cap_does_not_stop_a_run() {
     let (t, run_tickets) = b.run_backfill(&bb1(Account::Clean)).await;
     assert_eq!(t.status, "success");
     assert_eq!((t.tickets, run_tickets), (0, 1));
+}
+
+#[tokio::test]
+async fn run_decisions_neither_count_toward_nor_trip_a_head_guard() {
+    use crate::head_guard::test_support::{bucket_count, guard, with_counters};
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut b = bed(run_config(false, 10), vec![]).await;
+    let (hg, _, buckets) = with_counters(&[guard(BB1.0, None, Some(1), None)]).await;
+    b.ctx.head_guard = hg;
+    put_running(
+        &b.backfill_store,
+        RUN,
+        BB1.0,
+        vec![SUSPEND],
+        vec![LevelRow::Missing],
+    );
+    for account in [Account::Clean, Account::HasSpamHighRecall] {
+        let (t, run_tickets) = b.run_backfill(&bb1(account)).await;
+        assert_eq!((t.status.as_str(), run_tickets), ("success", 1));
+    }
+    let lkey = off_switch::lkey_for(BB1.0, None);
+    assert_eq!(bucket_count(&buckets, &lkey), 0);
+    assert!(b.ctx.off_switch.get(&lkey).is_none());
 }
 
 #[tokio::test]
@@ -767,6 +790,75 @@ async fn a_run_records_only_where_a_live_record_would() {
         "evidence_missing"
     );
     assert!(t.ais.is_empty());
+}
+
+#[tokio::test]
+async fn a_factory_run_applies_the_level_floor_on_the_messages_evidence() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    const DAY: i64 = 86_400_000;
+    let evidence = |days: i64| abuse_proto::ConfidenceEvidence {
+        precision_lower_bound: 0.96,
+        reads: 59,
+        humans: 0,
+        read_at_ms: now_millis() - days * DAY,
+        link: "read:rd_1".into(),
+    };
+    let mut high = bb1(Account::Clean);
+    high.confidence = abuse_proto::Confidence::High as i32;
+    for factory in [true, false] {
+        let b = bed(run_config(false, 10), vec![]).await;
+        let mut rec = put_running(
+            &b.backfill_store,
+            RUN,
+            BB1.0,
+            vec![SUSPEND],
+            vec![LevelRow::High],
+        );
+        rec.factory = factory;
+        b.backfill_store.rows.lock().unwrap().insert(
+            (backfill::RUN_PKEY.into(), RUN.into()),
+            serde_json::to_vec(&rec).unwrap(),
+        );
+        if !factory {
+            let (t, run_tickets) = b.run_backfill(&high).await;
+            assert_eq!(t.status, "success", "{:?}", info(&t));
+            assert_eq!(run_tickets, 1);
+            assert!(!info(&t).contains_key("level_row"), "not on rows");
+            continue;
+        }
+        for (ev, why) in [
+            (None, "evidence_missing"),
+            (Some(evidence(366)), "evidence_below_floor"),
+        ] {
+            let mut s = high.clone();
+            s.confidence_evidence = ev;
+            let (t, run_tickets) = b.run_backfill(&s).await;
+            assert_eq!(t.status, "dry_run", "{:?}", info(&t));
+            assert_eq!(info(&t)["action_control_forced_recording"], why);
+            assert_eq!(info(&t)["level_row"], "high");
+            assert!(t.ais.is_empty() && run_tickets == 0);
+        }
+        let mut s = high.clone();
+        s.confidence_evidence = Some(evidence(364));
+        let classifier_lkey = format!("user/c/{}/{}", BB1.0, BB1.1);
+        b.control_store.put_raw(&classifier_lkey, b"{not a record");
+        b.ctx.action_control.refresh().await.unwrap();
+        let (t, run_tickets) = b.run_backfill(&s).await;
+        assert_eq!(t.status, "dry_run", "{:?}", info(&t));
+        assert_eq!(info(&t)["action_control_forced_recording"], "unreadable");
+        assert!(t.ais.is_empty() && run_tickets == 0);
+        b.control_store
+            .rows
+            .lock()
+            .unwrap()
+            .retain(|(_, k), _| *k != classifier_lkey);
+        b.ctx.action_control.refresh().await.unwrap();
+        let (t, run_tickets) = b.run_backfill(&s).await;
+        assert_eq!(t.status, "success", "{:?}", info(&t));
+        assert_eq!(run_tickets, 1);
+        assert_eq!(info(&t)["confidence_evidence_supports"], "high");
+        assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

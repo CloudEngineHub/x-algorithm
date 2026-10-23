@@ -50,6 +50,32 @@ pub(super) const FOR_EMERGENCY_USE_ONLY_DROP_UNSPECIFIED: Rule = Rule {
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
+pub(super) const FOR_EMERGENCY_USE_ONLY_LABEL_INTERSTITIAL: Rule = Rule {
+    id: RuleId::ForEmergencyUseOnly,
+    audience: Everyone,
+    when: all![TweetHasLabel(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)],
+    action: label_interstitial(LabelInterstitialSpec::EmergencyDynamic),
+};
+
+const PUBLIC_INTEREST_LABELS_START: u64 = 1554076800000;
+
+pub(super) const PUBLIC_INTEREST_LABEL_INTERSTITIAL: Rule = Rule {
+    id: RuleId::PublicInterest,
+    audience: Everyone,
+    when: all![
+        TweetCreatedAfter(PUBLIC_INTEREST_LABELS_START),
+        any![
+            TweetHasLabel(SafetyLabelType::LOW_QUALITY),
+            TweetHasLabel(SafetyLabelType::MISINFO_CIVIC),
+            TweetHasLabel(SafetyLabelType::MISINFO_GENERIC),
+            TweetHasLabel(SafetyLabelType::MISINFO_MEDICAL),
+            TweetHasLabel(SafetyLabelType::MISINFO_CRISIS),
+            TweetHasLabel(SafetyLabelType::IPI_DEVELOPMENT_ONLY)
+        ]
+    ],
+    action: label_interstitial(LabelInterstitialSpec::PublicInterest),
+};
+
 const AUTHOR_LEVEL_3_LIMITED_ACTIONS: [LimitedActionType; 13] = {
     use LimitedActionType as A;
     [
@@ -1038,6 +1064,19 @@ pub(super) const LIMIT_REPLIES_COMMUNITY_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL
         !TweetIsRetweet,
         VIEWER_IS_NEITHER_ROOT_AUTHOR_NOR_INVITED,
         !ViewerIsFollowedByConversationRootAuthor
+    ],
+    action: limit(LimitedEngagementReason::ConversationControl),
+};
+
+pub(super) const LIMIT_REPLIES_FOLLOWERS_LIMITED_ENGAGEMENT_CONVERSATION_CONTROL: Rule = Rule {
+    id: RuleId::LimitRepliesFollowers,
+    audience: Everyone,
+    when: all![
+        TweetHasConversationControl(ConversationControlArm::Followers),
+        !ViewerLoggedOut,
+        !TweetIsRetweet,
+        VIEWER_IS_NEITHER_ROOT_AUTHOR_NOR_INVITED,
+        !ViewerFollowsConversationRootAuthor
     ],
     action: limit(LimitedEngagementReason::ConversationControl),
 };

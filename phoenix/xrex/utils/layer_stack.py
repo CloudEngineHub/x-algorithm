@@ -31,7 +31,7 @@ WrappedFn = Callable[..., NestedArray | tuple[NestedArray]]
 class LayerStackTail:
     num_layers: int
     layer_fn: WrappedFn
-    split_carry: Callable[[NestedArray], tuple[NestedArray, NestedArray]]
+    split_inputs: Callable[[NestedArray], tuple[NestedArray, NestedArray]]
 
 
 def _check_no_varargs(f: Callable[..., Any]) -> None:
@@ -290,15 +290,15 @@ class _LayerStack:
             carry, outputs_before_tail = self._scan_impl(
                 layer, carry, scanned_before_tail, unroll=self._unroll
             )
-            tail_constant, tail_carry = self._tail.split_carry(carry.x)
-            tail_layer_fn = partial(self._tail.layer_fn, tail_constant=tail_constant)
+            tail_input, tail_x = self._tail.split_inputs(carry.x)
+            tail_layer_fn = partial(self._tail.layer_fn, tail_input=tail_input)
             carry, tail_outputs = self._scan_impl(
                 partial(layer, layer_apply_fn=hk.transform_with_state(tail_layer_fn).apply),
-                carry._replace(x=tail_carry),
+                carry._replace(x=tail_x),
                 scanned_in_tail,
                 unroll=self._unroll,
             )
-            carry = carry._replace(x=(tail_constant, carry.x))
+            carry = carry._replace(x=(tail_input, carry.x))
             zs, states = jax.tree.map(
                 lambda *parts: jnp.concatenate(parts), outputs_before_tail, tail_outputs
             )

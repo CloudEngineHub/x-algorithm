@@ -1,3 +1,4 @@
+pub use crate::hydration::sources::test_users_metadata;
 use crate::server::VFServer;
 use crate::server_deps;
 use crate::staging::reference;

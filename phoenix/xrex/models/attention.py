@@ -23,6 +23,7 @@ class AttentionConfig(Config):
     attn_logit_cap: float = -1.0
     attn_logit_cap_method: str = "tanh"
     attn_impl: str = "pallas_attn"
+    candidate_only_attn_impl: Optional[str] = None
     attn_sharding_namespace: str = "attention"
     fa_version: str = "3"
     qk_norm: bool = False
@@ -39,7 +40,6 @@ class AttentionConfig(Config):
 
 class Attention(hk.Module):
     window_size: int = -1
-    supports_candidate_only: bool = False
 
     def __init__(
         self,

@@ -44,20 +44,14 @@ impl EvaluateTweetsEndpoint {
         client_switches: ClientSwitches,
         limited_actions_copy: LimitedActionsCopy,
         comparator: Option<Box<dyn EntryComparator>>,
+        quote_pass: QuotePassMode,
     ) -> Self {
         Self {
             post_evaluator,
             client_switches,
             limited_actions_copy,
             comparator: comparator.map(Arc::from),
-            quote_pass: QuotePassRunner::new(QuotePassMode::Off),
-        }
-    }
-
-    pub(crate) fn with_quote_pass(self, mode: QuotePassMode) -> Self {
-        Self {
-            quote_pass: QuotePassRunner::new(mode),
-            ..self
+            quote_pass: QuotePassRunner::new(quote_pass),
         }
     }
 
@@ -318,6 +312,7 @@ mod tests {
     use crate::retweet;
     use crate::rules::RuleEngine;
     use crate::rules::RuleId;
+    use crate::scenario::{tweet_data, Wire};
     use std::collections::HashMap;
     use xai_core_entities::entities::{
         GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
@@ -369,16 +364,7 @@ mod tests {
                     },
                 ),
         );
-        let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::<InMemorySources>::clone(&sources),
-                RuleEngine::for_tests(),
-                Arc::default(),
-            )),
-            ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json("[]"),
-            None,
-        );
+        let wire = Wire::new(Arc::<InMemorySources>::clone(&sources));
         for (level, code) in [
             (0, tonic::Code::Unimplemented),
             (4, tonic::Code::Unimplemented),
@@ -388,25 +374,20 @@ mod tests {
             ),
             (9999, tonic::Code::InvalidArgument),
         ] {
-            let error = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            let error = wire
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: level,
                     ..Default::default()
-                }))
+                })
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), code);
         }
-        let tweet = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {
-            tweet_id,
-            quote_context: outer_tweet_id
-                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
-        };
         let tweets = vec![
-            tweet(1, None),
-            tweet(1, Some(2)),
-            tweet(3, None),
-            tweet(3, None),
+            tweet_data(1, None),
+            tweet_data(1, Some(2)),
+            tweet_data(3, None),
+            tweet_data(3, None),
         ];
         for (level, quoted, evaluated) in [
             (
@@ -425,21 +406,16 @@ mod tests {
                 ))),
             ),
         ] {
-            let response = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            let sent = wire
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: level,
                     tweets: tweets.clone(),
                     ..Default::default()
-                }))
+                })
                 .await
-                .unwrap()
-                .into_inner();
+                .unwrap();
             assert_eq!(
-                response
-                    .results
-                    .into_iter()
-                    .map(|r| r.outcome.unwrap())
-                    .collect::<Vec<_>>(),
+                sent,
                 vec![
                     Outcome::Failed(vf_pb::Failed {}),
                     quoted,
@@ -458,27 +434,22 @@ mod tests {
             ),
         ] {
             let calls_before = sources.keys(Source::TesPureCoreData).len();
-            let response = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            let sent = wire
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: 8,
-                    tweets: tweet_ids.into_iter().map(|id| tweet(id, None)).collect(),
+                    tweets: tweet_ids
+                        .into_iter()
+                        .map(|id| tweet_data(id, None))
+                        .collect(),
                     ..Default::default()
-                }))
+                })
                 .await
-                .unwrap()
-                .into_inner();
+                .unwrap();
             assert_eq!(
                 sources.keys(Source::TesPureCoreData).len() - calls_before,
                 core_data_calls
             );
-            assert_eq!(
-                response
-                    .results
-                    .into_iter()
-                    .map(|r| r.outcome.unwrap())
-                    .collect::<Vec<_>>(),
-                outcomes
-            );
+            assert_eq!(sent, outcomes);
         }
     }
 
@@ -519,39 +490,15 @@ mod tests {
             if let Some(fault) = fault {
                 world = world.fault(Source::CommunityModeration, fault);
             }
-            let endpoint = EvaluateTweetsEndpoint::new(
-                Arc::new(PostEvaluator::new(
-                    Arc::new(world),
-                    RuleEngine::for_tests(),
-                    Arc::default(),
-                )),
-                ClientSwitches::for_tests(),
-                LimitedActionsCopy::from_json("[]"),
-                None,
-            );
-            let response = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            let sent = Wire::new(Arc::new(world))
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
                     viewer_id: Some(50),
-                    tweets: [4, 6]
-                        .map(|tweet_id| vf_pb::TweetData {
-                            tweet_id,
-                            quote_context: None,
-                        })
-                        .to_vec(),
-                }))
+                    tweets: vec![tweet_data(4, None), tweet_data(6, None)],
+                })
                 .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(
-                response
-                    .results
-                    .into_iter()
-                    .map(|r| r.outcome.unwrap())
-                    .collect::<Vec<_>>(),
-                [outcome.clone(), outcome],
-                "{fault:?}"
-            );
+                .unwrap();
+            assert_eq!(sent, [outcome.clone(), outcome], "{fault:?}");
         }
     }
 
@@ -561,26 +508,12 @@ mod tests {
         let bounced = vf_pb::SafetyLabelMap {
             labels: HashMap::from([(SafetyLabelType::BOUNCE.0, vf_pb::SafetyLabel::default())]),
         };
-        let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::new(
-                    InMemorySources::default()
-                        .tweet(1, 10)
-                        .labels(1, bounced)
-                        .authors(&[10]),
-                ),
-                RuleEngine::for_tests(),
-                Arc::default(),
-            )),
-            ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json("[]"),
-            None,
-        );
-        let entry = |outer_tweet_id: Option<u64>| vf_pb::TweetData {
-            tweet_id: 1,
-            quote_context: outer_tweet_id
-                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
-        };
+        let wire = Wire::new(Arc::new(
+            InMemorySources::default()
+                .tweet(1, 10)
+                .labels(1, bounced)
+                .authors(&[10]),
+        ));
         let dropped = filtered(ThriftFilteredReason::TweetIsBounced(true));
         let tombstoned = filtered(ThriftFilteredReason::SafetyResult(SafetyResult::new(
             None,
@@ -611,24 +544,19 @@ mod tests {
                 ],
             ),
         ] {
-            let response = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            let sent = wire
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: level.0,
                     viewer_id,
-                    tweets: vec![entry(None), entry(Some(2)), entry(None)],
-                }))
+                    tweets: vec![
+                        tweet_data(1, None),
+                        tweet_data(1, Some(2)),
+                        tweet_data(1, None),
+                    ],
+                })
                 .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(
-                response
-                    .results
-                    .into_iter()
-                    .map(|r| r.outcome.unwrap())
-                    .collect::<Vec<_>>(),
-                outcomes,
-                "{level:?} {viewer_id:?}"
-            );
+                .unwrap();
+            assert_eq!(sent, outcomes, "{level:?} {viewer_id:?}");
         }
     }
 
@@ -639,63 +567,45 @@ mod tests {
         let bounced = vf_pb::SafetyLabelMap {
             labels: HashMap::from([(SafetyLabelType::BOUNCE.0, vf_pb::SafetyLabel::default())]),
         };
-        let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::new(
-                    InMemorySources::default()
-                        .retweet(1, 10, 5, Some(20))
-                        .tweet(2, 30)
-                        .tweet(3, 10)
-                        .tweet(4, 10)
-                        .fail_key(Source::TesTweet, 4)
-                        .tweet(5, 20)
-                        .labels(5, bounced)
-                        .retweet(6, 10, 7, Some(30))
-                        .tweet(7, 30)
-                        .authors(&[10, 20])
-                        .user(30, suspended()),
-                ),
-                RuleEngine::for_tests(),
-                Arc::default(),
-            )),
-            ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json("[]"),
-            None,
-        );
+        let wire = Wire::new(Arc::new(
+            InMemorySources::default()
+                .retweet(1, 10, 5, Some(20))
+                .tweet(2, 30)
+                .tweet(3, 10)
+                .tweet(4, 10)
+                .fail_key(Source::TesTweet, 4)
+                .tweet(5, 20)
+                .labels(5, bounced)
+                .retweet(6, 10, 7, Some(30))
+                .tweet(7, 30)
+                .authors(&[10, 20])
+                .user(30, suspended()),
+        ));
         let evaluate = |tweets: Vec<vf_pb::TweetData>| {
-            let endpoint = &endpoint;
+            let wire = &wire;
             async move {
-                let request = Request::new(vf_pb::EvaluateTweetsRequest {
+                wire.send(vf_pb::EvaluateTweetsRequest {
                     safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
                     viewer_id: Some(VIEWER),
                     tweets,
-                });
-                let response = endpoint.handle(request).await.unwrap().into_inner();
-                response
-                    .results
-                    .into_iter()
-                    .map(|result| result.outcome.unwrap())
-                    .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap()
             }
-        };
-        let entry = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {
-            tweet_id,
-            quote_context: outer_tweet_id
-                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
         };
         let bounced = filtered(ThriftFilteredReason::TweetIsBounced(true));
         let suspended = filtered(ThriftFilteredReason::AuthorIsSuspended(true));
         let entries = [
-            (entry(3, None), shown()),
-            (entry(1, None), bounced.clone()),
-            (entry(5, Some(9)), bounced.clone()),
-            (entry(4, None), failed()),
-            (entry(5, None), bounced),
-            (entry(2, None), suspended.clone()),
-            (entry(6, None), suspended.clone()),
-            (entry(7, Some(9)), suspended.clone()),
-            (entry(3, None), shown()),
-            (entry(2, Some(9)), suspended),
+            (tweet_data(3, None), shown()),
+            (tweet_data(1, None), bounced.clone()),
+            (tweet_data(5, Some(9)), bounced.clone()),
+            (tweet_data(4, None), failed()),
+            (tweet_data(5, None), bounced),
+            (tweet_data(2, None), suspended.clone()),
+            (tweet_data(6, None), suspended.clone()),
+            (tweet_data(7, Some(9)), suspended.clone()),
+            (tweet_data(3, None), shown()),
+            (tweet_data(2, Some(9)), suspended),
         ];
         for (tweet, outcome) in &entries {
             assert_eq!(
@@ -715,33 +625,17 @@ mod tests {
         level: ThriftLevel,
         tweet_ids: &[u64],
     ) -> Vec<Outcome> {
-        let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(PostEvaluator::new(
-                Arc::new(world),
-                RuleEngine::for_tests(),
-                Arc::default(),
-            )),
-            ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json("[]"),
-            None,
-        );
-        let request = Request::new(vf_pb::EvaluateTweetsRequest {
-            safety_level: level.0,
-            viewer_id: Some(VIEWER),
-            tweets: tweet_ids
-                .iter()
-                .map(|&tweet_id| vf_pb::TweetData {
-                    tweet_id,
-                    quote_context: None,
-                })
-                .collect(),
-        });
-        let response = endpoint.handle(request).await.unwrap().into_inner();
-        response
-            .results
-            .into_iter()
-            .map(|result| result.outcome.unwrap())
-            .collect()
+        Wire::new(Arc::new(world))
+            .send(vf_pb::EvaluateTweetsRequest {
+                safety_level: level.0,
+                viewer_id: Some(VIEWER),
+                tweets: tweet_ids
+                    .iter()
+                    .map(|&tweet_id| tweet_data(tweet_id, None))
+                    .collect(),
+            })
+            .await
+            .unwrap()
     }
 
     fn shown() -> Outcome {
@@ -1037,7 +931,7 @@ mod tests {
     async fn the_forwarded_client_reaches_the_fetched_source_and_no_header_gets_the_defaults() {
         use crate::models::ClientCapability;
         use crate::rules::fixtures::CLIENT_CLASSES;
-        let sources = Arc::new(
+        let wire = Wire::new(Arc::new(
             InMemorySources::default()
                 .pure_core(
                     4,
@@ -1048,48 +942,34 @@ mod tests {
                     },
                 )
                 .tweet(6, 60),
-        );
-        let post_evaluator = Arc::new(PostEvaluator::new(
-            sources,
-            RuleEngine::for_tests(),
-            Arc::default(),
         ));
-        let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::clone(&post_evaluator),
-            ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json("[]"),
-            None,
-        );
         let class = CLIENT_CLASSES
             .iter()
             .find(|class| {
                 class.capability.verify_blur_support == Some(VerifyBlurSupport::IosNeedsUpdate)
             })
             .unwrap();
-        let header = xai_twittercontext::hydrate_twitter_context(&TwitterContextViewer {
+        let context = TwitterContextViewer {
             client_application_id: class.app_id,
             user_agent: class.user_agent.into(),
             ..TwitterContextViewer::default()
-        })
-        .unwrap();
-        for (header, expected) in [
-            (Some(header), class.capability),
+        };
+        let request = || vf_pb::EvaluateTweetsRequest {
+            safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
+            viewer_id: Some(1),
+            tweets: vec![tweet_data(4, None)],
+        };
+        for (context, expected) in [
+            (Some(&context), class.capability),
             (None, ClientCapability::default()),
         ] {
-            let mut request = Request::new(vf_pb::EvaluateTweetsRequest {
-                safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
-                viewer_id: Some(1),
-                tweets: vec![vf_pb::TweetData {
-                    tweet_id: 4,
-                    quote_context: None,
-                }],
-            });
-            if let Some(header) = header {
-                request.metadata_mut().insert("twittercontext", header);
+            match context {
+                Some(context) => wire.send_with_context(context, request()).await,
+                None => wire.send(request()).await,
             }
-            endpoint.handle(request).await.unwrap();
+            .unwrap();
             assert_eq!(
-                std::mem::take(&mut *post_evaluator.client_capabilities.lock().unwrap()),
+                std::mem::take(&mut *wire.post_evaluator().client_capabilities.lock().unwrap()),
                 [expected]
             );
         }

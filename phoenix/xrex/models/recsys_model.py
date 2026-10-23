@@ -20,7 +20,9 @@ from xai_configlib import configclass as configclass
 from xai_proto import recsys_pb2
 from xrex.data.recsys.ads_head_masking import (
     ADS_FAMILY_SLICE_HEADS,
+    EARLY_RELABEL_STREAM_ID,
     FRESH_STREAM_ID,
+    LATE_SPLIT_STREAM_ID,
 )
 from xrex.data.recsys.ads_late_window import ADS_LATE_WINDOW_TWIN_HEAD_INDICES
 from xrex.data.recsys.constants import (
@@ -45,7 +47,13 @@ from xrex.data.recsys.feature_config import (
     FloatFeature,
     Int64Feature,
 )
-from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch
+from xrex.data.recsys.recsys_batch import (
+    AUX_VALUE_EVENTS,
+    EMBEDDING_CONFIG,
+    EmbeddingType,
+    RecsysFeaturesBatch,
+    aux_value_label_keys,
+)
 from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats
 from xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions
 from xrex.models.layers import Linear, get_parameter
@@ -57,11 +65,6 @@ from xrex.models.loss_recsys import (
     cread_loss_compute,
     multihot_loss_compute,
     multihot_loss_weights,
-    purchase_value_loss_compute,
-    purchase_value_smoothed_stats,
-    purchase_value_stats,
-    purchase_value_valid_mask,
-    purchase_value_weights,
     tweedie_loss_compute,
 )
 from xrex.models.model_utils import Parameter
@@ -103,6 +106,27 @@ from xrex.models.sharding_context import ShardingContext
 from xrex.models.transformer import (
     Transformer,
     TransformerConfig,
+)
+from xrex.models.value_bin_tables import (
+    AUX_VALUE_BIN_TABLES,
+    PURCHASE_VALUE_BIN_PRIOR,
+    PURCHASE_VALUE_BIN_VALUES,
+    VALUE_BIN_EDGES,
+    VALUE_BIN_SMOOTHING,
+)
+from xrex.models.value_heads import (
+    PURCHASE_VALUE_EMA_KEY,
+    PURCHASE_VALUE_METRIC_PREFIX,
+    PURCHASE_VALUE_VT_METRIC_PREFIX,
+    VALUE_EMA_STATE_SIZE,
+    ValueBinTable,
+    value_binned_sums_key,
+    value_head_loss_compute,
+    value_head_stats,
+    value_smoothed_stats,
+    value_sums_key,
+    value_valid_mask,
+    value_valid_weights,
 )
 from xrex.utils.sharding import with_sharding_constraint_unless_manual
 from xrex.utils.utils import Summary, dump_to_file
@@ -344,6 +368,111 @@ def validate_continuous_action_losses(losses: list[ContinuousActionLossConfig]) 
                 "filters; zero out the one being replaced"
             )
         seen[key] = lc.metric_name
+
+
+@configclass
+class AuxValueHeadConfig(Config):
+    event: str = "content_view"
+
+    loss_weight: float = 0.0
+
+    bin_edges: tuple[float, ...] = VALUE_BIN_EDGES
+    bin_values: tuple[float, ...] = ()
+    bin_prior: tuple[float, ...] = ()
+    bin_smoothing: float = VALUE_BIN_SMOOTHING
+
+    smoothing_windows: tuple[int, ...] = (1 << 26, 1 << 28)
+
+    lanes: tuple[int, ...] = (EARLY_RELABEL_STREAM_ID,)
+
+    include_view_through: bool = False
+
+    def __post_init__(self):
+        table = AUX_VALUE_BIN_TABLES.get(self.event)
+        if table is not None and self.bin_edges == table.edges:
+            self.bin_values = self.bin_values or table.values
+            self.bin_prior = self.bin_prior or table.prior
+
+    @property
+    def param_prefix(self) -> str:
+        return f"aux_value_{self.event}"
+
+    @property
+    def metric_prefix(self) -> str:
+        population = "delayed_website" if self.include_view_through else "delayed_website_clicked"
+        return f"aux-value-{self.event.replace('_', '-')}_{population}"
+
+    @property
+    def bins(self) -> ValueBinTable:
+        return ValueBinTable(self.bin_edges, self.bin_values, self.bin_prior, self.bin_smoothing)
+
+    def validate(self) -> None:
+        if self.event not in AUX_VALUE_EVENTS:
+            raise ValueError(
+                f"aux value head event {self.event!r} must be one of {[*AUX_VALUE_EVENTS]}"
+            )
+        if not math.isfinite(self.loss_weight) or self.loss_weight < 0:
+            raise ValueError(f"aux value head {self.event}: loss_weight must be finite and >= 0")
+        if self.loss_weight == 0:
+            return
+        self.bins.validate(self.param_prefix)
+        if not self.smoothing_windows or any(w <= 0 for w in self.smoothing_windows):
+            raise ValueError(f"aux value head {self.event}: smoothing_windows must be positive")
+        valid_lanes = (EARLY_RELABEL_STREAM_ID, LATE_SPLIT_STREAM_ID)
+        if not self.lanes or any(lane not in valid_lanes for lane in self.lanes):
+            raise ValueError(
+                f"aux value head {self.event}: lanes must be a subset of {valid_lanes}"
+            )
+
+
+def parse_aux_value_heads(
+    weights: str, head: str = "binned", include_view_through: bool = False
+) -> tuple[AuxValueHeadConfig, ...]:
+    if head != "binned":
+        raise ValueError(f"aux_value_head_type must be 'binned', got {head!r}")
+    heads: list[AuxValueHeadConfig] = []
+    for item in weights.split(","):
+        if not item.strip():
+            continue
+        event, sep, raw_weight = (part.strip() for part in item.partition(":"))
+        if event not in AUX_VALUE_EVENTS:
+            raise ValueError(
+                f"aux_value_head_weights: unknown event {event!r} in {item!r}, "
+                f"expected event:weight with event in {[*AUX_VALUE_EVENTS]}"
+            )
+        try:
+            weight = float(raw_weight) if sep else math.nan
+        except ValueError:
+            weight = math.nan
+        if not (math.isfinite(weight) and weight > 0):
+            raise ValueError(
+                f"aux_value_head_weights: {item!r} needs a finite weight > 0 (event:weight)"
+            )
+        if any(h.event == event for h in heads):
+            raise ValueError(f"aux_value_head_weights: event {event!r} given twice")
+        heads.append(
+            AuxValueHeadConfig(
+                event=event, loss_weight=weight, include_view_through=include_view_through
+            )
+        )
+    return tuple(heads)
+
+
+@dataclass(frozen=True)
+class ValueHead:
+    metric_prefix: str
+    ema_key: str
+    loss_weight: float
+    smoothing_windows: tuple[int, ...]
+    valid_key: str
+    baseline_key: str
+    lanes: tuple[int, ...]
+    include_view_through: bool
+    bins: ValueBinTable | None
+    huber_delta: float = 1.0
+    slot: int | None = None
+    event: str | None = None
+    ratio_key: str | None = None
 
 
 def _get_surface_mask(
@@ -765,11 +894,121 @@ class RecsysAggregatedModelConfig(Config):
 
     purchase_value_loss_weight: float = 0.0
     purchase_value_huber_delta: float = 1.0
+    purchase_value_include_view_through: bool = False
     purchase_value_smoothing_windows: tuple[int, ...] = (1 << 28, 1 << 30)
+    purchase_value_head: str = "regression"
+    purchase_value_bin_edges: tuple[float, ...] = VALUE_BIN_EDGES
+    purchase_value_bin_values: tuple[float, ...] = PURCHASE_VALUE_BIN_VALUES
+    purchase_value_bin_prior: tuple[float, ...] = PURCHASE_VALUE_BIN_PRIOR
+    purchase_value_bin_smoothing: float = VALUE_BIN_SMOOTHING
+    purchase_value_history_tower: bool = False
+    purchase_value_history_tower_hidden: int = 64
+    purchase_value_history_tower_proj: int = 32
+    aux_value_heads: tuple[AuxValueHeadConfig, ...] = ()
+    aux_value_head_weights: str = ""
+    aux_value_head_type: str = "binned"
+    aux_value_include_view_through: bool = False
+    value_loss_normalization: Literal["valid_rows", "positions"] = "valid_rows"
 
     @property
     def purchase_value_enabled(self) -> bool:
         return self.purchase_value_loss_weight > 0
+
+    @property
+    def purchase_value_binned(self) -> bool:
+        return self.purchase_value_enabled and self.purchase_value_head == "binned"
+
+    @property
+    def purchase_value_bins(self) -> ValueBinTable:
+        return ValueBinTable(
+            self.purchase_value_bin_edges,
+            self.purchase_value_bin_values,
+            self.purchase_value_bin_prior,
+            self.purchase_value_bin_smoothing,
+        )
+
+    @property
+    def all_aux_value_heads(self) -> tuple[AuxValueHeadConfig, ...]:
+        return (
+            *self.aux_value_heads,
+            *parse_aux_value_heads(
+                self.aux_value_head_weights,
+                self.aux_value_head_type,
+                self.aux_value_include_view_through,
+            ),
+        )
+
+    @property
+    def active_aux_value_heads(self) -> tuple[AuxValueHeadConfig, ...]:
+        if not self.purchase_value_enabled:
+            return ()
+        return tuple(head for head in self.all_aux_value_heads if head.loss_weight > 0)
+
+    @property
+    def aux_value_events(self) -> tuple[str, ...]:
+        return tuple(head.event for head in self.active_aux_value_heads)
+
+    def value_head_ema_keys(self) -> dict[str, jax.Array]:
+        return {
+            f"{head.ema_key}/{ws}": jnp.zeros((VALUE_EMA_STATE_SIZE,), dtype=jnp.float32)
+            for head in self.value_heads()
+            for ws in head.smoothing_windows
+        }
+
+    def value_heads(self) -> tuple[ValueHead, ...]:
+        heads: list[ValueHead] = []
+        if self.purchase_value_enabled:
+            heads.append(
+                ValueHead(
+                    metric_prefix=(
+                        PURCHASE_VALUE_VT_METRIC_PREFIX
+                        if self.purchase_value_include_view_through
+                        else PURCHASE_VALUE_METRIC_PREFIX
+                    ),
+                    ema_key=PURCHASE_VALUE_EMA_KEY,
+                    loss_weight=self.purchase_value_loss_weight,
+                    smoothing_windows=self.purchase_value_smoothing_windows,
+                    valid_key="value_label_valid",
+                    baseline_key="value_baseline_mean_usd",
+                    lanes=(EARLY_RELABEL_STREAM_ID,),
+                    include_view_through=self.purchase_value_include_view_through,
+                    bins=self.purchase_value_bins if self.purchase_value_binned else None,
+                    huber_delta=self.purchase_value_huber_delta,
+                    slot=PURCHASE_VALUE_ACTION_INDEX,
+                )
+            )
+        for head in self.active_aux_value_heads:
+            ratio_key, valid_key, baseline_key = aux_value_label_keys(head.event)
+            heads.append(
+                ValueHead(
+                    metric_prefix=head.metric_prefix,
+                    ema_key=head.param_prefix,
+                    loss_weight=head.loss_weight,
+                    smoothing_windows=head.smoothing_windows,
+                    valid_key=valid_key,
+                    baseline_key=baseline_key,
+                    lanes=head.lanes,
+                    include_view_through=head.include_view_through,
+                    bins=head.bins,
+                    event=head.event,
+                    ratio_key=ratio_key,
+                )
+            )
+        return tuple(heads)
+
+    def validate_aux_value_heads(self) -> None:
+        heads = self.all_aux_value_heads
+        events = [head.event for head in heads]
+        if len(set(events)) != len(events):
+            raise ValueError(f"aux_value_heads events must be unique, got {events}")
+        for head in heads:
+            head.validate()
+        weighted = [head.event for head in heads if head.loss_weight > 0]
+        if weighted and not self.purchase_value_enabled:
+            raise ValueError(
+                f"aux_value_heads {weighted} need purchase_value_loss_weight > 0: the value "
+                "heads share one switch so runs without them are untouched"
+            )
 
     def validate_purchase_value(self) -> None:
         if (
@@ -777,6 +1016,20 @@ class RecsysAggregatedModelConfig(Config):
             or self.purchase_value_loss_weight < 0
         ):
             raise ValueError("purchase_value_loss_weight must be finite and nonnegative")
+        if self.value_loss_normalization not in ("valid_rows", "positions"):
+            raise ValueError(
+                f"value_loss_normalization must be valid_rows or positions, "
+                f"got {self.value_loss_normalization!r}"
+            )
+        if self.purchase_value_history_tower:
+            if not (self.purchase_value_enabled and self.purchase_value_binned):
+                raise ValueError(
+                    "purchase_value_history_tower needs the binned purchase-value head"
+                )
+            if self.use_seqpack:
+                raise ValueError("purchase_value_history_tower is not supported with use_seqpack")
+            if self.num_continuous_actions <= WEB_CONV_VALUE_USD_IDX:
+                raise ValueError("purchase_value_history_tower needs history value slot 6")
         if not self.purchase_value_enabled:
             return
         if self.num_continuous_actions <= PURCHASE_VALUE_ACTION_INDEX:
@@ -798,6 +1051,10 @@ class RecsysAggregatedModelConfig(Config):
             w <= 0 for w in self.purchase_value_smoothing_windows
         ):
             raise ValueError("purchase_value_smoothing_windows must be positive sample counts")
+        if self.purchase_value_head not in ("regression", "binned"):
+            raise ValueError("purchase_value_head must be 'regression' or 'binned'")
+        if self.purchase_value_head == "binned":
+            self.purchase_value_bins.validate("purchase_value")
 
     def conversion_delay_slices(self) -> list[ConversionDelaySlice]:
         if not self.conversion_delay_slice_thresholds_s or not self.ads_head_masking:
@@ -900,6 +1157,9 @@ class RecsysAggregatedModelConfig(Config):
     concat_history_bridge_prob: bool = False
     concat_history_web_conv_time_on_site: bool = False
     web_conv_time_on_site_norm_scale: float = 1800.0
+    add_history_web_conv_value: bool = False
+    web_conv_value_usd_cap: float = 10_000.0
+    web_conv_value_ratio_cap: float = 50.0
 
     mask_neg_feedback_on_negatives: bool = True
 
@@ -941,6 +1201,7 @@ class RecsysAggregatedModelConfig(Config):
 
     def make(self, sharding_context: ShardingContext) -> RecsysAggregatedModel:
         self.validate_purchase_value()
+        self.validate_aux_value_heads()
         self.validate_ads_head_masking()
         if (
             not (self.pad_candidates_to_128 or self.use_seqpack)
@@ -953,6 +1214,14 @@ class RecsysAggregatedModelConfig(Config):
             raise ValueError(
                 f"history_url_embedding_dim={self.history_url_embedding_dim}: must be >= 0 "
                 "and is only wired on the legacy (feature_prep_enabled=False) path"
+            )
+
+        if self.model_config.num_candidate_only_layers and (
+            self.transformer_output_only or self.page_rl.enabled
+        ):
+            raise ValueError(
+                "transformer_output_only and page_rl read the history's final hidden states, "
+                "which candidate-only layers do not update. Set num_candidate_only_layers=0."
             )
 
         if self.feature_prep_enabled:
@@ -993,10 +1262,6 @@ class RecsysAggregatedModelConfig(Config):
             assert (
                 isinstance(attn_config, RecsysAttentionConfig)
                 and attn_config.num_user_prefix_tokens == self.num_user_prefix_tokens
-            )
-        if self.model_config.candidate_only_layers:
-            assert not (self.transformer_output_only or self.page_rl.enabled), (
-                "transformer_output_only and page_rl read tokens that candidate-only blocks freeze"
             )
 
         validate_continuous_action_losses(self.continuous_action_losses)
@@ -1400,6 +1665,68 @@ def normalize_web_conv_time_on_site(millis: jax.Array, scale_secs: float) -> jax
     return jnp.log1p(secs) / jnp.log1p(jnp.float32(scale_secs))
 
 
+WEB_CONV_VALUE_USD_IDX = 6
+WEB_CONV_VALUE_RATIO_IDX = 7
+
+
+def normalize_web_conv_value(values: jax.Array, usd_cap: float, ratio_cap: float) -> jax.Array:
+    caps = jnp.array([usd_cap, ratio_cap], dtype=jnp.float32)
+    x = jnp.clip(values.astype(jnp.float32), 0.0, caps)
+    return jnp.log1p(x) / jnp.log1p(caps)
+
+
+PURCHASE_VALUE_HISTORY_FEATURES = 9
+
+
+def purchase_value_history_features(
+    history_continuous_actions: jax.Array,
+    history_auth_hashes: jax.Array,
+    history_impr_ts: jax.Array,
+    candidate_auth_hashes: jax.Array,
+    usd_cap: float,
+) -> jax.Array:
+    usd = history_continuous_actions[..., WEB_CONV_VALUE_USD_IDX].astype(jnp.float32)
+    valid = jnp.isfinite(usd) & (usd > 0)
+    v = jnp.where(valid, jnp.log1p(jnp.clip(usd, 0.0, usd_cap)) / math.log1p(usd_cap), 0.0)
+    num_rows = history_continuous_actions.shape[1]
+    log_count = lambda n: jnp.log1p(n.astype(jnp.float32)) / math.log1p(num_rows)
+    same = (
+        jnp.all(
+            history_auth_hashes[:, None, :, :] == candidate_auth_hashes[:, :, None, :],
+            axis=-1,
+        )
+        & valid[:, None, :]
+    )
+    v_same = jnp.where(same, v[:, None, :], 0.0)
+    n_same = same.sum(-1)
+    ts = history_impr_ts.astype(jnp.int32)
+    ts_rel = (ts - ts.max(axis=-1, keepdims=True)).astype(jnp.float32)
+    last_idx = jnp.argmax(jnp.where(same, ts_rel[:, None, :], -jnp.inf), axis=-1)
+    last_v = jnp.take_along_axis(v_same, last_idx[..., None], axis=-1)[..., 0]
+    n_user = valid.sum(-1)
+    user = jnp.stack(
+        [
+            (n_user > 0).astype(jnp.float32),
+            log_count(n_user),
+            v.max(-1),
+            v.sum(-1) / jnp.maximum(n_user, 1),
+        ],
+        axis=-1,
+    )
+    per_candidate = jnp.stack(
+        [
+            (n_same > 0).astype(jnp.float32),
+            log_count(n_same),
+            v_same.max(-1),
+            v_same.sum(-1) / jnp.maximum(n_same, 1),
+            jnp.where(n_same > 0, last_v, 0.0),
+        ],
+        axis=-1,
+    )
+    user = jnp.broadcast_to(user[:, None, :], per_candidate.shape[:2] + (user.shape[-1],))
+    return jnp.concatenate([per_candidate, user], axis=-1)
+
+
 def block_history_reduce(
     history_post_hashes: jnp.ndarray,
     history_author_hashes: jnp.ndarray,
@@ -1419,6 +1746,7 @@ def block_history_reduce(
     history_bridge_prob: jnp.ndarray | None = None,
     history_web_conv_time_on_site: jnp.ndarray | None = None,
     history_url_embeddings: jnp.ndarray | None = None,
+    history_web_conv_value: jnp.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     num_item_hashes = hash_keys.num_item_hashes
     num_author_hashes = hash_keys.num_author_hashes
@@ -1472,6 +1800,18 @@ def block_history_reduce(
         )
         history_post_author_embedding = history_post_author_embedding + jnp.dot(
             history_url_embeddings.astype(hist_url_proj_mat.dtype), hist_url_proj_mat
+        ).astype(history_post_author_embedding.dtype)
+    if history_web_conv_value is not None:
+        value_dirs = get_parameter(
+            "hist_web_conv_value_dirs",
+            [2, D],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(None, None),
+            lr_multiplier=lr_multiplier_func(2),
+        )
+        history_post_author_embedding = history_post_author_embedding + jnp.dot(
+            history_web_conv_value.astype(value_dirs.dtype), value_dirs
         ).astype(history_post_author_embedding.dtype)
 
     post_action_embedding_seq = history_post_author_embedding.reshape(B, -1, D)
@@ -1915,7 +2255,7 @@ class CandidateInputs(NamedTuple):
     loss_padding_mask: jax.Array
     loss_weights: jax.Array | None
     continuous_heads: dict[int, tuple[jax.Array, jax.Array | None]]
-    purchase_value: tuple[jax.Array, jax.Array, jax.Array] | None
+    value_heads: dict[str, tuple[jax.Array, jax.Array, jax.Array]]
 
 
 @dataclass
@@ -2756,6 +3096,108 @@ class RecsysAggregatedModel(hk.Module):
         return with_sharding_constraint_unless_manual(unembed_mat, out_pspec)
 
     @hk.transparent
+    def _value_bin_logits(
+        self, inputs: jax.Array, param_prefix: str, bins: ValueBinTable
+    ) -> jax.Array:
+        _config = self.config
+        emb_size = _config.model_config.emb_size
+        num_bins = bins.num_bins
+        embed_init = hk.initializers.VarianceScaling(_config.embed_init_scale, mode="fan_out")
+        unembed = get_parameter(
+            f"{param_prefix}_bin_unembeddings",
+            [emb_size, num_bins],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
+            pspec=P(None, None),
+            lr_multiplier=_config.model_config.scale_config.emb_lr_multiplier(emb_size),
+            rms_clip_axes=(-1, -2),
+            dtype_unwrap=jnp.float32,
+        )
+        log_prior = bins.log_prior
+        bias = get_parameter(
+            f"{param_prefix}_bin_bias",
+            [num_bins],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: jnp.asarray(log_prior, dtype=dtype).reshape(shape),
+            pspec=P(None),
+            lr_multiplier=1.0,
+            rms_clip_axes=(),
+            dtype_unwrap=jnp.float32,
+        )
+        return jnp.dot(inputs.astype(jnp.float32), unembed) + bias
+
+    @hk.transparent
+    def _purchase_value_bin_logits(self, inputs: jax.Array) -> jax.Array:
+        return self._value_bin_logits(inputs, "purchase_value", self.config.purchase_value_bins)
+
+    def _purchase_value_features(self, batch: RecsysFeaturesBatch) -> jax.Array | None:
+        if not self.config.purchase_value_history_tower:
+            return None
+        history_impr_ts = batch["history_seq"]["impr_ts"]
+        assert history_impr_ts is not None
+        return purchase_value_history_features(
+            cast_jax(batch["history_seq"]["continuous_actions"]),
+            cast_jax(batch["history_seq"]["auth_hashes"]),
+            cast_jax(history_impr_ts),
+            cast_jax(batch["candidate_seq"]["auth_hashes"]),
+            self.config.web_conv_value_usd_cap,
+        )
+
+    @hk.transparent
+    def _purchase_value_history_tower(self, inputs: jax.Array, features: jax.Array) -> jax.Array:
+        _config = self.config
+        emb_size = _config.model_config.emb_size
+        proj, hidden = (
+            _config.purchase_value_history_tower_proj,
+            _config.purchase_value_history_tower_hidden,
+        )
+        num_bins = _config.purchase_value_bins.num_bins
+        lr = _config.model_config.scale_config.emb_lr_multiplier
+
+        def weight(name, fan_in, fan_out, init):
+            return get_parameter(
+                f"purchase_value_history_tower_{name}",
+                [fan_in, fan_out],
+                dtype=jnp.float32,
+                init=init,
+                pspec=P(None, None),
+                lr_multiplier=lr(fan_in),
+                rms_clip_axes=(-1, -2),
+                dtype_unwrap=jnp.float32,
+            )
+
+        def bias(name, size):
+            return get_parameter(
+                f"purchase_value_history_tower_{name}",
+                [size],
+                dtype=jnp.float32,
+                init=hk.initializers.Constant(0.0),
+                pspec=P(None),
+                lr_multiplier=1.0,
+                rms_clip_axes=(),
+                dtype_unwrap=jnp.float32,
+            )
+
+        fan_in_init = hk.initializers.VarianceScaling(1.0, mode="fan_in")
+        w_state = weight("state_proj", emb_size, proj, fan_in_init)
+        w_in = weight("w_in", features.shape[-1] + proj, hidden, fan_in_init)
+        b_in = bias("b_in", hidden)
+        w_out = weight("w_out", hidden, num_bins, hk.initializers.Constant(0.0))
+        b_out = bias("b_out", num_bins)
+        pad = inputs.shape[1] - features.shape[1]
+        feats = jnp.pad(features.astype(jnp.float32), ((0, 0), (0, pad), (0, 0)))
+        state = jnp.dot(jax.lax.stop_gradient(inputs).astype(jnp.float32), w_state)
+        x = jnp.concatenate([feats, state], axis=-1)
+        return jnp.dot(jax.nn.gelu(jnp.dot(x, w_in) + b_in), w_out) + b_out
+
+    @hk.transparent
+    def decode_aux_value_heads(self, inputs: jax.Array) -> dict[str, jax.Array]:
+        return {
+            head.event: self._value_bin_logits(inputs, head.param_prefix, head.bins)
+            for head in self.config.active_aux_value_heads
+        }
+
+    @hk.transparent
     def _decode_cread(
         self, inputs: jax.Array, loss_config: ContinuousActionLossConfig
     ) -> jax.Array:
@@ -2785,7 +3227,10 @@ class RecsysAggregatedModel(hk.Module):
 
     @hk.transparent
     def decode_continuous(
-        self, inputs: jax.Array, product_surface: jax.Array | None = None
+        self,
+        inputs: jax.Array,
+        product_surface: jax.Array | None = None,
+        purchase_value_features: jax.Array | None = None,
     ) -> tuple[jax.Array, dict[int, jax.Array]]:
         self.cread_logits: dict[str, jax.Array] = {}
         unembeddings = self._get_continuous_unembedding()
@@ -2813,7 +3258,17 @@ class RecsysAggregatedModel(hk.Module):
             configs = configs_by_index.get(i, [])
 
             if i == PURCHASE_VALUE_ACTION_INDEX and self.config.purchase_value_enabled:
-                head_out = jax.nn.softplus(head_logits.astype(jnp.float32))
+                if self.config.purchase_value_binned:
+                    bin_logits = self._purchase_value_bin_logits(inputs)
+                    if self.config.purchase_value_history_tower:
+                        assert purchase_value_features is not None
+                        bin_logits = bin_logits + self._purchase_value_history_tower(
+                            inputs, purchase_value_features
+                        )
+                    head_logits_by_index[i] = bin_logits
+                    head_out = self.config.purchase_value_bins.readout(bin_logits)[..., None]
+                else:
+                    head_out = jax.nn.softplus(head_logits.astype(jnp.float32))
                 activated_slices.append(head_out.astype(head_logits.dtype))
                 continue
 
@@ -3068,6 +3523,7 @@ class RecsysAggregatedModel(hk.Module):
         history_dwell_time: jax.Array | None = None
         history_bridge_prob: jax.Array | None = None
         history_web_conv_time_on_site: jax.Array | None = None
+        history_web_conv_value: jax.Array | None = None
         history_continuous_actions = recsys_features_batch["history_seq"]["continuous_actions"]
         if history_continuous_actions is not None:
             ca = cast_jax(history_continuous_actions)
@@ -3076,6 +3532,12 @@ class RecsysAggregatedModel(hk.Module):
             _bridge_idx = recsys_pb2.ContinuousActionName.BRIDGE_PROBABILITY
             if _config.concat_history_bridge_prob and ca.shape[-1] > _bridge_idx:
                 history_bridge_prob = ca[:, :, _bridge_idx]
+            if _config.add_history_web_conv_value and ca.shape[-1] > WEB_CONV_VALUE_RATIO_IDX:
+                history_web_conv_value = normalize_web_conv_value(
+                    ca[:, :, [WEB_CONV_VALUE_USD_IDX, WEB_CONV_VALUE_RATIO_IDX]],
+                    _config.web_conv_value_usd_cap,
+                    _config.web_conv_value_ratio_cap,
+                )
         if _config.concat_history_web_conv_time_on_site:
             history_int64 = recsys_features_batch["history_seq"].get("int64_features")
             _tos_idx = [
@@ -3242,6 +3704,11 @@ class RecsysAggregatedModel(hk.Module):
                         num_devices, -1, _config.history_url_embedding_dim
                     )
                 ),
+                history_web_conv_value=(
+                    None
+                    if history_web_conv_value is None
+                    else history_web_conv_value.reshape(num_devices, -1, 2)
+                ),
             )
 
             assert recsys_embeddings.candidate_post_embeddings is not None
@@ -3403,6 +3870,7 @@ class RecsysAggregatedModel(hk.Module):
                 history_bridge_prob=history_bridge_prob,
                 history_web_conv_time_on_site=history_web_conv_time_on_site,
                 history_url_embeddings=history_url_embeddings,
+                history_web_conv_value=history_web_conv_value,
             )
             if _sid_recon and _sid_post_emb_h is not None:
                 history_embeddings += _sid_post_emb_h.astype(history_embeddings.dtype)
@@ -3486,6 +3954,8 @@ class RecsysAggregatedModel(hk.Module):
         seqpack_layout: SequencePackedLayout | None = None,
         return_candidate_embeddings: bool = False,
         act_l2_mask: jax.Array | None = None,
+        with_aux_value_heads: bool = False,
+        purchase_value_features: jax.Array | None = None,
     ) -> tuple[jax.Array, ...]:
         _debug_dir = self.config.model_config.debug_tensor_dump_output_folder
         dump_to_file(_debug_dir, "input_embeddings", input_embeddings)
@@ -3500,6 +3970,13 @@ class RecsysAggregatedModel(hk.Module):
 
         attn_mask = jnp.ones((B, T)).astype(jnp.int32)
 
+        if seqpack_layout is None:
+            candidate_start = candidate_start_offset
+        elif seqpack_layout.candidate_token_to_slot is not None:
+            candidate_start = T - seqpack_layout.candidate_token_to_slot.shape[-1]
+        else:
+            candidate_start = None
+
         model_out = self.model(
             input_embeddings,
             attn_mask,
@@ -3510,6 +3987,7 @@ class RecsysAggregatedModel(hk.Module):
             positions=positions,
             seqpack_layout=seqpack_layout,
             act_l2_mask=act_l2_mask,
+            candidate_start=candidate_start,
         )
 
         out_embeddings = model_out.output
@@ -3532,7 +4010,7 @@ class RecsysAggregatedModel(hk.Module):
         dump_to_file(_debug_dir, "last_hidden_after_norm", out_embeddings)
 
         if self.config.transformer_output_only:
-            return out_embeddings, jnp.zeros((0, 0, 0)), {}
+            return out_embeddings, jnp.zeros((0, 0, 0)), {}, {}
 
         assert candidate_start_offset is None or seqpack_layout is None
 
@@ -3562,11 +4040,14 @@ class RecsysAggregatedModel(hk.Module):
             logits = config.final_logit_cap * jnp.tanh(logits / config.final_logit_cap)
 
         continuous_predictions, head_logits_by_index = self.decode_continuous(
-            out_embeddings, product_surface
+            out_embeddings, product_surface, purchase_value_features
+        )
+        aux_value_logits = (
+            self.decode_aux_value_heads(out_embeddings) if with_aux_value_heads else {}
         )
 
         if not return_candidate_embeddings:
-            return logits, continuous_predictions, head_logits_by_index
+            return logits, continuous_predictions, head_logits_by_index, aux_value_logits
         if seqpack_layout is not None:
             input_candidates = jnp.take_along_axis(
                 input_embeddings, cast_jax(seqpack_layout.candidate_positions)[:, :, None], axis=1
@@ -3599,6 +4080,7 @@ class RecsysAggregatedModel(hk.Module):
             logits,
             continuous_predictions,
             head_logits_by_index,
+            aux_value_logits,
             candidate_embeddings,
             user_embeddings,
         )
@@ -3715,6 +4197,7 @@ class RecsysAggregatedModel(hk.Module):
                 if self.config.ads_pixel_head_masking and head_eligible_mask is not None:
                     eligible_heads = cast_jax(head_eligible_mask)
             trained_candidate_mask = batch["candidate_seq"].get("trained_candidate_mask")
+            value_padding_mask = target_padding_mask
             if trained_candidate_mask is not None:
                 trained_heads = cast_jax(trained_candidate_mask)
                 target_padding_mask = target_padding_mask & trained_heads.any(-1)
@@ -3722,6 +4205,15 @@ class RecsysAggregatedModel(hk.Module):
             negative_sample_mask = jnp.broadcast_to(negative_sample_mask, target_padding_mask.shape)
 
             loss_padding_mask, loss_weights = target_padding_mask, raw_weights
+            if self.config.safety_filter_apply_to_candidates and self.config.value_heads():
+                value_padding_mask, _ = apply_safety_filter(
+                    candidate_safety_mask,
+                    value_padding_mask,
+                    None,
+                    mode=self.config.safety_filter_mode,
+                    bits=self.config.safety_filter_bits,
+                    soft_weight=self.config.safety_filter_soft_weight,
+                )
             if self.config.safety_filter_apply_to_candidates:
                 loss_padding_mask, loss_weights = apply_safety_filter(
                     candidate_safety_mask,
@@ -3774,8 +4266,8 @@ class RecsysAggregatedModel(hk.Module):
                             )
                         total[f"continuous/{index}"] = jnp.sum(weights)
 
-            purchase_value = None
-            if self.config.purchase_value_loss_weight > 0:
+            value_heads = {}
+            for head in self.config.value_heads():
 
                 def value_operand(
                     name: str, dtype: jnp.dtype, batch=batch, mask=loss_padding_mask
@@ -3792,27 +4284,32 @@ class RecsysAggregatedModel(hk.Module):
                     if trained_heads is not None
                     else jnp.ones_like(loss_padding_mask, dtype=jnp.bool_)
                 )
-                value_mask = purchase_value_valid_mask(
-                    label_valid=value_operand("value_label_valid", jnp.bool_),
-                    padding_mask=loss_padding_mask,
+                value_mask = value_valid_mask(
+                    label_valid=value_operand(head.valid_key, jnp.bool_),
+                    padding_mask=value_padding_mask,
                     negative_sample_mask=negative_sample_mask,
                     sample_source=source_id
                     if source_id is not None
                     else jnp.zeros_like(loss_padding_mask),
                     has_click=targets[:, :, CLICK_ACTION_INDEX],
-                    has_purchase=targets[:, :, recsys_pb2.ActionName.ADS_PURCHASE_CONVERSION],
                     keeper_mask=keeper_mask,
+                    lanes=head.lanes,
+                    include_view_through=head.include_view_through,
                 )
-                value_ratio = (
-                    candidate_continuous_actions[:, :, PURCHASE_VALUE_ACTION_INDEX]
-                    if candidate_continuous_actions is not None
-                    and candidate_continuous_actions.shape[-1] > PURCHASE_VALUE_ACTION_INDEX
-                    else jnp.zeros_like(loss_padding_mask, dtype=jnp.float32)
-                )
-                baseline = value_operand("value_baseline_mean_usd", jnp.float32)
-                purchase_value = (value_ratio, baseline, value_mask)
-                _, weights = purchase_value_weights(value_ratio, baseline, value_mask, loss_weights)
-                total["purchase_value"] = jnp.sum(weights)
+                if head.slot is not None:
+                    value_ratio = (
+                        candidate_continuous_actions[:, :, head.slot]
+                        if candidate_continuous_actions is not None
+                        and candidate_continuous_actions.shape[-1] > head.slot
+                        else jnp.zeros_like(loss_padding_mask, dtype=jnp.float32)
+                    )
+                else:
+                    assert head.ratio_key is not None
+                    value_ratio = value_operand(head.ratio_key, jnp.float32)
+                baseline = value_operand(head.baseline_key, jnp.float32)
+                value_heads[head.ema_key] = (value_ratio, baseline, value_mask)
+                _, weights = value_valid_weights(value_ratio, baseline, value_mask, loss_weights)
+                total[f"value/{head.ema_key}"] = jnp.sum(weights)
 
             candidate_inputs.append(
                 CandidateInputs(
@@ -3832,7 +4329,7 @@ class RecsysAggregatedModel(hk.Module):
                     loss_padding_mask=loss_padding_mask,
                     loss_weights=loss_weights,
                     continuous_heads=continuous_heads,
-                    purchase_value=purchase_value,
+                    value_heads=value_heads,
                 )
             )
             totals.append(total)
@@ -3860,6 +4357,7 @@ class RecsysAggregatedModel(hk.Module):
         c = candidate_inputs
         if c is None:
             c = jax.tree.map(lambda x: x[0], self.loss_inputs_and_normalizers([batch])[0])
+        purchase_value_features = None
 
         if self.config.use_seqpack:
             layout = batch.get("packing_layout")
@@ -3924,6 +4422,7 @@ class RecsysAggregatedModel(hk.Module):
                     product_surface=c.product_surface,
                     return_candidate_embeddings=self.config.page_rl.enabled,
                     act_l2_mask=act_l2_mask,
+                    with_aux_value_heads=True,
                 )
         else:
             assert candidate_start_offset is not None
@@ -3987,7 +4486,7 @@ class RecsysAggregatedModel(hk.Module):
                     target_padding_mask=pad(c.target_padding_mask),
                     loss_padding_mask=pad(c.loss_padding_mask),
                     continuous_heads=jax.tree.map(pad, c.continuous_heads),
-                    purchase_value=jax.tree.map(pad, c.purchase_value),
+                    value_heads=jax.tree.map(pad, c.value_heads),
                 )
 
             segment_ids = attention_segment_ids(
@@ -4026,6 +4525,7 @@ class RecsysAggregatedModel(hk.Module):
                 if self.config.page_rl.enabled
                 else None
             )
+            purchase_value_features = self._purchase_value_features(batch)
             with Summary() as summarizer:
                 outputs = self(
                     input_embeddings,
@@ -4037,6 +4537,8 @@ class RecsysAggregatedModel(hk.Module):
                     product_surface=c.product_surface,
                     return_candidate_embeddings=self.config.page_rl.enabled,
                     act_l2_mask=act_l2_mask,
+                    with_aux_value_heads=True,
+                    purchase_value_features=purchase_value_features,
                 )
 
             history_padding = padding_mask[
@@ -4049,7 +4551,7 @@ class RecsysAggregatedModel(hk.Module):
                 :, None
             ]
 
-        candidate_logits, candidate_continuous_preds, head_logits_by_index = outputs[:3]
+        candidate_logits, candidate_continuous_preds, head_logits_by_index, aux_logits = outputs[:4]
         targets, negative_sample_mask, trained_heads, eligible_heads = (
             c.targets,
             c.negative_sample_mask,
@@ -4253,19 +4755,65 @@ class RecsysAggregatedModel(hk.Module):
             stats = {key: value / loss_normalizers["num_partials"] for key, value in stats.items()}
         stats["origin-loss"] = loss
         stats.update(cread_stats)
-        if c.purchase_value is not None:
-            value_ratio, baseline, value_mask = c.purchase_value
-            value_loss, value_sums = purchase_value_loss_compute(
-                raw_ratio=value_ratio,
-                pred_ratio=candidate_continuous_preds[:, :, PURCHASE_VALUE_ACTION_INDEX],
-                baseline_mean_usd=baseline,
-                valid_mask=value_mask,
-                delta=self.config.purchase_value_huber_delta,
-                raw_weights=loss_weights,
-                normalizer=normalizer("purchase_value"),
+        value_heads = self.config.value_heads()
+        value_loss_denominator = None
+        if value_heads and self.config.value_loss_normalization == "positions":
+            value_loss_denominator = normalizer("multihot")
+            if value_loss_denominator is None:
+                value_loss_denominator = jnp.sum(
+                    multihot_loss_weights(loss_padding_mask, loss_weights)
+                ).astype(jnp.float32)
+            stats["value-loss-denominator"] = (
+                value_loss_denominator
+                if loss_normalizers is None
+                else value_loss_denominator / loss_normalizers["num_partials"]
             )
-            continuous_action_loss_total += self.config.purchase_value_loss_weight * value_loss
-            stats["_purchase-value-sums"] = value_sums
+        if purchase_value_features is not None:
+            pvf = jnp.pad(
+                purchase_value_features.astype(jnp.float32),
+                (
+                    (0, 0),
+                    (0, loss_padding_mask.shape[1] - purchase_value_features.shape[1]),
+                    (0, 0),
+                ),
+            )
+
+            def history_value_sums(weights: jax.Array) -> jax.Array:
+                w = weights.astype(jnp.float32)
+                return jnp.stack([(pvf[..., 0] * w).sum(), (pvf[..., 5] * w).sum(), w.sum()])
+
+            stats["_purchase-value-history-sums"] = history_value_sums(loss_padding_mask)
+        for head in value_heads:
+            value_ratio, baseline, value_mask = c.value_heads[head.ema_key]
+            if purchase_value_features is not None and head.slot == PURCHASE_VALUE_ACTION_INDEX:
+                stats[f"_{head.metric_prefix}-history-sums"] = history_value_sums(value_mask)
+            if head.slot is not None:
+                pred_ratio = candidate_continuous_preds[:, :, head.slot]
+                bin_logits = head_logits_by_index.get(head.slot) if head.bins else None
+            else:
+                assert head.event is not None and head.bins is not None
+                bin_logits = aux_logits[head.event]
+                pred_ratio = head.bins.readout(bin_logits)
+            value_loss, value_stats = value_head_loss_compute(
+                value_ratio,
+                baseline,
+                value_mask,
+                head.metric_prefix,
+                pred_ratio=pred_ratio,
+                bin_logits=bin_logits,
+                bins=head.bins,
+                huber_delta=head.huber_delta,
+                raw_weights=loss_weights,
+                normalizer=normalizer(f"value/{head.ema_key}"),
+                loss_denominator=value_loss_denominator,
+            )
+            continuous_action_loss_total += head.loss_weight * value_loss
+            for key in (
+                value_sums_key(head.metric_prefix),
+                value_binned_sums_key(head.metric_prefix),
+            ):
+                if key in value_stats:
+                    stats[key] = value_stats[key]
 
         regularization_loss = loss + self.config.act_l2_weight * stats["act-l2-loss"]
         if self.config.per_layer_l2_weight != 0:
@@ -4275,7 +4823,7 @@ class RecsysAggregatedModel(hk.Module):
         regularization_loss += continuous_action_loss_total
 
         if self.config.page_rl.enabled:
-            page_loss, page_stats = self.page_rl_loss(batch, c, *outputs[3:])
+            page_loss, page_stats = self.page_rl_loss(batch, c, *outputs[4:])
             if loss_normalizers is not None:
                 page_loss = page_loss / loss_normalizers["num_partials"]
                 page_stats = {
@@ -4415,7 +4963,16 @@ class RecsysAggregatedModel(hk.Module):
         mask = c.loss_padding_mask
         dpa_product_key = c.dpa_product_key[..., 0] if c.dpa_product_key is not None else None
         stats = dict(stats)
-        value_sums = stats.pop("_purchase-value-sums", None)
+        value_heads = self.config.value_heads()
+        value_sums = {
+            key: stats.pop(key)
+            for head in value_heads
+            for key in (
+                value_sums_key(head.metric_prefix),
+                value_binned_sums_key(head.metric_prefix),
+            )
+            if key in stats
+        }
 
         stats.update(
             safety_filter_stats(
@@ -4565,25 +5122,47 @@ class RecsysAggregatedModel(hk.Module):
                 valid_mask=xauc_mask,
             )
 
-        if value_sums is not None:
-            value_stats = purchase_value_stats(value_sums)
-            stats.update(value_stats)
-            slice_count = stats.get(
+        history_sums = {
+            prefix: stats.pop(f"_{prefix}-history-sums")
+            for prefix in ("purchase-value", *(head.metric_prefix for head in value_heads))
+            if f"_{prefix}-history-sums" in stats
+        }
+        for prefix, sums in history_sums.items():
+            count = jnp.maximum(sums[2], 1.0)
+            stats[f"{prefix}-history-same-adv-share"] = sums[0] / count
+            stats[f"{prefix}-history-user-valued-share"] = sums[1] / count
+        if value_heads:
+            delayed_clicked = stats.get(
                 "delayed_website_clicked_num_tokens", jnp.zeros((), jnp.float32)
             )
-            stats["purchase-value_delayed_website_clicked-ratio-valid"] = value_stats[
-                "purchase-value_delayed_website_clicked-valid-count"
-            ] / jnp.maximum(slice_count, 1)
-            if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:
-                smoothed_stats, value_ema = purchase_value_smoothed_stats(
-                    sums=value_sums,
-                    slice_count=slice_count,
-                    rce_ema=rce_ema,
-                    batch_size=rce_alpha[0] * smoothing_windows[0],
-                    smoothing_windows=self.config.purchase_value_smoothing_windows,
-                )
-                stats.update(smoothed_stats)
-                stats["_rce_ema"] = {**stats.get("_rce_ema", {}), **value_ema}
+            delayed_all = delayed_clicked + stats.get(
+                "delayed_website_non_clicked_num_tokens", jnp.zeros((), jnp.float32)
+            )
+            smoothing_batch_size = (
+                rce_alpha[0] * smoothing_windows[0]
+                if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None
+                else None
+            )
+            for head in value_heads:
+                value_stats = value_head_stats(value_sums, head.metric_prefix)
+                stats.update(value_stats)
+                slice_count = delayed_all if head.include_view_through else delayed_clicked
+                stats[f"{head.metric_prefix}-ratio-valid"] = value_stats[
+                    f"{head.metric_prefix}-valid-count"
+                ] / jnp.maximum(slice_count, 1)
+                if smoothing_batch_size is not None:
+                    assert rce_ema is not None
+                    smoothed_stats, value_ema = value_smoothed_stats(
+                        sums=value_sums[value_sums_key(head.metric_prefix)],
+                        slice_count=slice_count,
+                        rce_ema=rce_ema,
+                        batch_size=smoothing_batch_size,
+                        smoothing_windows=head.smoothing_windows,
+                        ema_key=head.ema_key,
+                        metric_prefix=head.metric_prefix,
+                    )
+                    stats.update(smoothed_stats)
+                    stats["_rce_ema"] = {**stats.get("_rce_ema", {}), **value_ema}
 
         embedding_norms: dict[str, tuple[jax.Array, jax.Array]] = metric_inputs["embedding_norms"]
         for name, (l2_norms, padding) in embedding_norms.items():
@@ -4696,6 +5275,7 @@ class RecsysAggregatedModel(hk.Module):
                 candidate_start_offset=candidate_start_offset,
                 product_surface=product_surface,
                 return_candidate_embeddings=decode,
+                purchase_value_features=self._purchase_value_features(batch),
             )
 
         candidate_logits = outputs[0]
@@ -4710,7 +5290,7 @@ class RecsysAggregatedModel(hk.Module):
         if not decode:
             noop = page_decode_noop_outputs(self.config.page_rl, page_decode)
             return candidate_logits, candidate_continuous_predictions, *noop
-        candidate_embeddings, user_embeddings = outputs[3:]
+        candidate_embeddings, user_embeddings = outputs[4:]
         per_user = [
             candidate_logits,
             candidate_continuous_predictions,

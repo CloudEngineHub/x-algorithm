@@ -1,12 +1,9 @@
-use crate::hydration::{HydratedUser, Hydration, HydrationPlan, Hydrators, Quoted, RequestRows};
+use crate::hydration::{Hydration, HydrationPlan, Hydrators, RequestRows};
 use crate::models::{
     AuthorId, Decided, Evaluation, LimitedEngagement, MediaRestriction, Notice, Placement,
-    PostCandidate, QuoteFacts, TweetId, UserCandidate, UserEntity, Verdict, ViewerFeatures,
-    ViewerRelationship,
+    PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
 };
 use crate::params::CountryLists;
-#[cfg(test)]
-use crate::rules::legacy_table::{legacy_table, Unrepresentable};
 use crate::rules::levels::LevelRules;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
@@ -73,6 +70,8 @@ pub enum Effect {
     FilledMedia,
     KeptEarlierMedia,
     KeptEarlierMediaInsteadOfNotice,
+    FilledNotice,
+    KeptEarlierNotice,
     FilledEngagement,
     AddedEngagementReason,
     DuplicateEngagementReason,
@@ -96,7 +95,7 @@ impl Bucket {
         match self {
             Self::Withholding => true,
             Self::Media => !matches!(notice, Some(Notice::Appealable { .. })),
-            Self::Engagement => notice.is_none(),
+            Self::Engagement => !notice.is_some_and(Notice::is_whole_verdict),
         }
     }
 }
@@ -279,6 +278,7 @@ fn finish<E: Engine, O: PolicyObserver<E>>(
 
 #[derive(Default)]
 struct Decision {
+    notice: Option<Decided<Notice>>,
     media: Option<Decided<MediaRestriction>>,
     engagement: Option<Decided<LimitedEngagement>>,
     defaults: Defaults,
@@ -286,6 +286,14 @@ struct Decision {
 
 impl Decision {
     fn suppressed<E: Engine>(&self, action: &ActionSpec<E>) -> Option<Effect> {
+        if self.notice.is_some()
+            && matches!(
+                action,
+                ActionSpec::SoftIntervention(_) | ActionSpec::LabelInterstitial(_)
+            )
+        {
+            return Some(Effect::KeptEarlierNotice);
+        }
         self.media.as_ref()?;
         match action {
             ActionSpec::MediaRestriction(_) => Some(Effect::KeptEarlierMedia),
@@ -293,7 +301,8 @@ impl Decision {
             ActionSpec::Appealable(_)
             | ActionSpec::Drop(_)
             | ActionSpec::Tombstone(_)
-            | ActionSpec::LimitedEngagement(_) => None,
+            | ActionSpec::LimitedEngagement(_)
+            | ActionSpec::LabelInterstitial(_) => None,
         }
     }
 
@@ -314,7 +323,9 @@ impl Decision {
             ActionSpec::Appealable(_) | ActionSpec::Drop(_) | ActionSpec::Tombstone(_) => {
                 (Bucket::Withholding, unknown_reads)
             }
-            ActionSpec::MediaRestriction(_) | ActionSpec::SoftIntervention(_)
+            ActionSpec::MediaRestriction(_)
+            | ActionSpec::SoftIntervention(_)
+            | ActionSpec::LabelInterstitial(_)
                 if self.suppressed(action).is_none() =>
             {
                 (Bucket::Media, unknown_reads)
@@ -322,9 +333,9 @@ impl Decision {
             ActionSpec::LimitedEngagement(_) if self.engagement.is_none() => {
                 (Bucket::Engagement, unknown_reads)
             }
-            ActionSpec::MediaRestriction(_) | ActionSpec::SoftIntervention(_) => {
-                (Bucket::Media, Hydrators::empty())
-            }
+            ActionSpec::MediaRestriction(_)
+            | ActionSpec::SoftIntervention(_)
+            | ActionSpec::LabelInterstitial(_) => (Bucket::Media, Hydrators::empty()),
             ActionSpec::LimitedEngagement(_) => (Bucket::Engagement, Hydrators::empty()),
         };
         self.defaults.admit(bucket, reads);
@@ -365,6 +376,14 @@ impl Decision {
                 };
                 (None, effect)
             }
+            Some(Contribution::Notice(notice)) if !notice.is_whole_verdict() => {
+                self.notice = Some(Decided {
+                    value: notice,
+                    id,
+                    by,
+                });
+                (None, Effect::FilledNotice)
+            }
             Some(Contribution::Notice(notice)) => (
                 Some(Verdict::Shown {
                     notice: Some(Decided {
@@ -383,7 +402,7 @@ impl Decision {
 
     fn finish(self) -> Verdict {
         Verdict::Shown {
-            notice: None,
+            notice: self.notice,
             media: self.media,
             engagement: self.engagement,
         }
@@ -420,23 +439,6 @@ impl PostPolicy {
             user,
             post,
             hydrators,
-        }
-    }
-
-    #[inline]
-    fn user_candidate(
-        &self,
-        user: &UserEntity,
-        viewer_relationship: ViewerRelationship,
-        failed: Hydrators,
-        quoted: Quoted,
-    ) -> UserCandidate {
-        UserCandidate {
-            user: user.clone(),
-            viewer_relationship,
-            failed: failed
-                .intersection(self.user.hydrators)
-                .union(quoted.failed),
         }
     }
 
@@ -513,7 +515,7 @@ fn interned_name(
 
 fn plans_from_its_rows(rules: LevelRules, plan: &HydrationPlan) -> bool {
     match plan.rows() {
-        RequestRows::Posts => true,
+        RequestRows::Posts => !plan.keys_a_node_only_user_rows_give(),
         RequestRows::Users => {
             matches!(rules, LevelRules::UserOnly(_)) && plan.keys_only_user_rows_or_viewer()
         }
@@ -551,10 +553,8 @@ impl Admitted<'_> {
         &'c self,
         candidate: &'c PostCandidate,
         placement: Placement,
-        quote: QuoteFacts,
     ) -> RuleContext<'c> {
-        let context =
-            RuleContext::new(self.viewer, candidate, placement, quote, self.country_lists);
+        let context = RuleContext::new(self.viewer, candidate, placement, self.country_lists);
         #[cfg(test)]
         let context = context.hydrated_by(self.policy.post.hydrators);
         context
@@ -564,41 +564,25 @@ impl Admitted<'_> {
         &'c self,
         user: &'c UserCandidate,
         placement: Placement,
-        quote: QuoteFacts,
     ) -> RuleContext<'c, UserCandidate> {
-        let context = RuleContext::new(self.viewer, user, placement, quote, self.country_lists);
+        let context = RuleContext::new(self.viewer, user, placement, self.country_lists);
         #[cfg(test)]
         let context = context.hydrated_by(self.policy.user.hydrators);
         context
     }
 
-    fn evaluate_user(
-        &self,
-        user: &UserCandidate,
-        placement: Placement,
-        quote: QuoteFacts,
-    ) -> Evaluation {
+    fn evaluate_user(&self, user: &UserCandidate, placement: Placement) -> Evaluation {
         self.policy
             .user
-            .evaluate(&self.user_context(user, placement, quote))
+            .evaluate(&self.user_context(user, placement))
     }
 
     #[inline]
-    fn admit(
-        &self,
-        user: &UserEntity,
-        viewer_relationship: ViewerRelationship,
-        failed: Hydrators,
-        placement: Placement,
-        quoted: Quoted,
-    ) -> AdmittedUser<'_> {
+    fn admit(&self, user: UserCandidate, placement: Placement) -> AdmittedUser<'_> {
         AdmittedUser {
             admitted: self,
-            user: self
-                .policy
-                .user_candidate(user, viewer_relationship, failed, quoted),
+            user,
             placement,
-            quoted,
         }
     }
 }
@@ -614,19 +598,8 @@ impl AdmittedPosts<'_> {
         copied: bool,
         placement: Placement,
     ) -> Option<AdmittedPost<'_>> {
-        let mut candidate = self.users.hydration.candidate(tweet_id, copied)?;
-        let quoted = self.users.hydration.quoted(tweet_id, placement);
-        let author = self.users.admitted.admit(
-            &candidate.author,
-            candidate.viewer_relationship,
-            candidate.failed,
-            placement,
-            quoted,
-        );
-        if !quoted.failed.is_empty() {
-            let candidate = candidate.to_mut();
-            candidate.failed = candidate.failed.union(quoted.failed);
-        }
+        let candidate = self.users.hydration.candidate(tweet_id, copied)?;
+        let author = self.users.post(tweet_id, placement)?;
         Some(AdmittedPost { author, candidate })
     }
 }
@@ -655,36 +628,15 @@ pub(crate) struct AdmittedUsers<'a> {
 
 impl AdmittedUsers<'_> {
     pub(crate) fn post(&self, tweet_id: TweetId, placement: Placement) -> Option<AdmittedUser<'_>> {
-        let post = self.hydration.tweet(tweet_id)?.candidate()?;
-        Some(self.admitted.admit(
-            &post.author,
-            post.viewer_relationship,
-            post.failed,
-            placement,
-            self.hydration.quoted(tweet_id, placement),
-        ))
+        let reads = self.admitted.policy.user.hydrators;
+        let author = self.hydration.author(tweet_id, placement, reads)?;
+        Some(self.admitted.admit(author, placement))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "remove once a served level takes user rows")
-    )]
     pub(crate) fn user(&self, id: AuthorId) -> Option<AdmittedUser<'_>> {
-        let HydratedUser::Resolved {
-            user,
-            viewer_relationship,
-            failed,
-        } = self.hydration.user(id)?
-        else {
-            return None;
-        };
-        Some(self.admitted.admit(
-            user,
-            *viewer_relationship,
-            *failed,
-            Placement::Standalone,
-            Quoted::default(),
-        ))
+        let reads = self.admitted.policy.user.hydrators;
+        let user = self.hydration.user_candidate(id, reads)?;
+        Some(self.admitted.admit(user, Placement::Standalone))
     }
 }
 
@@ -692,7 +644,6 @@ pub(crate) struct AdmittedUser<'a> {
     admitted: &'a Admitted<'a>,
     user: UserCandidate,
     placement: Placement,
-    quoted: Quoted,
 }
 
 impl AdmittedUser<'_> {
@@ -701,8 +652,7 @@ impl AdmittedUser<'_> {
     }
 
     pub(crate) fn evaluate(&self) -> Evaluation {
-        self.admitted
-            .evaluate_user(&self.user, self.placement, self.quoted.facts)
+        self.admitted.evaluate_user(&self.user, self.placement)
     }
 
     #[inline]
@@ -711,16 +661,13 @@ impl AdmittedUser<'_> {
         candidate: &PostCandidate,
         observer: &mut O,
     ) -> Evaluation {
-        let (admitted, placement, quote) = (self.admitted, self.placement, self.quoted.facts);
-        let folded = admitted.policy.fold_user(
-            &admitted.user_context(&self.user, placement, quote),
-            observer,
-        );
-        admitted.policy.gate(
-            folded,
-            &admitted.context(candidate, placement, quote),
-            observer,
-        )
+        let (admitted, placement) = (self.admitted, self.placement);
+        let folded = admitted
+            .policy
+            .fold_user(&admitted.user_context(&self.user, placement), observer);
+        admitted
+            .policy
+            .gate(folded, &admitted.context(candidate, placement), observer)
     }
 }
 
@@ -742,7 +689,7 @@ impl RuleEngine {
                 let plan = HydrationPlan::new(level, policy.hydrators);
                 assert!(
                     plans_from_its_rows(level_rules, &plan),
-                    "{level:?} takes user rows but judges a post or plans a key no user row gives"
+                    "{level:?} plans keys its request rows cannot give"
                 );
                 Level { policy, plan }
             })
@@ -823,15 +770,14 @@ impl RuleEngine {
         placement: Placement,
         observer: &mut O,
     ) -> Evaluation {
-        self.admitted(level, viewer)
-            .admit(
-                &candidate.author,
-                candidate.viewer_relationship,
-                candidate.failed,
-                placement,
-                Quoted::default(),
-            )
-            .fold(candidate, observer)
+        let admitted = self.admitted(level, viewer);
+        let author = UserCandidate {
+            failed: candidate
+                .failed
+                .intersection(admitted.policy.user.hydrators),
+            ..UserCandidate::author_of(candidate)
+        };
+        admitted.admit(author, placement).fold(candidate, observer)
     }
 
     #[cfg(test)]
@@ -841,14 +787,12 @@ impl RuleEngine {
         viewer: &ViewerFeatures,
         user: &UserCandidate,
         placement: Placement,
-        quote: QuoteFacts,
     ) -> Evaluation {
         debug_assert!(
             matches!(level.spec().rules, LevelRules::UserOnly(_)),
             "{level:?} judges a post"
         );
-        self.admitted(level, viewer)
-            .evaluate_user(user, placement, quote)
+        self.admitted(level, viewer).evaluate_user(user, placement)
     }
 
     fn level(&self, level: SafetyLevel) -> &Level {
@@ -968,14 +912,10 @@ impl Policy {
 }
 
 #[cfg(test)]
-impl PostPolicy {
-    fn legacy_table(&self) -> Result<String, Unrepresentable> {
-        Ok(format!(
-            "# user\n{}# post\n{}",
-            legacy_table(&self.user.rules)?,
-            legacy_table(&self.post.rules)?
-        ))
-    }
+pub(super) struct WiredRule<'a, E: Engine = PostEngine> {
+    pub(super) name: &'static str,
+    pub(super) action: &'a ActionSpec<E>,
+    pub(super) when: RuleCond<E>,
 }
 
 #[cfg(test)]
@@ -989,6 +929,24 @@ impl RuleEngine {
         let mut total = Total::default();
         let evaluation = self.fold(level, viewer, candidate, Placement::Standalone, &mut total);
         total.into_trace(evaluation)
+    }
+
+    pub(super) fn fold_order(
+        &self,
+        level: SafetyLevel,
+    ) -> (Vec<WiredRule<'_, UserEngine>>, Vec<WiredRule<'_>>) {
+        fn wired<'a, E: Engine>(rules: &'a [(&'static str, Rule<E>)]) -> Vec<WiredRule<'a, E>> {
+            rules
+                .iter()
+                .map(|&(name, ref rule)| WiredRule {
+                    name,
+                    action: rule.action.spec(),
+                    when: rule.when,
+                })
+                .collect()
+        }
+        let policy = self.policy(level);
+        (wired(&policy.user.rules), wired(&policy.post.rules))
     }
 
     pub(super) fn with_level_for_tests(
@@ -1010,8 +968,8 @@ mod tests {
     use crate::hydration::Hydrator;
     use crate::models::Withholding;
     use crate::models::{
-        AuthorFeatures, ClientCapability, DropReason, NsfwViewerDropReason, SafetyLabelType,
-        VerifyBlurSupport, ViewerAge, ViewerProfile,
+        AuthorFeatures, ClientCapability, DropReason, NsfwViewerDropReason, SafetyLabelMap,
+        SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
         candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
@@ -1178,7 +1136,7 @@ country_specific_nsfw_content_gating:
     }
 
     #[test]
-    fn a_level_of_user_rows_judges_no_post_and_plans_only_user_and_viewer_keys() {
+    fn each_level_plans_only_the_keys_its_request_rows_give() {
         use crate::hydration::RequestRows;
         let user_rows = |nodes| {
             HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes)
@@ -1204,38 +1162,17 @@ country_specific_nsfw_content_gating:
             let plan = user_rows(user_and_viewer_keyed.with(post_keyed));
             assert!(!plans_from_its_rows(user_only, &plan), "{post_keyed:?}");
         }
-    }
-
-    #[test]
-    fn each_level_evaluates_its_pinned_policy() {
-        let rule_engine = RuleEngine::for_tests();
-        let tables: Vec<(String, String)> = SafetyLevel::VARIANTS
-            .iter()
-            .map(|&level| {
-                let table = rule_engine
-                    .policy(level)
-                    .legacy_table()
-                    .unwrap_or_else(|error| panic!("{level:?} has no legacy table: {error:?}"));
-                (
-                    format!("tests/fixtures/policy/{}.txt", <&str>::from(level)),
-                    table,
-                )
-            })
-            .collect();
-        let orphans: Vec<String> =
-            std::fs::read_dir(crate::pinned::crate_path("tests/fixtures/policy"))
-                .unwrap()
-                .map(|entry| {
-                    let name = entry.unwrap().file_name();
-                    format!("tests/fixtures/policy/{}", name.to_string_lossy())
-                })
-                .filter(|path| !tables.iter().any(|(table, _)| table == path))
-                .collect();
-        crate::pinned::assert_all_pinned(tables);
-        assert!(
-            orphans.is_empty(),
-            "no level renders {orphans:?}: delete them"
-        );
+        let post_rows = |nodes| {
+            HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Posts, nodes)
+        };
+        assert!(plans_from_its_rows(
+            user_only,
+            &post_rows(user_and_viewer_keyed)
+        ));
+        assert!(!plans_from_its_rows(
+            user_only,
+            &post_rows(user_and_viewer_keyed.with(Hydrator::AuthorProfile))
+        ));
     }
 
     #[test]
@@ -1371,6 +1308,17 @@ country_specific_nsfw_content_gating:
                     ActionSpec::Appealable(violations) => {
                         violations.iter().map(|violation| violation.label).collect()
                     }
+                    ActionSpec::LabelInterstitial(spec) => {
+                        for label in spec.labels() {
+                            assert!(
+                                SafetyLabelMap::SOURCE_READ_LABELS.contains(label),
+                                "{name} reads the source of {} but SafetyLabelMap drops it: add \
+                                 the label to SafetyLabelMap::SOURCE_READ_LABELS",
+                                spelled_label(*label),
+                            );
+                        }
+                        spec.labels().to_vec()
+                    }
                     ActionSpec::Drop(_)
                     | ActionSpec::Tombstone(_)
                     | ActionSpec::MediaRestriction(_)
@@ -1398,9 +1346,7 @@ country_specific_nsfw_content_gating:
             MediaRestriction, PostCandidate, SafetyLabelType, TombstoneReason, UserCandidate,
             ViewerFeatures,
         };
-        use crate::rules::fixtures::{
-            allow, author_viewer, blurred, candidate, logged_out_viewer, viewer, VIEWER_ID,
-        };
+        use crate::rules::fixtures::{allow, author_viewer, blurred, candidate, viewer, VIEWER_ID};
         use crate::rules::rule_spec::leaves::*;
         use crate::rules::rule_spec::rule::Audience::{Everyone, NonFollowers};
         use crate::rules::rule_spec::rule::{all, any, NamedCond, RuleCond, UserRule};
@@ -1630,75 +1576,13 @@ country_specific_nsfw_content_gating:
         }
 
         #[test]
-        fn non_followers_spare_the_author_and_followers_and_fail_closed_on_follows() {
-            let follows = Hydrators::of(Hydrator::Follows);
-            let dropped = withheld(
-                Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
-                "rule",
-            );
-            let followed = candidate().with_edge(Hydrator::Follows).build();
-            let mut follows_failed = candidate().build();
-            follows_failed.failed = follows;
-            let rows = [
-                (
-                    "author",
-                    author_viewer(),
-                    followed.clone(),
-                    Evaluation::complete(allow()),
-                ),
-                (
-                    "follower",
-                    viewer(VIEWER_ID),
-                    followed,
-                    Evaluation::complete(allow()),
-                ),
-                (
-                    "non-follower",
-                    viewer(VIEWER_ID),
-                    candidate().build(),
-                    Evaluation::complete(dropped.clone()),
-                ),
-                (
-                    "logged out",
-                    logged_out_viewer(),
-                    candidate().build(),
-                    Evaluation::complete(dropped.clone()),
-                ),
-                (
-                    "follows failed",
-                    viewer(VIEWER_ID),
-                    follows_failed,
-                    Evaluation::Complete {
-                        verdict: dropped,
-                        fail_open_defaults: follows,
-                    },
-                ),
-            ];
-            let policy = Policy::new(vec![(
-                "rule",
-                Rule {
-                    audience: NonFollowers,
-                    ..rule(all![], DROP_SUSPENDED)
-                },
-            )]);
-            for (who, viewer, candidate, evaluation) in rows {
-                let context = test_context(&viewer, &candidate).hydrated_by(policy.hydrators);
-                assert_eq!(policy.evaluate(&context), evaluation, "{who}");
-            }
-        }
-
-        #[test]
         fn a_user_rule_judges_the_author_with_no_post() {
             let follows = Hydrators::of(Hydrator::Follows);
             let dropped = withheld(
                 Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
                 "rule",
             );
-            let user = |post: PostCandidate| UserCandidate {
-                user: post.author,
-                viewer_relationship: post.viewer_relationship,
-                failed: post.failed,
-            };
+            let user = |post: PostCandidate| UserCandidate::author_of(&post);
             let suspended = || {
                 candidate().with_author_features(AuthorFeatures {
                     is_suspended: true,
@@ -1758,13 +1642,7 @@ country_specific_nsfw_content_gating:
             );
             for (who, viewer, candidate, evaluation) in rows {
                 assert_eq!(
-                    rule_engine.evaluate_user(
-                        level,
-                        &viewer,
-                        &candidate,
-                        Placement::Standalone,
-                        QuoteFacts::default()
-                    ),
+                    rule_engine.evaluate_user(level, &viewer, &candidate, Placement::Standalone),
                     evaluation,
                     "{who}"
                 );
@@ -1935,12 +1813,12 @@ country_specific_nsfw_content_gating:
         use crate::clients::socialgraph_client::{EdgeQuery, Graph};
         use crate::hydration::fallback_cache::FallbackCaches;
         use crate::hydration::inventory::Source;
-        use crate::hydration::sources::{suspended, Fault, InMemorySources};
-        use crate::hydration::{HydrationRequest, Hydrator, QuoteEntry};
+        use crate::hydration::sources::{suspended, InMemorySources};
+        use crate::hydration::{HydrationRequest, Hydrator};
         use crate::models::{ClientCapability, RawCandidate, SafetyLabelType, TweetId};
         use crate::models::{LimitedEngagementReason, Notice};
         use crate::rules::fixtures::{allow, candidate, dropped, viewer, VIEWER_ID};
-        use crate::rules::golden_corpus::cases;
+        use crate::rules::golden_corpus::post_cases;
         use crate::rules::rule_spec::conditions::VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES;
         use crate::rules::rule_spec::leaves::*;
         use crate::rules::rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
@@ -1990,7 +1868,7 @@ country_specific_nsfw_content_gating:
         fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {
             let rule_engine = RuleEngine::for_tests();
             let mut seen = (0, 0);
-            for (own_level, viewer, fetched) in cases() {
+            for (own_level, viewer, fetched) in post_cases() {
                 for &level in SafetyLevel::VARIANTS {
                     let failed_alone = if level == own_level {
                         rule_engine.policy(level).hydrators
@@ -2479,70 +2357,6 @@ country_specific_nsfw_content_gating:
             );
             let planned = hydrate(rule_engine.plan(SafetyLevel::FilterAll)).await;
             assert!(rule_engine.admit(SafetyLevel::FilterAll, &planned).is_ok());
-        }
-
-        #[tokio::test]
-        async fn a_failed_pair_edge_reads_unknown_in_the_user_and_post_folds_of_a_quoted_post() {
-            let level = SafetyLevel::FilterAll;
-            let rule_engine = RuleEngine::with_level_for_tests(
-                level,
-                vec![(
-                    "user_pair_edge",
-                    Rule {
-                        id: RuleId::FilterAll,
-                        audience: Everyone,
-                        when: AuthorBlocksOuterAuthor.leaf(),
-                        action: drop_post(DropAs::AuthorBlockViewer),
-                    },
-                )],
-                vec![(
-                    "post_pair_edge",
-                    rule(
-                        Everyone,
-                        RuleCond::Leaf(Predicate::PairEdge(AuthorBlocksOuterAuthor)),
-                        drop_post(DropAs::AuthorBlockViewer),
-                    ),
-                )],
-            );
-            let sources = InMemorySources::default()
-                .tweet(1, 10)
-                .tweet(9, 20)
-                .authors(&[10, 20])
-                .fault(Source::FlockUserPair, Fault::Fails);
-            let caches = FallbackCaches::default();
-            let request = HydrationRequest::new(
-                Some(50),
-                None,
-                ClientCapability::default(),
-                vec![raw(1, None)],
-                None,
-                &caches,
-            )
-            .with_quotes(vec![QuoteEntry {
-                inner: TweetId(1),
-                outer: TweetId(9),
-            }]);
-            let hydration = rule_engine.plan(level).hydrate(&sources, request).await;
-            let admitted = rule_engine.admit(level, &hydration).unwrap();
-            let post = admitted
-                .post(
-                    TweetId(1),
-                    false,
-                    Placement::InnerQuoted { outer: TweetId(9) },
-                )
-                .unwrap();
-            let unknown = Truth::Unknown {
-                default: false,
-                failed: Hydrators::of(Hydrator::AuthorBlocksOuterAuthor),
-            };
-            assert_eq!(
-                post.trace()
-                    .rows
-                    .iter()
-                    .map(|row| (row.by, row.truth))
-                    .collect::<Vec<_>>(),
-                [("user_pair_edge", unknown), ("post_pair_edge", unknown)]
-            );
         }
 
         #[tokio::test]

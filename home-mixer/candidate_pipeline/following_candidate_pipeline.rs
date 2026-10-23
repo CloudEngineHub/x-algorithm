@@ -20,6 +20,7 @@ use crate::query_hydrators::served_history_query_hydrator::ServedHistoryQueryHyd
 use crate::selectors::FollowingBlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
+use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -77,6 +78,7 @@ impl FollowingCandidatePipeline {
             who_to_follow_client,
             prompts_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -132,6 +134,7 @@ impl FollowingCandidatePipeline {
                 ) as Arc<dyn PromptsClient + Send + Sync>
             },
             AdsInjectionLoggingSideEffect::prod(),
+            FunnelTraceSideEffect::prod(),
             ServedAdHistoryCacheSideEffect::prod(datacenter),
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
@@ -148,6 +151,7 @@ impl FollowingCandidatePipeline {
             who_to_follow_client,
             prompts_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -166,6 +170,7 @@ impl FollowingCandidatePipeline {
         who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
         prompts_client: Arc<dyn PromptsClient + Send + Sync>,
         ads_injection_logging: AdsInjectionLoggingSideEffect,
+        funnel_trace: FunnelTraceSideEffect,
         served_ad_history: ServedAdHistoryCacheSideEffect,
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
@@ -199,6 +204,7 @@ impl FollowingCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> =
             Arc::new(vec![
                 Box::new(ads_injection_logging),
+                Box::new(funnel_trace),
                 Box::new(served_ad_history),
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
@@ -239,6 +245,7 @@ impl FollowingCandidatePipeline {
         let prompts_client: Arc<dyn PromptsClient + Send + Sync> = Arc::new(MockPromptsClient);
         let mock_kafka = Arc::new(MockKafkaPublisherClient) as Arc<dyn KafkaPublisherClient>;
         let ads_injection_logging = AdsInjectionLoggingSideEffect::new(Arc::clone(&mock_kafka));
+        let funnel_trace = FunnelTraceSideEffect::new(Arc::clone(&mock_kafka));
         let served_ad_history = ServedAdHistoryCacheSideEffect::new(Arc::new(
             xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
         ));
@@ -255,6 +262,7 @@ impl FollowingCandidatePipeline {
             who_to_follow_client,
             prompts_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,

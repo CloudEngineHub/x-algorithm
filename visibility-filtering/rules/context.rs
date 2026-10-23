@@ -1,7 +1,7 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     tweet_timestamp_ms, ClientCapability, PairEdges, Placement, PostCandidate, PostEntity,
-    QuoteFacts, QuoteLink, UserEntity, ViewerFeatures, ViewerRelationship,
+    QuoteFacts, UserEntity, ViewerFeatures, ViewerRelationship,
 };
 use crate::params::{CountryList, CountryLists};
 use crate::rules::rule_spec::engine::Candidate;
@@ -21,7 +21,6 @@ pub(super) struct CoreFacts<'a> {
     request_country: Option<&'a str>,
     client_capability: ClientCapability,
     placement: Placement,
-    quote: QuoteFacts,
     country_lists: &'a CountryLists,
 }
 
@@ -33,7 +32,6 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
         viewer: &'a ViewerFeatures,
         candidate: &'a C,
         placement: Placement,
-        quote: QuoteFacts,
         country_lists: &'a CountryLists,
     ) -> Self {
         Self {
@@ -42,7 +40,6 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
                 request_country: viewer.country_code.as_deref(),
                 client_capability: viewer.client_capability,
                 placement,
-                quote,
                 country_lists,
             },
             viewer,
@@ -88,7 +85,7 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
 
     #[inline]
     pub(super) fn acquire_pair_edges(&self, node: Hydrator) -> PairEdges {
-        self.reads(Hydrators::of(node)).facts.quote.pair_edges
+        self.reads(Hydrators::of(node)).candidate.quote().pair_edges
     }
 
     #[inline]
@@ -106,8 +103,15 @@ impl RuleContext<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct At<'c, 'a, C = PostCandidate>(&'c RuleContext<'a, C>);
+
+impl<C> Clone for At<'_, '_, C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C> Copy for At<'_, '_, C> {}
 
 impl<'a, C: Candidate> At<'_, 'a, C> {
     #[inline]
@@ -118,6 +122,11 @@ impl<'a, C: Candidate> At<'_, 'a, C> {
     #[inline]
     pub(super) fn viewer(self) -> &'a ViewerFeatures {
         self.0.viewer
+    }
+
+    #[inline]
+    pub(super) fn quote(self) -> QuoteFacts {
+        self.0.candidate.quote()
     }
 }
 
@@ -167,11 +176,6 @@ impl<'a> CoreFacts<'a> {
     #[inline]
     pub(super) fn placement(self) -> Placement {
         self.placement
-    }
-
-    #[inline]
-    pub(super) fn quote_link(self) -> Option<QuoteLink> {
-        self.quote.link
     }
 
     #[inline]

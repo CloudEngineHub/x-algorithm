@@ -40,6 +40,21 @@ pub struct ViewerProfile {
     pub is_read_only: bool,
     pub account_country_code: Option<String>,
     pub is_new_account: bool,
+    pub is_suspended: bool,
+    pub is_deactivated: bool,
+    pub has_uqf_enabled: bool,
+    pub mention_filter_is_following: bool,
+    pub has_blink_label: bool,
+    pub notification_filters: NotificationFilters,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotificationFilters {
+    pub no_confirmed_email: bool,
+    pub no_confirmed_phone: bool,
+    pub default_profile_image: bool,
+    pub new_users: bool,
+    pub not_followed_by: bool,
 }
 
 impl ViewerProfile {
@@ -52,9 +67,7 @@ impl ViewerProfile {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::VariantArray)]
 pub enum VerifyBlurSupport {
     #[default]
     Unsupported,
@@ -63,7 +76,7 @@ pub enum VerifyBlurSupport {
     Supported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientCapability {
     pub verify_blur_support: Option<VerifyBlurSupport>,
     pub modern_blur: bool,
@@ -72,7 +85,6 @@ pub struct ClientCapability {
     pub gore_blur_ignores_settings: bool,
     pub fosnr_rules: bool,
     pub fosnr_fallback_drops: bool,
-    #[serde(default)]
     pub soft_nsfw_new_user_drop: bool,
 }
 

@@ -20,6 +20,7 @@ use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
+use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -74,6 +75,7 @@ impl ForYouCandidatePipeline {
         let (
             ad_index_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -96,6 +98,7 @@ impl ForYouCandidatePipeline {
                 ) as Arc<dyn AdIndexClient + Send + Sync>
             },
             AdsInjectionLoggingSideEffect::prod(),
+            FunnelTraceSideEffect::prod(),
             ServedAdHistoryCacheSideEffect::prod(datacenter),
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
@@ -158,6 +161,7 @@ impl ForYouCandidatePipeline {
             strato_client,
             ad_index_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
@@ -179,6 +183,7 @@ impl ForYouCandidatePipeline {
         strato_client: Arc<dyn StratoClient + Send + Sync>,
         ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
         ads_injection_logging: AdsInjectionLoggingSideEffect,
+        funnel_trace: FunnelTraceSideEffect,
         served_ad_history: ServedAdHistoryCacheSideEffect,
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
@@ -226,6 +231,7 @@ impl ForYouCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> =
             Arc::new(vec![
                 Box::new(ads_injection_logging),
+                Box::new(funnel_trace),
                 Box::new(served_ad_history),
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
@@ -259,6 +265,7 @@ impl ForYouCandidatePipeline {
         let ad_index_client: Arc<dyn AdIndexClient + Send + Sync> = Arc::new(MockAdIndexClient);
         let mock_kafka = Arc::new(MockKafkaPublisherClient) as Arc<dyn KafkaPublisherClient>;
         let ads_injection = AdsInjectionLoggingSideEffect::new(Arc::clone(&mock_kafka));
+        let funnel_trace = FunnelTraceSideEffect::new(Arc::clone(&mock_kafka));
         let served_ad_history = ServedAdHistoryCacheSideEffect::new(Arc::new(
             xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
         ));
@@ -283,6 +290,7 @@ impl ForYouCandidatePipeline {
             strato_client,
             ad_index_client,
             ads_injection,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,

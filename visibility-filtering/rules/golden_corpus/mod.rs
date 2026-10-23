@@ -3,14 +3,15 @@ mod age_verification;
 mod article;
 mod author_state;
 mod baseline;
-mod builders;
 mod community;
 mod conversation_control;
 mod exclusive_content;
 mod interstitial;
+mod label_interstitial;
 mod legacy_interstitial;
 mod local_regulations;
 mod local_tweet;
+mod notifications;
 mod oon_media;
 mod oon_tweet_label;
 mod oon_user_label;
@@ -24,12 +25,12 @@ mod tweet_state;
 
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    Decided, Evaluation, Notice, Placement, PostCandidate, QuoteFacts, TweetId, UserCandidate,
-    Verdict, ViewerFeatures, Withholding,
+    Decided, Evaluation, Notice, Placement, PostCandidate, TweetId, UserCandidate, Verdict,
+    ViewerFeatures, ViewerRelationship, Withholding,
 };
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
-use crate::rules::levels::PostRules;
+use crate::rules::levels::{LevelRules, PostRules};
 use crate::rules::rule_spec::engine::{Engine, UserEngine};
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::{placed_test_context, RuleEngine, SafetyLevel};
@@ -50,50 +51,69 @@ enum Role {
     RetweetSource(Box<Role>),
 }
 
+#[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "test-only rows, built once per test, where the size costs nothing"
+)]
+pub(super) enum Subject {
+    Post(PostCandidate),
+    User(UserCandidate),
+}
+
 struct Row {
     name: &'static str,
-    post: PostCandidate,
+    subject: Subject,
     expect: Vec<(SafetyLevel, Role, Verdict)>,
 }
 
-struct UserRow {
-    name: &'static str,
-    role: &'static str,
-    viewer: ViewerFeatures,
-    user: UserCandidate,
-    quote: QuoteFacts,
-    expected: Verdict,
-}
-
-struct CorpusCase {
+pub(super) struct CorpusCase {
     name: String,
     level: SafetyLevel,
-    viewer: ViewerFeatures,
-    candidate: PostCandidate,
-    placement: Placement,
+    pub(super) viewer: ViewerFeatures,
+    pub(super) subject: Subject,
+    pub(super) placement: Placement,
     expected: Verdict,
 }
 
 const OUTER_TWEET_ID: TweetId = TweetId(2);
 
+impl Subject {
+    fn author_id(&self) -> u64 {
+        match self {
+            Subject::Post(post) => post.author.id,
+            Subject::User(user) => user.user.id,
+        }
+    }
+
+    fn viewer_relationship_mut(&mut self) -> &mut ViewerRelationship {
+        match self {
+            Subject::Post(post) => &mut post.viewer_relationship,
+            Subject::User(user) => &mut user.viewer_relationship,
+        }
+    }
+}
+
 impl Role {
-    fn view(&self, candidate: &mut PostCandidate) -> (String, ViewerFeatures, Placement) {
+    fn view(&self, subject: &mut Subject) -> (String, ViewerFeatures, Placement) {
         let standalone = |name: &str, viewer| (name.to_owned(), viewer, Placement::Standalone);
         match self {
             Role::NonFollower => standalone("non_follower", viewer(VIEWER_ID)),
-            Role::Author => standalone("author", viewer(candidate.author.id)),
+            Role::Author => standalone("author", viewer(subject.author_id())),
             Role::Follower => {
-                candidate.viewer_relationship.follows = true;
+                subject.viewer_relationship_mut().follows = true;
                 standalone("follower", viewer(VIEWER_ID))
             }
             Role::LoggedOut => {
-                candidate.viewer_relationship = Default::default();
-                candidate.post.edges = Hydrators::empty();
+                *subject.viewer_relationship_mut() = ViewerRelationship::default();
+                if let Subject::Post(post) = subject {
+                    post.post.edges = Hydrators::empty();
+                }
                 standalone("logged_out", logged_out_viewer())
             }
             Role::As(role_name, viewer) => standalone(role_name, viewer.clone()),
             Role::InnerQuoted(role) => {
-                let (role_name, viewer, _) = role.view(candidate);
+                let (role_name, viewer, _) = role.view(subject);
                 (
                     format!("inner_quoted_{role_name}"),
                     viewer,
@@ -103,7 +123,7 @@ impl Role {
                 )
             }
             Role::RetweetSource(role) => {
-                let (role_name, viewer, _) = role.view(candidate);
+                let (role_name, viewer, _) = role.view(subject);
                 (
                     format!("retweet_source_{role_name}"),
                     viewer,
@@ -116,19 +136,41 @@ impl Role {
 
 impl Row {
     fn expand(self) -> impl Iterator<Item = CorpusCase> {
-        let Row { name, post, expect } = self;
+        let Row {
+            name,
+            subject,
+            expect,
+        } = self;
         expect.into_iter().map(move |(level, role, expected)| {
-            let mut candidate = post.clone();
-            let (role_name, viewer, placement) = role.view(&mut candidate);
+            assert_eq!(
+                matches!(level.spec().rules, LevelRules::UserOnly(_)),
+                matches!(subject, Subject::User(_)),
+                "{name}: {level:?} judges the other subject kind",
+            );
+            let mut subject = subject.clone();
+            let (role_name, viewer, placement) = role.view(&mut subject);
             CorpusCase {
                 name: format!("{name}/{level:?}/{role_name}"),
                 level,
                 viewer,
-                candidate,
+                subject,
                 placement,
                 expected,
             }
         })
+    }
+}
+
+impl CorpusCase {
+    fn evaluate(&self, rule_engine: &RuleEngine) -> Evaluation {
+        match &self.subject {
+            Subject::Post(candidate) => {
+                rule_engine.evaluate(self.level, &self.viewer, candidate, self.placement)
+            }
+            Subject::User(user) => {
+                rule_engine.evaluate_user(self.level, &self.viewer, user, self.placement)
+            }
+        }
     }
 }
 
@@ -156,9 +198,7 @@ fn golden_corpus_pins_policy_verdicts() {
     assert_eq!(names.len(), cases.len(), "duplicate corpus case name");
     let mut failures = Vec::new();
     for case in cases {
-        let verdict = rule_engine
-            .evaluate(case.level, &case.viewer, &case.candidate, case.placement)
-            .into_verdict();
+        let verdict = case.evaluate(&rule_engine).into_verdict();
         if matches!(&case.expected, Verdict::Shown { media: Some(_), .. }) {
             let (action, reason) = proto_action(verdict.clone());
             assert_eq!(action.encode_to_vec(), [0x20, 0x01], "{}", case.name);
@@ -185,42 +225,6 @@ fn golden_corpus_pins_policy_verdicts() {
 }
 
 #[test]
-fn the_user_table_pins_quoted_tweet_rules_verdicts() {
-    let rule_engine = RuleEngine::for_tests();
-    let rows = quoted_tweet_rules::rows();
-    let names: BTreeSet<(&str, &str)> = rows.iter().map(|row| (row.name, row.role)).collect();
-    assert_eq!(names.len(), rows.len(), "duplicate user table row");
-    let failures: Vec<String> = rows
-        .iter()
-        .filter_map(|row| {
-            let verdict = rule_engine
-                .evaluate_user(
-                    QuotedTweetRules,
-                    &row.viewer,
-                    &row.user,
-                    Placement::InnerQuoted {
-                        outer: OUTER_TWEET_ID,
-                    },
-                    row.quote,
-                )
-                .into_verdict();
-            (verdict != row.expected).then(|| {
-                format!(
-                    "{}/{}:\n  expected {:?}\n  got      {:?}",
-                    row.name, row.role, row.expected, verdict
-                )
-            })
-        })
-        .collect();
-    assert!(
-        failures.is_empty(),
-        "{} user table row(s) diverged:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
-}
-
-#[test]
 #[ignore]
 fn bench_corpus_evaluation() {
     use std::hint::black_box;
@@ -240,12 +244,7 @@ fn bench_corpus_evaluation() {
         let start = Instant::now();
         for _ in 0..ROUNDS {
             for case in &cases {
-                black_box(rule_engine.evaluate(
-                    case.level,
-                    black_box(&case.viewer),
-                    black_box(&case.candidate),
-                    case.placement,
-                ));
+                black_box(black_box(case).evaluate(&rule_engine));
             }
         }
         let evaluations = u128::from(ROUNDS) * cases.len() as u128;
@@ -263,9 +262,11 @@ fn every_node_failing_changes_no_corpus_verdict_and_only_a_must_have_one_makes_i
     let best_effort = Hydrators::all().difference(Hydrators::all().must_have());
     for mut case in corpus() {
         for (failed, is_partial) in [(best_effort, false), (Hydrators::all(), true)] {
-            case.candidate.failed = failed;
-            let evaluation =
-                rule_engine.evaluate(case.level, &case.viewer, &case.candidate, case.placement);
+            match &mut case.subject {
+                Subject::Post(post) => post.failed = failed,
+                Subject::User(user) => user.failed = failed,
+            }
+            let evaluation = case.evaluate(&rule_engine);
             assert_eq!(
                 matches!(evaluation, Evaluation::Partial { .. }),
                 is_partial,
@@ -334,6 +335,7 @@ fn outcome(evaluation: &Evaluation) -> (&'static str, Vec<&'static str>) {
                 .map(|notice| match notice.value {
                     Notice::Appealable { .. } => "Appealable",
                     Notice::SoftIntervention(_) => "SoftIntervention",
+                    Notice::LabelInterstitial(_) => "LabelInterstitial",
                 })
                 .chain(media.iter().map(|_| "MediaRestriction"))
                 .chain(engagement.iter().map(|_| "LimitedEngagement"))
@@ -367,10 +369,13 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
             .chain(once(used))
             .collect();
         for case in &cases {
+            let Subject::Post(fetched) = &case.subject else {
+                continue;
+            };
             for &failed in &failures {
                 let candidate = PostCandidate {
                     failed,
-                    ..case.candidate.clone()
+                    ..fetched.clone()
                 };
                 let gate = rule_engine.evaluate(level, &case.viewer, &candidate, case.placement);
                 let fold = reference.evaluate(&placed_test_context(
@@ -398,42 +403,50 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
 
 #[test]
 fn every_wired_rule_decides_a_corpus_case() {
+    const KEYED_BY_LEVEL: [SafetyLevel; 2] = [TimelineHomeHydration, QuotedTweetRules];
     let rule_engine = RuleEngine::for_tests();
-    let wired: BTreeSet<&'static str> = SafetyLevel::VARIANTS
+    let decided: BTreeSet<(&'static str, &'static str)> = corpus()
         .iter()
-        .flat_map(|&level| rule_engine.wired_rule_names(level))
+        .flat_map(|c| {
+            let level = <&'static str>::from(c.level);
+            deciders(&c.expected)
+                .into_iter()
+                .map(move |rule| (level, rule))
+        })
         .collect();
-    let deciders: BTreeSet<&'static str> = corpus()
+    let missing: Vec<(SafetyLevel, &'static str)> = SafetyLevel::VARIANTS
         .iter()
-        .flat_map(|c| deciders(&c.expected))
-        .chain(
-            quoted_tweet_rules::rows()
-                .iter()
-                .flat_map(|row| deciders(&row.expected)),
-        )
+        .flat_map(|&level| {
+            rule_engine
+                .wired_rule_names(level)
+                .into_iter()
+                .map(move |rule| (level, rule))
+        })
+        .filter(|&(level, rule)| {
+            if KEYED_BY_LEVEL.contains(&level) {
+                !decided.contains(&(<&'static str>::from(level), rule))
+            } else {
+                !decided.iter().any(|&(_, decider)| decider == rule)
+            }
+        })
         .collect();
-    let missing: Vec<&&'static str> = wired.difference(&deciders).collect();
     assert!(
         missing.is_empty(),
-        "rules wired in RuleEngine but never the decider of any corpus case: {missing:?}"
+        "wired rules that decide no corpus case, at their own level for {KEYED_BY_LEVEL:?}: {missing:?}"
     );
 }
 
-fn corpus() -> Vec<CorpusCase> {
+pub(super) fn corpus() -> Vec<CorpusCase> {
     rows().into_iter().flat_map(Row::expand).collect()
 }
 
-pub(super) fn cases() -> Vec<(SafetyLevel, ViewerFeatures, PostCandidate)> {
+pub(super) fn post_cases() -> Vec<(SafetyLevel, ViewerFeatures, PostCandidate)> {
     corpus()
         .into_iter()
-        .map(|case| (case.level, case.viewer, case.candidate))
-        .collect()
-}
-
-pub(super) fn pairs() -> Vec<(ViewerFeatures, PostCandidate)> {
-    cases()
-        .into_iter()
-        .map(|(_, viewer, candidate)| (viewer, candidate))
+        .filter_map(|case| match case.subject {
+            Subject::Post(candidate) => Some((case.level, case.viewer, candidate)),
+            Subject::User(_) => None,
+        })
         .collect()
 }
 
@@ -453,12 +466,15 @@ fn rows() -> Vec<Row> {
         trusted_friends::rows(),
         conversation_control::rows(),
         interstitial::rows(),
+        label_interstitial::rows(),
         legacy_interstitial::rows(),
         local_regulations::rows(),
         local_tweet::rows(),
+        notifications::rows(),
         oon_media::rows(),
         oon_tweet_label::rows(),
         oon_user_label::rows(),
+        quoted_tweet_rules::rows(),
         reaction_video::rows(),
     ]
     .into_iter()

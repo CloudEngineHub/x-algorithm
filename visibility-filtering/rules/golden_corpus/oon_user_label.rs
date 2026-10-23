@@ -1,4 +1,4 @@
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::{AuthorLabel, PostCandidate};
 use crate::rules::fixtures::{allow, candidate, dropped};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeRecommendations};
@@ -8,7 +8,7 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "nsfw_high_recall_user_label",
-            post: user_labeled(AuthorLabel::NsfwHighRecall),
+            subject: Subject::Post(user_labeled(AuthorLabel::NsfwHighRecall)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -32,7 +32,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_high_precision_user_label",
-            post: user_labeled(AuthorLabel::NsfwHighPrecision),
+            subject: Subject::Post(user_labeled(AuthorLabel::NsfwHighPrecision)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -55,7 +55,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "spam_high_recall_user_label",
-            post: user_labeled(AuthorLabel::SpamHighRecall),
+            subject: Subject::Post(user_labeled(AuthorLabel::SpamHighRecall)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -78,7 +78,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "compromised_user_label",
-            post: user_labeled(AuthorLabel::Compromised),
+            subject: Subject::Post(user_labeled(AuthorLabel::Compromised)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -101,7 +101,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "read_only_user_label",
-            post: user_labeled(AuthorLabel::ReadOnly),
+            subject: Subject::Post(user_labeled(AuthorLabel::ReadOnly)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -124,7 +124,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "impersonation_user_label",
-            post: user_labeled(AuthorLabel::ImpersonationHighPrecision),
+            subject: Subject::Post(user_labeled(AuthorLabel::ImpersonationHighPrecision)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -147,7 +147,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_avatar_user_label",
-            post: user_labeled(AuthorLabel::NsfwAvatarImage),
+            subject: Subject::Post(user_labeled(AuthorLabel::NsfwAvatarImage)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -170,7 +170,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_banner_user_label",
-            post: user_labeled(AuthorLabel::NsfwBannerImage),
+            subject: Subject::Post(user_labeled(AuthorLabel::NsfwBannerImage)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -193,7 +193,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "abusive_high_recall_user_label",
-            post: user_labeled(AuthorLabel::AbusiveHighRecall),
+            subject: Subject::Post(user_labeled(AuthorLabel::AbusiveHighRecall)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -209,7 +209,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_near_perfect_user_label",
-            post: user_labeled(AuthorLabel::NsfwNearPerfect),
+            subject: Subject::Post(user_labeled(AuthorLabel::NsfwNearPerfect)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -233,7 +233,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "do_not_amplify_user_label",
-            post: user_labeled(AuthorLabel::DoNotAmplify),
+            subject: Subject::Post(user_labeled(AuthorLabel::DoNotAmplify)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,

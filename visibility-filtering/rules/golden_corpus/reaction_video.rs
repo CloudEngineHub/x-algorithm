@@ -1,4 +1,4 @@
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::SafetyLabelType;
 use crate::rules::fixtures::{allow, blurred, candidate, dropped, sensitive_opt_in_viewer};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
@@ -39,9 +39,11 @@ pub(super) fn rows() -> Vec<Row> {
     let mut rows = vec![
         Row {
             name: "reaction_to_adult_post",
-            post: candidate()
-                .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
+                    .build(),
+            ),
             expect: vec![
                 (TimelineHomeHydration, Role::NonFollower, adult()),
                 (TimelineHomeHydration, Role::Follower, adult()),
@@ -53,28 +55,34 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "reaction_to_adult_and_gore_post",
-            post: candidate()
-                .with_reacted_to_post_labels(&[
-                    SafetyLabelType::NSFW_HIGH_PRECISION,
-                    SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
-                ])
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_reacted_to_post_labels(&[
+                        SafetyLabelType::NSFW_HIGH_PRECISION,
+                        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+                    ])
+                    .build(),
+            ),
             expect: vec![(TimelineHomeHydration, Role::NonFollower, adult())],
         },
         Row {
             name: "gore_post_reacting_to_adult_post",
-            post: candidate()
-                .with_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)
-                .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION)
+                    .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
+                    .build(),
+            ),
             expect: vec![(TimelineHomeHydration, Role::NonFollower, adult())],
         },
         Row {
             name: "reaction_to_protected_author_post",
-            post: candidate()
-                .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
-                .with_protected_reacted_to_author()
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_reacted_to_post_labels(&[SafetyLabelType::NSFW_HIGH_PRECISION])
+                    .with_protected_reacted_to_author()
+                    .build(),
+            ),
             expect: vec![
                 (TimelineHomeHydration, Role::NonFollower, protected()),
                 (TimelineHomeHydration, Role::Follower, protected()),
@@ -86,7 +94,7 @@ pub(super) fn rows() -> Vec<Row> {
     ];
     rows.extend(GORE_LABELS.into_iter().map(|(name, label)| Row {
         name,
-        post: candidate().with_reacted_to_post_labels(&[label]).build(),
+        subject: Subject::Post(candidate().with_reacted_to_post_labels(&[label]).build()),
         expect: vec![
             (TimelineHomeHydration, Role::NonFollower, gore()),
             (TimelineHomeHydration, Role::Author, gore()),

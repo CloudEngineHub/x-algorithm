@@ -17,7 +17,9 @@ fn impresses_soft_nsfw_new_user(level: SafetyLevel) -> bool {
         | SafetyLevel::TimelineHome
         | SafetyLevel::TimelineHomeHydration
         | SafetyLevel::ImmersiveExpandedRecommendations
-        | SafetyLevel::QuotedTweetRules => false,
+        | SafetyLevel::QuotedTweetRules
+        | SafetyLevel::NotificationsFollow
+        | SafetyLevel::NotificationsWriterV2 => false,
     }
 }
 

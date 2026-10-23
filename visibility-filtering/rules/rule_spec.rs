@@ -1,8 +1,8 @@
 use crate::hydration::Hydrators;
 use crate::models::{
-    AuthorLabel, DropReason, FosnrReason, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
-    TombstoneReason, ViewerProfile, Withholding,
+    AuthorLabel, DropReason, EmergencyCopy, FosnrReason, LabelInterstitial,
+    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
+    PublicInterest, SafetyLabelMap, SafetyLabelType, TombstoneReason, ViewerProfile, Withholding,
 };
 use crate::params::{CountryList, LimitedActionType};
 use crate::rules::RuleContext;
@@ -15,6 +15,7 @@ use std::ops::Not;
 use xai_safety_label_store::types::label_meta;
 use xai_visibility_filtering::models::{FilteredReason, SafetyResult, SafetyResultReason};
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
+use xai_x_thrift::safety_result::SafetyResultReason as ThriftSafetyResultReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
@@ -32,12 +33,22 @@ pub(crate) enum RuleId {
     QuotedViewerMutesAuthorNotFollowing,
     QuotedAuthorBlocksQuotingAuthor,
     ProtectedQuotedAuthor,
+    DeactivatedViewer,
+    SuspendedViewer,
+    ViewerMutesAndDoesNotFollowAuthor,
+    NoConfirmedEmail,
+    NoConfirmedPhone,
+    NoDefaultProfileImage,
+    NoNewUsers,
+    NoNotFollowedBy,
+    OnlyPeopleIFollow,
 
     Pdna,
     Bounce,
     BounceQuoted,
     Spam,
     ForEmergencyUseOnly,
+    PublicInterest,
     FosnrHatefulConduct,
     FosnrViolentSpeech,
     FosnrAbuse,
@@ -105,10 +116,16 @@ pub(crate) enum RuleId {
     ImpersonationHighPrecisionUserLabel,
     AbusiveHighRecallUserLabel,
     DoNotAmplifyUserLabel,
+    NotGraduatedUserLabel,
+    AgathaSpamTopUserUserLabel,
+    EngagementSpammerUserLabel,
+    BlinkWorstUserLabel,
+    DownrankSpamReplyUserLabel,
 
     BlockedViewer,
     LimitRepliesByInvitation,
     LimitRepliesCommunity,
+    LimitRepliesFollowers,
     LimitRepliesSubscribers,
     LimitRepliesVerified,
     LimitRepliesMyNetwork,
@@ -211,6 +228,7 @@ pub(super) fn rule_name<E: Engine>(id: RuleId, action: &RuleAction<E>) -> String
             ("soft_intervention", Some(policy), None)
         }
         ActionSpec::Appealable(_) => ("appealable", None, None),
+        ActionSpec::LabelInterstitial(_) => ("label_interstitial", None, None),
     };
     let keeps_reason = matches!(action.spec(), ActionSpec::SoftIntervention(_));
     let squashed = |name: &str| name.replace('_', "");
@@ -261,6 +279,21 @@ pub(super) struct FosnrNotice {
     pub(super) level: i8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LabelInterstitialSpec {
+    PublicInterest,
+    EmergencyDynamic,
+}
+
+impl LabelInterstitialSpec {
+    pub(super) const fn labels(self) -> &'static [SafetyLabelType] {
+        match self {
+            Self::PublicInterest => &PUBLIC_INTEREST_LABELS,
+            Self::EmergencyDynamic => &[SafetyLabelType::FOR_EMERGENCY_USE_ONLY],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum ActionSpec<E: Engine = PostEngine> {
     Drop(DropReason),
@@ -269,6 +302,7 @@ pub(super) enum ActionSpec<E: Engine = PostEngine> {
     SoftIntervention(E::PostOnly<FosnrNotice>),
     LimitedEngagement(LimitedEngagementReason),
     Appealable(E::PostOnly<&'static [FosnrViolation]>),
+    LabelInterstitial(E::PostOnly<LabelInterstitialSpec>),
 }
 
 #[derive(Clone, PartialEq)]
@@ -291,6 +325,7 @@ impl<E: Engine> RuleAction<E> {
             ActionSpec::SoftIntervention(notice) => ActionSpec::SoftIntervention(E::open(*notice)),
             ActionSpec::LimitedEngagement(reason) => ActionSpec::LimitedEngagement(*reason),
             ActionSpec::Appealable(violations) => ActionSpec::Appealable(E::open(*violations)),
+            ActionSpec::LabelInterstitial(kind) => ActionSpec::LabelInterstitial(E::open(*kind)),
         };
         RuleAction { spec }
     }
@@ -406,6 +441,12 @@ pub(super) const fn appealable(violations: &'static [FosnrViolation]) -> RuleAct
     }
 }
 
+pub(super) const fn label_interstitial(spec: LabelInterstitialSpec) -> RuleAction {
+    RuleAction {
+        spec: ActionSpec::LabelInterstitial(spec),
+    }
+}
+
 pub(super) const fn blur<E: Engine>(reason: InterstitialReason) -> RuleAction<E> {
     media_interstitial(reason, None)
 }
@@ -445,6 +486,7 @@ impl<E: Engine> ActionSpec<E> {
             ActionSpec::MediaRestriction(_) => ("media restriction", "media"),
             ActionSpec::SoftIntervention(_) => ("soft intervention", "notice"),
             ActionSpec::LimitedEngagement(_) => ("limited engagement", "engagement"),
+            ActionSpec::LabelInterstitial(_) => ("label interstitial", "notice"),
         }
     }
 
@@ -479,6 +521,7 @@ impl<E: Engine> ActionSpec<E> {
                 )
                 .collect::<Vec<_>>()
                 .join(", "),
+            ActionSpec::LabelInterstitial(kind) => format!("{:?}", E::open(*kind)),
         }
     }
 }
@@ -529,6 +572,19 @@ impl<E: Fold> ActionSpec<E> {
                     appeal(violations, labels).map(Contribution::Notice)
                 },
             ),
+            Self::LabelInterstitial(kind) => E::run_post(
+                interpreter,
+                *kind,
+                |kind, In::<TweetSafetyLabels>(labels)| {
+                    match kind {
+                        LabelInterstitialSpec::PublicInterest => public_interest(labels),
+                        LabelInterstitialSpec::EmergencyDynamic => emergency_dynamic(labels),
+                    }
+                    .map(|interstitial| {
+                        Contribution::Notice(Notice::LabelInterstitial(interstitial))
+                    })
+                },
+            ),
         }
     }
 
@@ -543,6 +599,7 @@ impl<E: Engine> ActionSpec<E> {
             Self::Appealable(_) => 18,
             Self::Drop(_) => 17,
             Self::Tombstone(_) => 16,
+            Self::LabelInterstitial(_) => 11,
             Self::MediaRestriction(_) => 10,
             Self::SoftIntervention(_) => 8,
             Self::LimitedEngagement(_) => 6,
@@ -644,6 +701,126 @@ fn fosnr_reason(
         proactive: !labels.is_by_agent(label),
         appeal_submitted: labels.has_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED),
     }
+}
+
+const PUBLIC_INTEREST_LABELS: [SafetyLabelType; 6] = [
+    SafetyLabelType::LOW_QUALITY,
+    SafetyLabelType::MISINFO_CIVIC,
+    SafetyLabelType::MISINFO_GENERIC,
+    SafetyLabelType::MISINFO_MEDICAL,
+    SafetyLabelType::MISINFO_CRISIS,
+    SafetyLabelType::IPI_DEVELOPMENT_ONLY,
+];
+
+macro_rules! named {
+    ($($ident:ident),+ $(,)?) => {
+        [$((stringify!($ident), ThriftSafetyResultReason::$ident)),+]
+    };
+}
+
+const PUBLIC_INTEREST_REASONS: [(&str, ThriftSafetyResultReason); 30] = named![
+    EPISODIC,
+    ABUSE_EPISODIC_ENCOURAGE_SELF_HARM,
+    ABUSE_EPISODIC_HATEFUL_CONDUCT,
+    ABUSE_GLORIFICATION_OF_VIOLENCE,
+    ABUSE_GRATUITOUS_GORE,
+    ABUSE_MOB_HARASSMENT,
+    ABUSE_MOMENT_OF_DEATH_OR_DECEASED_USER,
+    ABUSE_PRIVATE_INFORMATION,
+    ABUSE_RIGHT_TO_PRIVACY,
+    ABUSE_THREAT_TO_EXPOSE,
+    ABUSE_VIOLENT_SEXUAL_CONDUCT,
+    ABUSE_VIOLENT_THREAT_HATEFUL_CONDUCT,
+    ABUSE_VIOLENT_THREAT_OR_BOUNTY,
+    ONE_OFF,
+    VOTING_MISINFORMATION,
+    HACKED_MATERIALS,
+    SCAMS,
+    PLATFORM_MANIPULATION,
+    MISINFO_CIVIC,
+    MISINFO_CRISIS,
+    MISINFO_GENERIC,
+    MISINFO_MEDICAL,
+    DEVELOPMENT_ONLY_PUBLIC_INTEREST,
+    NSFW_HIGH_PRECISION,
+    GORE_AND_VIOLENCE_HIGH_PRECISION,
+    FOSNR_SYNTHETIC_AND_MANIPULATED_MEDIA,
+    FOSNR_CIVIC_INTEGRITY,
+    FOSNR_ABUSE,
+    FOSNR_HATEFUL_CONDUCT,
+    FOSNR_VIOLENT_SPEECH,
+];
+
+fn spells(source: &str, ident: &str) -> bool {
+    source
+        .chars()
+        .map(|letter| letter.to_ascii_uppercase())
+        .eq(ident.chars().filter(|&letter| letter != '_'))
+}
+
+fn public_interest(labels: &SafetyLabelMap) -> Option<LabelInterstitial> {
+    let label = *LabelInterstitialSpec::PublicInterest
+        .labels()
+        .iter()
+        .find(|&&label| labels.has_label(label))?;
+    let source = labels.source(label);
+    let misinfo = |reason| PublicInterest {
+        reason,
+        limit: source.and_then(LimitedEngagementReason::from_misinfo_source),
+    };
+    let notice = match label {
+        SafetyLabelType::LOW_QUALITY => PublicInterest {
+            reason: source
+                .and_then(|source| {
+                    PUBLIC_INTEREST_REASONS
+                        .into_iter()
+                        .find(|(ident, _)| spells(source, ident))
+                })
+                .map_or(ThriftSafetyResultReason::ONE_OFF, |(_, reason)| reason),
+            limit: Some(LimitedEngagementReason::NonCompliant),
+        },
+        SafetyLabelType::MISINFO_CIVIC => misinfo(ThriftSafetyResultReason::MISINFO_CIVIC),
+        SafetyLabelType::MISINFO_GENERIC => misinfo(ThriftSafetyResultReason::MISINFO_GENERIC),
+        SafetyLabelType::MISINFO_MEDICAL => misinfo(ThriftSafetyResultReason::MISINFO_MEDICAL),
+        SafetyLabelType::MISINFO_CRISIS => misinfo(ThriftSafetyResultReason::MISINFO_CRISIS),
+        _ => PublicInterest {
+            reason: ThriftSafetyResultReason::DEVELOPMENT_ONLY_PUBLIC_INTEREST,
+            limit: Some(LimitedEngagementReason::NonCompliant),
+        },
+    };
+    Some(LabelInterstitial::PublicInterest(notice))
+}
+
+fn emergency_dynamic(labels: &SafetyLabelMap) -> Option<LabelInterstitial> {
+    let source = labels.source(SafetyLabelType::FOR_EMERGENCY_USE_ONLY)?;
+    let names_a_system = ["bot_id_", "Abuse", "hse"]
+        .iter()
+        .any(|prefix| source.starts_with(prefix))
+        || [
+            "A",
+            "B",
+            "AB",
+            "OneOff",
+            "VotingMisinformation",
+            "HackedMaterials",
+            "Scams",
+            "PlatformManipulation",
+        ]
+        .contains(&source);
+    if names_a_system {
+        return None;
+    }
+    let (copy, link) = source
+        .split_once('|')
+        .map_or((source, None), |(copy, link)| {
+            (copy, Some(link).filter(|link| !link.is_empty()))
+        });
+    Some(LabelInterstitial::EmergencyDynamic(Box::new(
+        EmergencyCopy {
+            copy: copy.to_owned(),
+            link: link.map(str::to_owned),
+        },
+    )))
 }
 
 fn account_or_request_country_in(

@@ -6,6 +6,10 @@ use crate::candidate_hydrators::media_info_hydrator::MediaInfoHydrator;
 use crate::candidate_hydrators::quote_hydrator::QuoteHydrator;
 use crate::candidate_hydrators::semantic_id_hydrator::SemanticIdHydrator;
 use crate::clients::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient};
+use crate::clients::recent_search_queries_store_client::{
+    MockRecentSearchQueriesStoreClient, ProdRecentSearchQueriesStoreClient,
+    RecentSearchQueriesStoreClient,
+};
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};
 use crate::clients::user_action_aggregation_client::{
@@ -20,6 +24,7 @@ use crate::query_hydrators::followed_grok_topics_query_hydrator::FollowedGrokTop
 use crate::query_hydrators::followed_starter_packs_query_hydrator::FollowedStarterPacksQueryHydrator;
 use crate::query_hydrators::followed_user_ids_query_hydrator::FollowedUserIdsQueryHydrator;
 use crate::query_hydrators::ip_query_hydrator::IpQueryHydrator;
+use crate::query_hydrators::recent_search_queries_query_hydrator::RecentSearchQueriesQueryHydrator;
 use crate::query_hydrators::scoring_sequence_query_hydrator::ScoringSequenceQueryHydrator;
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
@@ -104,6 +109,7 @@ impl PhoenixScoresPipeline {
         followed_grok_topics_client: Arc<dyn FollowedGrokTopicsStoreClient>,
         followed_starter_packs_client: Arc<dyn FollowedStarterPacksStoreClient>,
         user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient>,
+        recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient>,
         sid_client: Arc<dyn SidClient>,
     ) -> PhoenixScoresPipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
@@ -128,6 +134,9 @@ impl PhoenixScoresPipeline {
             )),
             Box::new(UserInstalledAppsQueryHydrator::new(
                 user_installed_apps_client,
+            )),
+            Box::new(RecentSearchQueriesQueryHydrator::new(
+                recent_search_queries_client,
             )),
             Box::new(IpQueryHydrator { client: ip_client }),
         ];
@@ -199,6 +208,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             sid_client,
         ) = tokio::join!(
             async {
@@ -324,6 +334,16 @@ impl PhoenixScoresPipeline {
                         .expect("Failed to create UserInstalledAppsStore client"),
                 ) as Arc<dyn UserInstalledAppsStoreClient>
             },
+            async {
+                match ProdRecentSearchQueriesStoreClient::new(datacenter).await {
+                    Ok(client) => Arc::new(client) as Arc<dyn RecentSearchQueriesStoreClient>,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RecentSearchQueriesStore client unavailable; hydration disabled");
+                        Arc::new(MockRecentSearchQueriesStoreClient)
+                            as Arc<dyn RecentSearchQueriesStoreClient>
+                    }
+                }
+            },
             async { Arc::new(ProdSidClient::new()) as Arc<dyn SidClient> },
         );
 
@@ -341,6 +361,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             sid_client,
         )
         .await
@@ -367,6 +388,8 @@ impl PhoenixScoresPipeline {
             Arc::new(MockFollowedStarterPacksStoreClient);
         let user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient> =
             Arc::new(MockUserInstalledAppsStoreClient);
+        let recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient> =
+            Arc::new(MockRecentSearchQueriesStoreClient);
         PhoenixScoresPipeline::build_with_clients(
             user_action_aggregation_client,
             phoenix_client,
@@ -381,6 +404,7 @@ impl PhoenixScoresPipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             Arc::new(MockSidClient) as Arc<dyn SidClient>,
         )
         .await

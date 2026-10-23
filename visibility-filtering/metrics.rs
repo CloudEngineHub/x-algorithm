@@ -31,6 +31,9 @@ const EVALUATE_TWEETS_DEADLINE: &str = "evaluate_tweets_deadline";
 const LOOKUP_REQUESTS: &str = "safety_labels_lookup_requests";
 const LOOKUP_LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
 const LOOKUP_DEADLINE: &str = "safety_labels_lookup_deadline";
+const NOTIFICATION_REQUESTS: &str = "filter_notifications_requests";
+const NOTIFICATION_LATENCY_MS: &str = "filter_notifications_latency_ms";
+const NOTIFICATION_RESULTS: &str = "filter_notifications_results";
 const REQUESTS_BY_CALLER: &str = "vf_requests_by_caller";
 const LATENCY_BY_CALLER_MS: &str = "vf_request_latency_by_caller_ms";
 const UNKNOWN_IDENTITY: &str = "unknown";
@@ -262,7 +265,7 @@ where
     result
 }
 
-fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
+pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
     let raw = metadata.get("grpc-timeout")?.to_str().ok()?;
     let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
     if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -360,6 +363,49 @@ impl Drop for RequestMetricsGuard {
         if let Some(sr) = global_stats_receiver() {
             self.emit(&*sr, self.start.elapsed());
         }
+    }
+}
+
+pub(crate) fn record_notification_request(
+    notification_type: &str,
+    outcome: RequestOutcome,
+    elapsed: Duration,
+) {
+    incr(
+        NOTIFICATION_REQUESTS,
+        &[
+            ("notification_type", notification_type),
+            ("outcome", outcome.into()),
+        ],
+        1,
+    );
+    if let RequestOutcome::Success = outcome {
+        observe_vm(
+            NOTIFICATION_LATENCY_MS,
+            &[("notification_type", notification_type)],
+            millis(elapsed),
+        );
+    }
+}
+
+pub(crate) fn record_notification_results(
+    notification_type: &str,
+    results: impl IntoIterator<Item = (&'static str, &'static str)>,
+) {
+    let mut counts: HashMap<(&str, &str), u64> = HashMap::new();
+    for result in results {
+        *counts.entry(result).or_default() += 1;
+    }
+    for ((outcome, reason), count) in counts {
+        incr(
+            NOTIFICATION_RESULTS,
+            &[
+                ("notification_type", notification_type),
+                ("outcome", outcome),
+                ("reason", reason),
+            ],
+            count,
+        );
     }
 }
 
@@ -471,6 +517,7 @@ mod tests {
     };
     use crate::quote::QUOTE_PASS;
     use crate::rules::RuleId;
+    use crate::safety_label_source::metrics::EXPIRED_LABELS;
     use std::fs;
     use std::path::Path;
     use xai_visibility_filtering::models::FilteredReason;
@@ -517,6 +564,7 @@ mod tests {
             "UNRESOLVED_TWEETS_METRIC = \"{UNRESOLVED_TWEETS}\""
         )));
         assert!(dashboard.contains(&format!("FT_DEADLINE_METRIC = \"{DEADLINE}\"")));
+        assert!(dashboard.contains(&format!("EXPIRED_LABELS_METRIC = \"{EXPIRED_LABELS}\"")));
         assert!(dashboard.contains(&format!(
             "ET_REQUESTS_METRIC = \"{EVALUATE_TWEETS_REQUESTS}\""
         )));
@@ -549,9 +597,9 @@ mod tests {
         assert!(dashboard.contains(&format!(
             "REQUESTS_BY_CALLER_NON_SUCCESS_FILTER = 'outcome=~\"{failure}|{cancelled}\"'"
         )));
-        assert!(dashboard.contains(&format!(
-            "FT_DEADLINE_REMAINING_METRIC = \"{DEADLINE_REMAINING_MS}\""
-        )));
+        assert!(dashboard.contains(&format!("FT_PHASE_METRIC = \"{PHASE_MS}\"")));
+        let hydration: &str = Stage::Hydration.into();
+        assert!(dashboard.contains(&format!("{{stage=\"{hydration}\",")));
         assert!(dashboard.contains(&format!(
             "VF_CLIENT_FT_LATENCY_VM_METRIC = \"{FILTER_TWEETS_LATENCY_VM_METRIC}\""
         )));

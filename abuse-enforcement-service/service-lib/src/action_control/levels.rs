@@ -15,9 +15,58 @@ pub fn level_lkey(
     }
 }
 
+pub(super) struct RowScope<'a> {
+    pub record: Option<(&'a str, &'a ActionControlRecord)>,
+    pub head: &'a str,
+    pub classifier: Option<&'a str>,
+    pub unreadable: bool,
+}
+
 impl Snapshot {
     fn first<'a>(&'a self, keys: impl Iterator<Item = String>) -> Option<Hit<'a>> {
         keys.into_iter().find_map(|k| self.at(&k))
+    }
+
+                pub(super) fn row_scope<'a>(
+        &'a self,
+        entity: ControlEntity,
+        names: &[&'a str],
+        classifier: Option<&'a str>,
+        factory: bool,
+    ) -> Option<RowScope<'a>> {
+        if !factory {
+            return self
+                .mover(entity, names, classifier)
+                .map(|(k, r)| RowScope {
+                    record: Some((k, r)),
+                    head: &r.head,
+                    classifier: r.classifier.as_deref(),
+                    unreadable: false,
+                });
+        }
+        let head = names[0];
+        let own = RowScope {
+            record: None,
+            head,
+            classifier: None,
+            unreadable: false,
+        };
+        let Some(c) = classifier else {
+            return Some(own);
+        };
+        Some(match self.at(&lkey_for(entity, head, Some(c), None)) {
+            Some(Hit::Record(k, r)) if r.mode == ControlMode::Rows => RowScope {
+                record: Some((k, r)),
+                head,
+                classifier: Some(c),
+                unreadable: false,
+            },
+            Some(Hit::Unreadable) => RowScope {
+                unreadable: true,
+                ..own
+            },
+            _ => own,
+        })
     }
 
                     pub(super) fn mover(
@@ -40,18 +89,27 @@ impl Snapshot {
         }
     }
 
-                    pub(super) fn row_decider(
+                        pub(super) fn row_decider(
         &self,
         entity: ControlEntity,
         names: &[&str],
         classifier: Option<&str>,
         row: LevelRow,
         recording: &ActionControlRecord,
+        factory: bool,
     ) -> Option<ActionControlRecord> {
-        if let Some((_, scope)) = self.mover(entity, names, classifier) {
-            let lkey = level_lkey(entity, &scope.head, scope.classifier.as_deref(), row);
+        if let Some(scope) = self.row_scope(entity, names, classifier, factory) {
+            if scope.unreadable {
+                return Some(recording.clone());
+            }
+            let lkey = level_lkey(entity, scope.head, scope.classifier, row);
             return Some(match self.at(&lkey) {
-                Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => r.clone(),
+                Some(Hit::Record(_, r))
+                    if r.mode != ControlMode::Rows
+                        && !(factory && r.mode == ControlMode::Rules) =>
+                {
+                    r.clone()
+                }
                 _ => recording.clone(),
             });
         }
@@ -120,16 +178,17 @@ pub(super) struct RowContext<'a> {
     pub classifier: &'a str,
     pub factory: bool,
     pub stale: bool,
+        pub author_id: i64,
 }
 
 fn logged(
-    matched: Matched,
+    matched: Option<Matched>,
     actions: Vec<PageAction>,
     forced: Option<&'static str>,
     outcome: RowOutcome,
 ) -> Resolved {
     Resolved {
-        matched: Some(matched),
+        matched,
         mode: ControlMode::Recording,
         page_actions: actions,
         forced,
@@ -149,12 +208,17 @@ pub(super) fn resolve_rows(
     let entity = entity_of(m.entity);
     let names: Vec<&str> = std::iter::once(m.head).chain(m.alias).collect();
     let classifier = (!m.classifier.is_empty() && valid_name(m.classifier)).then_some(m.classifier);
-    let (scope_lkey, scope) = snap.mover(entity, &names, classifier)?;
+    let scope = snap.row_scope(entity, &names, classifier, m.factory)?;
     let mut outcome = RowOutcome::new(claim);
-    let row_lkey = level_lkey(entity, &scope.head, scope.classifier.as_deref(), claim.row);
-    let scope_matched = || Matched {
-        lkey: scope_lkey.to_owned(),
-        record: scope.clone(),
+    if scope.unreadable {
+        return Some(logged(None, Vec::new(), Some("unreadable"), outcome));
+    }
+    let row_lkey = level_lkey(entity, scope.head, scope.classifier, claim.row);
+    let scope_matched = || {
+        scope.record.map(|(k, r)| Matched {
+            lkey: k.to_owned(),
+            record: r.clone(),
+        })
     };
     let record = match snap.at(&row_lkey) {
         None => return Some(logged(scope_matched(), Vec::new(), None, outcome)),
@@ -168,26 +232,30 @@ pub(super) fn resolve_rows(
             ));
         }
     };
-    let matched = Matched {
+    let matched = Some(Matched {
         lkey: row_lkey,
         record: record.clone(),
-    };
+    });
     let entity_ok =
         record.entity_type == entity && record.actions.iter().all(|a| a.entity() == entity);
     match record.mode {
+        ControlMode::Rules if m.factory => {
+            return Some(logged(
+                matched,
+                Vec::new(),
+                Some("factory_rules_row"),
+                outcome,
+            ));
+        }
         ControlMode::Rules => {
             return Some(Resolved {
-                matched: Some(matched),
+                matched,
                 row: Some(outcome),
                 ..Default::default()
             });
         }
         ControlMode::Recording => {
-            let forced = if record.actions.is_empty() {
-                None
-            } else if m.factory {
-                Some("factory_managed")
-            } else if !entity_ok {
+            let forced = if !record.actions.is_empty() && !entity_ok {
                 Some("wrong_entity")
             } else {
                 None
@@ -199,14 +267,6 @@ pub(super) fn resolve_rows(
             return Some(logged(matched, actions, forced, outcome));
         }
         _ => {}
-    }
-    if m.factory {
-        return Some(logged(
-            matched,
-            Vec::new(),
-            Some("factory_managed"),
-            outcome,
-        ));
     }
     if record.actions.is_empty() || !entity_ok {
         return Some(logged(matched, Vec::new(), Some("wrong_entity"), outcome));
@@ -226,11 +286,30 @@ pub(super) fn resolve_rows(
     if forced.is_some() {
         return Some(logged(matched, actions, forced, outcome));
     }
-    if let Some(why) = evidence_floor(Some(record), claim, cfg, &mut outcome) {
+    if let Some(why) = evidence_floor(Some(record), claim, cfg, m.factory, &mut outcome) {
         return Some(logged(matched, actions, Some(why), outcome));
     }
+    if let Some(bp) = record.rollout_bp {
+        let inside = record.rollout_takes(m.author_id);
+        outcome.rollout = Some((bp, rollout_bucket(&record.head, m.author_id)));
+        metrics::ACTION_CONTROL_ROLLOUT_TOTAL
+            .with_label_values(&[
+                record.head.as_str(),
+                claim.row.as_str(),
+                if inside { "inside" } else { "outside" },
+            ])
+            .inc();
+        if !inside {
+            return Some(logged(
+                matched,
+                actions,
+                Some(confidence::OUTSIDE_ROLLOUT),
+                outcome,
+            ));
+        }
+    }
     Some(Resolved {
-        matched: Some(matched),
+        matched,
         mode: ControlMode::Live,
         page_actions: actions,
         row: Some(outcome),
@@ -243,15 +322,25 @@ fn evidence_floor(
     row: Option<&ActionControlRecord>,
     claim: &Claim,
     cfg: &ControlConfig,
+    factory: bool,
     outcome: &mut RowOutcome,
 ) -> Option<&'static str> {
     let level = claim.row.level()?;
-    let evidence = row
-        .and_then(|r| r.evidence.as_deref().cloned())
-        .or_else(|| claim.evidence.clone());
-    let supports = evidence.as_ref().and_then(|e| {
-        confidence::supported_level(e, claim.now_ms, cfg.confidence.evidence_max_age_ms)
-    });
+    let (evidence, max_age_ms) = if factory {
+        (
+            claim.evidence.clone(),
+            cfg.confidence.factory_evidence_max_age_ms,
+        )
+    } else {
+        (
+            row.and_then(|r| r.evidence.as_deref().cloned())
+                .or_else(|| claim.evidence.clone()),
+            cfg.confidence.evidence_max_age_ms,
+        )
+    };
+    let supports = evidence
+        .as_ref()
+        .and_then(|e| confidence::supported_level(e, claim.now_ms, max_age_ms));
     outcome.evidence_supports = Some(supports);
     if supports.is_some_and(|s| s >= level) {
         return None;
@@ -282,21 +371,18 @@ pub(super) fn resolve_run(
     let entity = entity_of(m.entity);
     let names: Vec<&str> = std::iter::once(m.head).chain(m.alias).collect();
     let classifier = (!m.classifier.is_empty() && valid_name(m.classifier)).then_some(m.classifier);
-    let mover = snap.mover(entity, &names, classifier);
+    let scope = snap.row_scope(entity, &names, classifier, m.factory);
+    let on_rows = scope.is_some();
+    let unreadable = scope.as_ref().is_some_and(|s| s.unreadable);
     let mut outcome = RowOutcome::new(claim);
-    let row = mover.and_then(|(_, scope)| {
-        match snap.at(&level_lkey(
-            entity,
-            &scope.head,
-            scope.classifier.as_deref(),
-            claim.row,
-        )) {
+    let row = scope.and_then(|scope| {
+        match snap.at(&level_lkey(entity, scope.head, scope.classifier, claim.row)) {
             Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => Some(r),
             _ => None,
         }
     });
-    let forced = if m.factory {
-        Some("factory_managed")
+    let forced = if unreadable {
+        Some("unreadable")
     } else if actions.is_empty() || actions.iter().any(|a| a.entity() != entity) {
         Some("wrong_entity")
     } else if !cfg.enabled {
@@ -305,11 +391,10 @@ pub(super) fn resolve_run(
         Some("stale_snapshot")
     } else if !safety_ok(m.entity) {
         Some("safety_checks_changed")
-    } else if mover.is_some() && claim.row.level().is_some() && cfg.confidence.unreadable.is_some()
-    {
+    } else if on_rows && claim.row.level().is_some() && cfg.confidence.unreadable.is_some() {
         Some("confidence_config_unreadable")
-    } else if mover.is_some() {
-        evidence_floor(row, claim, cfg, &mut outcome)
+    } else if on_rows {
+        evidence_floor(row, claim, cfg, m.factory, &mut outcome)
     } else {
         None
     };
@@ -324,8 +409,10 @@ pub(super) fn resolve_run(
         forced,
         dedup_class: Some(page_class(actions)),
         producer_dry: false,
-        row: mover.is_some().then_some(outcome),
-        by_row: mover.is_some(),
+        row: on_rows.then_some(outcome),
+        by_row: on_rows,
+        factory: m.factory,
+        unlisted: false,
     }
 }
 
@@ -361,7 +448,7 @@ pub(super) fn weak_rows(
             };
             let mut outcome = RowOutcome::new(&claim);
             (row.level().is_some() && cfg.confidence.unreadable.is_some())
-                || evidence_floor(record, &claim, cfg, &mut outcome).is_some()
+                || evidence_floor(record, &claim, cfg, false, &mut outcome).is_some()
         })
         .collect()
 }
@@ -392,7 +479,7 @@ pub(super) fn as_running(
         ControlEntity::User => EntityType::User,
         ControlEntity::Post => EntityType::Post,
     };
-    let (mut mode, _, _) = effective(&rec, entity, factory, cfg, stale, safety_ok);
+    let (mut mode, _, _) = effective(&rec, entity, cfg, stale, safety_ok);
     if let Some(level) = rec.confidence.and_then(LevelRow::level) {
         let supports = rec.evidence.as_deref().and_then(|e| {
             confidence::supported_level(e, now_ms, cfg.confidence.evidence_max_age_ms)
@@ -402,7 +489,7 @@ pub(super) fn as_running(
             .as_deref()
             .is_some_and(|o| confidence::override_active(o, rec.updated_at_ms, now_ms));
         if cfg.confidence.unreadable.is_some()
-            || (supports.is_none_or(|s| s < level) && !overridden)
+            || (!factory && supports.is_none_or(|s| s < level) && !overridden)
         {
             mode = ControlMode::Recording;
         }
@@ -451,6 +538,76 @@ pub(super) fn evidence_harsher(
     why
 }
 
+fn acts_on_every_account(rec: &ActionControlRecord) -> bool {
+    rec.mode == ControlMode::Live && !rec.actions.is_empty() && rec.rollout_bp.is_none()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EveryAccountEnded {
+        At(i64),
+        Unknown(i64),
+}
+
+impl EveryAccountEnded {
+    fn at_ms(self) -> i64 {
+        match self {
+            Self::At(t) | Self::Unknown(t) => t,
+        }
+    }
+}
+
+pub(crate) fn every_account_ended(
+    lkey: &str,
+    current: &ActionControlRecord,
+    history: Option<&[ActionControlHistoryEntry]>,
+    now_ms: i64,
+) -> Option<EveryAccountEnded> {
+    const MAX_STEPS: usize = 64;
+    let since = now_ms - ROLLOUT_WAIT_MS;
+    let unknown = Some(EveryAccountEnded::Unknown(current.updated_at_ms));
+    let mut rec = current;
+    for _ in 0..MAX_STEPS {
+        if rec.updated_at_ms <= since {
+            return None;
+        }
+        let entry = history.unwrap_or_default().iter().find(|e| {
+            e.lkey == lkey && e.version == rec.version && e.after.write_nonce == rec.write_nonce
+        });
+        let Some(entry) = entry else {
+            return unknown;
+        };
+        match &entry.before {
+            None => return None,
+            Some(p) if acts_on_every_account(p) => {
+                return (entry.at_ms > since).then_some(EveryAccountEnded::At(entry.at_ms));
+            }
+            Some(p) => rec = p,
+        }
+    }
+    unknown
+}
+
+fn rollout_wait(row: LevelRow, ended: EveryAccountEnded, now_ms: i64) -> SetError {
+    let r = row.as_str();
+    let ago = (now_ms - ended.at_ms()).max(0) / 1_000;
+    let left = ((ended.at_ms() + ROLLOUT_WAIT_MS - now_ms).max(0) + 999) / 1_000;
+    let what = match ended {
+        EveryAccountEnded::At(_) => {
+            format!("the {r} row stopped acting on every account {ago} s ago")
+        }
+        EveryAccountEnded::Unknown(_) => format!(
+            "the {r} row was saved {ago} s ago and its history doesn't show whether it acted on every account before"
+        ),
+    };
+    SetError::Invalid(
+        "rollout_wait",
+        format!(
+            "{what}: set its rollout in {left} s, once every pod has read that save \
+             (a pod on an image without rollouts keeps acting on the last row it could read)"
+        ),
+    )
+}
+
 fn row_problem(
     entity: ControlEntity,
     row: LevelRow,
@@ -458,6 +615,7 @@ fn row_problem(
     actions: &[PageAction],
     evidence: Option<&ConfidenceEvidence>,
     evidence_override: Option<&EvidenceOverride>,
+    rollout_bp: Option<u32>,
     now_ms: i64,
 ) -> Result<(), SetError> {
     let r = row.as_str();
@@ -533,6 +691,12 @@ fn row_problem(
             return bad("invalid_override", p);
         }
     }
+    if rollout_bp.is_some_and(|bp| bp > ROLLOUT_ALL_BP) {
+        return bad(
+            "invalid_rollout",
+            format!("the {r} row's rollout is 0 to {ROLLOUT_ALL_BP} basis points (0% to 100%)"),
+        );
+    }
     Ok(())
 }
 
@@ -573,6 +737,12 @@ pub(super) fn validate_confidence(
                 "evidence and overrides belong on a row".into(),
             );
         }
+        if req.rollout_bp.is_some() {
+            return bad(
+                "invalid_rollout",
+                "a rollout belongs on a row; send it in rows".into(),
+            );
+        }
         if let Some(rows) = &req.rows {
             for row in LevelRow::ALL {
                 if let Some(s) = rows.get(row) {
@@ -583,6 +753,7 @@ pub(super) fn validate_confidence(
                         &s.actions,
                         s.evidence.as_ref(),
                         s.evidence_override.as_ref(),
+                        s.rollout_bp,
                         now_ms,
                     )?;
                 }
@@ -598,7 +769,12 @@ pub(super) fn validate_confidence(
             &req.actions,
             req.evidence.as_ref(),
             req.evidence_override.as_ref(),
+            req.rollout_bp,
             now_ms,
+        ),
+        None if req.rollout_bp.is_some() => bad(
+            "invalid_rollout",
+            "a rollout belongs on a low, mid, high or missing row".into(),
         ),
         None if req.evidence.is_some() => bad(
             "invalid_evidence",
@@ -660,6 +836,12 @@ pub(super) fn record_problem(rec: &ActionControlRecord, now_ms: i64) -> Option<&
             return Some("evidence lower bound is not a number from 0 to 1");
         }
     }
+    if rec.rollout_bp.is_some() && rec.confidence.is_none() {
+        return Some("a rollout on a record that isn't a row");
+    }
+    if rec.rollout_bp.is_some_and(|bp| bp > ROLLOUT_ALL_BP) {
+        return Some("a rollout over 10,000 basis points");
+    }
     None
 }
 
@@ -677,6 +859,7 @@ pub(super) fn view(cfg: &ControlConfig) -> ConfidenceView {
             })
             .collect(),
         evidence_max_age_ms: cfg.confidence.evidence_max_age_ms,
+        factory_evidence_max_age_ms: cfg.confidence.factory_evidence_max_age_ms,
         config_error: cfg.confidence.unreadable.clone(),
     }
 }
@@ -715,10 +898,13 @@ impl ActionControl {
         let alias = cfg.aliases.get(&req.head).map(String::as_str);
         let names: Vec<&str> = std::iter::once(req.head.as_str()).chain(alias).collect();
         let rows = self.scan_rows().await?;
-        let snap = Snapshot::of_rows(&rows, "");
+        let snap = Snapshot::of_rows(&rows, &[]);
         let scope_prior = self.get_raw(&scope_lkey).await?;
         let scope_version = scope_prior.as_deref().map(raw_version);
         let scope_before = scope_prior.as_deref().and_then(|b| parse_record(b).ok());
+        let factory = seen
+            .iter()
+            .any(|s| s.factory && s.head == req.head && s.entity_type == entity);
         let moving = req.mode == ControlMode::Rows;
         let leaving = !moving && req.confidence.is_none();
         let on_rows = scope_before
@@ -731,7 +917,7 @@ impl ActionControl {
             let not_rules: Vec<String> = snap
                 .under_scope(entity, &names, classifier)
                 .into_iter()
-                .filter(|(_, mode)| *mode != Some(ControlMode::Rules))
+                .filter(|(_, mode)| !factory && *mode != Some(ControlMode::Rules))
                 .map(|(k, _)| k)
                 .collect();
             if !not_rules.is_empty() {
@@ -743,7 +929,7 @@ impl ActionControl {
                     ),
                 ));
             }
-        } else if !on_rows {
+        } else if !(on_rows || (factory && classifier.is_none())) {
             return Err(SetError::Invalid(
                 "scope_not_on_rows",
                 format!("{scope_lkey} is not on rows; move it with mode rows and its four rows"),
@@ -754,6 +940,7 @@ impl ActionControl {
                       actions: Vec<PageAction>,
                       evidence: Option<ConfidenceEvidence>,
                       evidence_override: Option<EvidenceOverride>,
+                      rollout_bp: Option<u32>,
                       version: u64| {
             let mut rec = ActionControlRecord {
                 v: ACTION_CONTROL_RECORD_VERSION,
@@ -772,6 +959,8 @@ impl ActionControl {
                 confidence: row,
                 evidence: evidence.map(Box::new),
                 evidence_override: evidence_override.map(Box::new),
+                admit_unlisted_labels: false,
+                rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),
             };
             rec.v = rec.schema_version();
             rec
@@ -797,6 +986,7 @@ impl ActionControl {
                             s.actions.clone(),
                             s.evidence.clone(),
                             s.evidence_override.clone(),
+                            s.rollout_bp,
                         )
                     }),
                     s.and_then(|s| s.expected_version),
@@ -808,6 +998,7 @@ impl ActionControl {
                         req.actions.clone(),
                         req.evidence.clone(),
                         req.evidence_override.clone(),
+                        req.rollout_bp,
                     )),
                     req.expected_version,
                 )
@@ -815,8 +1006,8 @@ impl ActionControl {
             if expected != version {
                 return Err(SetError::Conflict(before, version));
             }
-            let (mode, actions, evidence, evidence_override) =
-                setting.unwrap_or((ControlMode::Recording, Vec::new(), None, None));
+            let (mode, actions, evidence, evidence_override, rollout_bp) =
+                setting.unwrap_or((ControlMode::Recording, Vec::new(), None, None, None));
             writes.push(RowWrite {
                 row,
                 lkey,
@@ -826,15 +1017,59 @@ impl ActionControl {
                     actions,
                     evidence,
                     evidence_override,
+                    rollout_bp,
                     version.unwrap_or(0) + 1,
                 ),
                 prior,
             });
             befores.push(before);
         }
+        if let Some(w) = writes
+            .iter()
+            .zip(&befores)
+            .find(|(w, before)| {
+                w.after.rollout_bp.is_some() && before.as_ref().is_some_and(acts_on_every_account)
+            })
+            .map(|(w, _)| w)
+        {
+            let r = w.row.as_str();
+            return Err(SetError::Invalid(
+                "rollout_from_every_account",
+                format!(
+                    "the {r} row acts on every account now: set it to log only and save, then set its rollout \
+                     (a pod on an image without rollouts keeps acting on the last row it could read)"
+                ),
+            ));
+        }
+        let recent: Vec<(&RowWrite, &ActionControlRecord)> = writes
+            .iter()
+            .zip(&befores)
+            .filter_map(|(w, b)| Some((w, b.as_ref()?)))
+            .filter(|(w, b)| {
+                w.after.rollout_bp.is_some() && b.updated_at_ms > now_ms - ROLLOUT_WAIT_MS
+            })
+            .collect();
+        if !recent.is_empty() {
+            let history = self.row_history(&req.head).await;
+            for (w, before) in recent {
+                if let Some(ended) =
+                    every_account_ended(&w.lkey, before, history.as_deref(), now_ms)
+                {
+                    return Err(rollout_wait(w.row, ended, now_ms));
+                }
+            }
+        }
 
-        let recording = record(None, ControlMode::Recording, Vec::new(), None, None, 0);
-        let has_set_aside = !snap.under_scope(entity, &names, classifier).is_empty();
+        let recording = record(
+            None,
+            ControlMode::Recording,
+            Vec::new(),
+            None,
+            None,
+            None,
+            0,
+        );
+        let has_set_aside = !factory && !snap.under_scope(entity, &names, classifier).is_empty();
         let set_aside = has_set_aside && snap.mover(entity, &names, classifier).is_none();
         let scope_write = (moving || leaving).then(|| {
             let (mode, actions) = if moving {
@@ -842,26 +1077,37 @@ impl ActionControl {
             } else {
                 (req.mode, req.actions.clone())
             };
-            record(
-                None,
-                mode,
-                actions,
-                None,
-                None,
-                scope_version.unwrap_or(0) + 1,
-            )
+            ActionControlRecord {
+                admit_unlisted_labels: admits_unlisted_after(&req, scope_before.as_ref()),
+                ..record(
+                    None,
+                    mode,
+                    actions,
+                    None,
+                    None,
+                    None,
+                    scope_version.unwrap_or(0) + 1,
+                )
+            }
         });
-        let rules_after = record(None, ControlMode::Rules, Vec::new(), None, None, 0);
+        let rules_after = record(None, ControlMode::Rules, Vec::new(), None, None, None, 0);
         let mut compare: Vec<(LevelRow, ActionControlRecord)> =
             writes.iter().map(|w| (w.row, w.after.clone())).collect();
         if let (true, Some(after)) = (leaving, &scope_write) {
-            let without = Snapshot::of_rows(&rows, &scope_lkey);
+            let gone: Vec<String> = LevelRow::ALL
+                .into_iter()
+                .map(|row| level_lkey(entity, &req.head, classifier, row))
+                .chain([scope_lkey.clone()])
+                .collect();
+            let gone: Vec<&str> = gone.iter().map(String::as_str).collect();
+            let without = Snapshot::of_rows(&rows, &gone);
             for row in LevelRow::ALL {
-                let next = match after.mode {
-                    ControlMode::Rules => without
-                        .row_decider(entity, &names, classifier, row, &recording)
-                        .unwrap_or_else(|| rules_after.clone()),
-                    _ => after.clone(),
+                let next = if after.mode == ControlMode::Rules || factory {
+                    without
+                        .row_decider(entity, &names, classifier, row, &recording, factory)
+                        .unwrap_or_else(|| rules_after.clone())
+                } else {
+                    after.clone()
                 };
                 compare.push((row, next));
                 if has_set_aside && after.mode != ControlMode::Rules {
@@ -873,9 +1119,6 @@ impl ActionControl {
             ControlEntity::User => safety.user.ok,
             ControlEntity::Post => safety.post.ok,
         };
-        let factory = seen
-            .iter()
-            .any(|s| s.factory && s.head == req.head && s.entity_type == entity);
         let stale = self.is_stale();
         let rules_specs: Option<Vec<Value>> = {
             let scope_rows: Vec<&ActionControlSeen> = seen
@@ -892,7 +1135,8 @@ impl ActionControl {
         };
         let mut harsher: Vec<String> = Vec::new();
         for (row, after) in compare {
-            let mut priors = vec![snap.row_decider(entity, &names, classifier, row, &recording)];
+            let mut priors =
+                vec![snap.row_decider(entity, &names, classifier, row, &recording, factory)];
             if set_aside {
                 priors.push(None);
             }
@@ -915,6 +1159,12 @@ impl ActionControl {
                     }
                 }
             }
+        }
+        if let Some(why) = scope_write
+            .as_ref()
+            .and_then(|after| admits_unlisted_harsher(scope_before.as_ref(), after))
+        {
+            harsher.push(why.to_owned());
         }
         if !harsher.is_empty() && req.confirm.as_deref() != Some(CONFIRM_WORD) {
             return Err(SetError::Invalid(
@@ -1000,11 +1250,6 @@ impl ActionControl {
             key_id,
             "action control rows written"
         );
-        let factory_heads: HashSet<(ControlEntity, String)> = seen
-            .iter()
-            .filter(|s| s.factory)
-            .map(|s| (s.entity_type, s.head.clone()))
-            .collect();
         let (lkey, rec, before) = match scope_write {
             Some(rec) => (scope_lkey, rec, scope_before),
             None => {
@@ -1012,7 +1257,7 @@ impl ActionControl {
                 (w.lkey, w.after, befores.remove(0))
             }
         };
-        let view = self.view(&lkey, &rec, cfg, stale, safety, &factory_heads);
+        let view = self.view(&lkey, &rec, cfg, stale, safety);
         Ok(SetOutcome {
             view,
             before,
@@ -1041,6 +1286,25 @@ impl ActionControl {
         SetError::Store(format!(
             "{msg}; every record this save wrote was put back as it was, so nothing changed"
         ))
+    }
+
+        async fn row_history(&self, head: &str) -> Option<Vec<ActionControlHistoryEntry>> {
+        let pkey = format!("{HISTORY_PKEY_PREFIX}{head}");
+        match tokio::time::timeout(self.scan_timeout, self.store.scan(&pkey)).await {
+            Ok(Ok(rows)) => Some(
+                rows.iter()
+                    .filter_map(|(_, v)| serde_json::from_slice(v).ok())
+                    .collect(),
+            ),
+            Ok(Err(e)) => {
+                warn!(error = %e, head, "action control: history read failed");
+                None
+            }
+            Err(_) => {
+                warn!(head, "action control: history read timed out");
+                None
+            }
+        }
     }
 
         async fn write_history(

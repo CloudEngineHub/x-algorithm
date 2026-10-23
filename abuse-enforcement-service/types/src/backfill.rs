@@ -84,6 +84,8 @@ pub struct BackfillRunRecord {
     pub left_out: Vec<i64>,
     #[serde(default)]
     pub include_genuine_liveness_passes: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub factory: bool,
     pub reason: String,
     pub created_by: String,
     pub created_by_key: String,
@@ -222,6 +224,7 @@ mod tests {
             expected_count: 3,
             left_out: vec![],
             include_genuine_liveness_passes: false,
+            factory: false,
             reason: "r".into(),
             created_by: "a@example.com".into(),
             created_by_key: "page".into(),
@@ -240,8 +243,19 @@ mod tests {
         assert_eq!(json["actions"], serde_json::json!([{"kind": "suspend"}]));
         assert_eq!(json["state"], "running");
         assert_eq!(json["source"], "logged_only");
+        assert!(json.get("factory").is_none());
         let back: BackfillRunRecord = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, rec);
+        let factory = BackfillRunRecord {
+            factory: true,
+            ..rec.clone()
+        };
+        let fjson = serde_json::to_value(&factory).unwrap();
+        assert_eq!(fjson["factory"], true);
+        assert_eq!(
+            serde_json::from_value::<BackfillRunRecord>(fjson).unwrap(),
+            factory
+        );
         let mut extra = json;
         extra["surprise"] = true.into();
         assert!(serde_json::from_value::<BackfillRunRecord>(extra).is_err());

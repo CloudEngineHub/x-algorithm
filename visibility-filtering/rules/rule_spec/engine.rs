@@ -1,5 +1,5 @@
 use crate::hydration::Hydrators;
-use crate::models::{PostCandidate, UserCandidate, UserEntity, ViewerRelationship};
+use crate::models::{PostCandidate, QuoteFacts, UserCandidate, UserEntity, ViewerRelationship};
 use crate::rules::context::RuleContext;
 use crate::rules::rule_spec::features::leaves::{ViewerFollowsAuthor, ViewerIsAuthor};
 use crate::rules::rule_spec::inputs::{Inputs, Interpreter};
@@ -43,6 +43,7 @@ pub(in crate::rules) trait Fold: Engine {
 pub trait Candidate {
     fn author(&self) -> &UserEntity;
     fn viewer_relationship(&self) -> ViewerRelationship;
+    fn quote(&self) -> QuoteFacts;
     fn failed(&self) -> Hydrators;
 }
 
@@ -105,8 +106,13 @@ impl Engine for UserEngine {
             Predicate::Request(leaf) => Predicate::Request(leaf),
             Predicate::AuthorFacts(leaf) => Predicate::AuthorFacts(leaf),
             Predicate::ViewerAccount(leaf) => Predicate::ViewerAccount(leaf),
+            Predicate::ViewerLabel(leaf) => Predicate::ViewerLabel(leaf),
+            Predicate::NotificationFilter(leaf) => Predicate::NotificationFilter(leaf),
             Predicate::AuthorSafety(leaf) => Predicate::AuthorSafety(leaf),
             Predicate::AuthorLabels(leaf) => Predicate::AuthorLabels(leaf),
+            Predicate::AuthorProfile(leaf) => Predicate::AuthorProfile(leaf),
+            Predicate::AuthorEmail(leaf) => Predicate::AuthorEmail(leaf),
+            Predicate::AuthorPhone(leaf) => Predicate::AuthorPhone(leaf),
             Predicate::Relationship(leaf) => Predicate::Relationship(leaf),
             Predicate::PairEdge(leaf) => Predicate::PairEdge(leaf),
             Predicate::PostFacts(Absent(never, _))
@@ -164,6 +170,11 @@ impl Candidate for PostCandidate {
     }
 
     #[inline]
+    fn quote(&self) -> QuoteFacts {
+        QuoteFacts::default()
+    }
+
+    #[inline]
     fn failed(&self) -> Hydrators {
         self.failed
     }
@@ -178,6 +189,11 @@ impl Candidate for UserCandidate {
     #[inline]
     fn viewer_relationship(&self) -> ViewerRelationship {
         self.viewer_relationship
+    }
+
+    #[inline]
+    fn quote(&self) -> QuoteFacts {
+        self.quote
     }
 
     #[inline]

@@ -10,10 +10,11 @@ pub use xai_abuse_enforcement_types::action_control::{
 
 pub const CONFIG_KEY: &str = "confidence";
 pub const DEFAULT_EVIDENCE_MAX_AGE_DAYS: i64 = 30;
+pub const DEFAULT_FACTORY_EVIDENCE_MAX_AGE_DAYS: i64 = 365;
 const DAY_MS: i64 = 86_400_000;
 const MAX_EVIDENCE_AGE_DAYS: f64 = 365.0;
 pub const CLOCK_SKEW_MS: i64 = 300_000;
-const CONFIG_KEYS: &[&str] = &["evidence_max_age_days"];
+const CONFIG_KEYS: &[&str] = &["evidence_max_age_days", "factory_evidence_max_age_days"];
 const MAX_READS: u32 = 100_000;
 const ALPHA: f64 = 0.05;
 
@@ -58,6 +59,7 @@ pub fn message_claim(score: &abuse_proto::ScoreResult, now_ms: i64) -> Claim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfidenceConfig {
     pub evidence_max_age_ms: i64,
+    pub factory_evidence_max_age_ms: i64,
     pub unreadable: Option<String>,
 }
 
@@ -65,6 +67,7 @@ impl Default for ConfidenceConfig {
     fn default() -> Self {
         Self {
             evidence_max_age_ms: DEFAULT_EVIDENCE_MAX_AGE_DAYS * DAY_MS,
+            factory_evidence_max_age_ms: DEFAULT_FACTORY_EVIDENCE_MAX_AGE_DAYS * DAY_MS,
             unreadable: None,
         }
     }
@@ -94,15 +97,23 @@ impl ConfidenceConfig {
             ),
             None => bad.push(v.to_string()),
         }
-        match v.get("evidence_max_age_days") {
-            None | Some(Value::Null) => {}
-            Some(days) => match days
-                .as_f64()
-                .filter(|d| d.is_finite() && *d > 0.0 && *d <= MAX_EVIDENCE_AGE_DAYS)
-            {
-                Some(d) => out.evidence_max_age_ms = (d * DAY_MS as f64) as i64,
-                None => bad.push(format!("evidence_max_age_days={days}")),
-            },
+        for (key, field) in [
+            ("evidence_max_age_days", &mut out.evidence_max_age_ms),
+            (
+                "factory_evidence_max_age_days",
+                &mut out.factory_evidence_max_age_ms,
+            ),
+        ] {
+            match v.get(key) {
+                None | Some(Value::Null) => {}
+                Some(days) => match days
+                    .as_f64()
+                    .filter(|d| d.is_finite() && *d > 0.0 && *d <= MAX_EVIDENCE_AGE_DAYS)
+                {
+                    Some(d) => *field = (d * DAY_MS as f64) as i64,
+                    None => bad.push(format!("{key}={days}")),
+                },
+            }
         }
         if bad.is_empty() {
             return out;
@@ -118,6 +129,7 @@ impl ConfidenceConfig {
         }
         Self {
             evidence_max_age_ms: 0,
+            factory_evidence_max_age_ms: 0,
             unreadable: Some(bad),
         }
     }
@@ -223,6 +235,7 @@ pub struct RowOutcome {
     pub unknown: bool,
     pub evidence_supports: Option<Option<ConfidenceLevel>>,
     pub override_by: Option<String>,
+    pub rollout: Option<(u32, u32)>,
 }
 
 impl RowOutcome {
@@ -232,6 +245,7 @@ impl RowOutcome {
             unknown: claim.unknown,
             evidence_supports: None,
             override_by: None,
+            rollout: None,
         }
     }
 
@@ -252,6 +266,10 @@ impl RowOutcome {
         if let Some(by) = &self.override_by {
             keys.push(("confidence_override_by".to_owned(), by.clone()));
         }
+        if let Some((bp, bucket)) = self.rollout {
+            keys.push(("rollout_bp".to_owned(), bp.to_string()));
+            keys.push(("rollout_bucket".to_owned(), bucket.to_string()));
+        }
         keys
     }
 }
@@ -266,17 +284,23 @@ pub fn logged_because(forced: Option<&str>, unknown: bool) -> &'static str {
         Some("evidence_missing" | "evidence_below_floor" | "confidence_config_unreadable") => {
             "weak_evidence"
         }
-        Some("factory_managed") => "factory_managed",
+        Some("factory_rules_row") => "factory_rules_row",
+        Some("ignore_store") => "ignore_store",
         Some("wrong_entity") => "wrong_entity",
+        Some(OUTSIDE_ROLLOUT) => OUTSIDE_ROLLOUT,
         Some(_) => "unreadable",
     }
 }
+
+pub const OUTSIDE_ROLLOUT: &str = "outside_rollout";
 
 pub const INFO_KEYS: &[&str] = &[
     "level_row",
     "logged_because",
     "confidence_evidence_supports",
     "confidence_override_by",
+    "rollout_bp",
+    "rollout_bucket",
 ];
 
 #[cfg(test)]
@@ -394,6 +418,15 @@ mod tests {
             "weak_evidence"
         );
         assert_eq!(logged_because(Some("band_ambiguous"), false), "unreadable");
+        assert_eq!(
+            logged_because(Some("factory_rules_row"), false),
+            "factory_rules_row"
+        );
+        assert_eq!(logged_because(Some("ignore_store"), false), "ignore_store");
+        assert_eq!(
+            logged_because(Some(OUTSIDE_ROLLOUT), false),
+            "outside_rollout"
+        );
     }
 
     #[test]
@@ -404,6 +437,22 @@ mod tests {
         let fine = ConfidenceConfig::from_value(Some(&json!({"evidence_max_age_days": 7})));
         assert_eq!(fine.unreadable, None);
         assert_eq!(fine.evidence_max_age_ms, 7 * DAY_MS);
+        assert_eq!(fine.factory_evidence_max_age_ms, 365 * DAY_MS);
+        let factory =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 365})));
+        assert_eq!(factory.unreadable, None);
+        assert_eq!(factory.evidence_max_age_ms, 30 * DAY_MS);
+        assert_eq!(factory.factory_evidence_max_age_ms, 365 * DAY_MS);
+        let factory =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 90})));
+        assert_eq!(factory.factory_evidence_max_age_ms, 90 * DAY_MS);
+        let half =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": 0.5})));
+        assert_eq!(half.factory_evidence_max_age_ms, DAY_MS / 2);
+        let null =
+            ConfidenceConfig::from_value(Some(&json!({"factory_evidence_max_age_days": null})));
+        assert_eq!(null.unreadable, None);
+        assert_eq!(null.factory_evidence_max_age_ms, 365 * DAY_MS);
         for bad in [
             json!({"label_map": {"*_suspend": "high"}}),
             json!({"label_map": {}}),
@@ -411,6 +460,11 @@ mod tests {
             json!({"evidence_max_age_days": -1}),
             json!({"evidence_max_age_days": 0}),
             json!({"evidence_max_age_days": 3650}),
+            json!({"factory_evidence_max_age_days": 0}),
+            json!({"factory_evidence_max_age_days": -1}),
+            json!({"evidence_max_age_days": 7, "factory_evidence_max_age_days": 400}),
+            json!({"factory_evidence_max_age_days": 366}),
+            json!({"factory_evidence_max_age_days": "365"}),
             json!({"floors": {"high": 0.5}}),
             json!("on"),
             json!([]),
@@ -418,6 +472,7 @@ mod tests {
             let cfg = ConfidenceConfig::from_value(Some(&bad));
             assert!(cfg.unreadable.is_some(), "{bad}");
             assert_eq!(cfg.evidence_max_age_ms, 0, "{bad}");
+            assert_eq!(cfg.factory_evidence_max_age_ms, 0, "{bad}");
         }
         assert!(
             ConfidenceConfig::from_value(Some(&json!({"label_map": {}})))

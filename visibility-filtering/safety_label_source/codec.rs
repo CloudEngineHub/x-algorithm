@@ -10,42 +10,24 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use tracing::debug;
 
 #[derive(Debug, Clone)]
-pub struct LkeyBytes(pub [u8; 4]);
-
-#[derive(Debug, Clone)]
-pub struct MvalBytes(pub Vec<u8>);
-
-#[derive(Debug, Clone)]
 pub struct RawSafetyLabel {
-    pub lkey: LkeyBytes,
-    pub mval: MvalBytes,
+    pub lkey: [u8; 4],
+    pub mval: Vec<u8>,
 }
 
-pub fn decode_mval_payload(bytes: &[u8]) -> Option<vf_pb::SafetyLabelMap> {
-    xai_safety_label_store::mval_safety_label_map::decode_mval(bytes).map(proto::label_map_to_proto)
+pub(crate) fn decode_raw_labels(items: &[RawSafetyLabel]) -> Option<vf_pb::SafetyLabelMap> {
+    contain_decode_panic(|| decode_raw_labels_inner(items)).map(proto::label_map_to_proto)
 }
 
-pub(crate) enum DecodeAttempt {
-    Success(vf_pb::SafetyLabelMap),
-    Panic,
-}
-
-pub(crate) fn decode_raw_labels(items: &[RawSafetyLabel]) -> DecodeAttempt {
-    contain_decode_panic(|| decode_raw_labels_inner(items))
-}
-
-fn contain_decode_panic(decode: impl FnOnce() -> SafetyLabelMap) -> DecodeAttempt {
-    match catch_unwind(AssertUnwindSafe(decode)) {
-        Ok(map) => DecodeAttempt::Success(proto::label_map_to_proto(map)),
-        Err(_) => DecodeAttempt::Panic,
-    }
+pub(crate) fn contain_decode_panic<T>(decode: impl FnOnce() -> T) -> Option<T> {
+    catch_unwind(AssertUnwindSafe(decode)).ok()
 }
 
 fn decode_raw_labels_inner(items: &[RawSafetyLabel]) -> SafetyLabelMap {
     let mut map = HashMap::with_capacity(items.len());
     for item in items {
-        let label_type = decode_lkey_bytes(item.lkey.0);
-        let label = match xai_x_thrift::deserialize_mval(&item.mval.0) {
+        let label_type = decode_lkey_bytes(item.lkey);
+        let label = match xai_x_thrift::deserialize_mval(&item.mval) {
             Ok(l) => l,
             Err(e) => {
                 debug!(label_type = ?label_type, error = %e, "skipping label value with corrupt mval from manhattan");
@@ -78,25 +60,16 @@ mod tests {
 
     fn raw_label(lt: SafetyLabelType, mval: Vec<u8>) -> RawSafetyLabel {
         RawSafetyLabel {
-            lkey: LkeyBytes(encode_lkey(lt)),
-            mval: MvalBytes(mval),
-        }
-    }
-
-    #[track_caller]
-    fn decoded(items: &[RawSafetyLabel]) -> vf_pb::SafetyLabelMap {
-        match decode_raw_labels(items) {
-            DecodeAttempt::Success(map) => map,
-            DecodeAttempt::Panic => panic!("expected Success, got Panic"),
+            lkey: encode_lkey(lt),
+            mval,
         }
     }
 
     #[test]
-    fn decode_raw_labels_contains_panics() {
-        assert!(matches!(
-            contain_decode_panic(|| panic!("test decode panic")),
-            DecodeAttempt::Panic
-        ));
+    fn contain_decode_panic_turns_a_panic_into_none() {
+        assert!(
+            contain_decode_panic(|| -> SafetyLabelMap { panic!("test decode panic") }).is_none()
+        );
     }
 
     #[test]
@@ -106,7 +79,7 @@ mod tests {
             raw_label(SafetyLabelType::BOUNCE, vec![0xDE, 0xAD]),
             raw_label(SafetyLabelType::NSFW_HIGH_PRECISION, mval_with_score()),
         ];
-        let map = decoded(&items);
+        let map = decode_raw_labels(&items).unwrap();
         assert_eq!(map.labels.len(), 3);
         assert!(map.labels.contains_key(&i32::from(SafetyLabelType::SPAM)));
         assert!(map.labels.contains_key(&i32::from(SafetyLabelType::BOUNCE)));

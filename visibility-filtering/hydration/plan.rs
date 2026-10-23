@@ -1,9 +1,9 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
+use crate::hydration::fetcher::{AskedFields, FetcherId};
 use crate::hydration::hydrator::{Edge, Part, RequestRows};
-use crate::hydration::inventory::Source;
 use crate::hydration::relation::{Relation, Role};
 use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
-use crate::rules::SafetyLevel;
+use crate::rules::{Expansion, SafetyLevel};
 use std::fmt;
 use std::time::Duration;
 use strum::VariantArray;
@@ -19,7 +19,7 @@ pub(crate) struct HydrationPlan {
 
 pub(super) struct Group {
     pub(super) position: usize,
-    pub(super) source: Source,
+    pub(super) fetcher: FetcherId,
     pub(super) input: Option<Hydrator>,
     pub(super) nodes: Hydrators,
     clients: Vec<&'static str>,
@@ -38,12 +38,12 @@ impl HydrationPlan {
         let nodes = hydrators.closed(rows);
         let mut groups: Vec<Group> = Vec::new();
         for node in nodes.iter() {
-            let spec = node.spec();
+            let spec = node.spec_at(rows);
             let (client, method) = spec.label;
             let input = node.input_at(rows);
             match groups
                 .iter_mut()
-                .find(|group| group.source == spec.source && group.input == input)
+                .find(|group| group.fetcher == spec.fetcher() && group.input == input)
             {
                 Some(group) => {
                     group.nodes = group.nodes.with(node);
@@ -56,7 +56,7 @@ impl HydrationPlan {
                 }
                 None => groups.push(Group {
                     position: groups.len(),
-                    source: spec.source,
+                    fetcher: spec.fetcher(),
                     input,
                     nodes: Hydrators::of(node),
                     clients: vec![client],
@@ -88,7 +88,7 @@ impl HydrationPlan {
             .collect();
         for (group, readers) in groups.iter_mut().zip(readers) {
             group.edges = edges(group.nodes);
-            group.fields = fields(group.source, group.nodes);
+            group.fields = fields(group.fetcher, group.nodes, rows);
             group.readers = readers;
         }
         Self {
@@ -115,6 +115,12 @@ impl HydrationPlan {
         self.nodes
             .iter()
             .all(|node| node.key_at(self.rows).keys_user_rows())
+    }
+
+    pub(crate) fn keys_a_node_only_user_rows_give(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.key_at(self.rows).keys_only_user_rows())
     }
 
     pub(super) fn reads_viewer_profile(&self) -> bool {
@@ -166,14 +172,14 @@ impl HydrationPlan {
 impl Group {
     pub(super) fn ceiling(&self) -> Duration {
         if self.nodes.has_must_have() {
-            HYDRATION_TIMEOUT
-        } else {
-            BEST_EFFORT_HYDRATION_TIMEOUT
+            return HYDRATION_TIMEOUT;
         }
-    }
-
-    pub(super) fn reads_relation(&self) -> bool {
-        self.nodes.iter().any(|node| node.spec().relation.is_some())
+        self.nodes
+            .iter()
+            .find_map(|node| Expansion::of(node.relation()?))
+            .map_or(BEST_EFFORT_HYDRATION_TIMEOUT, |expansion| {
+                expansion.spec().deadline
+            })
     }
 
     pub(super) fn label(&self) -> (String, String) {
@@ -189,31 +195,14 @@ impl Group {
     }
 }
 
-fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
-    let nodes = match source {
-        Source::GizmoduckAuthor => Hydrator::VARIANTS
+fn fields(fetcher: FetcherId, nodes: Hydrators, rows: RequestRows) -> Vec<QueryFields> {
+    let nodes = match fetcher.spec().fields {
+        AskedFields::EveryLevel => Hydrator::VARIANTS
             .iter()
             .copied()
-            .filter(|node| node.spec().source == source)
+            .filter(|node| node.spec_at(rows).fetcher() == fetcher)
             .fold(Hydrators::empty(), Hydrators::with),
-        Source::TesPureCoreData
-        | Source::TesTweet
-        | Source::TesConversationControl
-        | Source::TesQuotedTweet
-        | Source::SafetyLabels
-        | Source::GizmoduckViewer
-        | Source::Flock
-        | Source::FlockUserPair
-        | Source::ViewerCountry
-        | Source::Wingman
-        | Source::CommunityModeration
-        | Source::CommunityModerator
-        | Source::CommunityViewerRemoved
-        | Source::ArticleLifecycle
-        | Source::ArticleMediaEntities
-        | Source::ArticleCoverMedia
-        | Source::TrustedFriends
-        | Source::UserLocation => nodes,
+        AskedFields::Planned => nodes,
     };
     let mut fields = Vec::new();
     for node in nodes.iter() {
@@ -322,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn a_level_of_user_rows_plans_no_pure_core_and_keys_author_lookups_by_user() {
+    fn a_level_of_user_rows_plans_no_pure_core_and_asks_the_actor_source_by_user() {
         let nodes = Hydrators::of(Hydrator::ViewerProfile)
             .with(Hydrator::AuthorSafety)
             .with(Hydrator::Follows)
@@ -334,7 +323,7 @@ mod tests {
             "\
 quoted_tweet_rules: 3 calls
 gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: - nodes: author_safety fields: SAFETY|LABELS
+gizmoduck_actor/get_users after: - nodes: author_safety fields: SAFETY|LABELS|PROFILE
 socialgraph/batch_check_relationships after: - nodes: follows,blocks follows-fwd[users] blocks-fwd[users] (skipped logged out)
 "
         );

@@ -1,5 +1,6 @@
 use crate::dark_traffic_setup;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
+use crate::filter_notifications::FilterNotificationsEndpoint;
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::{GetSafetyLabelsCodec, GetSafetyLabelsEndpoint};
 use crate::server_deps::{self, Comparators};
@@ -46,9 +47,10 @@ pub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::R
 }
 
 pub struct VFServer {
-    evaluate_tweets: EvaluateTweetsEndpoint,
-    filter_tweets: FilterTweetsEndpoint,
-    get_safety_labels: GetSafetyLabelsEndpoint,
+    pub(crate) evaluate_tweets: EvaluateTweetsEndpoint,
+    pub(crate) filter_notifications: FilterNotificationsEndpoint,
+    pub(crate) filter_tweets: FilterTweetsEndpoint,
+    pub(crate) get_safety_labels: GetSafetyLabelsEndpoint,
 }
 
 #[tonic::async_trait]
@@ -122,18 +124,6 @@ impl VFServer {
             .await
             .into_server(Comparators::default())
     }
-
-    pub(crate) fn from_endpoints(
-        evaluate_tweets: EvaluateTweetsEndpoint,
-        filter_tweets: FilterTweetsEndpoint,
-        get_safety_labels: GetSafetyLabelsEndpoint,
-    ) -> Self {
-        Self {
-            evaluate_tweets,
-            filter_tweets,
-            get_safety_labels,
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -143,6 +133,13 @@ impl vf_pb::VisibilityFilteringService for VFServer {
         request: Request<vf_pb::EvaluateTweetsRequest>,
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
         self.evaluate_tweets.handle(request).await
+    }
+
+    async fn filter_notifications(
+        &self,
+        request: Request<vf_pb::FilterNotificationsRequest>,
+    ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {
+        self.filter_notifications.handle(request).await
     }
 
     async fn filter_tweets(
@@ -157,15 +154,15 @@ impl vf_pb::VisibilityFilteringService for VFServer {
 mod tests {
     use super::*;
     use crate::hydration::sources::InMemorySources;
-    use crate::params::limited_actions_copy::LimitedActionsCopy;
     use crate::params::ClientSwitches;
-    use crate::post_evaluator::PostEvaluator;
-    use crate::rules::RuleEngine;
-    use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
+    use crate::safety_label_source::lookup::{
+        LookupResults, ManhattanLookup, RemoteSource, TwemcacheLookup,
+    };
     use crate::safety_label_source::types::FailureKind;
-    use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
+    use crate::safety_label_source::types::TwemcacheOutcome;
     use crate::safety_label_source::LookupError;
     use crate::safety_label_source::SafetyLabelSource;
+    use crate::scenario::{tweet_data, Wire};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use xai_visibility_filtering::vf_client::XaiVfClient;
@@ -187,10 +184,8 @@ mod tests {
 
     #[tonic::async_trait]
     impl ManhattanLookup for NoLabels {
-        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
-            ids.iter()
-                .map(|&id| (id, ManhattanOutcome::Resolved(Default::default())))
-                .collect()
+        async fn get(&self, ids: &[u64]) -> LookupResults {
+            ids.iter().map(|&id| (id, Ok(Default::default()))).collect()
         }
     }
 
@@ -198,18 +193,15 @@ mod tests {
 
     #[tonic::async_trait]
     impl ManhattanLookup for LabelsForPostOne {
-        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
+        async fn get(&self, ids: &[u64]) -> LookupResults {
             ids.iter()
                 .map(|&id| {
-                    let outcome = if id == 1 {
-                        ManhattanOutcome::Resolved(post_one_labels())
+                    let result = if id == 1 {
+                        Ok(post_one_labels())
                     } else {
-                        ManhattanOutcome::Failure(LookupError::new(
-                            FailureKind::ManhattanFetch,
-                            "down",
-                        ))
+                        Err(LookupError::new(FailureKind::ManhattanFetch, "down"))
                     };
-                    (id, outcome)
+                    (id, result)
                 })
                 .collect()
         }
@@ -229,25 +221,22 @@ mod tests {
     }
 
     fn server(sources: InMemorySources) -> VFServer {
-        let post_evaluator = Arc::new(PostEvaluator::new(
-            Arc::new(sources),
-            RuleEngine::for_tests(),
-            Arc::default(),
-        ));
+        let wire = Wire::new(Arc::new(sources));
+        let post_evaluator = Arc::clone(wire.post_evaluator());
         let labels = Arc::new(NoLabels);
-        VFServer::from_endpoints(
-            EvaluateTweetsEndpoint::new(
-                Arc::clone(&post_evaluator),
+        VFServer {
+            evaluate_tweets: wire.into_endpoint(),
+            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(&post_evaluator)),
+            filter_tweets: FilterTweetsEndpoint::new(
+                post_evaluator,
                 ClientSwitches::for_tests(),
-                LimitedActionsCopy::from_json("[]"),
                 None,
             ),
-            FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests(), None),
-            GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
+            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
                 Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),
                 Some(1024),
             ))),
-        )
+        }
     }
 
     async fn serve(server: VFServer) -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {
@@ -279,11 +268,6 @@ mod tests {
         ))
         .await;
         let client = XaiVfClient::from_channel(channel);
-        let tweet = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {
-            tweet_id,
-            quote_context: outer_tweet_id
-                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
-        };
         let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
         let protected = || {
             TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
@@ -293,11 +277,11 @@ mod tests {
         let deleted =
             || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));
         let cases = [
-            (tweet(1, None), found(), Some(found())),
-            (tweet(1, None), protected(), Some(protected())),
-            (tweet(1, Some(2)), found(), None),
-            (tweet(2, None), found(), None),
-            (tweet(2, None), deleted(), Some(deleted())),
+            (tweet_data(1, None), found(), Some(found())),
+            (tweet_data(1, None), protected(), Some(protected())),
+            (tweet_data(1, Some(2)), found(), None),
+            (tweet_data(2, None), found(), None),
+            (tweet_data(2, None), deleted(), Some(deleted())),
         ];
         let home = client
             .evaluate_tweets(

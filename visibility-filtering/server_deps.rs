@@ -3,9 +3,11 @@ use crate::clients::article_client::ArticleClient;
 use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
 use crate::clients::trusted_friends_client::TrustedFriendsClient;
+use crate::clients::user_devices_client::UserDevicesClient;
 use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
+use crate::filter_notifications::FilterNotificationsEndpoint;
 use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
 use crate::hydration::community_source::CommunitySource;
@@ -22,7 +24,7 @@ use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
 use crate::safety_label_source::manhattan::ManhattanSource;
 use crate::safety_label_source::twemcache::TwemcacheSource;
-use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher, Warmer};
+use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
 use crate::server::VFServer;
 use anyhow::Context;
@@ -130,7 +132,7 @@ pub(crate) enum CacheWarming {
 }
 
 impl CacheWarming {
-    fn warmer(self, build: impl FnOnce() -> Option<Arc<dyn Warmer>>) -> Option<Arc<dyn Warmer>> {
+    fn warmer(self, build: impl FnOnce() -> Option<Arc<CacheWarmer>>) -> Option<Arc<CacheWarmer>> {
         match self {
             Self::AsConfigured => build(),
             Self::Off => None,
@@ -251,21 +253,24 @@ pub(crate) struct Comparators {
 
 impl ServerDeps {
     pub(crate) fn into_server(self, comparators: Comparators) -> VFServer {
-        VFServer::from_endpoints(
-            EvaluateTweetsEndpoint::new(
+        VFServer {
+            evaluate_tweets: EvaluateTweetsEndpoint::new(
                 Arc::clone(&self.post_evaluator),
                 self.client_switches.clone(),
                 self.limited_actions_copy,
                 comparators.evaluate_tweets,
-            )
-            .with_quote_pass(crate::config::quote_pass()),
-            FilterTweetsEndpoint::new(
+                crate::config::quote_pass(),
+            ),
+            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(
+                &self.post_evaluator,
+            )),
+            filter_tweets: FilterTweetsEndpoint::new(
                 self.post_evaluator,
                 self.client_switches,
                 comparators.filter_tweets,
             ),
-            GetSafetyLabelsEndpoint::new(self.safety_label_source),
-        )
+            get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source),
+        }
     }
 }
 
@@ -380,6 +385,7 @@ pub(crate) async fn prod_sources(
     let trusted_friends_client = TrustedFriendsClient::new(stratoserver.clone());
     let user_location_client = UserLocationClient::new(stratoserver.clone());
     let article_client = ArticleClient::new(stratoserver.clone());
+    let user_devices_client = UserDevicesClient::new(stratoserver.clone());
 
     let wingman_client = Arc::new(
         init_client_with_retry("wingman", init_deadline, || {
@@ -470,11 +476,12 @@ pub(crate) async fn prod_sources(
         user_location: user_location_client,
         safety_labels: Arc::clone(&safety_label_source),
         communities,
+        user_devices: user_devices_client,
     });
     (sources, safety_label_source)
 }
 
-fn build_cache_warmer(stratoserver: StratoGrpc) -> Option<Arc<dyn Warmer>> {
+fn build_cache_warmer(stratoserver: StratoGrpc) -> Option<Arc<CacheWarmer>> {
     if !crate::config::cache_warm_enabled() {
         return None;
     }

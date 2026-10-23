@@ -16,6 +16,7 @@ use crate::vf_client::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notification {
     Follow { actor_id: u64 },
+    FollowRequestAccepted { actor_id: u64 },
 }
 
 impl Notification {
@@ -24,6 +25,12 @@ impl Notification {
             Self::Follow { actor_id } => vf_pb::Notification {
                 actor_id,
                 kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),
+            },
+            Self::FollowRequestAccepted { actor_id } => vf_pb::Notification {
+                actor_id,
+                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
+                    vf_pb::FollowRequestAccepted {},
+                )),
             },
         }
     }
@@ -265,6 +272,19 @@ mod tests {
                 }))
             })
             .collect()
+    }
+
+    #[test]
+    fn a_follow_request_accepted_sends_its_own_kind() {
+        assert_eq!(
+            Notification::FollowRequestAccepted { actor_id: 10 }.into_proto(),
+            vf_pb::Notification {
+                actor_id: 10,
+                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
+                    vf_pb::FollowRequestAccepted {},
+                )),
+            }
+        );
     }
 
     fn follows(actors: &[u64]) -> Vec<Notification> {

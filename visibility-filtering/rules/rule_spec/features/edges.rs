@@ -11,6 +11,7 @@ pub enum RelationshipLeaf {
     ViewerBlocksAuthor,
     ViewerMutesAuthor,
     ViewerIsBlockedByAuthor,
+    AuthorFollowsViewer,
 }
 
 impl RelationshipLeaf {
@@ -21,6 +22,7 @@ impl RelationshipLeaf {
             Self::ViewerBlocksAuthor => Hydrator::Blocks,
             Self::ViewerMutesAuthor => Hydrator::Mutes,
             Self::ViewerIsBlockedByAuthor => Hydrator::BlockedByAuthor,
+            Self::AuthorFollowsViewer => Hydrator::AuthorFollowsViewer,
         }
     }
 
@@ -31,6 +33,7 @@ impl RelationshipLeaf {
             Self::ViewerBlocksAuthor => relationship.blocks,
             Self::ViewerMutesAuthor => relationship.mutes,
             Self::ViewerIsBlockedByAuthor => relationship.blocked_by,
+            Self::AuthorFollowsViewer => relationship.followed_by,
         }
     }
 
@@ -55,6 +58,7 @@ impl RelationshipLeaf {
 pub enum EdgeLeaf {
     ViewerMutesRetweetsFromAuthor,
     ViewerIsFollowedByConversationRootAuthor,
+    ViewerFollowsConversationRootAuthor,
     ViewerSuperFollowsConversationRootAuthor,
     ViewerIsTrustedFriendsListMemberOrOwner,
     ViewerIsOutsideNarrowcastPlace,
@@ -66,6 +70,7 @@ impl EdgeLeaf {
         match self {
             Self::ViewerMutesRetweetsFromAuthor => Hydrator::MuteRetweets,
             Self::ViewerIsFollowedByConversationRootAuthor => Hydrator::RootFollowsViewer,
+            Self::ViewerFollowsConversationRootAuthor => Hydrator::ViewerFollowsRoot,
             Self::ViewerSuperFollowsConversationRootAuthor => Hydrator::SuperFollowsRoot,
             Self::ViewerIsTrustedFriendsListMemberOrOwner => Hydrator::TrustedFriends,
             Self::ViewerIsOutsideNarrowcastPlace => Hydrator::OutsideNarrowcastPlace,

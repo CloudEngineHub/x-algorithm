@@ -5,7 +5,8 @@ use std::time::Duration;
 use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
-use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
+use crate::hydration::batch::{Hydrated, HydrationBatch};
+use crate::hydration::sources::Expired;
 use crate::params::CountryList;
 use crate::rules::SafetyLevel;
 
@@ -81,17 +82,21 @@ impl KeyedResultCounts {
                     counts.partial_keys += 1;
                     counts.partial_candidates += candidate_count;
                 }
-                Some(Hydrated::Failed(HydrationError::Timeout)) => {
-                    counts.timeout_keys += 1;
-                    counts.timeout_candidates += candidate_count;
-                }
-                _ => {
+                Some(Hydrated::Failed | Hydrated::Unanswered) | None => {
                     counts.error_keys += 1;
                     counts.error_candidates += candidate_count;
                 }
             }
         }
         counts
+    }
+
+    fn timed_out<K>(candidate_count_by_claimed_key: &FxHashMap<K, usize>) -> Self {
+        Self {
+            timeout_keys: candidate_count_by_claimed_key.len(),
+            timeout_candidates: candidate_count_by_claimed_key.values().sum(),
+            ..Self::default()
+        }
     }
 
     fn outcome(self) -> HydratorOutcome {
@@ -111,12 +116,15 @@ pub(crate) fn record_keyed_hydrator_request<K, V>(
     method: &str,
     safety_level: SafetyLevel,
     candidate_count_by_claimed_key: &FxHashMap<K, usize>,
-    answer: &impl AsRef<[HydrationBatch<K, V>]>,
+    answer: Result<&impl AsRef<[HydrationBatch<K, V>]>, &Expired>,
     latency_ms: f64,
 ) where
     K: Eq + Hash,
 {
-    let counts = KeyedResultCounts::from_batch(candidate_count_by_claimed_key, answer);
+    let counts = match answer {
+        Ok(answer) => KeyedResultCounts::from_batch(candidate_count_by_claimed_key, answer),
+        Err(Expired) => KeyedResultCounts::timed_out(candidate_count_by_claimed_key),
+    };
     let outcome = counts.outcome();
     if outcome != HydratorOutcome::Success {
         debug!(
@@ -521,7 +529,11 @@ mod tests {
             request_author_id: None,
         }];
         let mut store = Store::new(plan, Some(50), ClientCapability::default(), &raw, None);
-        let group = |source| plan.groups().find(|group| group.source == source).unwrap();
+        let group = |source| {
+            plan.groups()
+                .find(|group| group.fetcher.source == source)
+                .unwrap()
+        };
         let tweets = store.offer(group(Source::TesTweet)).unwrap();
         let circle = TweetFeatures {
             trusted_friends_list_id: Some(7),
@@ -541,10 +553,7 @@ mod tests {
 
     #[test]
     fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40, 41]);
-
-        let counts =
-            KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0), (41, 3)]), &batch);
+        let counts = KeyedResultCounts::timed_out(&FxHashMap::from_iter([(40, 0), (41, 3)]));
 
         assert_eq!((counts.timeout_keys, counts.timeout_candidates), (2, 3));
         assert_eq!(counts.outcome(), HydratorOutcome::Timeout);

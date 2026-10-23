@@ -329,7 +329,9 @@ pub(crate) fn comparable_request(
         }
         SafetyLevel::FilterAll
         | SafetyLevel::TimelineHomeHydration
-        | SafetyLevel::QuotedTweetRules => {
+        | SafetyLevel::QuotedTweetRules
+        | SafetyLevel::NotificationsFollow
+        | SafetyLevel::NotificationsWriterV2 => {
             return Err("level_unmapped");
         }
     };

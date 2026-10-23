@@ -8,8 +8,8 @@ pub use xai_abuse_enforcement_types::backfill::*;
 use xai_abuse_proto::enforcement as abuse_proto;
 
 use crate::action_control::{
-    ActionControl, CONFIRM_WORD, ControlConfig, ControlStore, DRY_RUN_LABEL_PREFIX, FACTORY_LABEL,
-    entity_of, lkey_for,
+    ActionControl, CONFIRM_WORD, ControlConfig, ControlStore, DRY_RUN_LABEL_PREFIX, entity_of,
+    lkey_for,
 };
 use crate::backfill_claims::{ClaimStore, KeyLocks};
 use crate::facts::{EntityType, Facts, GizmoduckFacts};
@@ -214,11 +214,8 @@ pub fn check_message(
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     if score.dry_run
         || score.skip_author_credibility_prechecks
-        || !score.requested_actions.is_empty()
         || !score.policy_version.is_empty()
-        || labels
-            .iter()
-            .any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX) || l == FACTORY_LABEL)
+        || labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))
     {
         return Err(STATUS_BAD_MESSAGE);
     }
@@ -248,7 +245,9 @@ pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool
             .labels
             .iter()
             .any(|l| l == crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP),
-        PageAction::LivenessCheck {} | PageAction::PostSpamHighRecall { .. } => false,
+        PageAction::LivenessCheck {}
+        | PageAction::PostSpamHighRecall { .. }
+        | PageAction::HideReply { .. } => false,
     })
 }
 
@@ -806,14 +805,25 @@ impl Backfill {
                 None,
             ));
         }
-        let weak = control.weak_rows(
-            entity,
-            &req.head,
-            req.classifier.as_deref(),
-            &req.levels,
-            control_cfg,
-            now_ms,
-        );
+        let seen = control
+            .scan_seen()
+            .await
+            .map_err(|e| RunError::Store(format!("the seen list could not be read: {e}")))?;
+        let factory = seen
+            .iter()
+            .any(|s| s.factory && s.head == req.head && s.entity_type == req.entity);
+        let weak = if factory {
+            Vec::new()
+        } else {
+            control.weak_rows(
+                entity,
+                &req.head,
+                req.classifier.as_deref(),
+                &req.levels,
+                control_cfg,
+                now_ms,
+            )
+        };
         if !weak.is_empty() {
             return Err(RunError::Conflict(
                 "weak_evidence",
@@ -860,6 +870,7 @@ impl Backfill {
             expected_count: req.expected_count,
             left_out: req.left_out,
             include_genuine_liveness_passes: req.include_genuine_liveness_passes,
+            factory,
             reason: req.reason.trim().to_owned(),
             created_by: who.to_owned(),
             created_by_key: key_id.to_owned(),
@@ -1138,14 +1149,18 @@ impl Backfill {
                 ControlEntity::User => EntityType::User,
                 ControlEntity::Post => EntityType::Post,
             };
-            let weak = control.weak_rows(
-                entity,
-                &stored.head,
-                stored.classifier.as_deref(),
-                &stored.levels,
-                control_cfg,
-                now_ms,
-            );
+            let weak = if stored.factory {
+                Vec::new()
+            } else {
+                control.weak_rows(
+                    entity,
+                    &stored.head,
+                    stored.classifier.as_deref(),
+                    &stored.levels,
+                    control_cfg,
+                    now_ms,
+                )
+            };
             if !weak.is_empty() {
                 return conflict(
                     "weak_evidence",
@@ -1410,6 +1425,7 @@ pub(crate) mod test_support {
             expected_count: 1,
             left_out: vec![],
             include_genuine_liveness_passes: false,
+            factory: false,
             reason: "r".into(),
             created_by: "operator@example.com".into(),
             created_by_key: "page".into(),
@@ -2473,6 +2489,171 @@ mod tests {
         ));
     }
 
+        fn seen_factory(control: &MemControlStore, head: &str) {
+        let seen = crate::action_control::ActionControlSeen {
+            head: head.into(),
+            classifier: "c".into(),
+            band: "-".into(),
+            entity_type: ControlEntity::User,
+            factory: true,
+            last_seen_ms: 1,
+            rule_id: String::new(),
+            action_specs: serde_json::json!([]),
+        };
+        control.rows.lock().unwrap().insert(
+            (
+                crate::action_control::SEEN_PKEY.into(),
+                crate::action_control::seen_lkey(&seen),
+            ),
+            serde_json::to_vec(&seen).unwrap(),
+        );
+    }
+
+            fn high_row(
+        control: &MemControlStore,
+        head: &str,
+        scope: bool,
+        evidence: Option<crate::action_control::ConfidenceEvidence>,
+    ) {
+        use crate::action_control::test_support::record;
+        use crate::action_control::{ActionControlRecord, ControlMode};
+        if scope {
+            control.put_record(&record(head, None, None, ControlMode::Rows, vec![]));
+        }
+        control.put_record(&ActionControlRecord {
+            confidence: Some(LevelRow::High),
+            evidence: evidence.map(Box::new),
+            ..record(
+                head,
+                None,
+                None,
+                ControlMode::Live,
+                vec![PageAction::Suspend {}],
+            )
+        });
+    }
+
+                    #[tokio::test]
+    async fn a_factory_head_starts_without_the_row_evidence_check() {
+        let (store, bf, _, sw) = parts();
+        let control = Arc::new(MemControlStore::default());
+        high_row(&control, "H", true, None);
+        high_row(&control, "F", false, None);
+        let ac = ActionControl::new(control.clone(), "test".into(), String::new());
+        ac.refresh().await.unwrap();
+        let req = || BackfillRunStartRequest {
+            levels: vec![LevelRow::High],
+            expected_control_version: Some(1),
+            ..start_request("run-00000001", "H", NOW)
+        };
+        assert!(matches!(
+            start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await,
+            Err(RunError::Conflict("weak_evidence", ..))
+        ));
+        seen_factory(&control, "H");
+        control
+            .fail_scan
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        match start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await {
+            Err(RunError::Store(msg)) => assert!(msg.contains("seen list"), "{msg}"),
+            other => panic!("expected a store error, got {other:?}"),
+        }
+        assert!(store.pkey_rows(RUN_PKEY).is_empty(), "nothing written");
+        control
+            .fail_scan
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (rec, created) = start(&bf, &ac, &sw, req(), "page", Some("a@example.com"))
+            .await
+            .unwrap();
+        assert!(created && rec.factory);
+        assert_eq!(rec.state, RunState::Running);
+        seen_factory(&control, "F");
+        let req = BackfillRunStartRequest {
+            levels: vec![LevelRow::High],
+            ..start_request("run-00000002", "F", NOW)
+        };
+        let (rec, created) = start(&bf, &ac, &sw, req, "page", Some("a@example.com"))
+            .await
+            .unwrap();
+        assert!(created && rec.factory);
+        assert_eq!(rec.state, RunState::Running);
+    }
+
+            #[tokio::test]
+    async fn resume_skips_the_row_evidence_check_only_for_a_factory_run() {
+        const DAY: i64 = 86_400_000;
+        let now = crate::now_millis();
+        let (_, bf, _, sw) = parts();
+        let control = Arc::new(MemControlStore::default());
+        let read = crate::action_control::ConfidenceEvidence {
+            precision_lower_bound: 0.96,
+            reads: 59,
+            humans: 0,
+            read_at_ms: now - 29 * DAY,
+            link: "read:rd_1".into(),
+        };
+        high_row(&control, "N", true, Some(read));
+        high_row(&control, "F", true, None);
+        seen_factory(&control, "F");
+        let ac = ActionControl::new(control.clone(), "test".into(), String::new());
+        ac.refresh().await.unwrap();
+        for (head, run_id, refused) in [("N", "run-0000000n", true), ("F", "run-0000000f", false)] {
+            let req = BackfillRunStartRequest {
+                levels: vec![LevelRow::High],
+                expected_control_version: Some(1),
+                ..start_request(run_id, head, now)
+            };
+            let (rec, _) = bf
+                .start(
+                    req,
+                    Some("a@example.com"),
+                    "page",
+                    &config("page", "sender", 10),
+                    &ac,
+                    &ControlConfig::default(),
+                    &sw,
+                    now,
+                )
+                .await
+                .unwrap();
+            change(
+                &bf,
+                &ac,
+                &sw,
+                run_id,
+                Change::Pause,
+                1,
+                "page",
+                None,
+                now + 1,
+            )
+            .await
+            .unwrap();
+            let resumed = change(
+                &bf,
+                &ac,
+                &sw,
+                run_id,
+                Change::Resume,
+                2,
+                "page",
+                Some(CONFIRM_WORD),
+                now + 2 * DAY,
+            )
+            .await;
+            if refused {
+                assert!(!rec.factory);
+                assert!(
+                    matches!(resumed, Err(RunError::Conflict("weak_evidence", ..))),
+                    "{resumed:?}"
+                );
+            } else {
+                assert!(rec.factory);
+                assert_eq!(resumed.unwrap().state, RunState::Running);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pause_resume_stop_done_follow_the_states() {
         let (_, bf, ac, sw) = parts();
@@ -2974,6 +3155,9 @@ mod tests {
         let mut left_out = s.clone();
         left_out.user_id = 5;
         assert_eq!(check_message(&rec, &left_out), Err(STATUS_NOT_IN_RUN));
+        let mut factory = s.clone();
+        factory.policy_version = "3".into();
+        assert_eq!(check_message(&rec, &factory), Err(STATUS_BAD_MESSAGE));
         s.skip_author_credibility_prechecks = true;
         assert_eq!(check_message(&rec, &s), Err(STATUS_BAD_MESSAGE));
     }

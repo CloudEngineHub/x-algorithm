@@ -53,6 +53,7 @@ from xrex.data.recsys.recsys_batch import (
     PAGE_RECORD_COLUMNS,
     POST_INT64_FEATURE_SIZE,
     USER_INT64_FEATURE_SIZE,
+    VALUE_LABEL_DTYPES,
     CandidateNegativeFilter,
     CandidateNegativeMode,
     EmbeddingType,
@@ -65,6 +66,7 @@ from xrex.data.recsys.recsys_batch import (
     empty_page_record_arrays,
     empty_user_feature_arrays,
     from_record_batch,
+    value_label_dtypes,
 )
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE
 from xrex.models.recsys_embedding import HashTable
@@ -1658,10 +1660,9 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
             padded["head_eligible_mask"] = np.pad(
                 _hem, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
             )
-        if (value_valid := post_seq.get("value_label_valid")) is not None:
-            padded["value_label_valid"] = pad_array(value_valid)
-        if (value_baseline := post_seq.get("value_baseline_mean_usd")) is not None:
-            padded["value_baseline_mean_usd"] = pad_array(value_baseline)
+        for key in VALUE_LABEL_DTYPES:
+            if (value_labels := post_seq.get(key)) is not None:
+                padded[key] = pad_array(value_labels)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
             padded["conversion_delay_ms"] = np.pad(
                 delays,
@@ -1772,6 +1773,7 @@ class PhoenixDataset(Dataset):
     include_candidate_post_ids: bool = False
     date_range: tuple[str, str] | None = None
     search_query_embedding_dim: int = 0
+    aux_value_events: tuple[str, ...] = ()
 
     candidate_negative_filter: CandidateNegativeFilter | None = None
     candidate_negative_mode: CandidateNegativeMode | None = None
@@ -1796,6 +1798,7 @@ class PhoenixDataset(Dataset):
     enable_stale_post_30d: bool = False
 
     ads_head_masking: bool = False
+    dump_keep_rate_per_10000: int | None = None
     ads_pixel_head_masking: bool = False
     page_records: bool = False
 
@@ -2261,12 +2264,14 @@ class PhoenixDataset(Dataset):
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                         stale_post_30d=self.enable_stale_post_30d,
                         ads_head_masking=self.ads_head_masking,
+                        dump_keep_rate_per_10000=self.dump_keep_rate_per_10000,
                         ads_pixel_head_masking=self.ads_pixel_head_masking,
                         reply_parent_mode=self.reply_parent_mode,
                         page_records=self.page_records,
                         id_list_specs=id_list_specs,
                         history_url_embedding_dim=self.history_url_embedding_dim,
                         alloc=self._alloc,
+                        aux_value_events=self.aux_value_events,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -2297,11 +2302,16 @@ class PhoenixDataset(Dataset):
                         and (id_list_mask := batch.get("user_id_list_mask")) is not None
                     ):
                         id_list_fill_logged = True
-                        rates = id_lists.fill_rates(id_list_mask, id_list_specs)
+                        stats = id_lists.fill_stats(id_list_mask, id_list_specs)
                         rank_logger.info(
-                            "id-list features: rows with >=1 id in the first batch: "
-                            + ", ".join(f"{n}={r:.3f}" for n, r in rates.items())
+                            "id-list features in the first batch (users>=1 / full at k / "
+                            "mean fill): "
+                            + ", ".join(
+                                f"{n}={a:.3f}/{b:.3f}/{c:.3f}" for n, (a, b, c) in stats.items()
+                            )
                         )
+                        for warning in id_lists.fill_warnings(stats):
+                            rank_logger.warning(f"id-list features: {warning}")
 
                     if record_batch.num_rows < batch_size:
                         rank_logger.warning(
@@ -2501,8 +2511,10 @@ class PhoenixDataset(Dataset):
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
                 **self._example_head_eligible_mask(batch_size, candidate_seq_len),
-                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
-                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                **{
+                    key: np.zeros((batch_size, candidate_seq_len), dtype=dtype)
+                    for key, dtype in value_label_dtypes(self.aux_value_events).items()
+                },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
@@ -2650,8 +2662,10 @@ class PhoenixToyDataset(PhoenixDataset):
                     (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
                 **self._example_head_eligible_mask(batch_size, candidate_seq_len),
-                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
-                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
+                **{
+                    key: np.zeros((batch_size, candidate_seq_len), dtype=dtype)
+                    for key, dtype in value_label_dtypes(self.aux_value_events).items()
+                },
                 conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids

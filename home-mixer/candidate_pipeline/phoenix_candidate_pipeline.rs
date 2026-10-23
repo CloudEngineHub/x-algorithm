@@ -45,6 +45,10 @@ use crate::clients::popular_authors_store_client::{
 use crate::clients::post_engagers_client::{
     MockPostEngagersClient, PostEngagersClient, ProdPostEngagersClient,
 };
+use crate::clients::recent_search_queries_store_client::{
+    MockRecentSearchQueriesStoreClient, ProdRecentSearchQueriesStoreClient,
+    RecentSearchQueriesStoreClient,
+};
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::sid_retrieval_client::{
     MockSidRetrievalClient, ProdSidRetrievalClient, SidRetrievalClient,
@@ -103,6 +107,7 @@ use crate::query_hydrators::impression_bloom_filter_query_hydrator::ImpressionBl
 use crate::query_hydrators::ip_query_hydrator::IpQueryHydrator;
 use crate::query_hydrators::muted_user_ids_query_hydrator::MutedUserIdsQueryHydrator;
 use crate::query_hydrators::mutual_follow_query_hydrator::MutualFollowQueryHydrator;
+use crate::query_hydrators::recent_search_queries_query_hydrator::RecentSearchQueriesQueryHydrator;
 use crate::query_hydrators::retrieval_sequence_query_hydrator::RetrievalSequenceQueryHydrator;
 use crate::query_hydrators::scoring_sequence_query_hydrator::ScoringSequenceQueryHydrator;
 use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserIdsQueryHydrator;
@@ -262,6 +267,7 @@ impl PhoenixCandidatePipeline {
         followed_grok_topics_client: Arc<dyn FollowedGrokTopicsStoreClient>,
         followed_starter_packs_client: Arc<dyn FollowedStarterPacksStoreClient>,
         user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient>,
+        recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient>,
         engagement_signals_client: Arc<dyn EngagementSignalsClient>,
         feature_switches: Arc<FeatureSwitches>,
         vm_ranker_xds: &super::VmRankerXdsConfig,
@@ -311,6 +317,9 @@ impl PhoenixCandidatePipeline {
             )),
             Box::new(UserInstalledAppsQueryHydrator::new(
                 user_installed_apps_client,
+            )),
+            Box::new(RecentSearchQueriesQueryHydrator::new(
+                recent_search_queries_client,
             )),
             Box::new(ExplicitEngagementSignalsQueryHydrator::new(
                 engagement_signals_client.clone(),
@@ -585,6 +594,7 @@ impl PhoenixCandidatePipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             engagement_signals_client,
             engagement_counts_client_impl,
             post_engagers_client,
@@ -846,6 +856,16 @@ impl PhoenixCandidatePipeline {
                 ) as Arc<dyn UserInstalledAppsStoreClient>
             },
             async {
+                match ProdRecentSearchQueriesStoreClient::new(datacenter).await {
+                    Ok(client) => Arc::new(client) as Arc<dyn RecentSearchQueriesStoreClient>,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RecentSearchQueriesStore client unavailable; hydration disabled");
+                        Arc::new(MockRecentSearchQueriesStoreClient)
+                            as Arc<dyn RecentSearchQueriesStoreClient>
+                    }
+                }
+            },
+            async {
                 let s2s = xai_manhattan::s2s::S2sConfig {
                     client_cert_path: S2S_CRT_PATH.clone(),
                     client_key_path: S2S_KEY_PATH.clone(),
@@ -953,6 +973,7 @@ impl PhoenixCandidatePipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             engagement_signals_client,
             feature_switches,
             vm_ranker_xds,
@@ -1021,6 +1042,8 @@ impl PhoenixCandidatePipeline {
             Arc::new(MockFollowedStarterPacksStoreClient);
         let user_installed_apps_client: Arc<dyn UserInstalledAppsStoreClient> =
             Arc::new(MockUserInstalledAppsStoreClient);
+        let recent_search_queries_client: Arc<dyn RecentSearchQueriesStoreClient> =
+            Arc::new(MockRecentSearchQueriesStoreClient);
         let engagement_signals_client: Arc<dyn EngagementSignalsClient> =
             Arc::new(MockEngagementSignalsClient);
         let feature_switches = Arc::new(FeatureSwitches::new(vec![]).unwrap());
@@ -1060,6 +1083,7 @@ impl PhoenixCandidatePipeline {
             followed_grok_topics_client,
             followed_starter_packs_client,
             user_installed_apps_client,
+            recent_search_queries_client,
             engagement_signals_client,
             feature_switches,
             &super::VmRankerXdsConfig::disabled_with_healthz(),

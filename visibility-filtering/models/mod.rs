@@ -6,7 +6,7 @@ pub mod tweet;
 pub mod verdict;
 pub mod viewer;
 
-pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
+pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet, AuthorProfile};
 pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
 pub use tweet::{
@@ -14,12 +14,13 @@ pub use tweet::{
     TweetFeatures,
 };
 pub use verdict::{
-    Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
-    Withholding,
+    Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice,
+    NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict, Withholding,
 };
 pub use viewer::{
-    ClientCapability, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
+    ClientCapability, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures,
+    ViewerProfile,
 };
 
 use crate::hydration::{Hydrator, Hydrators};
@@ -146,58 +147,30 @@ pub struct PostCandidate {
 pub struct UserCandidate {
     pub user: UserEntity,
     pub viewer_relationship: ViewerRelationship,
+    pub quote: QuoteFacts,
     pub failed: Hydrators,
+}
+
+#[cfg(test)]
+impl UserCandidate {
+    pub(crate) fn author_of(post: &PostCandidate) -> Self {
+        Self {
+            user: post.author.clone(),
+            viewer_relationship: post.viewer_relationship,
+            quote: QuoteFacts::default(),
+            failed: post.failed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct UserEntity {
     pub id: u64,
-    pub is_suspended: bool,
-    pub is_deactivated: bool,
-    pub is_protected: bool,
-    pub is_nsfw_user: bool,
-    pub is_nsfw_admin: bool,
-    pub is_erased: bool,
-    pub is_offboarded: bool,
+    pub features: AuthorFeatures,
     pub labels: AuthorLabelSet,
-}
-
-impl UserEntity {
-    pub(crate) fn new(id: u64, features: AuthorFeatures, labels: AuthorLabelSet) -> Self {
-        let AuthorFeatures {
-            is_suspended,
-            is_deactivated,
-            is_protected,
-            is_nsfw_user,
-            is_nsfw_admin,
-            is_erased,
-            is_offboarded,
-        } = features;
-        Self {
-            id,
-            is_suspended,
-            is_deactivated,
-            is_protected,
-            is_nsfw_user,
-            is_nsfw_admin,
-            is_erased,
-            is_offboarded,
-            labels,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn features(&self) -> AuthorFeatures {
-        AuthorFeatures {
-            is_suspended: self.is_suspended,
-            is_deactivated: self.is_deactivated,
-            is_protected: self.is_protected,
-            is_nsfw_user: self.is_nsfw_user,
-            is_nsfw_admin: self.is_nsfw_admin,
-            is_erased: self.is_erased,
-            is_offboarded: self.is_offboarded,
-        }
-    }
+    pub profile: AuthorProfile,
+    pub lacks_confirmed_email: bool,
+    pub lacks_verified_phone: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -206,6 +179,7 @@ pub struct ViewerRelationship {
     pub blocks: bool,
     pub mutes: bool,
     pub blocked_by: bool,
+    pub followed_by: bool,
 }
 
 impl ViewerRelationship {
@@ -216,6 +190,7 @@ impl ViewerRelationship {
             Hydrator::Blocks => Some(&mut self.blocks),
             Hydrator::Mutes => Some(&mut self.mutes),
             Hydrator::BlockedByAuthor => Some(&mut self.blocked_by),
+            Hydrator::AuthorFollowsViewer => Some(&mut self.followed_by),
             Hydrator::PureCore
             | Hydrator::Tweet
             | Hydrator::ConversationControl
@@ -230,6 +205,7 @@ impl ViewerRelationship {
             | Hydrator::RootFollowsViewer
             | Hydrator::RootFollowsViewerSecondDegree
             | Hydrator::SuperFollowsRoot
+            | Hydrator::ViewerFollowsRoot
             | Hydrator::BlockedByConversationRoot
             | Hydrator::ConversationRootPost
             | Hydrator::BlockedByConversationRootPost
@@ -246,7 +222,11 @@ impl ViewerRelationship {
             | Hydrator::OuterAuthorFollowsAuthor
             | Hydrator::QuotedTweet
             | Hydrator::ReactedToPostSafetyLabels
-            | Hydrator::ReactedToAuthorSafety => None,
+            | Hydrator::ReactedToAuthorSafety
+            | Hydrator::ViewerNotificationFilters
+            | Hydrator::AuthorProfile
+            | Hydrator::AuthorConfirmedEmail
+            | Hydrator::AuthorVerifiedPhone => None,
         }
     }
 
@@ -266,9 +246,9 @@ pub struct PostEntity {
     pub edges: Hydrators,
     pub conversation_control: Option<ConversationControlFeatures>,
     pub community_moderation: CommunityModeration,
-    pub viewer_is_community_moderator: Option<bool>,
+            pub viewer_is_community_moderator: Option<bool>,
     pub viewer_is_removed_from_community: bool,
-    pub article_lifecycle: Option<ArticleLifecycle>,
+        pub article_lifecycle: Option<ArticleLifecycle>,
     pub article_has_media_entities: bool,
     pub article_has_cover_media: bool,
     pub reacted_to_post_safety_labels: SafetyLabelMap,

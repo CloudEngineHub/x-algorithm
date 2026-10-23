@@ -721,9 +721,14 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             concat_history_web_conv_time_on_site=mparams.get(
                 "concat_history_web_conv_time_on_site", False
             ),
+            add_history_web_conv_value=mparams.get("add_history_web_conv_value", False),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
+            value_loss_normalization=mparams.get("value_loss_normalization", "valid_rows"),
+            aux_value_head_weights=mparams.get("aux_value_head_weights", ""),
+            aux_value_head_type=mparams.get("aux_value_head_type", "binned"),
+            aux_value_include_view_through=mparams.get("aux_value_include_view_through", False),
             condition_search_relevance_on_prompt=mparams.get(
                 "condition_search_relevance_on_prompt", False
             ),
@@ -911,6 +916,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                     qk_norm=mparams.get("qk_norm", False),
                     max_num_segments_per_batch=1,
                     attn_impl=mparams["attn_impl"],
+                    candidate_only_attn_impl=mparams.get("candidate_only_attn_impl"),
                     fa_version="3",
                     qkv_merge=True,
                     rotary=True,
@@ -932,7 +938,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 remat_policy=mparams.get("remat_policy", RematType.WHOLE),
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
-                candidate_only_layers=tuple(mparams.get("candidate_only_layers", ())),
+                num_candidate_only_layers=mparams.get("num_candidate_only_layers", 0),
                 output_vocab_size=mparams["output_vocab_size"],
             ),
             hash_table=hash_table,

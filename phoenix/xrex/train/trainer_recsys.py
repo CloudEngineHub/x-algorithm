@@ -444,6 +444,13 @@ class RecsysTrainer(Trainer):
             assert isinstance(self.model_config, RecsysAggregatedModelConfig)
             hl = self.model_config.history_seq_len
             self.seqpack_distribution = FixedLengthDistribution(min_len=hl, max_len=hl, mean_len=hl)
+        if isinstance(self.model_config, RecsysAggregatedModelConfig) and isinstance(
+            self.dataset, PhoenixDataset
+        ):
+            events = self.model_config.aux_value_events
+            missing = [e for e in events if e not in self.dataset.aux_value_events]
+            if missing:
+                self.dataset.aux_value_events = (*self.dataset.aux_value_events, *missing)
         if self.export_stablehlo_bundle and not self.checkpoint_config.copy_port:
             raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
         if self.forward_only and (
@@ -597,16 +604,10 @@ class RecsysTrainer(Trainer):
             batch = self.add_block_sparse_layout(batch)
         return batch
 
-    def _purchase_value_ema_keys(self) -> dict[str, jax.Array]:
-        if not (
-            isinstance(self.model_config, RecsysAggregatedModelConfig)
-            and self.model_config.purchase_value_enabled
-        ):
+    def _value_head_ema_keys(self) -> dict[str, jax.Array]:
+        if not isinstance(self.model_config, RecsysAggregatedModelConfig):
             return {}
-        return {
-            f"purchase_value/{ws}": jnp.zeros((10,), dtype=jnp.float32)
-            for ws in self.model_config.purchase_value_smoothing_windows
-        }
+        return self.model_config.value_head_ema_keys()
 
     def _conversion_delay_slice_ema_keys(self, state_size: int) -> dict[str, jax.Array]:
         if not isinstance(self.model_config, RecsysAggregatedModelConfig):
@@ -727,7 +728,7 @@ class RecsysTrainer(Trainer):
                 for m in mask_keys
                 for ws in self.smoothing_windows
             }
-            rce_ema.update(self._purchase_value_ema_keys())
+            rce_ema.update(self._value_head_ema_keys())
             rce_ema.update(self._conversion_delay_slice_ema_keys(3))
 
         calib_ema = None
@@ -1185,7 +1186,7 @@ class RecsysTrainer(Trainer):
         if isinstance(self.dataset, RustKafkaDataset) and self.dataset.redistribution_reader_count(
             data_world_size
         ):
-            if self.evals or self.empty_history_augmentation_rate > 0:
+            if self.empty_history_augmentation_rate > 0:
                 raise ValueError("Redistribution requires one consumed batch per training step")
 
         assert elapsed_samples >= self.dataloader_offset, (
@@ -2924,7 +2925,7 @@ class RecsysTrainer(Trainer):
                         else:
                             reconciled_rce[key] = jnp.zeros((3,), dtype=jnp.float32)
             for key, zeros in {
-                **self._purchase_value_ema_keys(),
+                **self._value_head_ema_keys(),
                 **self._conversion_delay_slice_ema_keys(3),
             }.items():
                 loaded = loaded_rce.get(key) if loaded_rce else None

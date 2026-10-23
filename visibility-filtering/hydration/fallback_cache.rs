@@ -99,7 +99,7 @@ impl<E: Clone> FallbackCache<E> {
                             }
                         }
                     }
-                    Hydrated::Failed(error) => {
+                    missed @ (Hydrated::Failed | Hydrated::Unanswered) => {
                         match self.entries.get(&key).as_ref().and_then(C::get) {
                             Some(value) => {
                                 counts.stale += 1;
@@ -107,7 +107,7 @@ impl<E: Clone> FallbackCache<E> {
                             }
                             None => {
                                 counts.unavailable += 1;
-                                Hydrated::Failed(error)
+                                missed
                             }
                         }
                     }
@@ -176,7 +176,7 @@ impl<E: Clone> FallbackCache<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::batch::{HydrationBatch, HydrationError};
+    use crate::hydration::batch::HydrationBatch;
 
     type Pair = (Option<String>, Option<String>);
 
@@ -256,7 +256,7 @@ mod tests {
     }
 
     fn failed() -> Hydrated<String> {
-        Hydrated::Failed(HydrationError::Timeout)
+        Hydrated::Failed
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
         cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));
         let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));
 
-        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed(_))));
+        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed)));
     }
 
     #[test]

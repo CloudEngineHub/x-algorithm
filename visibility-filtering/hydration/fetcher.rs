@@ -1,8 +1,11 @@
-use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
-use crate::hydration::Cause;
+use crate::hydration::batch::{Hydrated, HydrationBatch};
+use crate::hydration::inventory::{Answer, Batch, Source};
+use crate::hydration::relation::Relation;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::hash::Hash;
+use strum::VariantArray;
 
 pub(super) struct Fetcher<V, K = u64> {
     states: FxHashMap<K, State<V>>,
@@ -34,15 +37,9 @@ impl<V, K: Copy + Eq + Hash> Fetcher<V, K> {
     pub(super) fn land(&mut self, claimed: &[K], batch: HydrationBatch<K, V>) {
         let mut answers = batch.into_hydrated();
         for &key in claimed {
-            let answer = answers.remove(&key);
-            debug_assert!(answer.is_some(), "a call answers every key it claimed");
-            let answer = answer.unwrap_or(Hydrated::Failed(HydrationError::Error));
+            let answer = answers.remove(&key).unwrap_or(Hydrated::Unanswered);
             self.states.insert(key, State::Landed(answer));
         }
-    }
-
-    pub(super) fn has_landed(&self, key: K) -> bool {
-        matches!(self.states.get(&key), Some(State::Landed(_)))
     }
 
     pub(super) fn get(&self, key: K) -> Option<&V> {
@@ -60,13 +57,146 @@ impl<V, K: Copy + Eq + Hash> Fetcher<V, K> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Owner {
+    Request,
+    Related(Relation),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FetcherSpec {
+    pub(super) batch: Batch,
+    pub(super) fields: AskedFields,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AskedFields {
+    Planned,
+    EveryLevel,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FetcherId {
+    pub(crate) source: Source,
+    pub(crate) owner: Owner,
+}
+
+impl FetcherId {
+    #[cfg(test)]
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
+        Source::VARIANTS.iter().flat_map(|&source| {
+            let owners = Relation::VARIANTS
+                .iter()
+                .filter(move |relation| relation.owns(source))
+                .map(|&relation| Owner::Related(relation));
+            std::iter::once(Owner::Request)
+                .chain(owners)
+                .map(move |owner| Self { source, owner })
+        })
+    }
+
+    pub(super) const fn spec(self) -> FetcherSpec {
+        let batch = self.source.row().batch;
+        match self.owner {
+            Owner::Request => FetcherSpec {
+                batch,
+                fields: if matches!(
+                    self.source,
+                    Source::GizmoduckAuthor | Source::GizmoduckActor
+                ) {
+                    AskedFields::EveryLevel
+                } else {
+                    AskedFields::Planned
+                },
+            },
+            Owner::Related(_) => FetcherSpec {
+                batch: match batch {
+                    Batch::Requested => Batch::Keys,
+                    Batch::Unrecorded | Batch::Keys => batch,
+                },
+                fields: AskedFields::Planned,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<Source> for FetcherId {
+    fn from(source: Source) -> Self {
+        Self {
+            source,
+            owner: Owner::Request,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<(Relation, Source)> for FetcherId {
+    fn from((relation, source): (Relation, Source)) -> Self {
+        Self {
+            source,
+            owner: Owner::Related(relation),
+        }
+    }
+}
+
+impl fmt::Debug for FetcherId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.owner {
+            Owner::Request => write!(f, "{:?}", self.source),
+            Owner::Related(relation) => write!(f, "{:?}@{}", self.source, <&str>::from(relation)),
+        }
+    }
+}
+
+pub(super) struct Fetchers<V> {
+    request: Fetcher<V>,
+    related: [Fetcher<V>; Relation::VARIANTS.len()],
+}
+
+impl<V> Default for Fetchers<V> {
+    fn default() -> Self {
+        Self {
+            request: Fetcher::default(),
+            related: Default::default(),
+        }
+    }
+}
+
+impl<V> Fetchers<V> {
+    pub(super) fn request(&self) -> &Fetcher<V> {
+        &self.request
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Relation::VARIANTS sizes the array, so every Relation indexes it"
+    )]
+    pub(super) fn of(&self, owner: Owner) -> &Fetcher<V> {
+        match owner {
+            Owner::Request => &self.request,
+            Owner::Related(relation) => &self.related[relation as usize],
+        }
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Relation::VARIANTS sizes the array, so every Relation indexes it"
+    )]
+    pub(super) fn of_mut(&mut self, owner: Owner) -> &mut Fetcher<V> {
+        match owner {
+            Owner::Request => &mut self.request,
+            Owner::Related(relation) => &mut self.related[relation as usize],
+        }
+    }
+}
+
 pub(super) trait AnyFetcher<K = u64> {
     fn claim(&mut self, keys: Vec<K>) -> Vec<K>;
     fn has_claimed(&self) -> bool;
     fn is_claimed(&self, key: K) -> bool;
-    fn has_incomplete(&self) -> bool;
     fn is_incomplete(&self, key: K) -> bool;
-    fn miss(&self, key: K) -> Option<Cause>;
+    fn answer(&self, key: K) -> Answer;
 }
 
 impl<V, K: Copy + Eq + Hash> AnyFetcher<K> for Fetcher<V, K> {
@@ -90,21 +220,20 @@ impl<V, K: Copy + Eq + Hash> AnyFetcher<K> for Fetcher<V, K> {
         self.states.contains_key(&key)
     }
 
-    fn has_incomplete(&self) -> bool {
-        self.states.values().any(|state| !state.is_complete())
-    }
-
     fn is_incomplete(&self, key: K) -> bool {
         self.states
             .get(&key)
             .is_some_and(|state| !state.is_complete())
     }
 
-    fn miss(&self, key: K) -> Option<Cause> {
+    fn answer(&self, key: K) -> Answer {
         match self.states.get(&key) {
-            Some(State::Landed(Hydrated::Found(_) | Hydrated::Partial(_))) => None,
-            Some(State::Landed(Hydrated::NotFound)) => Some(Cause::NotFound),
-            Some(State::Landed(Hydrated::Failed(_)) | State::Pending) | None => Some(Cause::Failed),
+            Some(State::Landed(Hydrated::Found(_))) => Answer::Found,
+            Some(State::Landed(Hydrated::Partial(_))) => Answer::Partial,
+            Some(State::Landed(Hydrated::NotFound)) => Answer::NotFound,
+            Some(State::Landed(Hydrated::Failed)) => Answer::Failed,
+            Some(State::Landed(Hydrated::Unanswered) | State::Pending) => Answer::Unanswered,
+            None => Answer::Unclaimed,
         }
     }
 }
@@ -123,7 +252,7 @@ mod tests {
                 (1, Hydrated::Found(7)),
                 (2, Hydrated::NotFound),
                 (3, Hydrated::Partial(7)),
-                (4, Hydrated::Failed(HydrationError::Timeout)),
+                (4, Hydrated::Failed),
             ])),
         );
 
@@ -136,14 +265,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "a call answers every key it claimed")]
-    fn a_call_that_leaves_out_a_claimed_key_breaks_the_fetcher_contract() {
+    fn a_claimed_key_the_answer_leaves_out_lands_unanswered() {
         let mut fetcher = Fetcher::default();
         let keys = fetcher.claim(vec![1, 2]);
         fetcher.land(
             &keys,
             HydrationBatch::from_hydrated(FxHashMap::from_iter([(1, Hydrated::Found(7))])),
         );
+
+        assert!(fetcher.is_incomplete(2));
+        assert_eq!(fetcher.answer(2), Answer::Unanswered);
     }
 }

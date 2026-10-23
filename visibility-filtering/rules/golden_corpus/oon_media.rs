@@ -1,7 +1,9 @@
-use super::builders::{author_candidate, tweet_candidate, viewer_in_country, viewer_with_age};
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::models::{ViewerAge, ViewerFeatures};
-use crate::rules::fixtures::{allow, author_viewer, dropped};
+use crate::rules::fixtures::{
+    allow, author_candidate, author_viewer, dropped, tweet_candidate, viewer_in_country,
+    viewer_with_age,
+};
 use crate::rules::SafetyLevel::{
     ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeRecommendations,
 };
@@ -11,7 +13,7 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "dmca_media",
-            post: tweet_candidate(|t| t.media.has_dmca_media = true),
+            subject: Subject::Post(tweet_candidate(|t| t.media.has_dmca_media = true)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -26,7 +28,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_user_flag",
-            post: tweet_candidate(|t| t.nsfw.user = true),
+            subject: Subject::Post(tweet_candidate(|t| t.nsfw.user = true)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -48,7 +50,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_admin_flag",
-            post: tweet_candidate(|t| t.nsfw.admin = true),
+            subject: Subject::Post(tweet_candidate(|t| t.nsfw.admin = true)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -70,7 +72,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_user_author",
-            post: author_candidate(|a| a.is_nsfw_user = true),
+            subject: Subject::Post(author_candidate(|a| a.is_nsfw_user = true)),
             expect: vec![
                 (TimelineHome, Role::NonFollower, allow()),
                 (
@@ -108,7 +110,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_admin_author",
-            post: author_candidate(|a| a.is_nsfw_admin = true),
+            subject: Subject::Post(author_candidate(|a| a.is_nsfw_admin = true)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -131,7 +133,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_denied_media_de",
-            post: tweet_candidate(|t| t.media.geo_deny_list = vec!["de".to_string()]),
+            subject: Subject::Post(tweet_candidate(|t| {
+                t.media.geo_deny_list = vec!["de".to_string()]
+            })),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -165,7 +169,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_allow_listed_media_us",
-            post: tweet_candidate(|t| t.media.geo_allow_list = vec!["us".to_string()]),
+            subject: Subject::Post(tweet_candidate(|t| {
+                t.media.geo_allow_list = vec!["us".to_string()]
+            })),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -192,7 +198,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_allow_listed_media_uppercase",
-            post: tweet_candidate(|t| t.media.geo_allow_list = vec!["US".to_string()]),
+            subject: Subject::Post(tweet_candidate(|t| {
+                t.media.geo_allow_list = vec!["US".to_string()]
+            })),
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::As("in_us", viewer_in_country("us")),
@@ -201,7 +209,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_denied_media_uppercase",
-            post: tweet_candidate(|t| t.media.geo_deny_list = vec!["DE".to_string()]),
+            subject: Subject::Post(tweet_candidate(|t| {
+                t.media.geo_deny_list = vec!["DE".to_string()]
+            })),
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::As("in_de", viewer_in_country("de")),
@@ -213,7 +223,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_denied_media_worldwide",
-            post: tweet_candidate(|t| t.media.geo_deny_list = vec!["xx".to_string()]),
+            subject: Subject::Post(tweet_candidate(|t| {
+                t.media.geo_deny_list = vec!["xx".to_string()]
+            })),
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::NonFollower,
@@ -225,12 +237,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_denied_media_retweet",
-            post: {
+            subject: Subject::Post({
                 let mut candidate =
                     tweet_candidate(|t| t.media.geo_deny_list = vec!["de".to_string()]);
                 candidate.post.source_tweet_id = Some(2);
                 candidate
-            },
+            }),
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::As("in_de", viewer_in_country("de")),

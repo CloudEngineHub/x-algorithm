@@ -18,9 +18,36 @@ fn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {
         .is_none_or(|created_at| created_at > now)
 }
 
+fn system_unix_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn label_is_live(expires_at_msec: Option<i64>, now_ms: i64) -> bool {
+    match expires_at_msec {
+        Some(expires_at_msec) => expires_at_msec.wrapping_sub(now_ms) > 0,
+        None => true,
+    }
+}
+
+fn drop_expired_labels(map: &vf_pb::SafetyLabelMap, now_ms: i64) -> vf_pb::SafetyLabelMap {
+    vf_pb::SafetyLabelMap {
+        labels: map
+            .labels
+            .iter()
+            .filter(|(_, label)| label_is_live(label.expires_at_msec, now_ms))
+            .map(|(id, label)| (*id, label.clone()))
+            .collect(),
+    }
+}
+
 pub struct SafetyLabelSource {
         cache: Option<ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>>,
     remote: Arc<RemoteSource>,
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl SafetyLabelSource {
@@ -29,6 +56,15 @@ impl SafetyLabelSource {
     }
 
     fn with_clock(remote: Arc<RemoteSource>, cache_capacity: Option<usize>, clock: Clock) -> Self {
+        Self::with_clocks(remote, cache_capacity, clock, Arc::new(system_unix_ms))
+    }
+
+    fn with_clocks(
+        remote: Arc<RemoteSource>,
+        cache_capacity: Option<usize>,
+        clock: Clock,
+        now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
         info!(
             cache_capacity = cache_capacity.unwrap_or(0),
             ttl_secs = TTL.as_secs(),
@@ -37,6 +73,7 @@ impl SafetyLabelSource {
         Self {
             cache: cache_capacity.map(|capacity| ExpiringCache::with_clock(capacity, clock)),
             remote,
+            now_ms,
         }
     }
 
@@ -55,6 +92,22 @@ impl SafetyLabelSource {
         self.backfill_local(remote_results, &mut results);
 
         Self::emit_stats(total - batch_size, batch_size, expired);
+
+        let now_ms = (self.now_ms)();
+        let mut dropped = 0;
+        for labels in results.values_mut() {
+            let Ok(map) = labels else { continue };
+            if map
+                .labels
+                .values()
+                .any(|label| !label_is_live(label.expires_at_msec, now_ms))
+            {
+                let live = drop_expired_labels(map, now_ms);
+                dropped += map.labels.len() - live.labels.len();
+                *map = Arc::new(live);
+            }
+        }
+        metrics::record_expired_labels(dropped);
 
         results
     }
@@ -119,11 +172,13 @@ mod tests {
     };
     use crate::safety_label_source::codec::RawSafetyLabel;
     use crate::safety_label_source::lookup::RemoteSource;
+    use crate::safety_label_source::lookup::{LookupResults, ManhattanLookup, TwemcacheLookup};
     use crate::safety_label_source::manhattan::ManhattanSource;
     use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
+    use crate::safety_label_source::types::TwemcacheOutcome;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tonic::async_trait;
     use xai_cache::{KVCacheError, Key, Value};
 
@@ -366,5 +421,90 @@ mod tests {
         let restamped = l1_expiry(&source, tweet_id).expect("re-backfilled");
 
         assert!(restamped > first_expiry);
+    }
+
+    fn proto_label(expires_at_msec: Option<i64>) -> vf_pb::SafetyLabel {
+        vf_pb::SafetyLabel {
+            expires_at_msec,
+            ..vf_pb::SafetyLabel::default()
+        }
+    }
+
+    struct HitMap {
+        map: vf_pb::SafetyLabelMap,
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TwemcacheLookup for HitMap {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
+            self.fetches.fetch_add(ids.len(), Ordering::SeqCst);
+            ids.iter()
+                .map(|&id| (id, TwemcacheOutcome::Hit(self.map.clone())))
+                .collect()
+        }
+    }
+
+    struct EmptyManhattan;
+
+    #[async_trait]
+    impl ManhattanLookup for EmptyManhattan {
+        async fn get(&self, _: &[u64]) -> LookupResults {
+            FxHashMap::default()
+        }
+    }
+
+    fn label_ids(map: &vf_pb::SafetyLabelMap) -> Vec<i32> {
+        let mut ids: Vec<i32> = map.labels.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_cached_label_drops_out_after_it_expires_without_a_refetch() {
+        let now = Arc::new(AtomicI64::new(1_000));
+        let now_ms = Arc::clone(&now);
+        let hit = Arc::new(HitMap {
+            map: vf_pb::SafetyLabelMap {
+                labels: HashMap::from([
+                    (1, proto_label(None)),
+                    (2, proto_label(Some(1_000))),
+                    (3, proto_label(Some(5_000))),
+                ]),
+            },
+            fetches: AtomicUsize::new(0),
+        });
+        let source = SafetyLabelSource::with_clocks(
+            Arc::new(RemoteSource::new(
+                Arc::clone(&hit),
+                Arc::new(EmptyManhattan),
+            )),
+            Some(8),
+            Clock::new(),
+            Arc::new(move || now_ms.load(Ordering::Relaxed)),
+        );
+
+        let first = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(first.get(&42).unwrap().as_ref().unwrap()),
+            vec![1, 3]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
+
+        now.store(5_000, Ordering::Relaxed);
+        let later = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(later.get(&42).unwrap().as_ref().unwrap()),
+            vec![1]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
+
+        now.store(0, Ordering::Relaxed);
+        let rewound = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(rewound.get(&42).unwrap().as_ref().unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
     }
 }

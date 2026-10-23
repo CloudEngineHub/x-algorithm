@@ -94,6 +94,198 @@ user|GraphSuspensionTrainedFleet|panda_reports_embedding_v10_rough_spam|HighCred
 user|GraphSuspensionTrainedFleet|panda_reports_embedding_v10_rough_spam|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
 user|GraphSuspensionTrainedFleet|panda_reports_embedding_v10_rough_spam|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		bc6ae2ea9be99be5
 user|GraphSuspensionTrainedFleet|panda_reports_embedding_v10_rough_spam|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Deactivated|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	4db674cce735a1da
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		af8287e9c5a17e9a
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Deactivated|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	4db674cce735a1da
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot|bb1_post_spam_bot_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Clean|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	d6680687475d2c22
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Clean|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		646179fd9ae231a1
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Clean|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	d6680687475d2c22
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Suspended|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	01ffca4eccc09451
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Suspended|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		0a48ab0daf15403f
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Suspended|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	01ffca4eccc09451
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Deactivated|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	deba557005dbd222
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		085a477e48265132
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Deactivated|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	deba557005dbd222
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	f3ff2027d3dab7a9
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		24386bbdfd4d4228
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	f3ff2027d3dab7a9
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=2)=None	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=2)=None	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=2)=None	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=2)=None	cap=0		f35266b107379264
+user|NearDupEmbeddingCseMatch|bb1_post_spam_bot_bounce|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		27f3645a54331db6
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2972a133437ce869
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		2972a133437ce869
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2972a133437ce869
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Deactivated|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a4c5a0f7c0153ed6
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		9685b5b6d174f5bd
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Deactivated|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a4c5a0f7c0153ed6
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		651ddf13bc561799
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		212fa300d0b4f2ad
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		c0d7619aec180cde
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		18542434340d50e9
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		0aadf4548abc188a
+user|PandaReportsEmbeddingV10RoughUserAggGe4|bb1_reply_spam_bot_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Clean|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	eb602760e985b822
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Clean|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		46e1534fd08d2da2
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Clean|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	eb602760e985b822
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Suspended|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	ad57f33bbd5615af
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Suspended|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		1b5a4351cd24de10
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Suspended|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	ad57f33bbd5615af
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Deactivated|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	80f6fef7546c5a8c
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		fa0a5c7f22c29d35
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Deactivated|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	80f6fef7546c5a8c
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	7710bc7c968f6311
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		2a88b88beb592f43
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	7710bc7c968f6311
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=2)=None	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=2)=None	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=2)=None	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=2)=None	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|bb1_reply_spam_bot_bounce|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		1de8ea1252c4d0ec
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Deactivated|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	4db674cce735a1da
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		af8287e9c5a17e9a
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Deactivated|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	4db674cce735a1da
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot|bb1_user_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Clean|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	d6680687475d2c22
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Clean|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		646179fd9ae231a1
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Clean|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	d6680687475d2c22
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Suspended|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	01ffca4eccc09451
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Suspended|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		0a48ab0daf15403f
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Suspended|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	01ffca4eccc09451
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Deactivated|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	deba557005dbd222
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		085a477e48265132
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Deactivated|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	deba557005dbd222
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	f3ff2027d3dab7a9
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		24386bbdfd4d4228
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	f3ff2027d3dab7a9
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=2)=None	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=2)=None	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=2)=None	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=2)=None	cap=0		f35266b107379264
+user|NearDupEmbeddingCseMatch|liveness_check_and_spam_high_recall_7d|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Clean|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=1	intakeAction:addLabelsV2	d526fcba24265f8f
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Clean|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		ca9a02c570f96ee7
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Clean|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Suspended|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=1	intakeAction:addLabelsV2	3ed9e99b2cdbf3a7
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Suspended|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		190d8ef1763209fd
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Suspended|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Deactivated|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=1	intakeAction:addLabelsV2	5305a3d26bfb9c0b
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		6083aa9ddfa4daaa
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Deactivated|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=1	intakeAction:addLabelsV2	27035185d2d6f9b1
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		83e06c863f9a15f8
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HasSpamHighRecall|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=1)=None	cap=0		212fa300d0b4f2ad
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers5k|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=1)=None	cap=0		c0d7619aec180cde
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|Followers200k|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=1)=None	cap=0		18542434340d50e9
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|HighCred|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=1)=None	cap=0		0aadf4548abc188a
+user|PandaReportsEmbeddingV10RoughUserAggGe4|spam_high_recall_7d|NotFound|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Clean|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	eb602760e985b822
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Clean|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		46e1534fd08d2da2
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Clean|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	eb602760e985b822
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Suspended|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	ad57f33bbd5615af
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Suspended|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		1b5a4351cd24de10
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Suspended|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	ad57f33bbd5615af
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Deactivated|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	80f6fef7546c5a8c
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Deactivated|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		fa0a5c7f22c29d35
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Deactivated|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	80f6fef7546c5a8c
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=2)=new,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	7710bc7c968f6311
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=2)=None	cap=0		2a88b88beb592f43
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=2)=bypass,update(class=2,own_claim=true)	cap=1	multiEntityIntakeAction:addLabelsV2,multiEntityIntakeAction:bounceViaTemplate	7710bc7c968f6311
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=2)=None	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=2)=None	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=2)=None	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=2)=None	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|bb1_user_bounce|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
 user|UserEmbeddingPostSpamBot|llm_slop_user|Clean|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=1	intakeAction:addLabelsV2	d43ed4d311ee0edb
 user|UserEmbeddingPostSpamBot|llm_slop_user|Clean|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		791ffc9d259d0cc4
 user|UserEmbeddingPostSpamBot|llm_slop_user|Clean|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
@@ -262,294 +454,54 @@ user|PandaReportsEmbeddingV10RoughUserAggGe4|enforcement_cusp_liveness|HighCred|
 user|PandaReportsEmbeddingV10RoughUserAggGe4|enforcement_cusp_liveness|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
 user|PandaReportsEmbeddingV10RoughUserAggGe4|enforcement_cusp_liveness|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=2)=None	cap=0		0aadf4548abc188a
 user|PandaReportsEmbeddingV10RoughUserAggGe4|enforcement_cusp_liveness|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=2)=bypass,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6b7e37a27d9f8629
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		bff4f491139ad0f4
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|inauthentic_detection_v45_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|inauthentic_detection_v45_label_shr|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	96fbd19b8506200e
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		8d412b03695c0d46
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	96fbd19b8506200e
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5cc93c8403627f3d
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		0412d5a39476c283
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5cc93c8403627f3d
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|inauthentic_detection_v45_bounce_captcha|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		27f3645a54331db6
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		651ddf13bc561799
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4|inauthentic_detection_v45_bounce_arkose|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6b7e37a27d9f8629
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		bff4f491139ad0f4
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|cluster_spam_extended_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|cluster_spam_extended_bounce|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	96fbd19b8506200e
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		8d412b03695c0d46
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	96fbd19b8506200e
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5cc93c8403627f3d
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		0412d5a39476c283
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5cc93c8403627f3d
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|cluster_spam_extended_label_shr|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		27f3645a54331db6
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		651ddf13bc561799
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4|cluster_spam_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6b7e37a27d9f8629
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		bff4f491139ad0f4
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		bc6ae2ea9be99be5
-user|GraphSuspensionTrainedFleet|cluster_spam_bounce|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
-user|UserEmbeddingPostSpamBot|cluster_spam_label_shr|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Clean|dry=0|held=-	platform_row_without_requested_actions	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		69176b15550da3de
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Clean|dry=1|held=-	platform_row_without_requested_actions	[true]	peek(class=0)=None	cap=0		69176b15550da3de
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Clean|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=0)=None	cap=0		294fcfa985b346b0
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Suspended|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=0)=None	cap=0		e1d1d2051b56eb1a
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Deactivated|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HasSpamHighRecall|dry=0|held=-	platform_row_without_requested_actions	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		4ff2e9980ee6aa1d
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HasSpamHighRecall|dry=1|held=-	platform_row_without_requested_actions	[true]	peek(class=0)=None	cap=0		4ff2e9980ee6aa1d
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HasSpamHighRecall|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=0)=None	cap=0		ebe81246fc16e5cb
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers5k|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=0)=None	cap=0		d19837439027ba0c
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|Followers200k|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=0)=None	cap=0		64f28388a2e2a9b1
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|HighCred|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=0)=None	cap=0		f35266b107379264
-user|NearDupEmbeddingCseMatch|abuse_platform_requested_actions|NotFound|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		27f3645a54331db6
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	56f501f4ff5154f8
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		db0af05b75a44db2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5e373000c082cff2
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		651ddf13bc561799
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	ff4bf72909f11ddf
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		212fa300d0b4f2ad
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4||Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		c0d7619aec180cde
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4||HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		18542434340d50e9
-user|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		0aadf4548abc188a
-user|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0aadf4548abc188a
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6b7e37a27d9f8629
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	5e4a8b98f1189bd0
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		501397bcdc5ffb5f
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		501397bcdc5ffb5f
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		0475c668d5bb0579
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		0475c668d5bb0579
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		bff4f491139ad0f4
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	a1dde7617b1d6ffb
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		8f9f06821eef0b7c
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e32bdd2c24a2079d
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		6fe581795481c834
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		bc6ae2ea9be99be5
+user|GraphSuspensionTrainedFleet|impersonation_scam_classifier_v1_suspend|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		bc6ae2ea9be99be5
+user|UserEmbeddingPostSpamBot||Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot||Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		b07f8c5cbad6232b
+user|UserEmbeddingPostSpamBot||Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	8183d5d191706c94
+user|UserEmbeddingPostSpamBot||Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
+user|UserEmbeddingPostSpamBot||Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		e50fa7a8f70ceb8d
+user|UserEmbeddingPostSpamBot||Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e50fa7a8f70ceb8d
+user|UserEmbeddingPostSpamBot||Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
+user|UserEmbeddingPostSpamBot||Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		74c21de17b2170e3
+user|UserEmbeddingPostSpamBot||Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		74c21de17b2170e3
+user|UserEmbeddingPostSpamBot||HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot||HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		6abcfdf8a197e92e
+user|UserEmbeddingPostSpamBot||HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	6036145f53f7eebf
+user|UserEmbeddingPostSpamBot||Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot||Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot||Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e28e4362b08f950a
+user|UserEmbeddingPostSpamBot||Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot||Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot||Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		2da77e4223624e5b
+user|UserEmbeddingPostSpamBot||HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot||HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot||HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		3e64bdef15092da6
+user|UserEmbeddingPostSpamBot||NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot||NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		5a621b0180059427
+user|UserEmbeddingPostSpamBot||NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		5a621b0180059427
 post|UserEmbeddingPostSpamBot|llm_slop_post|Clean|dry=0|held=-	success	[false]	try_insert(class=1)=new,update(class=1,own_claim=true)	cap=0	intakeAction:addLabelsV2	e6bda8cd04482222
 post|UserEmbeddingPostSpamBot|llm_slop_post|Clean|dry=1|held=-	dry_run	[true]	peek(class=1)=None	cap=0		eccabfd28d4491ec
 post|UserEmbeddingPostSpamBot|llm_slop_post|Clean|dry=0|held=1	dedup_skipped	[false]	try_insert(class=1)=duplicate	cap=0		a4803058667fa002
@@ -718,30 +670,30 @@ post|PandaReportsEmbeddingV10RoughUserAggGe4||HighCred|dry=0|held=1	dedup_skippe
 post|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		92abca751ed444a5
 post|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=1|held=-	user_not_found	[true]	peek(class=0)=None	cap=0		92abca751ed444a5
 post|PandaReportsEmbeddingV10RoughUserAggGe4||NotFound|dry=0|held=1	dedup_skipped	[false]	try_insert(class=0)=duplicate	cap=0		a4803058667fa002
-user|factory|Clean|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	f789397fb03934c4
-user|factory|Clean|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		4247c262c5a1fa93
-user|factory|Clean|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	f789397fb03934c4
-user|factory|Suspended|dry=0|held=-	already_suspended	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		32a8e81794fec07f
-user|factory|Suspended|dry=1|held=-	already_suspended	[true]	peek(class=3)=None	cap=0		32a8e81794fec07f
-user|factory|Suspended|dry=0|held=1	already_suspended	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		32a8e81794fec07f
-user|factory|Deactivated|dry=0|held=-	already_deactivated	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		fdba975969c9d057
-user|factory|Deactivated|dry=1|held=-	already_deactivated	[true]	peek(class=3)=None	cap=0		fdba975969c9d057
-user|factory|Deactivated|dry=0|held=1	already_deactivated	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		fdba975969c9d057
-user|factory|HasSpamHighRecall|dry=0|held=-	success	[false]	try_insert(class=3)=new,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	cbfe6be8b6c19d9b
-user|factory|HasSpamHighRecall|dry=1|held=-	dry_run	[true]	peek(class=3)=None	cap=0		33db164f98f26708
-user|factory|HasSpamHighRecall|dry=0|held=1	success	[false]	try_insert(class=3)=bypass,update(class=3,own_claim=true)	cap=1	intakeAction:suspendUser	cbfe6be8b6c19d9b
-user|factory|Followers5k|dry=0|held=-	high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		e79a4e1d9864c1b8
-user|factory|Followers5k|dry=1|held=-	high_follower_count	[true]	peek(class=3)=None	cap=0		e79a4e1d9864c1b8
-user|factory|Followers5k|dry=0|held=1	high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		e79a4e1d9864c1b8
-user|factory|Followers200k|dry=0|held=-	very_high_follower_count	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		4764d7914ed94365
-user|factory|Followers200k|dry=1|held=-	very_high_follower_count	[true]	peek(class=3)=None	cap=0		4764d7914ed94365
-user|factory|Followers200k|dry=0|held=1	very_high_follower_count	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		4764d7914ed94365
-user|factory|HighCred|dry=0|held=-	pagerank_skipped	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		fa95d149c01ce34a
-user|factory|HighCred|dry=1|held=-	pagerank_skipped	[true]	peek(class=3)=None	cap=0		fa95d149c01ce34a
-user|factory|HighCred|dry=0|held=1	pagerank_skipped	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		fa95d149c01ce34a
-user|factory|NotFound|dry=0|held=-	user_not_found	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		4583b03d45ac1599
-user|factory|NotFound|dry=1|held=-	user_not_found	[true]	peek(class=3)=None	cap=0		4583b03d45ac1599
-user|factory|NotFound|dry=0|held=1	user_not_found	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		4583b03d45ac1599
+user|factory|Clean|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		5623febadf1f9c05
+user|factory|Clean|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		5623febadf1f9c05
+user|factory|Clean|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		5623febadf1f9c05
+user|factory|Suspended|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		f3ab337382911450
+user|factory|Suspended|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		f3ab337382911450
+user|factory|Suspended|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		f3ab337382911450
+user|factory|Deactivated|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		9aaf4222f9243777
+user|factory|Deactivated|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		9aaf4222f9243777
+user|factory|Deactivated|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		9aaf4222f9243777
+user|factory|HasSpamHighRecall|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		aaf6cc7611e3de72
+user|factory|HasSpamHighRecall|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		aaf6cc7611e3de72
+user|factory|HasSpamHighRecall|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		aaf6cc7611e3de72
+user|factory|Followers5k|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		34cc9a88425e10a9
+user|factory|Followers5k|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		34cc9a88425e10a9
+user|factory|Followers5k|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		34cc9a88425e10a9
+user|factory|Followers200k|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		d677ca5ea69b61c4
+user|factory|Followers200k|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		d677ca5ea69b61c4
+user|factory|Followers200k|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		d677ca5ea69b61c4
+user|factory|HighCred|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		abe930b7f824bb2b
+user|factory|HighCred|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		abe930b7f824bb2b
+user|factory|HighCred|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		abe930b7f824bb2b
+user|factory|NotFound|dry=0|held=-	no_actions	[true]	peek(class=0)=None	cap=0		bd054b307de1a6a6
+user|factory|NotFound|dry=1|held=-	no_actions	[true]	peek(class=0)=None	cap=0		bd054b307de1a6a6
+user|factory|NotFound|dry=0|held=1	no_actions	[true]	peek(class=0)=Some(1)	cap=0		bd054b307de1a6a6
 user|SwitchedOffHead|anchor_campaign_suspend|Clean|dry=0|held=-	enforcement_switched_off	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=0		6d52de8059abc831
 user|SwitchedOffHead|anchor_campaign_suspend|Clean|dry=1|held=-	enforcement_switched_off	[true]	peek(class=3)=None	cap=0		6d52de8059abc831
 user|SwitchedOffHead|anchor_campaign_suspend|Clean|dry=0|held=1	enforcement_switched_off	[false]	try_insert(class=3)=bypass,update_skip(class=0,own_claim=true)	cap=0		6d52de8059abc831
@@ -752,6 +704,14 @@ user|cap_full|anchor_campaign_suspend|Clean	max_enforcement_reached	[false]	try_
 user|cap_full|anchor_campaign_user|Clean	max_enforcement_reached	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|anchor_campaign_suspend_cse|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|panda_reports_embedding_v10_rough_spam|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_post_spam_bot_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_post_spam_bot_bounce|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_reply_spam_bot_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_reply_spam_bot_bounce|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_user_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|liveness_check_and_spam_high_recall_7d|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|spam_high_recall_7d|Clean	max_enforcement_reached	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
+user|cap_full|bb1_user_bounce|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|llm_slop_user|Clean	max_enforcement_reached	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|SpamEmbeddingMajorityPoster|Clean	max_enforcement_reached	[false]	try_insert(class=1)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|spam_liveness_check_required|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
@@ -759,14 +719,4 @@ user|cap_full|enforcement_cusp_arkose|Clean	max_enforcement_reached	[false]	try_
 user|cap_full|enforcement_threshold_reached|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|enforcement_cusp_captcha|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
 user|cap_full|enforcement_cusp_liveness|Clean	max_enforcement_reached	[false]	try_insert(class=2)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|inauthentic_detection_v45_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|inauthentic_detection_v45_label_shr|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|inauthentic_detection_v45_bounce_captcha|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|inauthentic_detection_v45_bounce_arkose|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_extended_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_extended_bounce|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_extended_label_shr|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_bounce|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|cluster_spam_label_shr|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3
-user|cap_full|abuse_platform_requested_actions|Clean	platform_row_without_requested_actions	[false]	try_insert(class=0)=new,update_skip(class=0,own_claim=true)	cap=0		41abc7122faad53d
+user|cap_full|impersonation_scam_classifier_v1_suspend|Clean	max_enforcement_reached	[false]	try_insert(class=3)=new,update_skip(class=0,own_claim=true)	cap=1		a3bf5d60c018ddc3

@@ -22,6 +22,7 @@ from xrex.models.model_utils import get_parameter
 from xrex.models.normalization import all_heads_qk_norm
 from xrex.models.recsys_attention import (
     CutedslRankerAttention,
+    CutedslRankerCandidateOnlyAttention,
     CutedslRankerVarlenAttention,
     PallasRankerAttention,
     PallasRankerAttentionInference,
@@ -153,7 +154,6 @@ class MultiHeadAttention(hk.Module):
         segment_ids_k: Optional[jax.Array] = None,
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
-        history: jax.Array | None = None,
     ) -> MultiHeadAttentionOutput:
         projection = self._linear_projection
         assert segment_ids is not None, "segment_ids is required"
@@ -167,9 +167,7 @@ class MultiHeadAttention(hk.Module):
         num_q_heads = self.config.num_q_heads
         num_kv_heads = self.config.num_kv_heads
         assert num_q_heads % num_kv_heads == 0
-        num_q_per_kv = num_q_heads // num_kv_heads
 
-        mesh = self.sharding_context.mesh
         input_size = input_to_query.shape[-1]
         lr_multiplier = self.scale_config.hidden_lr_multiplier(input_size)
 
@@ -183,50 +181,9 @@ class MultiHeadAttention(hk.Module):
             ),
         )
         qkv_weights_pspec = P(None, None)
-        assert history is None or self.config.qkv_merge, "Candidate-only attention needs merged QKV"
         if self.config.qkv_merge:
-
-            def slicing(input):
-                b, s, _, _, d = input.shape
-                query_heads = input[:, :, :, :num_q_per_kv]
-                key_heads = input[:, :, :, num_q_per_kv : num_q_per_kv + 1]
-                value_heads = input[:, :, :, num_q_per_kv + 1 :]
-                return (
-                    query_heads.reshape(b, s, -1, d),
-                    key_heads.reshape(b, s, -1, d),
-                    value_heads.reshape(b, s, -1, d),
-                )
-
-            qkv_projection = Linear(
-                (num_q_heads + 2 * num_kv_heads) * self.config.key_size,
-                w_init=self.w_init,
-                with_bias=self.config.with_bias,
-                name=f"qkv{self.name_suffix}",
-                pspec=qkv_weights_pspec,
-                lr_multiplier=lr_multiplier,
-                sharding_context=self.sharding_context,
-            )
-            qkv = qkv_projection(input_to_query)
-            qkv = qkv.reshape(*qkv.shape[:-1], -1, self.config.key_size)
-            qkv = jnp.reshape(qkv, (qkv.shape[0], qkv.shape[1], num_kv_heads, -1, qkv.shape[-1]))
-            if history is not None:
-
-                def key_value_columns(weight_or_bias: jax.Array) -> jax.Array:
-                    leading_dims = weight_or_bias.shape[:-1]
-                    heads = weight_or_bias.reshape(
-                        *leading_dims, num_kv_heads, num_q_per_kv + 2, -1
-                    )
-                    return heads[..., num_q_per_kv:, :].reshape(*leading_dims, -1)
-
-                history_kv = qkv_projection(history, output_columns=key_value_columns)
-                history_key_heads, history_value_heads = jnp.unstack(
-                    history_kv.reshape(*history.shape[:2], num_kv_heads, 2, -1), axis=-2
-                )
-
-            out_specs = (qkv_pspec,) * 3
-            query_heads, key_heads, value_heads = shard_map_unless_manual(
-                slicing, out_specs=out_specs, in_specs=qkv_pspec, mesh=mesh
-            )(qkv)
+            qkv = self._qkv_proj(input_size)(input_to_query)
+            query_heads, key_heads, value_heads = self._qkv_split(qkv)
 
         else:
             query_heads = projection(
@@ -285,13 +242,6 @@ class MultiHeadAttention(hk.Module):
             with_sharding_constraint_unless_manual(x, activation_with_kvheads_pspec)
             for x in (key_heads, value_heads)
         )
-        if history is not None:
-            history_key_heads = with_sharding_constraint_unless_manual(
-                checkpoint_name(history_key_heads, "key_heads"), activation_with_kvheads_pspec
-            )
-            history_value_heads = with_sharding_constraint_unless_manual(
-                checkpoint_name(history_value_heads, "value_heads"), activation_with_kvheads_pspec
-            )
 
         add_rope = self.config.rotary
 
@@ -299,22 +249,12 @@ class MultiHeadAttention(hk.Module):
             qk_lr = self.scale_config.qk_norm_lr_multiplier()
             wd_mask = self.scale_config.ln_weight_decay_mask
             query_heads = all_heads_qk_norm("q_norm", qk_lr, weight_decay_mask=wd_mask)(query_heads)
-            k_norm = all_heads_qk_norm("k_norm", qk_lr, weight_decay_mask=wd_mask)
-            key_heads = k_norm(key_heads)
-            if history is not None:
-                history_key_heads = k_norm(history_key_heads)
+            key_heads = all_heads_qk_norm("k_norm", qk_lr, weight_decay_mask=wd_mask)(key_heads)
 
         if add_rope:
-            if history is not None:
-                history_positions, positions = jnp.split(positions, [history.shape[1]], axis=1)
-                (history_key_heads,) = self._apply_rope(
-                    history_key_heads, positions=history_positions
-                )
             key_heads, query_heads = self._apply_rope(key_heads, query_heads, positions=positions)
             query_heads = checkpoint_name(query_heads, "query_heads_rope")
             key_heads = checkpoint_name(key_heads, "key_heads_rope")
-            if history is not None:
-                history_key_heads = checkpoint_name(history_key_heads, "key_heads_rope")
 
         if self.config.attn_impl == "recsys_flash_attn":
             raise NotImplementedError(
@@ -330,12 +270,6 @@ class MultiHeadAttention(hk.Module):
             mask=mask,
             seqpack_layout=seqpack_layout,
         )
-        if history is not None:
-            assert attn_class.supports_candidate_only, (
-                f"{self.config.attn_impl} has no candidate-only attention"
-            )
-            extra_attn_kwargs |= {"own_key": key_heads, "own_value": value_heads}
-            key_heads, value_heads = history_key_heads, history_value_heads
         tmp = attn_class(
             self.config,
             self.scale_config,
@@ -406,6 +340,47 @@ class MultiHeadAttention(hk.Module):
             value_heads=value_heads.reshape(*value_heads.shape[:2], -1),
             attn_output=attn_output,
         )
+
+    @hk.transparent
+    def _qkv_proj(self, input_size: int) -> Linear:
+        return Linear(
+            (self.config.num_q_heads + 2 * self.config.num_kv_heads) * self.config.key_size,
+            w_init=self.w_init,
+            with_bias=self.config.with_bias,
+            name=f"qkv{self.name_suffix}",
+            pspec=P(None, None),
+            lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size),
+            sharding_context=self.sharding_context,
+        )
+
+    def _qkv_split(self, qkv: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        num_kv_heads = self.config.num_kv_heads
+        num_q_per_kv = self.config.num_q_heads // num_kv_heads
+        qkv = jnp.reshape(qkv, (*qkv.shape[:2], num_kv_heads, -1, self.config.key_size))
+
+        def slicing(input):
+            b, s, _, _, d = input.shape
+            query_heads = input[:, :, :, :num_q_per_kv]
+            key_heads = input[:, :, :, num_q_per_kv : num_q_per_kv + 1]
+            value_heads = input[:, :, :, num_q_per_kv + 1 :]
+            return (
+                query_heads.reshape(b, s, -1, d),
+                key_heads.reshape(b, s, -1, d),
+                value_heads.reshape(b, s, -1, d),
+            )
+
+        qkv_pspec = P(
+            self.data_axis,
+            self.sharding_context.logical_axis_to_physical(
+                "sequence", namespace=self.config.attn_sharding_namespace
+            ),
+            self.sharding_context.logical_axis_to_physical(
+                "kv_head", namespace=self.config.attn_sharding_namespace
+            ),
+        )
+        return shard_map_unless_manual(
+            slicing, out_specs=(qkv_pspec,) * 3, in_specs=qkv_pspec, mesh=self.sharding_context.mesh
+        )(qkv)
 
     @hk.transparent
     def _apply_rope(self, *heads: jax.Array, positions: jax.Array | None) -> tuple[jax.Array, ...]:
@@ -555,6 +530,134 @@ class MultiHeadAttention(hk.Module):
 
         *leading_dims, _ = x.shape
         return y.reshape((*leading_dims, num_heads, head_size))
+
+
+class CandidateOnlyAttention(MultiHeadAttention):
+    def __call__(
+        self,
+        candidate_states: jax.Array,
+        history_states: jax.Array,
+        segment_ids: jax.Array,
+        positions: jax.Array | None,
+        seqpack_layout: SequencePackedLayout | None,
+    ) -> MultiHeadAttentionOutput:
+        config = self.config
+        assert config.qkv_merge, (
+            "Candidate-only attention is not implemented yet for qkv_merge=False. Set "
+            "candidate_only_attn_impl=None to run the candidate-only layers with qkv_merge=False."
+        )
+        num_kv_heads = config.num_kv_heads
+        num_q_per_kv = config.num_q_heads // num_kv_heads
+
+        qkv = self._qkv_proj(candidate_states.shape[-1])
+        query_heads, candidate_keys, candidate_values = self._qkv_split(qkv(candidate_states))
+
+        def key_value_columns(weight_or_bias: jax.Array) -> jax.Array:
+            leading = weight_or_bias.shape[:-1]
+            heads = weight_or_bias.reshape(*leading, num_kv_heads, num_q_per_kv + 2, -1)
+            return heads[..., num_q_per_kv:, :].reshape(*leading, -1)
+
+        history_keys, history_values = jnp.unstack(
+            qkv(history_states, output_columns=key_value_columns).reshape(
+                *history_states.shape[:2], num_kv_heads, 2, -1
+            ),
+            axis=-2,
+        )
+
+        def shard_heads(x: jax.Array, head_axis: str) -> jax.Array:
+            return with_sharding_constraint_unless_manual(
+                x,
+                self.sharding_context.sharding_specs(
+                    NamedShape(x.shape, ("batch_attn", "replicated", head_axis, "hidden")),
+                    namespace=config.attn_sharding_namespace,
+                ),
+            )
+
+        query_heads = shard_heads(checkpoint_name(query_heads, "query_heads"), "q_head")
+        candidate_keys, history_keys = (
+            shard_heads(checkpoint_name(k, "key_heads"), "kv_head")
+            for k in (candidate_keys, history_keys)
+        )
+        candidate_values, history_values = (
+            shard_heads(checkpoint_name(v, "value_heads"), "kv_head")
+            for v in (candidate_values, history_values)
+        )
+
+        if config.qk_norm:
+            qk_lr = self.scale_config.qk_norm_lr_multiplier()
+            wd_mask = self.scale_config.ln_weight_decay_mask
+            query_heads = all_heads_qk_norm("q_norm", qk_lr, weight_decay_mask=wd_mask)(query_heads)
+            k_norm = all_heads_qk_norm("k_norm", qk_lr, weight_decay_mask=wd_mask)
+            candidate_keys, history_keys = k_norm(candidate_keys), k_norm(history_keys)
+
+        if config.rotary:
+            assert positions is not None, "RoPE needs the history and candidate positions"
+            history_positions, candidate_positions = jnp.split(
+                positions, [history_states.shape[1]], axis=1
+            )
+            (history_keys,) = self._apply_rope(history_keys, positions=history_positions)
+            candidate_keys, query_heads = self._apply_rope(
+                candidate_keys, query_heads, positions=candidate_positions
+            )
+            query_heads = checkpoint_name(query_heads, "query_heads_rope")
+            candidate_keys, history_keys = (
+                checkpoint_name(k, "key_heads_rope") for k in (candidate_keys, history_keys)
+            )
+
+        candidate_region_kwargs = (
+            {
+                name: jnp.asarray(getattr(seqpack_layout, name), dtype=jnp.int32)
+                for name in ("candidate_cu_seqlens", "candidate_key_starts", "candidate_key_counts")
+            }
+            if seqpack_layout is not None
+            else {}
+        )
+        attention = self._get_candidate_only_attn_impl()(
+            config, self.scale_config, sharding_context=self.sharding_context
+        )
+        attn, _ = attention(
+            query_heads,
+            history_keys,
+            history_values,
+            segment_ids,
+            None,
+            jnp.ones(segment_ids.shape, dtype=jnp.int32),
+            candidate_keys=candidate_keys,
+            candidate_values=candidate_values,
+            **candidate_region_kwargs,
+        )
+
+        assert not config.attn_output_gate, "Candidate-only attention has no output gate"
+        attn = checkpoint_name(attn, "attn")
+        attn_output = jnp.reshape(attn, (*attn.shape[:2], -1))
+        attn = with_sharding_constraint_unless_manual(
+            attn_output,
+            self.sharding_context.sharding_specs(
+                NamedShape(attn_output.shape, ("batch_attn", "sequence", "kv_head")),
+                namespace=config.attn_sharding_namespace,
+            ),
+        )
+        embeddings = self._out_projection(
+            attn,
+            self.model_size,
+            w_init=self.w_init,
+            with_bias=config.with_bias,
+            pspec=P(None, None),
+            lr_multiplier=self.scale_config.attn_output_lr_multiplier(attn.shape[-1]),
+            rms_clip_axes=(-2, -1),
+            name=f"out{self.name_suffix}",
+        )
+        return MultiHeadAttentionOutput(output=embeddings, attn_output=attn_output)
+
+    @hk.transparent
+    def _get_candidate_only_attn_impl(self) -> Type[Attention]:
+        match self.config.candidate_only_attn_impl:
+            case "cutedsl_ranker_candidate_only_attn":
+                return CutedslRankerCandidateOnlyAttention
+            case _:
+                raise ValueError(
+                    f"Unknown candidate_only_attn_impl {self.config.candidate_only_attn_impl!r}"
+                )
 
 
 def rotate_half(

@@ -17,6 +17,8 @@ pub enum SafetyLevel {
     TimelineHomeHydration,
     ImmersiveExpandedRecommendations,
     QuotedTweetRules,
+    NotificationsFollow,
+    NotificationsWriterV2,
 }
 
 pub(crate) struct LevelSpec {
@@ -137,6 +139,26 @@ impl SafetyLevel {
                 author_not_found: AuthorNotFound::ReadsErased,
                 rows: RequestRows::Posts,
             },
+            SafetyLevel::NotificationsFollow => LevelSpec {
+                proto: None,
+                thrift: Some(ThriftLevel::NOTIFICATIONS_FOLLOW),
+                on_evaluate_tweets: false,
+                rules: LevelRules::UserOnly(levels::NOTIFICATIONS_FOLLOW),
+                unspecified_drop_is_exact: false,
+                quote_entries: QuoteEntries::NotJudged,
+                author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Users,
+            },
+            SafetyLevel::NotificationsWriterV2 => LevelSpec {
+                proto: None,
+                thrift: Some(ThriftLevel::NOTIFICATIONS_WRITER_V2),
+                on_evaluate_tweets: false,
+                rules: LevelRules::UserOnly(levels::NOTIFICATIONS_WRITER_V2),
+                unspecified_drop_is_exact: false,
+                quote_entries: QuoteEntries::NotJudged,
+                author_not_found: AuthorNotFound::Unresolves,
+                rows: RequestRows::Users,
+            },
         }
     }
 
@@ -152,6 +174,16 @@ impl SafetyLevel {
             let spec = variant.spec();
             spec.on_evaluate_tweets && spec.thrift == Some(level)
         })
+    }
+
+    pub(crate) fn from_notification_thrift(number: i32) -> Option<Self> {
+        Self::VARIANTS.iter().copied().find(|variant| {
+            variant.spec().rows == RequestRows::Users && variant.thrift_number() == Some(number)
+        })
+    }
+
+    pub(crate) fn thrift_number(self) -> Option<i32> {
+        self.spec().thrift.map(|thrift| thrift.0)
     }
 
     pub(crate) fn is_carried_by(self, rpc: Rpc) -> bool {
@@ -219,11 +251,20 @@ mod tests {
     fn every_level_reports_the_number_the_thrift_enum_gives_it() {
         let numbers: Vec<_> = SafetyLevel::VARIANTS
             .iter()
-            .map(|level| level.spec().thrift.map(|thrift| thrift.0))
+            .map(|level| level.thrift_number())
             .collect();
         assert_eq!(
             numbers,
-            [Some(16), Some(8), Some(61), Some(82), Some(247), None]
+            [
+                Some(16),
+                Some(8),
+                Some(61),
+                Some(82),
+                Some(247),
+                None,
+                Some(246),
+                Some(72)
+            ]
         );
     }
 
@@ -241,13 +282,17 @@ mod tests {
                     [Rpc::FilterTweets, Rpc::EvaluateTweets]
                         .into_iter()
                         .all(|rpc| !level.is_carried_by(rpc)),
-                    "{level:?} is user-only, so no request carries it"
+                    "{level:?} is user-only, so no post request carries it"
                 ),
                 LevelRules::UserThenPost(_) => assert!(
                     spec.proto.is_some() || spec.on_evaluate_tweets,
                     "{level:?} has no ingress"
                 ),
             }
+            assert!(
+                spec.rows == RequestRows::Posts || spec.thrift.is_some(),
+                "{level:?} takes user rows without a Thrift level FilterNotifications names"
+            );
             assert!(
                 !spec.on_evaluate_tweets || spec.thrift.is_some(),
                 "{level:?} is served on EvaluateTweets without a Thrift level"

@@ -294,7 +294,7 @@ mod tests {
     use crate::clients::socialgraph_client::{EdgeDirection, Graph};
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{control, suspended, InMemorySources};
-    use crate::hydration::{Hydrator, Lookup};
+    use crate::hydration::{Hydrator, Lookup, Relation};
     use crate::metrics::Rpc;
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
@@ -585,7 +585,7 @@ mod tests {
                 &[2][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[20]]
-Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
+Flock follows-rev[90] super_follows-fwd[] follows-fwd[] blocks-rev[90]
 Flock follows-fwd[20] blocks-rev[20]",
                     tweet_keyed("[[2]]")
                 ),
@@ -596,7 +596,7 @@ Flock follows-fwd[20] blocks-rev[20]",
                 &[1, 2, 3, 5][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30]]
-Flock follows-rev[80, 90] super_follows-fwd[] blocks-rev[80, 90]
+Flock follows-rev[80, 90] super_follows-fwd[] follows-fwd[] blocks-rev[80, 90]
 Flock follows-fwd[10, 20, 30] blocks-rev[10, 20, 30]",
                     tweet_keyed("[[1, 2, 3, 5]]")
                 ),
@@ -607,9 +607,9 @@ Flock follows-fwd[10, 20, 30] blocks-rev[10, 20, 30]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40, 60]]
-Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
+Flock follows-rev[90] super_follows-fwd[] follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40, 60] blocks-rev[10, 20, 30, 40, 60]
-Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]
+Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]
 Flock follows-fwd[] blocks-rev[70]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
@@ -620,9 +620,9 @@ Flock follows-fwd[] blocks-rev[70]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40], [60]]
-Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
+Flock follows-rev[90] super_follows-fwd[] follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40] blocks-rev[10, 20, 30, 40]
-Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]
+Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]
 Flock follows-fwd[60] blocks-rev[60, 70]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
@@ -633,9 +633,9 @@ Flock follows-fwd[60] blocks-rev[60, 70]",
                 &[1, 2, 3, 4][..],
                 format!(
                     "{}\nGizmoduckViewer [[1]]\nGizmoduckAuthor [[10, 20, 30, 40, 60]]
-Flock follows-rev[90] super_follows-fwd[] blocks-rev[90]
+Flock follows-rev[90] super_follows-fwd[] follows-fwd[] blocks-rev[90]
 Flock follows-fwd[10, 20, 30, 40, 60] blocks-rev[10, 20, 30, 40, 60]
-Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
+Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
                     tweet_keyed("[[1, 2, 3, 4], [5, 6]]")
                 ),
             ),
@@ -1222,8 +1222,8 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         assert_eq!(
             root_selects,
             [
-                "Flock follows-rev[] super_follows-fwd[90] blocks-rev[90]",
-                "Flock follows-rev[90] super_follows-fwd[] blocks-rev[]",
+                "Flock follows-rev[] super_follows-fwd[90] follows-fwd[] blocks-rev[90]",
+                "Flock follows-rev[90] super_follows-fwd[] follows-fwd[] blocks-rev[]",
             ]
         );
         assert!(sources.keys(Source::Wingman).is_empty());
@@ -1260,7 +1260,7 @@ Flock follows-rev[80] super_follows-fwd[] blocks-rev[80]",
         assert_eq!(
             batches(sources),
             "\
-TesPureCoreData [[5], [2], [100]]
+TesPureCoreData [[5], [2]]
 TesTweet [[5], [2]]
 TesConversationControl [[5], [2]]
 SafetyLabels [[5], [2]]
@@ -1268,6 +1268,10 @@ GizmoduckViewer [[1]]
 GizmoduckAuthor [[20, 40]]
 Flock follows-fwd[20, 40] blocks-rev[20, 40]
 Flock blocks-rev[30]"
+        );
+        assert_eq!(
+            sources.keys((Relation::ConversationRoot, Source::TesPureCoreData)),
+            [vec![100]]
         );
     }
 

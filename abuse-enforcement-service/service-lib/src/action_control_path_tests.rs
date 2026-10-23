@@ -5,10 +5,12 @@ use xai_abuse_proto::enforcement::ScoreResult;
 
 use super::*;
 use crate::action_control::test_support::record;
-use crate::action_control::{ActionControlRecord, ControlMode, Lifetime, PageAction};
+use crate::action_control::{
+    ActionControlRecord, ControlEntity, ControlMode, LevelRow, Lifetime, PageAction,
+};
 use crate::replay_tests::{
     Account, BAKED_POST_RULES, BAKED_USER_RULES, BedConfig, HEADS, TestBed, Trace, base_config,
-    message, on_config, scenarios, switched_off,
+    factory_message, message, on_config, scenarios, switched_off,
 };
 
 const SUSPEND: PageAction = PageAction::Suspend {};
@@ -68,6 +70,280 @@ fn ais_names(t: &Trace) -> Vec<String> {
 
 fn live(head: &str, band: Option<&str>, actions: Vec<PageAction>) -> ActionControlRecord {
     record(head, None, band, ControlMode::Live, actions)
+}
+
+const FACTORY_HEAD: &str = "IsDelayedSuspendSpam";
+
+fn factory_row(row: LevelRow, mode: ControlMode, actions: Vec<PageAction>) -> ActionControlRecord {
+    ActionControlRecord {
+        confidence: Some(row),
+        ..record(FACTORY_HEAD, None, None, mode, actions)
+    }
+}
+
+#[tokio::test]
+async fn a_factory_row_without_actions_records_before_any_fetch() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    for (records, logged) in [
+        (vec![], "no_selection"),
+        (
+            vec![live(FACTORY_HEAD, None, vec![SUSPEND])],
+            "no_selection",
+        ),
+        (
+            vec![factory_row(LevelRow::Missing, ControlMode::Rules, vec![])],
+            "factory_rules_row",
+        ),
+    ] {
+        let b = bed(records, false).await;
+        for account in Account::ALL {
+            let t = b.run_fresh(&factory_message(account)).await;
+            assert_eq!(t.status, action_control::STATUS_NO_ACTIONS, "{account:?}");
+            assert!(t.ais.is_empty() && t.tickets == 0);
+            assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"], "{account:?}");
+            assert!(t.outcomes[0].dry_run);
+            let i = info(&t);
+            assert_eq!(i["level_row"], "missing");
+            assert_eq!(i["logged_because"], logged);
+            assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+            assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+        }
+        assert_eq!(b.fetches().await, 0, "{logged}");
+        b.run_fresh(&bb1(&[], Account::Clean)).await;
+        assert!(b.fetches().await > 0, "a rules decision fetches");
+    }
+    let mut ignore = on_config(false, None);
+    ignore["action_control"] = serde_json::json!({"enabled": true, "ignore_store": true});
+    let b = bed_with(vec![], ignore, BAKED_USER_RULES).await;
+    let t = b.run_fresh(&factory_message(Account::Clean)).await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"]);
+    assert_eq!(info(&t)["logged_because"], "ignore_store");
+    assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn a_factory_row_acts_on_its_own_evidence_without_the_rules() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    const DAY: i64 = 86_400_000;
+    let b = bed(
+        vec![factory_row(
+            LevelRow::High,
+            ControlMode::Live,
+            vec![SUSPEND],
+        )],
+        false,
+    )
+    .await;
+    let with_evidence = |days: i64| {
+        let mut s = factory_message(Account::Clean);
+        s.confidence = abuse_proto::Confidence::High as i32;
+        s.confidence_evidence = Some(abuse_proto::ConfidenceEvidence {
+            precision_lower_bound: 0.96,
+            reads: 59,
+            humans: 0,
+            read_at_ms: now_millis() - days * DAY,
+            link: "read:rd_1".into(),
+        });
+        s
+    };
+    let t = b.run_fresh(&with_evidence(366)).await;
+    assert_eq!(t.status, "dry_run");
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    assert_eq!(info(&t)["logged_because"], "weak_evidence");
+    assert_eq!(
+        info(&t)["action_control_forced_recording"],
+        "evidence_below_floor"
+    );
+    let t = b.run_fresh(&with_evidence(364)).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!((t.ais.len(), t.tickets), (1, 1));
+    let i = info(&t);
+    assert_eq!(i["action_control_lkey"], "user/l/IsDelayedSuspendSpam/high");
+    assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+    assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+}
+
+#[tokio::test]
+async fn a_factory_row_that_acts_takes_dedup_the_off_switch_and_the_cap() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let row = || factory_row(LevelRow::Missing, ControlMode::Live, vec![SUSPEND]);
+    let score = factory_message(Account::Clean);
+    let b = bed(vec![row()], false).await;
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(
+        t.dedup_calls[0], "try_insert(class=3)=new",
+        "claims at its suspend"
+    );
+    assert_eq!((t.ais.len(), t.tickets), (1, 1));
+    let again = b.run(&score).await;
+    assert_eq!(again.status, "dedup_skipped");
+    assert!(again.ais.is_empty() && again.tickets == 0);
+
+    let mut off = off_switch::test_support::record(FACTORY_HEAD, None, true, None);
+    off.updated_at_ms = 1;
+    let switched = TestBed::new(BedConfig {
+        user_rules: BAKED_USER_RULES,
+        post_rules: BAKED_POST_RULES,
+        config: on_config(false, None),
+        off_switches: vec![off],
+        control_records: vec![row()],
+    })
+    .await;
+    let t = switched.run_fresh(&score).await;
+    assert_eq!(t.status, off_switch::STATUS_SWITCHED_OFF);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+
+    let capped = bed_with(vec![row()], on_config(false, Some(0)), BAKED_USER_RULES).await;
+    let t = capped.run_fresh(&score).await;
+    assert_eq!(t.status, "max_enforcement_reached");
+    assert!(t.ais.is_empty());
+}
+
+#[tokio::test]
+async fn a_factory_decision_for_a_test_user_is_skipped_first() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![], false).await;
+    let mut score = factory_message(Account::Clean);
+    score.user_id = 2_050_000_001;
+    assert!(test_user::is_test_user_id(score.user_id));
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "test_user_skipped");
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn factory_decisions_and_runs_mark_their_head_factory_in_the_seen_list() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut acting = message(
+        EntityType::User,
+        "FactoryActing",
+        "factory_acting@1",
+        &["model_factory"],
+        Account::Clean,
+    );
+    acting.policy_version = "1".into();
+    let acting_row = ActionControlRecord {
+        confidence: Some(LevelRow::Missing),
+        ..record(
+            "FactoryActing",
+            None,
+            None,
+            ControlMode::Live,
+            vec![SUSPEND],
+        )
+    };
+    let mut config = on_config(false, None);
+    config["backfill_runs"] =
+        serde_json::json!({"page_keys": ["page"], "max_user_decisions_per_day": 10});
+    let b = bed_with(vec![acting_row], config, BAKED_USER_RULES).await;
+    let (run_head, run_model) = HEADS[3];
+    let mut run = crate::backfill::test_support::put_running(
+        &b.backfill_store,
+        "run-00000001",
+        run_head,
+        vec![SUSPEND],
+        vec![LevelRow::Missing],
+    );
+    run.factory = true;
+    b.backfill_store.rows.lock().unwrap().insert(
+        (crate::backfill::RUN_PKEY.into(), run.run_id.clone()),
+        serde_json::to_vec(&run).unwrap(),
+    );
+    let mut run_score = message(EntityType::User, run_head, run_model, &[], Account::Clean);
+    run_score.backfill_run_id = run.run_id.clone();
+    run_score.score_ts_ms = now_millis() - 60_000;
+
+    assert_eq!(
+        b.run_fresh(&factory_message(Account::Clean)).await.status,
+        action_control::STATUS_NO_ACTIONS
+    );
+    assert_eq!(b.run_fresh(&acting).await.status, "success");
+    b.run_fresh(&bb1(&[&suspend_label()], Account::Clean)).await;
+    b.dedup.slots.lock().unwrap().clear();
+    b.run_on(&b.backfill_processor(), &run_score).await;
+
+    b.ctx.action_control.spawn_seen_writer().unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let seen = b.ctx.action_control.scan_seen().await.unwrap();
+            if seen.len() >= 4 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("four seen rows");
+    let of = |head: &str| {
+        seen.iter()
+            .find(|s| s.head == head)
+            .unwrap_or_else(|| panic!("{head} not seen: {seen:?}"))
+    };
+    for head in [FACTORY_HEAD, "FactoryActing", run_head] {
+        let s = of(head);
+        assert!(s.factory, "{head}");
+        assert_eq!(s.rule_id, "", "{head}");
+        assert_eq!(s.action_specs, serde_json::json!([]), "{head}");
+    }
+    let rules = of(BB1.0);
+    assert!(!rules.factory);
+    assert_eq!(rules.rule_id, suspend_label());
+}
+
+#[test]
+fn only_a_policy_version_marks_a_factory_message() {
+    let mut s = factory_message(Account::Clean);
+    assert!(is_factory_message(&s));
+    s.policy_version.clear();
+    assert!(
+        !is_factory_message(&s),
+        "the routing label alone is not one"
+    );
+    assert!(!is_factory_message(&bb1(&[], Account::Clean)));
+}
+
+#[tokio::test]
+async fn a_grox_impersonation_scam_message_is_suspended_by_its_rule() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let grox = |account| {
+        message(
+            EntityType::User,
+            "ImpersonationScam",
+            "impersonation_scam_classifier_v1",
+            &[
+                "impersonation_scam_classifier_v1_threshold_reached",
+                "impersonation_scam_classifier_v1_suspend",
+            ],
+            account,
+        )
+    };
+    let score = grox(Account::Clean);
+    assert!(!is_factory_message(&score));
+    let b = bed(vec![], false).await;
+    let t = b.run_fresh(&score).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(ais_names(&t), vec!["suspendUser"]);
+    let i = info(&t);
+    assert_eq!(i["matched_rule_id"], "act_impersonation_scam_suspend");
+    assert_eq!(i["action_control_mode"], "rules");
+    assert_eq!(
+        i["action_specs"],
+        r#"[{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}]"#
+    );
+    for (account, want) in [
+        (Account::Suspended, ALREADY_SUSPENDED),
+        (Account::Deactivated, "already_deactivated"),
+        (Account::Followers5k, "high_follower_count"),
+        (Account::HighCred, "pagerank_skipped"),
+    ] {
+        let t = b.run_fresh(&grox(account)).await;
+        assert_eq!(t.status, want, "{account:?}");
+        assert!(t.ais.is_empty(), "{account:?}");
+        assert_eq!(t.tickets, 0, "{account:?}");
+    }
 }
 
 #[tokio::test]
@@ -618,7 +894,7 @@ async fn assert_no_ais_anywhere(
     let mut n = 0;
     for sc in scenarios(user_rules, BAKED_POST_RULES)
         .into_iter()
-        .filter(|s| s.id.starts_with("user|") && !s.id.contains("|factory|") && !s.dry_run)
+        .filter(|s| s.id.starts_with("user|") && !s.dry_run)
     {
         let t = b.run_fresh(&sc.score).await;
         assert!(t.ais.is_empty(), "{}: {:?}", sc.id, t.ais);
@@ -831,11 +1107,6 @@ async fn move_to_page(
             );
             continue;
         };
-        let head = if head == "factory" {
-            "IsDelayedSuspendSpam"
-        } else {
-            head
-        };
         let band = (!label.is_empty() && !label.starts_with("cap_full")).then_some(label);
         let rec = record(head, None, band, ControlMode::Live, actions);
         let b = &beds[&(sc.dry_run, sc.cap)];
@@ -881,8 +1152,6 @@ async fn move_to_page(
                 .into()
         } else if was.status == "dedup_skipped" && moved.status != "dedup_skipped" {
             "dedup class from the page's actions outranks the held entry (auto)".into()
-        } else if head == "IsDelayedSuspendSpam" && moved.ais.is_empty() {
-            "factory head: live record runs as recording only".into()
         } else if was.status == "already_deactivated" {
             "deactivated account: `already_deactivated` is a routing rule, not a safety check"
                 .into()
@@ -1104,4 +1373,386 @@ async fn a_fact_gated_suspend_that_fires_acts_over_a_held_liveness_check() {
     assert_eq!(t.status, "success");
     assert_eq!(ais_names(&t), vec!["bounceViaTemplate"]);
     assert_eq!(t.tickets, 1);
+}
+
+
+const REPLY_HEAD: &str = "GrokDistilledReplyAuthor";
+const REPLY_MODEL: &str = "reply_bot_v1_2";
+const REPLY_LABEL: &str = "grok_distilled_reply_author";
+
+fn listing(b: &TestBed, topic: &str, labels: &[&str], negative: &[&str]) -> ScoreResultProcessor {
+    ScoreResultProcessor {
+        topic: topic.into(),
+        labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+        negative_labels: negative.iter().map(|l| (*l).to_owned()).collect(),
+        ..b.processor()
+    }
+}
+
+fn user_topic(b: &TestBed) -> ScoreResultProcessor {
+    listing(
+        b,
+        "abuse.embeddings.user_decisions",
+        &["anchor_campaign_suspend"],
+        &[],
+    )
+}
+
+fn post_topic(b: &TestBed) -> ScoreResultProcessor {
+    listing(
+        b,
+        "abuse.embeddings.post_decisions",
+        &["gibberish_post"],
+        &[],
+    )
+}
+
+fn reply_bot(entity: EntityType) -> ScoreResult {
+    message(
+        entity,
+        REPLY_HEAD,
+        REPLY_MODEL,
+        &[REPLY_LABEL],
+        Account::Clean,
+    )
+}
+
+fn of_entity(entity: ControlEntity, r: ActionControlRecord) -> ActionControlRecord {
+    ActionControlRecord {
+        entity_type: entity,
+        ..r
+    }
+}
+
+fn on_rows(entity: ControlEntity) -> ActionControlRecord {
+    admitting(of_entity(
+        entity,
+        record(REPLY_HEAD, None, None, ControlMode::Rows, vec![]),
+    ))
+}
+
+fn admitting(r: ActionControlRecord) -> ActionControlRecord {
+    ActionControlRecord {
+        admit_unlisted_labels: true,
+        ..r
+    }
+}
+
+fn assert_dropped(t: &Trace, status: &str) {
+    assert_eq!(t.status, status);
+    assert!(t.outcomes.is_empty() && t.ais.is_empty() && t.dedup_calls.is_empty());
+}
+
+fn assert_logged_before_any_fetch(t: &Trace) {
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    assert_eq!(t.dedup_calls, vec!["peek(class=0)=None"]);
+    assert_eq!(t.outcomes.len(), 1);
+    assert!(t.outcomes[0].dry_run);
+    let i = info(t);
+    assert_eq!(i["logged_because"], "no_selection");
+    assert_eq!(i["level_row"], "missing");
+    assert_eq!(i["dry_run_source"], "page");
+    assert_eq!(i["matched_rule_id"], action_control::PAGE_RULE_ID);
+    assert!(!i.keys().any(|k| k.starts_with("rules_would")), "{i:?}");
+}
+
+#[tokio::test]
+async fn an_unlisted_head_without_a_deciding_record_is_dropped() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let rules = || admitting(record(REPLY_HEAD, None, None, ControlMode::Rules, vec![]));
+    let rows_without_opt_in =
+        |e| of_entity(e, record(REPLY_HEAD, None, None, ControlMode::Rows, vec![]));
+    for records in [
+        vec![],
+        vec![
+            of_entity(ControlEntity::User, rules()),
+            of_entity(ControlEntity::Post, rules()),
+        ],
+        vec![
+            rows_without_opt_in(ControlEntity::User),
+            rows_without_opt_in(ControlEntity::Post),
+        ],
+    ] {
+        let b = bed(records, false).await;
+        let t = b
+            .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+            .await;
+        assert_dropped(&t, "no_match");
+        let t = b
+            .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+            .await;
+        assert_dropped(&t, "no_match");
+        assert_eq!(b.fetches().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn one_head_on_both_levels_logs_only_where_its_record_is_saved() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![on_rows(ControlEntity::Post)], false).await;
+    let negative = listing(&b, "abuse.embeddings.post_decisions", &[], &[REPLY_LABEL]);
+    for processor in [post_topic(&b), negative] {
+        let t = b
+            .run_admitted(&processor, &reply_bot(EntityType::Post))
+            .await;
+        assert_logged_before_any_fetch(&t);
+        assert_eq!(t.outcomes[0].head, REPLY_HEAD);
+    }
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_dropped(&t, "no_match");
+    assert_eq!(b.fetches().await, 0);
+
+    b.set_records(&[on_rows(ControlEntity::Post), on_rows(ControlEntity::User)])
+        .await;
+    for (processor, entity) in [
+        (post_topic(&b), EntityType::Post),
+        (user_topic(&b), EntityType::User),
+    ] {
+        let t = b.run_admitted(&processor, &reply_bot(entity)).await;
+        assert_logged_before_any_fetch(&t);
+    }
+    assert_eq!(b.fetches().await, 0);
+
+    b.ctx.action_control.spawn_seen_writer().unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let seen = b.ctx.action_control.scan_seen().await.unwrap();
+            if seen.iter().filter(|s| s.head == REPLY_HEAD).count() >= 2 {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the head seen on both levels");
+    let mut levels: Vec<ControlEntity> = seen
+        .iter()
+        .filter(|s| s.head == REPLY_HEAD)
+        .inspect(|s| assert!(!s.factory && s.rule_id.is_empty() && s.band == REPLY_LABEL))
+        .map(|s| s.entity_type)
+        .collect();
+    levels.dedup();
+    assert!(levels.contains(&ControlEntity::Post) && levels.contains(&ControlEntity::User));
+}
+
+#[tokio::test]
+async fn the_saved_page_record_logs_only() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut records = vec![on_rows(ControlEntity::Post)];
+    for row in [
+        LevelRow::Low,
+        LevelRow::Mid,
+        LevelRow::High,
+        LevelRow::Missing,
+    ] {
+        records.push(ActionControlRecord {
+            confidence: Some(row),
+            ..of_entity(
+                ControlEntity::Post,
+                record(REPLY_HEAD, None, None, ControlMode::Recording, vec![]),
+            )
+        });
+    }
+    let b = bed(records, false).await;
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+        .await;
+    assert_logged_before_any_fetch(&t);
+    assert_eq!(b.fetches().await, 0);
+}
+
+#[tokio::test]
+async fn an_unlisted_head_follows_its_record_and_factory_heads_are_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(
+        vec![
+            admitting(live(REPLY_HEAD, None, vec![SHR7])),
+            admitting(record(FACTORY_HEAD, None, None, ControlMode::Rows, vec![])),
+        ],
+        false,
+    )
+    .await;
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, "success");
+    assert_eq!(ais_names(&t), vec!["addLabelsV2"]);
+    assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))
+        .await;
+    assert_dropped(&t, "no_match");
+
+    b.set_records(&[admitting(record(
+        REPLY_HEAD,
+        None,
+        None,
+        ControlMode::Recording,
+        vec![],
+    ))])
+    .await;
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.outcomes[0].dry_run);
+
+    let t = b
+        .run_admitted(&user_topic(&b), &factory_message(Account::Clean))
+        .await;
+    assert_dropped(&t, "no_match");
+}
+
+#[tokio::test]
+async fn a_listed_head_with_a_record_is_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let label = suspend_label();
+    for records in [vec![], vec![live(BB1.0, None, vec![SHR7])]] {
+        let b = bed(records, false).await;
+        let msg = bb1(&[&label], Account::Clean);
+        let via_admission = b.run_admitted(&user_topic(&b), &msg).await;
+        let direct = b.run_fresh(&msg).await;
+        assert_eq!(via_admission.status, direct.status);
+        assert_eq!(ais_names(&via_admission), ais_names(&direct));
+        assert_eq!(info(&via_admission), info(&direct));
+    }
+}
+
+#[tokio::test]
+async fn a_head_on_rows_without_the_opt_in_is_unchanged() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let mut records = vec![record(BB1.0, None, None, ControlMode::Rows, vec![])];
+    for (row, mode) in [
+        (LevelRow::Low, ControlMode::Rules),
+        (LevelRow::Mid, ControlMode::Recording),
+        (LevelRow::High, ControlMode::Rules),
+        (LevelRow::Missing, ControlMode::Rules),
+    ] {
+        records.push(ActionControlRecord {
+            confidence: Some(row),
+            ..record(BB1.0, None, None, mode, vec![])
+        });
+    }
+    let b = bed(records, false).await;
+    for level in [
+        abuse_proto::Confidence::High,
+        abuse_proto::Confidence::Mid,
+        abuse_proto::Confidence::Low,
+        abuse_proto::Confidence::Unspecified,
+    ] {
+        let mut msg = bb1(&["not_listed"], Account::Clean);
+        msg.confidence = level as i32;
+        let t = b.run_admitted(&user_topic(&b), &msg).await;
+        assert_dropped(&t, "no_match");
+    }
+    assert_eq!(b.fetches().await, 0);
+}
+
+const HIDE_REPLY: PageAction = PageAction::HideReply {
+    lifetime: Lifetime::Permanent,
+};
+
+fn hiding(rollout_bp: Option<u32>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::Post),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            rollout_bp,
+            ..of_entity(
+                ControlEntity::Post,
+                live(REPLY_HEAD, None, vec![HIDE_REPLY]),
+            )
+        },
+    ]
+}
+
+fn reply_by(account: Account) -> ScoreResult {
+    message(
+        EntityType::Post,
+        REPLY_HEAD,
+        REPLY_MODEL,
+        &[REPLY_LABEL],
+        account,
+    )
+}
+
+fn assert_hidden(t: &Trace) {
+    assert_eq!(t.status, "success", "{:?}", t.outcomes);
+    assert!(!t.ais.is_empty());
+    assert!(!t.outcomes[0].dry_run);
+}
+
+fn assert_logged_with_hide(t: &Trace, because: &str) {
+    assert_eq!(t.status, "dry_run", "{:?}", t.outcomes);
+    assert!(t.ais.is_empty() && t.tickets == 0);
+    assert!(t.outcomes[0].dry_run);
+    let i = info(t);
+    assert_eq!(i["logged_because"], because);
+    assert_eq!(i["action_control_forced_recording"], because);
+    assert_eq!(i["action_control_mode"], "recording");
+    assert_eq!(i["dry_run_source"], "page");
+    assert_eq!(i["level_row"], "missing");
+    assert!(
+        i["action_specs"].contains("RiskyHighVizReply"),
+        "the row's action is recorded: {i:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_rollout_hides_replies_inside_it_and_logs_the_rest() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let place = |a: Account| action_control::rollout_bucket(REPLY_HEAD, a.user_id());
+    let (mut low, mut high) = (Account::Clean, Account::HasPhoenixSkip);
+    assert_ne!(place(low), place(high));
+    if place(low) > place(high) {
+        std::mem::swap(&mut low, &mut high);
+    }
+    let b = bed(hiding(Some(place(high))), false).await;
+    let t = b.run_admitted(&post_topic(&b), &reply_by(low)).await;
+    assert_hidden(&t);
+    assert_eq!(info(&t)["rollout_bp"], place(high).to_string());
+    assert_eq!(info(&t)["rollout_bucket"], place(low).to_string());
+    let t = b.run_admitted(&post_topic(&b), &reply_by(high)).await;
+    assert_logged_with_hide(&t, "outside_rollout");
+    assert_eq!(info(&t)["rollout_bucket"], place(high).to_string());
+    assert_eq!(t.dedup_calls.len(), 1, "{:?}", t.dedup_calls);
+    assert!(t.dedup_calls[0].starts_with("peek"), "{:?}", t.dedup_calls);
+
+    b.set_records(&hiding(Some(0))).await;
+    for account in [low, high] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_logged_with_hide(&t, "outside_rollout");
+    }
+    b.set_records(&hiding(None)).await;
+    for account in [low, high] {
+        let t = b.run_admitted(&post_topic(&b), &reply_by(account)).await;
+        assert_hidden(&t);
+        assert!(!info(&t).contains_key("rollout_bp"));
+    }
+}
+
+#[tokio::test]
+async fn a_row_this_image_cannot_read_logs_only() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(vec![on_rows(ControlEntity::Post)], false).await;
+    let mut newer = serde_json::to_value(&hiding(Some(10_000))[1]).unwrap();
+    newer["v"] = (action_control::ACTION_CONTROL_RECORD_VERSION + 1).into();
+    newer["rollout_next"] = 1.into();
+    b.control_store.rows.lock().unwrap().insert(
+        (
+            action_control::MH_PKEY.into(),
+            format!("post/l/{REPLY_HEAD}/missing"),
+        ),
+        serde_json::to_vec(&newer).unwrap(),
+    );
+    b.ctx.action_control.refresh().await.unwrap();
+    let t = b
+        .run_admitted(&post_topic(&b), &reply_by(Account::Clean))
+        .await;
+    assert_eq!(t.status, action_control::STATUS_NO_ACTIONS);
+    assert!(t.ais.is_empty() && t.tickets == 0 && t.outcomes[0].dry_run);
+    assert_eq!(info(&t)["logged_because"], "unreadable");
 }

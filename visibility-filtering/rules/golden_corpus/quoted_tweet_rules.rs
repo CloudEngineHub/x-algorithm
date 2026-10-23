@@ -1,10 +1,8 @@
-use super::builders::author_candidate;
-use super::{UserRow, OUTER_TWEET_ID};
-use crate::hydration::Hydrator::{Blocks, Follows, Mutes};
-use crate::models::{PairEdges, PostCandidate, QuoteFacts, QuoteLink, UserCandidate};
-use crate::rules::fixtures::{
-    allow, author_viewer, candidate, dropped, logged_out_viewer, viewer, AUTHOR_ID, VIEWER_ID,
-};
+use super::{Role, Row, Subject, OUTER_TWEET_ID};
+use crate::hydration::Hydrator::{Blocks, Mutes};
+use crate::models::{PairEdges, PostCandidate, QuoteFacts, QuoteLink, UserCandidate, Verdict};
+use crate::rules::fixtures::{allow, author_candidate, candidate, dropped, AUTHOR_ID};
+use crate::rules::SafetyLevel::{self, QuotedTweetRules};
 use xai_visibility_filtering::models::FilteredReason;
 
 const QUOTING_AUTHOR_ID: u64 = 200;
@@ -23,15 +21,24 @@ fn quoted() -> QuoteFacts {
     quoted_by(QUOTING_AUTHOR_ID, PairEdges::default())
 }
 
-fn author(post: PostCandidate) -> UserCandidate {
-    UserCandidate {
+fn author(post: PostCandidate, quote: QuoteFacts) -> Subject {
+    Subject::User(UserCandidate {
         user: post.author,
         viewer_relationship: post.viewer_relationship,
+        quote,
         failed: post.failed,
-    }
+    })
 }
 
-pub(super) fn rows() -> Vec<UserRow> {
+fn inner_quoted(role: Role, expected: Verdict) -> (SafetyLevel, Role, Verdict) {
+    (
+        QuotedTweetRules,
+        Role::InnerQuoted(Box::new(role)),
+        expected,
+    )
+}
+
+pub(super) fn rows() -> Vec<Row> {
     let author_state = [
         (
             "deactivated_author",
@@ -58,59 +65,42 @@ pub(super) fn rows() -> Vec<UserRow> {
             "suspended_author/drop",
         ),
     ];
-    let mut rows: Vec<UserRow> = author_state
+    let mut rows: Vec<Row> = author_state
         .into_iter()
-        .flat_map(|(name, post, reason, by)| {
-            [
-                UserRow {
-                    name,
-                    role: "non_follower",
-                    viewer: viewer(VIEWER_ID),
-                    user: author(post.clone()),
-                    quote: quoted(),
-                    expected: dropped(reason, by),
-                },
-                UserRow {
-                    name,
-                    role: "author",
-                    viewer: author_viewer(),
-                    user: author(post),
-                    quote: quoted(),
-                    expected: allow(),
-                },
-            ]
+        .map(|(name, post, reason, by)| Row {
+            name,
+            subject: author(post, quoted()),
+            expect: vec![
+                inner_quoted(Role::NonFollower, dropped(reason, by)),
+                inner_quoted(Role::Author, allow()),
+            ],
         })
         .collect();
     rows.extend([
-        UserRow {
+        Row {
             name: "viewer_blocks_author",
-            role: "non_follower",
-            viewer: viewer(VIEWER_ID),
-            user: author(candidate().with_edge(Blocks).build()),
-            quote: quoted(),
-            expected: dropped(
-                FilteredReason::ViewerBlocksAuthor,
-                "viewer_blocks_author/drop",
-            ),
+            subject: author(candidate().with_edge(Blocks).build(), quoted()),
+            expect: vec![inner_quoted(
+                Role::NonFollower,
+                dropped(
+                    FilteredReason::ViewerBlocksAuthor,
+                    "viewer_blocks_author/drop",
+                ),
+            )],
         },
-        UserRow {
+        Row {
             name: "viewer_mutes_author",
-            role: "non_follower",
-            viewer: viewer(VIEWER_ID),
-            user: author(candidate().with_edge(Mutes).build()),
-            quote: quoted(),
-            expected: dropped(
-                FilteredReason::ViewerMutesAuthor,
-                "quoted_viewer_mutes_author_not_following/drop",
-            ),
-        },
-        UserRow {
-            name: "viewer_mutes_author",
-            role: "follower",
-            viewer: viewer(VIEWER_ID),
-            user: author(candidate().with_edge(Mutes).with_edge(Follows).build()),
-            quote: quoted(),
-            expected: allow(),
+            subject: author(candidate().with_edge(Mutes).build(), quoted()),
+            expect: vec![
+                inner_quoted(
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerMutesAuthor,
+                        "quoted_viewer_mutes_author_not_following/drop",
+                    ),
+                ),
+                inner_quoted(Role::Follower, allow()),
+            ],
         },
     ]);
     let blocked = PairEdges {
@@ -127,7 +117,7 @@ pub(super) fn rows() -> Vec<UserRow> {
         outer_author_follows_author: true,
         ..PairEdges::default()
     };
-    let protected = || author(author_candidate(|a| a.is_protected = true));
+    let protected = |quote| author(author_candidate(|a| a.is_protected = true), quote);
     let protected_dropped = || {
         dropped(
             FilteredReason::AuthorIsProtected,
@@ -135,69 +125,37 @@ pub(super) fn rows() -> Vec<UserRow> {
         )
     };
     rows.extend([
-        UserRow {
+        Row {
             name: "quoted_author_blocks_quoting_author",
-            role: "non_follower",
-            viewer: viewer(VIEWER_ID),
-            user: author(candidate().build()),
-            quote: quoted_by(QUOTING_AUTHOR_ID, blocked),
-            expected: blocks_quoting_author(),
+            subject: author(candidate().build(), quoted_by(QUOTING_AUTHOR_ID, blocked)),
+            expect: vec![
+                inner_quoted(Role::NonFollower, blocks_quoting_author()),
+                inner_quoted(Role::LoggedOut, blocks_quoting_author()),
+            ],
         },
-        UserRow {
-            name: "quoted_author_blocks_quoting_author",
-            role: "logged_out",
-            viewer: logged_out_viewer(),
-            user: author(candidate().build()),
-            quote: quoted_by(QUOTING_AUTHOR_ID, blocked),
-            expected: blocks_quoting_author(),
+        Row {
+            name: "quoted_author_blocks_quoting_author_self_quote",
+            subject: author(candidate().build(), quoted_by(AUTHOR_ID, blocked)),
+            expect: vec![inner_quoted(Role::NonFollower, allow())],
         },
-        UserRow {
-            name: "quoted_author_blocks_quoting_author",
-            role: "self_quote",
-            viewer: viewer(VIEWER_ID),
-            user: author(candidate().build()),
-            quote: quoted_by(AUTHOR_ID, blocked),
-            expected: allow(),
-        },
-        UserRow {
+        Row {
             name: "protected_quoted_author",
-            role: "non_follower",
-            viewer: viewer(VIEWER_ID),
-            user: protected(),
-            quote: quoted(),
-            expected: protected_dropped(),
+            subject: protected(quoted()),
+            expect: vec![
+                inner_quoted(Role::NonFollower, protected_dropped()),
+                inner_quoted(Role::LoggedOut, protected_dropped()),
+                inner_quoted(Role::Author, protected_dropped()),
+            ],
         },
-        UserRow {
-            name: "protected_quoted_author",
-            role: "logged_out",
-            viewer: logged_out_viewer(),
-            user: protected(),
-            quote: quoted(),
-            expected: protected_dropped(),
+        Row {
+            name: "protected_quoted_author_quoting_author_follows",
+            subject: protected(quoted_by(QUOTING_AUTHOR_ID, quoting_author_follows)),
+            expect: vec![inner_quoted(Role::NonFollower, allow())],
         },
-        UserRow {
-            name: "protected_quoted_author",
-            role: "author",
-            viewer: author_viewer(),
-            user: protected(),
-            quote: quoted(),
-            expected: protected_dropped(),
-        },
-        UserRow {
-            name: "protected_quoted_author",
-            role: "quoting_author_follows",
-            viewer: viewer(VIEWER_ID),
-            user: protected(),
-            quote: quoted_by(QUOTING_AUTHOR_ID, quoting_author_follows),
-            expected: allow(),
-        },
-        UserRow {
-            name: "protected_quoted_author",
-            role: "self_quote",
-            viewer: viewer(VIEWER_ID),
-            user: protected(),
-            quote: quoted_by(AUTHOR_ID, PairEdges::default()),
-            expected: allow(),
+        Row {
+            name: "protected_quoted_author_self_quote",
+            subject: protected(quoted_by(AUTHOR_ID, PairEdges::default())),
+            expect: vec![inner_quoted(Role::NonFollower, allow())],
         },
     ]);
     rows

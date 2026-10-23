@@ -1,10 +1,9 @@
-use crate::hydration::request_context;
+use crate::hydration::{request_context, Cause, Unresolved};
 use crate::metrics::{self as ft_metrics, Rpc};
 use crate::models::{Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, Verdict};
-use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator, UserEvaluation};
+use crate::post_evaluator::{AuthorJudgement, PostBatch, PostEvaluation, PostEvaluator};
 use crate::retweet;
 use crate::rules::{QuoteEntries, RuleId, SafetyLevel};
-use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -65,23 +64,6 @@ pub(crate) struct QuotePass {
     pub(crate) key: EvaluationKey,
     pub(crate) outcome: PassOutcome,
     pub(crate) author: Option<Evaluation>,
-}
-
-impl QuotePass {
-    pub(crate) fn decided_by(
-        &self,
-        served_rule: Option<(SafetyLevel, &'static str)>,
-    ) -> Option<(SafetyLevel, &'static str)> {
-        match self.outcome.rendering() {
-            QuoteRendering::Rerendered(_) => self
-                .author
-                .as_ref()
-                .and_then(|author| treatment::decided_by(author.verdict()))
-                .map(|rule| (SafetyLevel::QuotedTweetRules, rule)),
-            QuoteRendering::Served => served_rule,
-            QuoteRendering::Omitted => None,
-        }
-    }
 }
 
 fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
@@ -218,7 +200,7 @@ async fn quote_pass(
 fn passes(
     level: SafetyLevel,
     outcomes: &[PostEvaluation],
-    authors: &HashMap<EvaluationKey, UserEvaluation>,
+    authors: &HashMap<EvaluationKey, AuthorJudgement>,
 ) -> Vec<QuotePass> {
     let outers: HashMap<_, _> = outcomes
         .iter()
@@ -240,7 +222,7 @@ fn passes(
                     &outcome.evaluation,
                     author,
                 ),
-                author: author.map(|author| author.evaluation.clone()),
+                author: author.and_then(AuthorJudgement::evaluation),
             })
         })
         .collect()
@@ -250,7 +232,7 @@ fn pass(
     level: SafetyLevel,
     outer: Option<&Evaluation>,
     inner: &Evaluation,
-    author: Option<&UserEvaluation>,
+    author: Option<&AuthorJudgement>,
 ) -> PassOutcome {
     match outer {
         None => return PassOutcome::OuterAbsent,
@@ -271,7 +253,13 @@ fn pass(
     match (inner, author, judge(level, author)) {
         (
             Evaluation::NotFound(_),
-            Some(_),
+            Some(
+                AuthorJudgement::Judged(_)
+                | AuthorJudgement::Unresolved(Unresolved {
+                    cause: Cause::Failed,
+                    ..
+                }),
+            ),
             judged @ (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),
         ) => judged,
         (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,
@@ -279,11 +267,11 @@ fn pass(
     }
 }
 
-fn judge(level: SafetyLevel, author: Option<&UserEvaluation>) -> PassOutcome {
-    let Some(author) = author.filter(|author| author.failed.is_empty()) else {
+fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
+    let Some(AuthorJudgement::Judged(evaluation)) = author else {
         return PassOutcome::FailedOpen;
     };
-    match &author.evaluation {
+    match evaluation {
         Evaluation::Complete {
             verdict: Verdict::Withheld(Decided { id, .. }),
             ..
@@ -338,20 +326,18 @@ fn record(level: SafetyLevel, passes: &[QuotePass]) {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::Graph;
-    use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
+    use crate::evaluate_tweets::EntryComparator;
     use crate::hydration::fallback_cache::FallbackCaches;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{suspended, Fault, InMemorySources};
     use crate::hydration::tweet_fallback_cache;
     use crate::metrics::thread_recorded;
     use crate::models::TweetId;
-    use crate::params::limited_actions_copy::LimitedActionsCopy;
-    use crate::params::ClientSwitches;
     use crate::rules::RuleEngine;
+    use crate::scenario::{tweet_data, Wire};
     use std::time::Duration;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
     use tokio::time::timeout;
-    use tonic::Request;
     use vf_pb::tweet_evaluation::Outcome;
     use xai_core_entities::entities::{
         GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState,
@@ -383,25 +369,15 @@ mod tests {
     }
 
     struct Served {
-        endpoint: EvaluateTweetsEndpoint,
+        wire: Wire,
         compared: UnboundedReceiver<Passes>,
     }
 
     impl Served {
         fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {
             let (captured, compared) = unbounded_channel();
-            let endpoint = EvaluateTweetsEndpoint::new(
-                Arc::new(PostEvaluator::new(
-                    world,
-                    RuleEngine::for_tests(),
-                    Arc::new(caches),
-                )),
-                ClientSwitches::for_tests(),
-                LimitedActionsCopy::from_json("[]"),
-                Some(Box::new(Captured(captured))),
-            )
-            .with_quote_pass(mode);
-            Self { endpoint, compared }
+            let wire = Wire::serving(world, caches, Some(Box::new(Captured(captured))), mode);
+            Self { wire, compared }
         }
 
         async fn outcomes(
@@ -409,19 +385,14 @@ mod tests {
             viewer_id: Option<u64>,
             tweets: Vec<vf_pb::TweetData>,
         ) -> Vec<Outcome> {
-            self.endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+            self.wire
+                .send(vf_pb::EvaluateTweetsRequest {
                     safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
                     viewer_id,
                     tweets,
-                }))
+                })
                 .await
                 .unwrap()
-                .into_inner()
-                .results
-                .into_iter()
-                .map(|result| result.outcome.unwrap())
-                .collect()
         }
 
         async fn compared(&mut self) -> Passes {
@@ -479,16 +450,8 @@ mod tests {
             .authors(&[QUOTING_AUTHOR])
     }
 
-    fn entry(tweet_id: u64, outer_tweet_id: Option<u64>) -> vf_pb::TweetData {
-        vf_pb::TweetData {
-            tweet_id,
-            quote_context: outer_tweet_id
-                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),
-        }
-    }
-
     fn quote_with_outer() -> Vec<vf_pb::TweetData> {
-        vec![entry(OUTER, None), entry(INNER, Some(OUTER))]
+        vec![tweet_data(OUTER, None), tweet_data(INNER, Some(OUTER))]
     }
 
     async fn serve(
@@ -516,14 +479,25 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn the_shadow_pass_judges_the_outer_first_then_the_quoted_author_and_serves_as_off() {
-        let quote = || EvaluationKey {
-            tweet_id: TweetId(INNER),
-            placement: Placement::InnerQuoted {
-                outer: TweetId(OUTER),
-            },
-        };
+    struct PassCase {
+        name: &'static str,
+        viewer_id: Option<u64>,
+        world: InMemorySources,
+        tweets: Vec<vf_pb::TweetData>,
+        outcome: PassOutcome,
+    }
+
+    fn case(name: &'static str, world: InMemorySources, outcome: PassOutcome) -> PassCase {
+        PassCase {
+            name,
+            viewer_id: Some(VIEWER),
+            world,
+            tweets: quote_with_outer(),
+            outcome,
+        }
+    }
+
+    fn pass_cases() -> Vec<PassCase> {
         let deactivated = Safety {
             deactivated: true,
             ..Default::default()
@@ -536,190 +510,148 @@ mod tests {
             offboarded: true,
             ..Default::default()
         };
-        let cases = [
-            (
-                "passed",
-                Some(VIEWER),
-                world(),
-                quote_with_outer(),
-                PassOutcome::Passed,
-            ),
-            (
+        vec![
+            case("passed", world(), PassOutcome::Passed),
+            case(
                 "deactivated",
-                Some(VIEWER),
                 world().user(QUOTED_AUTHOR, author(deactivated.clone())),
-                quote_with_outer(),
                 dropped(
                     "deactivated_author/drop",
                     ThriftFilteredReason::AuthorIsDeactivated(true),
                 ),
             ),
-            (
+            case(
                 "erased",
-                Some(VIEWER),
                 world().user(QUOTED_AUTHOR, author(erased)),
-                quote_with_outer(),
                 dropped(
                     "erased_author/drop/inactive",
                     ThriftFilteredReason::AuthorIsDeactivated(true),
                 ),
             ),
-            (
+            case(
                 "offboarded",
-                Some(VIEWER),
                 world().user(QUOTED_AUTHOR, author(offboarded)),
-                quote_with_outer(),
                 dropped(
                     "offboarded_author/drop/inactive",
                     ThriftFilteredReason::AuthorAccountIsInactive(true),
                 ),
             ),
-            (
+            case(
                 "suspended",
-                Some(VIEWER),
                 world().user(QUOTED_AUTHOR, suspended()),
-                quote_with_outer(),
                 dropped(
                     "suspended_author/drop",
                     ThriftFilteredReason::AuthorIsSuspended(true),
                 ),
             ),
-            (
+            case(
                 "quoted author blocks quoting author",
-                Some(VIEWER),
                 world().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),
-                quote_with_outer(),
                 dropped(
                     "quoted_author_blocks_quoting_author/drop/author_block_viewer",
                     ThriftFilteredReason::AuthorBlockViewer(true),
                 ),
             ),
-            (
+            case(
                 "viewer blocks author",
-                Some(VIEWER),
                 world().edge(Graph::Blocks, VIEWER, QUOTED_AUTHOR),
-                quote_with_outer(),
                 dropped(
                     "viewer_blocks_author/drop",
                     ThriftFilteredReason::UnspecifiedReason(true),
                 ),
             ),
-            (
+            case(
                 "viewer mutes author",
-                Some(VIEWER),
                 world().edge(Graph::Mutes, VIEWER, QUOTED_AUTHOR),
-                quote_with_outer(),
                 dropped(
                     "quoted_viewer_mutes_author_not_following/drop",
                     ThriftFilteredReason::UnspecifiedReason(true),
                 ),
             ),
-            (
+            case(
                 "protected",
-                Some(VIEWER),
                 world().user(QUOTED_AUTHOR, protected()),
-                quote_with_outer(),
                 dropped(
                     "protected_quoted_author/drop",
                     ThriftFilteredReason::AuthorIsProtected(true),
                 ),
             ),
-            (
+            case(
                 "outer withheld",
-                Some(VIEWER),
                 world().user(QUOTING_AUTHOR, suspended()),
-                quote_with_outer(),
                 PassOutcome::OuterWithheld,
             ),
-            (
+            case(
                 "outer not found",
-                Some(VIEWER),
                 InMemorySources::default()
                     .tweet(INNER, QUOTED_AUTHOR)
                     .authors(&[QUOTED_AUTHOR]),
-                quote_with_outer(),
                 PassOutcome::OuterWithheld,
             ),
-            (
+            case(
                 "outer failed",
-                Some(VIEWER),
                 world().fail_key(Source::TesPureCoreData, OUTER),
-                quote_with_outer(),
                 PassOutcome::OuterWithheld,
             ),
-            (
-                "outer absent",
-                Some(VIEWER),
-                world().user(QUOTED_AUTHOR, suspended()),
-                vec![entry(INNER, Some(OUTER))],
-                PassOutcome::OuterAbsent,
-            ),
-            (
+            PassCase {
+                tweets: vec![tweet_data(INNER, Some(OUTER))],
+                ..case(
+                    "outer absent",
+                    world().user(QUOTED_AUTHOR, suspended()),
+                    PassOutcome::OuterAbsent,
+                )
+            },
+            case(
                 "inner deleted",
-                Some(VIEWER),
                 InMemorySources::default()
                     .tweet(OUTER, QUOTING_AUTHOR)
                     .authors(&[QUOTING_AUTHOR]),
-                quote_with_outer(),
                 PassOutcome::InnerUnresolved,
             ),
-            (
+            case(
                 "deleted inner whose author blocks the quoting author",
-                Some(VIEWER),
                 deleted_inner().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),
-                quote_with_outer(),
                 dropped(
                     "quoted_author_blocks_quoting_author/drop/author_block_viewer",
                     ThriftFilteredReason::AuthorBlockViewer(true),
                 ),
             ),
-            (
+            case(
                 "deleted inner of a deactivated author",
-                Some(VIEWER),
                 deleted_inner().user(QUOTED_AUTHOR, author(deactivated)),
-                quote_with_outer(),
                 dropped(
                     "deactivated_author/drop",
                     ThriftFilteredReason::AuthorIsDeactivated(true),
                 ),
             ),
-            (
+            case(
                 "deleted inner of a protected author",
-                Some(VIEWER),
                 deleted_inner().user(QUOTED_AUTHOR, protected()),
-                quote_with_outer(),
                 dropped(
                     "protected_quoted_author/drop",
                     ThriftFilteredReason::AuthorIsProtected(true),
                 ),
             ),
-            (
+            case(
                 "deleted inner whose author level 65 does not drop",
-                Some(VIEWER),
                 deleted_inner(),
-                quote_with_outer(),
                 PassOutcome::InnerUnresolved,
             ),
-            (
+            case(
                 "deleted inner of a not-found author",
-                Some(VIEWER),
                 InMemorySources::default()
                     .tweet(OUTER, QUOTING_AUTHOR)
                     .quote(OUTER, INNER, QUOTED_AUTHOR)
                     .authors(&[QUOTING_AUTHOR]),
-                quote_with_outer(),
                 erased_drop(),
             ),
-            (
+            case(
                 "live inner of a not-found author",
-                Some(VIEWER),
                 live_inner_of_a_not_found_author(),
-                quote_with_outer(),
                 erased_drop(),
             ),
-            (
+            case(
                 "live inner of a soft user",
-                Some(VIEWER),
                 world().user(
                     QUOTED_AUTHOR,
                     GizmoduckUserResult {
@@ -727,54 +659,64 @@ mod tests {
                         response_state: Some(UserResponseState::SoftUser),
                     },
                 ),
-                quote_with_outer(),
                 erased_drop(),
             ),
-            (
+            case(
                 "deleted inner whose author lookup failed",
-                Some(VIEWER),
                 deleted_inner().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),
-                quote_with_outer(),
                 PassOutcome::FailedOpen,
             ),
-            (
+            case(
                 "live inner whose author lookup failed",
-                Some(VIEWER),
                 world().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),
-                quote_with_outer(),
                 PassOutcome::InnerUnresolved,
             ),
-            (
+            case(
                 "deleted inner whose outer's quoted tweet lookup failed",
-                Some(VIEWER),
                 deleted_inner()
                     .edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR)
                     .fault(Source::TesQuotedTweet, Fault::Fails),
-                quote_with_outer(),
                 PassOutcome::FailedOpen,
             ),
-            (
+            case(
                 "block pair edge failed",
-                Some(VIEWER),
                 world()
                     .user(QUOTED_AUTHOR, protected())
                     .edge(Graph::Follows, QUOTING_AUTHOR, QUOTED_AUTHOR)
                     .fault(Source::FlockUserPair, Fault::Fails),
-                quote_with_outer(),
                 PassOutcome::FailedOpen,
             ),
-            (
-                "follow pair edge failed for a protected author the quoting author follows",
-                None,
-                world()
-                    .user(QUOTED_AUTHOR, protected())
-                    .edge(Graph::Follows, QUOTING_AUTHOR, QUOTED_AUTHOR)
-                    .fail_graph(Graph::Follows),
-                quote_with_outer(),
-                PassOutcome::FailedOpen,
-            ),
-        ];
-        for (name, viewer_id, world, tweets, outcome) in cases {
+            PassCase {
+                viewer_id: None,
+                ..case(
+                    "follow pair edge failed for a protected author the quoting author follows",
+                    world()
+                        .user(QUOTED_AUTHOR, protected())
+                        .edge(Graph::Follows, QUOTING_AUTHOR, QUOTED_AUTHOR)
+                        .fail_graph(Graph::Follows),
+                    PassOutcome::FailedOpen,
+                )
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_shadow_pass_judges_outer_then_quoted_author_by_every_wired_rule_serving_as_off() {
+        let quote = || EvaluationKey {
+            tweet_id: TweetId(INNER),
+            placement: Placement::InnerQuoted {
+                outer: TweetId(OUTER),
+            },
+        };
+        let mut rerendered = vec![];
+        for PassCase {
+            name,
+            viewer_id,
+            world,
+            tweets,
+            outcome,
+        } in pass_cases()
+        {
             let world = Arc::new(world);
             let (off, no_passes) = serve(
                 Arc::clone(&world),
@@ -799,22 +741,30 @@ mod tests {
                 [(quote(), &outcome)],
                 "{name}"
             );
+            if let PassOutcome::Dropped(Rerendered { by, .. }) = outcome {
+                rerendered.push(by);
+            }
         }
+        let undecided: Vec<&str> = RuleEngine::for_tests()
+            .wired_rule_names(SafetyLevel::QuotedTweetRules)
+            .into_iter()
+            .filter(|&rule| !rerendered.contains(&RuleId::of_rule_name(rule).unwrap()))
+            .collect();
+        assert!(
+            undecided.is_empty(),
+            "quoted_tweet_rules rules no quote entry rerenders: {undecided:?}"
+        );
     }
 
     #[test]
     fn a_level_65_drop_rerenders_by_its_rule_identity_whatever_its_name() {
-        use crate::hydration::Hydrators;
         use crate::models::{DropReason, Withholding};
         use xai_visibility_filtering::models::FilteredReason;
-        let author = UserEvaluation {
-            evaluation: Evaluation::complete(Verdict::Withheld(Decided {
-                value: Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
-                id: RuleId::SuspendedAuthor,
-                by: "renamed",
-            })),
-            failed: Hydrators::empty(),
-        };
+        let author = AuthorJudgement::Judged(Evaluation::complete(Verdict::Withheld(Decided {
+            value: Withholding::Drop(DropReason::Legacy(FilteredReason::AuthorIsSuspended)),
+            id: RuleId::SuspendedAuthor,
+            by: "renamed",
+        })));
         assert!(matches!(
             judge(SafetyLevel::TimelineHomeHydration, Some(&author)),
             PassOutcome::Dropped(Rerendered {
@@ -852,7 +802,10 @@ mod tests {
             .user(QUOTED_AUTHOR, protected())
             .latency(Source::TesQuotedTweet, Duration::from_millis(10));
         let mut tweets = quote_with_outer();
-        tweets.extend([entry(LIVE_OUTER, None), entry(LIVE_INNER, Some(LIVE_OUTER))]);
+        tweets.extend([
+            tweet_data(LIVE_OUTER, None),
+            tweet_data(LIVE_INNER, Some(LIVE_OUTER)),
+        ]);
         let (_, passes) = serve(Arc::new(world), QuotePassMode::Shadow, Some(VIEWER), tweets).await;
         let protected_drop = dropped(
             "protected_quoted_author/drop",
@@ -900,7 +853,7 @@ mod tests {
             FallbackCaches::default(),
             QuotePassMode::Shadow,
         );
-        served.endpoint = served.endpoint.with_quote_pass_permits(1);
+        served.wire = served.wire.quote_pass_permits(1);
         for request in ["first", "second"] {
             let (_, passes) = served.serve(Some(VIEWER), quote_with_outer()).await;
             assert_eq!(
@@ -919,7 +872,7 @@ mod tests {
             FallbackCaches::default(),
             QuotePassMode::Shadow,
         );
-        served.endpoint = served.endpoint.with_quote_pass_permits(1);
+        served.wire = served.wire.quote_pass_permits(1);
         thread_recorded::start();
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
@@ -960,7 +913,7 @@ mod tests {
         };
         let mut served = Served::new(Arc::clone(&world), caches, QuotePassMode::Shadow);
         let (_, passes) = served
-            .serve(Some(VIEWER), vec![entry(INNER, Some(OUTER))])
+            .serve(Some(VIEWER), vec![tweet_data(INNER, Some(OUTER))])
             .await;
         assert_eq!(passes[0].outcome, PassOutcome::OuterAbsent);
         assert!(
@@ -971,7 +924,9 @@ mod tests {
             "the pass fetched the outer's pure core"
         );
         world.break_source(Source::TesPureCoreData, Fault::Fails);
-        let (outer, _) = served.serve(Some(VIEWER), vec![entry(OUTER, None)]).await;
+        let (outer, _) = served
+            .serve(Some(VIEWER), vec![tweet_data(OUTER, None)])
+            .await;
         assert_eq!(outer, [Outcome::Failed(vf_pb::Failed {})]);
     }
 

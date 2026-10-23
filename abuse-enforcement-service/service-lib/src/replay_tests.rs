@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use xai_abuse_proto::enforcement::{
-    self as abuse_proto, EntityType as ProtoEntityType, FiredHead, RequestedAction, ScoreResult,
-    SummaryCounters,
+    self as abuse_proto, EntityType as ProtoEntityType, FiredHead, ScoreResult, SummaryCounters,
 };
 use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, Label, Labels, Safety};
 use xai_core_entities::gizmoduck_client::MockGizmoduckClient;
@@ -82,9 +81,10 @@ pub(crate) struct TestBed {
     pub tickets: Arc<AtomicI64>,
         pub claims: Arc<backfill_claims::test_support::MemClaimStore>,
     pub outcomes: Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>,
-    control_store: Arc<action_control::test_support::MemControlStore>,
+    pub control_store: Arc<action_control::test_support::MemControlStore>,
     pub backfill_store: Arc<action_control::test_support::MemControlStore>,
-    _strato: wiremock::MockServer,
+    gizmoduck: Arc<MockGizmoduckClient>,
+    strato: wiremock::MockServer,
 }
 
 pub(crate) struct BedConfig<'a> {
@@ -211,7 +211,7 @@ impl TestBed {
         let claims = Arc::new(backfill_claims::test_support::MemClaimStore::listing_all());
         let ctx = EnforcementCtx {
             ais_client: ais_client::AisClient::recording(ais.clone()),
-            gd: gizmoduck::GizmoduckCoreClient::from_client(gd),
+            gd: gizmoduck::GizmoduckCoreClient::from_client(gd.clone()),
             cred_clients: strato::CredClients {
                 high_page_rank: column("hpr"),
                 grey_badge: column("grey"),
@@ -226,6 +226,10 @@ impl TestBed {
                 overturn_hold::FakeHoldStore::new(Vec::new()),
             ))),
             off_switch,
+            head_guard: Arc::new(head_guard::HeadGuard::new(
+                Arc::new(action_control::test_support::MemControlStore::default()),
+                None,
+            )),
             action_control,
             backfill: Arc::new(backfill::Backfill::new(
                 backfill_store.clone(),
@@ -243,8 +247,13 @@ impl TestBed {
             outcomes,
             control_store,
             backfill_store,
-            _strato: server,
+            gizmoduck: gd,
+            strato: server,
         }
+    }
+
+        pub(crate) async fn fetches(&self) -> usize {
+        self.gizmoduck.call_count() + self.strato.received_requests().await.map_or(0, |r| r.len())
     }
 
     pub(crate) fn processor(&self) -> ScoreResultProcessor {
@@ -295,7 +304,28 @@ impl TestBed {
         self.ais.take();
         self.outcomes.lock().unwrap().clear();
         let tickets_before = self.tickets.load(Ordering::Relaxed);
-        let result = processor.process(score).await;
+        let result = processor.process(score, None).await;
+        self.trace(result, tickets_before)
+    }
+
+            pub(crate) async fn run_admitted(
+        &self,
+        processor: &ScoreResultProcessor,
+        score: &ScoreResult,
+    ) -> Trace {
+        self.dedup.slots.lock().unwrap().clear();
+        self.dedup.take_calls();
+        self.ais.take();
+        self.outcomes.lock().unwrap().clear();
+        let tickets_before = self.tickets.load(Ordering::Relaxed);
+        let result = match processor.admit(score).await {
+            Admission::Admitted(control) => processor.process(score, control.map(|c| *c)).await,
+            Admission::Dropped(status) => Ok(status.to_owned()),
+        };
+        self.trace(result, tickets_before)
+    }
+
+    fn trace(&self, result: Result<String, EnforcementFailed>, tickets_before: i64) -> Trace {
         let status = match &result {
             Ok(s) => s.clone(),
             Err(e) => format!("error:{}", e.source),
@@ -465,30 +495,15 @@ pub(crate) fn factory_message(account: Account) -> ScoreResult {
         EntityType::User,
         "IsDelayedSuspendSpam",
         "is_delayed_suspend_spam@3",
-        &["abuse_platform_requested_actions"],
+        &["model_factory"],
         account,
     );
     s.policy_version = "3".into();
-    s.requested_actions = vec![RequestedAction {
-        kind: "suspend".into(),
-        perm: false,
-        policy: "PlatformManipulation".into(),
-        head: "IsDelayedSuspendSpam".into(),
-        ..Default::default()
-    }];
     s
 }
 
 pub(crate) fn base_config(dry_run: bool, cap: Option<u64>) -> serde_json::Value {
-    let mut c = serde_json::json!({
-        "dry_run": dry_run,
-        "generic_actions": {
-            "user": {"kinds": ["suspend", "label", "spam_liveness_check", "bounce_captcha", "bounce_arkose"],
-                     "suspend_policies": ["PlatformManipulation"], "labels": ["SpamHighRecall"]},
-            "post": {"kinds": ["post_label", "suspend_author"], "suspend_policies": ["Cse"],
-                     "labels": ["SpamHighRecall", "RiskyHighVizReply"]}
-        },
-    });
+    let mut c = serde_json::json!({ "dry_run": dry_run });
     if let Some(cap) = cap {
         c["max_user_enforcements_per_day"] = cap.into();
     }

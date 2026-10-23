@@ -1,10 +1,9 @@
-use super::builders::{controlled_root, labeled, on_client, viewer_in_country};
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{ClientCapability, SafetyLabelType, ViewerFeatures, ViewerProfile};
 use crate::rules::fixtures::{
-    allow, appealed, blurred, candidate, dropped, noticed, viewer, viewer_with_profile, AUTHOR_ID,
-    VIEWER_ID,
+    allow, appealed, blurred, candidate, controlled_root, dropped, labeled, noticed, on_client,
+    viewer, viewer_in_country, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
 };
 use crate::rules::SafetyLevel::{
     ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
@@ -18,7 +17,7 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "malicious_url_label",
-            post: labeled(SafetyLabelType::MALICIOUS_URL),
+            subject: Subject::Post(labeled(SafetyLabelType::MALICIOUS_URL)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -42,7 +41,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_high_recall_label",
-            post: labeled(SafetyLabelType::NSFW_HIGH_RECALL),
+            subject: Subject::Post(labeled(SafetyLabelType::NSFW_HIGH_RECALL)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -65,7 +64,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "do_not_amplify_label",
-            post: labeled(SafetyLabelType::DO_NOT_AMPLIFY),
+            subject: Subject::Post(labeled(SafetyLabelType::DO_NOT_AMPLIFY)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -88,7 +87,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "spam_high_recall_label",
-            post: labeled(SafetyLabelType::SPAM_HIGH_RECALL),
+            subject: Subject::Post(labeled(SafetyLabelType::SPAM_HIGH_RECALL)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -120,7 +119,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "brazil_election_legal_label",
-            post: labeled(SafetyLabelType::BRAZIL_ELECTION_LEGAL),
+            subject: Subject::Post(labeled(SafetyLabelType::BRAZIL_ELECTION_LEGAL)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -175,10 +174,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "brazil_election_legal_label_followed",
-            post: candidate()
-                .with_label(SafetyLabelType::BRAZIL_ELECTION_LEGAL)
-                .with_edge(Hydrator::Follows)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::BRAZIL_ELECTION_LEGAL)
+                    .with_edge(Hydrator::Follows)
+                    .build(),
+            ),
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::As("follower_in_br", viewer_in_country("br")),
@@ -190,7 +191,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_insults_label",
-            post: labeled(SafetyLabelType::FOSNR_ABUSE_INSULTS),
+            subject: Subject::Post(labeled(SafetyLabelType::FOSNR_ABUSE_INSULTS)),
             expect: vec![
                 (
                     TimelineHomeRecommendations,
@@ -269,10 +270,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_insults_by_agent_under_appeal",
-            post: candidate()
-                .with_agent_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
-                .with_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_agent_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                    .with_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED)
+                    .build(),
+            ),
             expect: vec![
                 (
                     TimelineHomeHydration,
@@ -298,12 +301,14 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_insults_on_nsfw_media",
-            post: candidate()
-                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
-                .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
-                .with_media()
-                .with_edge(Hydrator::Follows)
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                    .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
+                    .with_media()
+                    .with_edge(Hydrator::Follows)
+                    .build(),
+            ),
             expect: vec![(
                 TimelineHomeHydration,
                 Role::As(
@@ -318,10 +323,14 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "fosnr_abuse_insults_in_by_invitation_conversation",
-            post: candidate()
-                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
-                .with_conversation_control(controlled_root(ConversationControlArm::ByInvitation))
-                .build(),
+            subject: Subject::Post(
+                candidate()
+                    .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                    .with_conversation_control(controlled_root(
+                        ConversationControlArm::ByInvitation,
+                    ))
+                    .build(),
+            ),
             expect: vec![(
                 TimelineHomeHydration,
                 Role::Follower,

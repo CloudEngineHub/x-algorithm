@@ -56,6 +56,7 @@ pub mod config;
 pub mod dark_traffic_setup;
 pub(crate) mod evaluate_tweets;
 pub mod explain;
+pub(crate) mod filter_notifications;
 pub(crate) mod filter_tweets;
 pub(crate) mod get_safety_labels;
 pub(crate) mod hydration;

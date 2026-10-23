@@ -1,3 +1,4 @@
+use super::build_non_selected;
 use crate::ads::{
     AdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender, SafeGapAdsBlender,
     TimeGapAdsBlender, TimeGapConfig,
@@ -50,7 +51,7 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
         let video_carousel = drop_carousel_if_who_to_follow_present(video_carousel, &wtf_modules);
 
         let input_post_count = posts.len();
-        let input_ad_count = ads.len();
+        let input_ads = ads.clone();
 
         let time_gap_blender;
         let blender: &dyn AdsBlender = match query.params.get(AdsBlenderType).as_str() {
@@ -89,14 +90,8 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             .iter()
             .filter(|i| matches!(i.item, Some(feed_item::Item::Post(_))))
             .count();
-        let output_ad_count = blended
-            .iter()
-            .filter(|i| matches!(i.item, Some(feed_item::Item::Ad(_))))
-            .count();
-
         let dropped_posts = input_post_count.saturating_sub(output_post_count);
-        let dropped_ads = input_ad_count.saturating_sub(output_ad_count);
-        let non_selected = build_non_selected_placeholders(dropped_posts, dropped_ads);
+        let non_selected = build_non_selected(dropped_posts, input_ads, &blended);
 
         SelectResult {
             selected: blended,
@@ -208,23 +203,6 @@ fn insert_feed_survey(blended: &mut Vec<FeedItem>, feed_survey: Option<FeedSurve
             item: Some(feed_item::Item::FeedSurvey(survey)),
         },
     );
-}
-
-fn build_non_selected_placeholders(dropped_posts: usize, dropped_ads: usize) -> Vec<FeedItem> {
-    let mut non_selected = Vec::with_capacity(dropped_posts + dropped_ads);
-    for _ in 0..dropped_posts {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Post(ScoredPost::default())),
-        });
-    }
-    for _ in 0..dropped_ads {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Ad(AdIndexInfo::default())),
-        });
-    }
-    non_selected
 }
 
 struct PartitionedFeedItems {

@@ -49,18 +49,15 @@ impl GetSafetyLabelsEndpoint {
         metrics::record_batch_size(BatchStage::Request, unique_ids.len());
 
         let resolved = self.safety_label_source.get(&unique_ids).await;
-        let outcome = GetSafetyLabelsOutcome::try_from_resolved(resolved, unique_ids.len())?;
-        let failed_count = outcome.failure_count();
+        let (response, failure_counts) =
+            CachedGetSafetyLabelsResponse::try_from_resolved(resolved, unique_ids.len())?;
 
-        metrics::record_lookup_tweet_ids(outcome.success_count(), failed_count);
-        for (kind, &count) in &outcome.failures {
+        metrics::record_lookup_tweet_ids(response.results.len(), response.failed_ids.len());
+        for (kind, &count) in &failure_counts {
             metrics::record_lookup_failures(kind, count);
         }
 
-        Ok(Response::new(CachedGetSafetyLabelsResponse {
-            results: outcome.results,
-            failed_ids: outcome.failed_ids,
-        }))
+        Ok(Response::new(response))
     }
 }
 
@@ -71,6 +68,44 @@ pub(crate) struct CachedGetSafetyLabelsResponse {
 }
 
 impl CachedGetSafetyLabelsResponse {
+    fn try_from_resolved(
+        resolved: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        requested_count: usize,
+    ) -> Result<(Self, EnumMap<FailureKind, usize>), Status> {
+        let mut results = HashMap::with_capacity(resolved.len());
+        let mut failed_ids = Vec::new();
+        let mut failures = EnumMap::default();
+
+        for (id, lookup_result) in resolved {
+            match lookup_result {
+                Ok(label_map) => {
+                    results.insert(id, label_map);
+                }
+                Err(e) => {
+                    failed_ids.push(id);
+                    failures[e.kind] += 1;
+                }
+            }
+        }
+
+        failed_ids.sort_unstable();
+
+        let accounted_count = results.len() + failed_ids.len();
+        if accounted_count != requested_count {
+            return Err(Status::internal(format!(
+                "GetSafetyLabels invariant violation: requested={requested_count} accounted={accounted_count}"
+            )));
+        }
+
+        Ok((
+            Self {
+                results,
+                failed_ids,
+            },
+            failures,
+        ))
+    }
+
     fn encode(&self, buf: &mut impl BufMut) {
         hash_map::encode(
             uint64::encode,
@@ -119,68 +154,6 @@ impl Encoder for GetSafetyLabelsCodec {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct GetSafetyLabelsOutcome {
-    requested_count: usize,
-    pub(crate) results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,
-    pub(crate) failed_ids: Vec<u64>,
-    pub(crate) failures: EnumMap<FailureKind, usize>,
-}
-
-impl GetSafetyLabelsOutcome {
-    pub(crate) fn try_from_resolved(
-        resolved: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
-        requested_count: usize,
-    ) -> Result<Self, Status> {
-        let mut results = HashMap::with_capacity(resolved.len());
-        let mut failed_ids = Vec::new();
-        let mut failures = EnumMap::default();
-
-        for (id, lookup_result) in resolved {
-            match lookup_result {
-                Ok(label_map) => {
-                    results.insert(id, label_map);
-                }
-                Err(e) => {
-                    failed_ids.push(id);
-                    failures[e.kind] += 1;
-                }
-            }
-        }
-
-        failed_ids.sort_unstable();
-
-        let result = Self {
-            requested_count,
-            results,
-            failed_ids,
-            failures,
-        };
-
-        if result.accounted_count() != result.requested_count {
-            return Err(Status::internal(format!(
-                "GetSafetyLabels invariant violation: requested={} accounted={}",
-                result.requested_count,
-                result.accounted_count()
-            )));
-        }
-
-        Ok(result)
-    }
-
-    pub(crate) fn success_count(&self) -> usize {
-        self.results.len()
-    }
-
-    pub(crate) fn failure_count(&self) -> usize {
-        self.failed_ids.len()
-    }
-
-    fn accounted_count(&self) -> usize {
-        self.results.len() + self.failed_ids.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,7 +180,7 @@ mod tests {
 
     #[test]
     fn try_from_resolved_reports_partial_failure() {
-        let outcome = GetSafetyLabelsOutcome::try_from_resolved(
+        let (response, failure_counts) = CachedGetSafetyLabelsResponse::try_from_resolved(
             FxHashMap::from_iter([
                 (1, Ok(Arc::new(labels_with_entry(11)))),
                 (4, Ok(Arc::new(labels_with_entry(44)))),
@@ -224,12 +197,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.success_count(), 2);
-        assert_eq!(outcome.results.len(), 2);
-        assert_eq!(outcome.failed_ids, vec![2, 3]);
-        assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 1);
-        assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 1);
-        assert_eq!(outcome.failure_count(), 2);
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.failed_ids, vec![2, 3]);
+        assert_eq!(failure_counts[FailureKind::ManhattanFetch], 1);
+        assert_eq!(failure_counts[FailureKind::ManhattanDecode], 1);
     }
 
     fn prod_shaped_label_map(id: u64) -> vf_pb::SafetyLabelMap {
@@ -308,7 +279,7 @@ mod tests {
 
     #[test]
     fn try_from_resolved_rejects_missing_ids() {
-        let status = GetSafetyLabelsOutcome::try_from_resolved(
+        let status = CachedGetSafetyLabelsResponse::try_from_resolved(
             FxHashMap::from_iter([(7, Ok(Arc::new(labels_with_entry(22))))]),
             2,
         )

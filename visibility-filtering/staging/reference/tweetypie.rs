@@ -221,7 +221,9 @@ impl TweetypieReference {
             SafetyLevel::FilterAll
             | SafetyLevel::TimelineHomeHydration
             | SafetyLevel::ImmersiveExpandedRecommendations
-            | SafetyLevel::QuotedTweetRules => return,
+            | SafetyLevel::QuotedTweetRules
+            | SafetyLevel::NotificationsFollow
+            | SafetyLevel::NotificationsWriterV2 => return,
         }
         let tweet_ids: Vec<TweetId> = outcomes
             .iter()

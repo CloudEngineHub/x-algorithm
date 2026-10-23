@@ -1,7 +1,8 @@
 use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::Edge;
-use crate::hydration::Cause;
+use crate::hydration::inventory::Answer;
+use crate::hydration::{Cause, Hydrator};
 use crate::models::{AuthorId, ReplyTo, TweetId};
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 
@@ -20,7 +21,7 @@ impl Store {
         row: &RequestRow,
     ) -> Option<ConversationRootAuthor> {
         let id = row.tweet_id()?.0;
-        let (conversation_id, parent_id) = match self.pure_cores.get(id)?.reply_to? {
+        let (conversation_id, parent_id) = match self.pure_cores.request().get(id)?.reply_to? {
             ReplyTo::Root { root_author_id, .. } => {
                 return Some(ConversationRootAuthor::PureCore(root_author_id));
             }
@@ -32,15 +33,16 @@ impl Store {
         if let Some(author) = self.root_author_in_batch(conversation_id, parent_id) {
             return Some(ConversationRootAuthor::PureCore(author));
         }
-        let root = match (self.controls.get(id), self.controls.miss(id)) {
+        let root = match (self.controls.get(id), self.controls.answer(id)) {
             (Some(control), _) => ConversationRootAuthor::ConversationControl(AuthorId(
                 control.conversation_tweet_author_id,
             )),
-            (None, Some(Cause::NotFound)) if !self.row_tweet_ids.contains(&conversation_id) => {
+            (None, Answer::NotFound) if !self.requested_tweet_ids.contains(&conversation_id) => {
                 ConversationRootAuthor::RootPost(conversation_id)
             }
-            (None, Some(Cause::NotFound))
-                if self.pure_cores.miss(conversation_id.0) == Some(Cause::Failed) =>
+            (None, Answer::NotFound)
+                if self.existence_miss(Hydrator::PureCore, conversation_id.0)
+                    == Some(Cause::Failed) =>
             {
                 ConversationRootAuthor::RootPureCoreFailed
             }
@@ -56,8 +58,9 @@ impl Store {
     ) -> Option<AuthorId> {
         let row_core = |id: TweetId| {
             self.pure_cores
+                .request()
                 .get(id.0)
-                .filter(|_| self.row_tweet_ids.contains(&id))
+                .filter(|_| self.requested_tweet_ids.contains(&id))
         };
         row_core(conversation_id)
             .map(|root| root.author_id)

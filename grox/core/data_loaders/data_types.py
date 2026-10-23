@@ -238,6 +238,7 @@ class Video(BaseModel):
     convo_video: ConvoVideo | None = None
     crop_seconds: float | None = None
     key_frames_ranking: RankingQuery | None = None
+    motion_reveal: bool = False
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":

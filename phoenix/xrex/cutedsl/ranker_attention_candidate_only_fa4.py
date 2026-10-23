@@ -29,7 +29,9 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
 
     if arch not in (90, 100):
         raise NotImplementedError(
-            "ranker candidate attention: only SM90 (H100) and SM100 (GB200/GB300) are supported"
+            "Ranker candidate-only attention supports only SM90 (H100) and SM100 (GB200/GB300). "
+            "On this GPU, set seqpack_candidate_packing=False and candidate_only_attn_impl=None "
+            "to compute every token and keep only the candidates' outputs."
         )
 
     qpk = num_q_heads // num_kv_heads

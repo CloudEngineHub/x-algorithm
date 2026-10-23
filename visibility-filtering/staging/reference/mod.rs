@@ -12,12 +12,14 @@ use strum::VariantNames;
 use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
+use users::UserReference;
 use vf_service::{ReferenceCompareHarness, TweetVerdict};
 use xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use xai_twittercontext_proto::TwitterContextViewer;
-use xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};
+use xai_visibility_filtering::vf_client::StratoVfClient;
 
 pub(crate) mod tweetypie;
+mod users;
 pub(crate) mod vf_service;
 
 const ENV_DUAL_CALL_HARNESS_ENABLED: &str = "VF_DUAL_CALL_HARNESS_ENABLED";
@@ -32,6 +34,7 @@ pub enum Reference {
     None,
         VfService,
         Tweetypie,
+            Users,
 }
 
 impl Reference {
@@ -83,11 +86,22 @@ pub(crate) async fn build(
     match reference() {
         Reference::None => Comparators::default(),
         Reference::VfService => Comparators {
-            filter_tweets: Some(Box::new(
-                build_vf_service(datacenter, init_deadline, metadata).await,
-            )),
+            filter_tweets: Some(Box::new(Arc::new(ReferenceCompareHarness::new(
+                strato_vf(datacenter, init_deadline, metadata).await,
+                datacenter,
+            )))),
             evaluate_tweets: None,
         },
+        Reference::Users => {
+            let strato = strato_vf(datacenter, init_deadline, metadata).await;
+            Comparators {
+                filter_tweets: Some(Box::new(Arc::new(UserReference::new(
+                    Arc::clone(&strato.grpc_client),
+                    post_evaluator,
+                )))),
+                evaluate_tweets: None,
+            }
+        }
         Reference::Tweetypie => {
             let reference = tweetypie::build(
                 init_deadline,
@@ -108,16 +122,16 @@ pub(crate) async fn build(
     clippy::expect_used,
     reason = "startup fail-fast: init failure is fatal"
 )]
-async fn build_vf_service(
+async fn strato_vf(
     datacenter: &str,
     init_deadline: Instant,
     metadata: Option<&MetadataMap>,
-) -> Arc<ReferenceCompareHarness> {
+) -> Arc<StratoVfClient> {
     let client_id = format!(
         "visibility-filtering-service.{}",
         env::var(ENV_APP_ENV).unwrap_or_else(|_| "staging".to_string())
     );
-    let strato: Arc<dyn VfClient + Send + Sync> = Arc::new(
+    Arc::new(
         init_client_with_retry("strato_vf", init_deadline, || {
             let client_id = client_id.clone();
             async move {
@@ -139,8 +153,7 @@ async fn build_vf_service(
         })
         .await
         .expect("Failed to initialize Strato VF client (reference comparator)"),
-    );
-    Arc::new(ReferenceCompareHarness::new(strato, datacenter))
+    )
 }
 
 impl Comparator for Arc<ReferenceCompareHarness> {
@@ -162,6 +175,21 @@ impl Comparator for Arc<ReferenceCompareHarness> {
                     })
                     .collect(),
             );
+        }))
+    }
+}
+
+impl Comparator for Arc<UserReference> {
+    fn begin(
+        &self,
+        viewer_id: Option<u64>,
+        _country_code: Option<String>,
+        safety_level: SafetyLevel,
+        tweet_ids: Vec<u64>,
+    ) -> Option<FinishComparison> {
+        let reference = Arc::clone(self);
+        Some(Box::new(move |_| {
+            reference.spawn(viewer_id, safety_level, tweet_ids);
         }))
     }
 }
@@ -205,6 +233,7 @@ impl EntryComparator for Arc<TweetypieReference> {
 #[cfg(test)]
 mod tests {
     use super::Reference;
+    use serde::Deserialize;
 
     #[test]
     fn reference_defaults_to_none_and_is_refused_in_prod() {
@@ -224,6 +253,10 @@ mod tests {
             Reference::resolve(Some("tweetypie"), false, Some("staging")),
             Ok(Reference::Tweetypie)
         );
+        assert_eq!(
+            Reference::resolve(Some("users"), false, Some("staging")),
+            Ok(Reference::Users)
+        );
         assert!(Reference::resolve(Some("VfService"), false, Some("staging")).is_err());
         assert!(Reference::resolve(Some("vf_service"), false, Some("prod")).is_err());
         assert_eq!(
@@ -231,5 +264,36 @@ mod tests {
             Ok(Reference::None)
         );
         assert!(Reference::resolve(None, true, Some("staging")).is_err());
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        Deliberate,
+        Gap,
+    }
+
+        #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Divergence {
+        divergence: String,
+        kind: Kind,
+        ticket: Option<String>,
+        behavior: String,
+    }
+
+    #[test]
+    fn each_divergence_states_its_behavior_and_a_gap_names_its_ticket() {
+        let path = crate::pinned::crate_path("tests/divergences.json");
+        let registry: Vec<Divergence> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for entry in registry {
+            let name = &entry.divergence;
+            assert!(!entry.behavior.is_empty(), "{name}: no behavior");
+            assert!(
+                matches!(entry.kind, Kind::Deliberate) || entry.ticket.is_some(),
+                "{name}: a gap names its ticket"
+            );
+        }
     }
 }

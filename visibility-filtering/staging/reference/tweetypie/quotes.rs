@@ -12,12 +12,6 @@ use std::sync::Arc;
 use tokio::time::timeout;
 use xai_twittercontext_proto::TwitterContextViewer;
 
-impl TpResult {
-    pub(crate) fn inner_quoted(&self) -> TpResult {
-        Lens::InnerQuoted.answer(self)
-    }
-}
-
 impl Lens {
     fn answer(self, outer: &TpResult) -> TpResult {
         let failed_class: &str = Class::Failed.into();
@@ -126,7 +120,9 @@ fn quote_comparisons(
         | SafetyLevel::TimelineHome
         | SafetyLevel::TimelineHomeRecommendations
         | SafetyLevel::ImmersiveExpandedRecommendations
-        | SafetyLevel::QuotedTweetRules => return None,
+        | SafetyLevel::QuotedTweetRules
+        | SafetyLevel::NotificationsFollow
+        | SafetyLevel::NotificationsWriterV2 => return None,
     }
     let mut outers = Vec::new();
     for outcome in outcomes {

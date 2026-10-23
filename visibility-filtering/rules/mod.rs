@@ -3,23 +3,23 @@ mod author_rules;
 mod catalog;
 mod context;
 pub mod engine;
+mod expansion;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod golden_corpus;
-#[cfg(test)]
-mod legacy_table;
 mod levels;
 mod rule_spec;
 mod safety_level;
 mod tweet_rules;
 
 #[cfg(test)]
-use crate::models::{Placement, PostCandidate, QuoteFacts, ViewerFeatures};
+use crate::models::{Placement, PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
 pub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};
+pub(crate) use expansion::Expansion;
 pub(crate) use rule_spec::observed::NoTrace;
 pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
 pub(crate) use rule_spec::RuleId;
@@ -50,11 +50,5 @@ pub(crate) fn placed_test_context<'a>(
     use std::sync::LazyLock;
 
     static COUNTRY_LISTS: LazyLock<CountryLists> = LazyLock::new(CountryLists::starting_at_default);
-    RuleContext::new(
-        viewer,
-        candidate,
-        placement,
-        QuoteFacts::default(),
-        &COUNTRY_LISTS,
-    )
+    RuleContext::new(viewer, candidate, placement, &COUNTRY_LISTS)
 }

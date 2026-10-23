@@ -1,9 +1,9 @@
 use rustc_hash::FxHashMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::cached_value::{self, CacheLookup};
+use super::cached_value;
 use super::lookup::TwemcacheLookup;
 use super::metrics::{self, CacheResult, CacheTier, SourceOutcome};
 use super::types::{FallbackReason, LabelSource, TwemcacheOutcome};
@@ -50,12 +50,16 @@ struct ItemCounts {
     hit: usize,
     not_found: usize,
     miss: usize,
-    fallback: BTreeMap<FallbackReason, usize>,
 }
 
 impl ItemCounts {
-    fn record_fallback(&mut self, reason: FallbackReason) {
-        *self.fallback.entry(reason).or_default() += 1;
+    fn count(&mut self, outcome: &TwemcacheOutcome) {
+        match outcome {
+            TwemcacheOutcome::Hit(_) => self.hit += 1,
+            TwemcacheOutcome::NotFound => self.not_found += 1,
+            TwemcacheOutcome::Miss => self.miss += 1,
+            TwemcacheOutcome::FallThrough(_) => {}
+        }
     }
 
     fn record_metrics(&self) {
@@ -113,38 +117,12 @@ impl TwemcacheLookup for TwemcacheSource {
         let map = self.cache.multi_get(&keys).await;
         for (&tweet_id, key) in ids.iter().zip(&keys) {
             let outcome = match map.get(key) {
-                Some(Ok(Some(bytes))) => match cached_value::decode(bytes) {
-                    CacheLookup::Hit(label_map) => {
-                        counts.hit += 1;
-                        TwemcacheOutcome::Hit(label_map)
-                    }
-                    CacheLookup::NotFound => {
-                        counts.not_found += 1;
-                        TwemcacheOutcome::NotFound
-                    }
-                    CacheLookup::Miss => {
-                        counts.miss += 1;
-                        TwemcacheOutcome::Miss
-                    }
-                    CacheLookup::DecodeError | CacheLookup::DecodePanic => {
-                        counts.record_fallback(FallbackReason::Decode);
-                        TwemcacheOutcome::FallThrough(FallbackReason::Decode)
-                    }
-                },
-                Some(Ok(None)) => {
-                    counts.miss += 1;
-                    TwemcacheOutcome::Miss
-                }
-                Some(Err(e)) => {
-                    let reason = fallback_reason(e);
-                    counts.record_fallback(reason);
-                    TwemcacheOutcome::FallThrough(reason)
-                }
-                None => {
-                    counts.record_fallback(FallbackReason::MissingResponse);
-                    TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse)
-                }
+                Some(Ok(Some(bytes))) => cached_value::decode(bytes),
+                Some(Ok(None)) => TwemcacheOutcome::Miss,
+                Some(Err(e)) => TwemcacheOutcome::FallThrough(fallback_reason(e)),
+                None => TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse),
             };
+            counts.count(&outcome);
             results.insert(tweet_id, outcome);
         }
         metrics::record_source_request(

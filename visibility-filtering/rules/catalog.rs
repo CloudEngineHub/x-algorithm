@@ -1,7 +1,8 @@
+use crate::rules::engine::WiredRule;
 use crate::rules::rule_spec::engine::Engine;
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::rule_spec::rule_name;
-use crate::rules::SafetyLevel;
+use crate::rules::{RuleEngine, SafetyLevel};
 use std::cmp::Reverse;
 use std::fmt::Write;
 use strum::VariantArray;
@@ -97,7 +98,39 @@ pub(super) fn catalog() -> String {
         }
         writeln!(doc, "- {}. Levels: {}.", entry.line, levels.join(", ")).unwrap();
     }
+    doc.push_str(
+        "\n## Levels\n\n\
+         Each level's rules in fold order: the user list, then the post list, each under its\n\
+         actions in precedence order.\n",
+    );
+    let rule_engine = RuleEngine::for_tests();
+    for &level in SafetyLevel::VARIANTS {
+        writeln!(doc, "\n### {}\n", <&str>::from(level)).unwrap();
+        let (user, post) = rule_engine.fold_order(level);
+        write_wired(&mut doc, "user", &user);
+        write_wired(&mut doc, "post", &post);
+    }
     doc
+}
+
+fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E>]) {
+    let mut band = None;
+    for rule in rules {
+        let (kind, slot) = rule.action.kind_and_slot();
+        if band != Some(kind) {
+            band = Some(kind);
+            match slot {
+                "withholding" => writeln!(doc, "- {list}, {kind}, withholding:"),
+                _ => writeln!(doc, "- {list}, {kind}, {slot} slot:"),
+            }
+            .unwrap();
+        }
+        if rules.iter().filter(|other| other.name == rule.name).count() > 1 {
+            writeln!(doc, "  - `{}` when `{}`", rule.name, spelled(rule.when)).unwrap();
+        } else {
+            writeln!(doc, "  - `{}`", rule.name).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

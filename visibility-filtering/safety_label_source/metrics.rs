@@ -11,6 +11,7 @@ const MANHATTAN_KEYS: &str = "safety_labels_manhattan_keys";
 const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
+pub const EXPIRED_LABELS: &str = "safety_labels_expired_labels";
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -104,6 +105,10 @@ pub(crate) enum WarmKeyResult {
 
 pub(crate) fn record_cache_warm_keys(result: WarmKeyResult, count: usize) {
     incr_nonzero(CACHE_WARM_KEYS, &[("result", result.into())], count as u64);
+}
+
+pub(crate) fn record_expired_labels(count: usize) {
+    incr_nonzero(EXPIRED_LABELS, &[], count as u64);
 }
 
 pub(crate) fn record_batch_size(stage: BatchStage, size: usize) {

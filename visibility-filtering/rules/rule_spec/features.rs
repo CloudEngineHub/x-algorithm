@@ -23,7 +23,10 @@ mod tweet;
 mod viewer;
 
 pub use article::ArticleStageLeaf;
-pub use author::{AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf};
+pub use author::{
+    AuthorEmailLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorPhoneLeaf, AuthorProfileLeaf,
+    AuthorSafetyLeaf,
+};
 pub use community::{CommunityModeratorLeaf, CommunityViewerRemovedLeaf, PostModerationLeaf};
 pub use compound::CompoundLeaf;
 pub use edges::{EdgeLeaf, PairEdgeLeaf, RelationshipLeaf};
@@ -31,19 +34,23 @@ pub use post::{PostFactsLeaf, ReplyControlLeaf, SourceTweetIdLeaf, TweetSafetyLa
 pub use reaction::{ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf};
 pub use request::RequestLeaf;
 pub use tweet::TweetLeaf;
-pub use viewer::ViewerAccountLeaf;
+pub use viewer::{NotificationFilterLeaf, ViewerAccountLeaf, ViewerLabelLeaf};
 
 pub(in crate::rules) use post::TweetSafetyLabels;
 
 pub(in crate::rules) mod leaves {
     pub(in crate::rules) use super::ArticleStageLeaf::*;
+    pub(in crate::rules) use super::AuthorEmailLeaf::*;
     pub(in crate::rules) use super::AuthorFactsLeaf::*;
     pub(in crate::rules) use super::AuthorLabelsLeaf::*;
+    pub(in crate::rules) use super::AuthorPhoneLeaf::*;
+    pub(in crate::rules) use super::AuthorProfileLeaf::*;
     pub(in crate::rules) use super::AuthorSafetyLeaf::*;
     pub(in crate::rules) use super::CommunityModeratorLeaf::*;
     pub(in crate::rules) use super::CommunityViewerRemovedLeaf::*;
     pub(in crate::rules) use super::CompoundLeaf::*;
     pub(in crate::rules) use super::EdgeLeaf::*;
+    pub(in crate::rules) use super::NotificationFilterLeaf::*;
     pub(in crate::rules) use super::PairEdgeLeaf::*;
     pub(in crate::rules) use super::PostFactsLeaf::*;
     pub(in crate::rules) use super::PostModerationLeaf::*;
@@ -56,6 +63,7 @@ pub(in crate::rules) mod leaves {
     pub(in crate::rules) use super::TweetLeaf::*;
     pub(in crate::rules) use super::TweetSafetyLabelsLeaf::*;
     pub(in crate::rules) use super::ViewerAccountLeaf::*;
+    pub(in crate::rules) use super::ViewerLabelLeaf::*;
 }
 
 pub(in crate::rules) trait Feature {

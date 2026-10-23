@@ -15,14 +15,15 @@ pub mod tweet_source;
 
 use crate::metrics::Rpc;
 use crate::models::{
-    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures,
-    TweetId, UserEntity, ViewerFeatures, ViewerRelationship,
+    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetId,
+    UserCandidate, UserEntity, ViewerFeatures, ViewerRelationship,
 };
 pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
+pub(crate) use fetcher::Owner;
 pub(crate) use hydrator::RequestRows;
 pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
@@ -90,10 +91,6 @@ impl<'a> HydrationRequest<'a> {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "remove once a served level takes user rows")
-    )]
     pub(crate) fn for_users(
         viewer_id: u64,
         users: Vec<AuthorId>,
@@ -131,7 +128,7 @@ pub(crate) struct Hydration {
     viewer: ViewerFeatures,
     viewer_state: Option<ViewerState>,
     planned: Hydrators,
-    incomplete: Hydrators,
+    viewer_failed: Hydrators,
     tweets: FxHashMap<TweetId, HydratedTweet>,
     users: FxHashMap<AuthorId, HydratedUser>,
     quotes: FxHashMap<QuoteEntry, Quoted>,
@@ -139,10 +136,6 @@ pub(crate) struct Hydration {
     posts_judged_for: Option<Rpc>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "remove once a served level takes user rows")
-)]
 pub(crate) enum HydratedUser {
     Resolved {
         user: UserEntity,
@@ -152,10 +145,10 @@ pub(crate) enum HydratedUser {
     Unresolved(Cause),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Quoted {
-    pub(crate) facts: QuoteFacts,
-    pub(crate) failed: Hydrators,
+#[derive(Clone, Copy, Default)]
+struct Quoted {
+    facts: QuoteFacts,
+    failed: Hydrators,
 }
 
 impl Hydration {
@@ -171,8 +164,8 @@ impl Hydration {
         self.planned
     }
 
-        pub(crate) fn incomplete(&self) -> Hydrators {
-        self.incomplete
+    pub(crate) fn viewer_failed(&self) -> Hydrators {
+        self.viewer_failed
     }
 
     pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {
@@ -183,15 +176,44 @@ impl Hydration {
         self.users.get(&id)
     }
 
-    pub(crate) fn quoted(&self, id: TweetId, placement: Placement) -> Quoted {
-        match placement {
+    pub(crate) fn author(
+        &self,
+        id: TweetId,
+        placement: Placement,
+        reads: Hydrators,
+    ) -> Option<UserCandidate> {
+        let post = self.tweet(id)?.candidate()?;
+        let quoted = match placement {
             Placement::InnerQuoted { outer } => self
                 .quotes
                 .get(&QuoteEntry { inner: id, outer })
                 .copied()
                 .unwrap_or_default(),
             Placement::Standalone | Placement::RetweetSource => Quoted::default(),
-        }
+        };
+        Some(UserCandidate {
+            user: post.author.clone(),
+            viewer_relationship: post.viewer_relationship,
+            quote: quoted.facts,
+            failed: post.failed.intersection(reads).union(quoted.failed),
+        })
+    }
+
+    pub(crate) fn user_candidate(&self, id: AuthorId, reads: Hydrators) -> Option<UserCandidate> {
+        let HydratedUser::Resolved {
+            user,
+            viewer_relationship,
+            failed,
+        } = self.user(id)?
+        else {
+            return None;
+        };
+        Some(UserCandidate {
+            user: user.clone(),
+            viewer_relationship: *viewer_relationship,
+            quote: QuoteFacts::default(),
+            failed: failed.intersection(reads),
+        })
     }
 
     pub(crate) fn is_on(&self, relation: Relation) -> bool {
@@ -204,13 +226,13 @@ impl Hydration {
         let copy = copied
             .then(|| self.tweet(tweet.source_tweet_id()?)?.candidate())
             .flatten()
-            .map(|source| CopiedFromSource::of(&source.post.tweet_features))
-            .filter(|copy| !copy.is_on(&candidate.post.tweet_features));
+            .map(|source| source.post.tweet_features.media.has_uploaded_media)
+            .filter(|&has_media| has_media != candidate.post.tweet_features.media.has_media);
         Some(match copy {
             None => Cow::Borrowed(candidate),
-            Some(copy) => {
+            Some(has_media) => {
                 let mut candidate = candidate.clone();
-                copy.copy_onto(&mut candidate.post.tweet_features);
+                candidate.post.tweet_features.media.has_media = has_media;
                 Cow::Owned(candidate)
             }
         })
@@ -233,27 +255,6 @@ impl Hydration {
 
     pub(crate) fn has_fetched_retweet_sources(&self) -> bool {
         self.has_fetched_retweet_sources
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CopiedFromSource {
-    has_media: bool,
-}
-
-impl CopiedFromSource {
-    fn of(source: &TweetFeatures) -> Self {
-        Self {
-            has_media: source.media.has_uploaded_media,
-        }
-    }
-
-    fn is_on(self, retweet: &TweetFeatures) -> bool {
-        retweet.media.has_media == self.has_media
-    }
-
-    fn copy_onto(self, retweet: &mut TweetFeatures) {
-        retweet.media.has_media = self.has_media;
     }
 }
 

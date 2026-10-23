@@ -20,12 +20,12 @@ from xai_configlib import Config, configclass
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
 from xrex.models.attention import AttentionConfig
 from xrex.models.layers import (
+    CandidateOnlyAttention,
     Linear,
     MultiHeadAttention,
     MultiHeadAttentionOutput,
 )
 from xrex.models.normalization import RMSNorm
-from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.remat import (
     RematType,
     custom_remat_policy,
@@ -77,7 +77,7 @@ class TransformerConfig(Config):
 
     use_layer_stack: bool = False
     unroll_layer_stack: bool = False
-    candidate_only_layers: tuple[int, ...] = ()
+    num_candidate_only_layers: int = 0
 
     use_remat: bool = True
     remat_policy: RematType = RematType.WHOLE
@@ -162,14 +162,10 @@ class MHABlock(hk.Module):
         segment_ids_k: Optional[jax.Array] = None,
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
-        history: jax.Array | None = None,
+        history_states: jax.Array | None = None,
     ) -> MultiHeadAttentionOutput:
-        _, num_queries, model_size = inputs.shape
-        num_tokens = num_queries if history is None else history.shape[1] + num_queries
+        _, _, model_size = inputs.shape
         initializer = hk.initializers.VarianceScaling(self.scale_config.attn_init_scale**2)
-        assert mask.ndim == 4, f"shape: {mask.shape}"
-        assert mask.shape[2] in {1, num_tokens}, str(mask.shape)
-        assert mask.shape[3] in {1, num_tokens}, str(mask.shape)
 
         def attn_block(
             input_to_query: jax.Array,
@@ -195,7 +191,6 @@ class MHABlock(hk.Module):
                     segment_ids_k=segment_ids_k,
                     positions=positions,
                     seqpack_layout=seqpack_layout,
-                    history=history,
                 )
 
             return softmax_attn()
@@ -210,9 +205,24 @@ class MHABlock(hk.Module):
             inputs,
             activation_pspecs,
         )
-        if history is not None:
-            history = with_sharding_constraint_unless_manual(history, activation_pspecs)
-        attn_output = attn_block(inputs, inputs, inputs, mask, segment_ids, segment_ids_k)
+        if history_states is None:
+            assert mask.ndim == 4, f"shape: {mask.shape}"
+            assert mask.shape[2] in {1, inputs.shape[1]}, str(mask.shape)
+            assert mask.shape[3] in {1, inputs.shape[1]}, str(mask.shape)
+            attn_output = attn_block(inputs, inputs, inputs, mask, segment_ids, segment_ids_k)
+        else:
+            history_states = with_sharding_constraint_unless_manual(
+                history_states, activation_pspecs
+            )
+            attn_output = CandidateOnlyAttention(
+                model_size=model_size,
+                config=self.config,
+                scale_config=self.scale_config,
+                w_init=initializer,
+                sharding_context=self.sharding_context,
+                name="multi_head_attention",
+            )(inputs, history_states, segment_ids, positions, seqpack_layout)
+
         attn_output = replace(
             attn_output,
             output=with_sharding_constraint_unless_manual(attn_output.output, activation_pspecs),
@@ -422,7 +432,7 @@ class DecoderLayer(hk.Module):
         seqpack_layout: SequencePackedLayout | None = None,
         remat_fn: Optional[Callable[[Callable], Callable]] = None,
         padding_mask: Optional[jax.Array] = None,
-        history: jax.Array | None = None,
+        history_states: jax.Array | None = None,
     ) -> DecoderOutput:
         layer_norm = partial(
             RMSNorm,
@@ -443,12 +453,12 @@ class DecoderLayer(hk.Module):
         h_attn_in = residual
         residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
-        def run_attn_layer(h_attn_in: jax.Array, history: jax.Array | None):
+        def run_attn_layer(h_attn_in: jax.Array, history_states: jax.Array | None):
             if self.pre_norm:
                 pre_attn_norm = layer_norm(name=self.pre_attn_norm_name)
                 h_ln = pre_attn_norm(h_attn_in)
-                if history is not None:
-                    history = pre_attn_norm(history)
+                if history_states is not None:
+                    history_states = pre_attn_norm(history_states)
             else:
                 h_ln = h_attn_in
             h_ln = with_sharding_constraint_unless_manual(h_ln, activation_pspec)
@@ -465,7 +475,7 @@ class DecoderLayer(hk.Module):
                 segment_ids_k=segment_ids_k,
                 positions=positions,
                 seqpack_layout=seqpack_layout,
-                history=history,
+                history_states=history_states,
             )
             h_attn = checkpoint_name(attn_outputs.output, "attn_outputs")
 
@@ -482,7 +492,9 @@ class DecoderLayer(hk.Module):
 
             return h_attn, attn_input, attn_outputs, attn_loss
 
-        h_attn, attn_input, attn_outputs, attn_loss = remat_fn(run_attn_layer)(h_attn_in, history)
+        h_attn, attn_input, attn_outputs, attn_loss = remat_fn(run_attn_layer)(
+            h_attn_in, history_states
+        )
 
         residual = residual + h_attn
         residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
@@ -646,6 +658,7 @@ class Transformer(hk.Module):
         seqpack_layout: SequencePackedLayout | None = None,
         subset_index: jax.Array | None = None,
         act_l2_mask: jax.Array | None = None,
+        candidate_start: int | None = None,
     ) -> TransformerModelOutput:
         config = self.config
 
@@ -664,7 +677,7 @@ class Transformer(hk.Module):
                 f"Since mask is rank 4, expected shape {(B, 1, T, T)}, but got {mask.shape} instead"
             )
 
-        h = jnp.zeros((B, T, H), dtype=jnp.bfloat16) + embeddings
+        hidden_states = jnp.zeros((B, T, H), dtype=jnp.bfloat16) + embeddings
 
         assert config.remat_boundary in ("block", "layer"), (
             f"Invalid remat boundary: {config.remat_boundary}"
@@ -681,8 +694,8 @@ class Transformer(hk.Module):
             prevent_cse=config.prevent_cse,
         )
 
-        def block(
-            h,
+        def run_decoder_layer(
+            hidden_states,
             mask,
             segment_ids,
             segment_ids_k: Optional[jax.Array] = None,
@@ -690,7 +703,7 @@ class Transformer(hk.Module):
             name: Optional[str] = None,
             global_layer_index: Optional[jax.Array] = None,
             seqpack_layout: SequencePackedLayout | None = None,
-            history: jax.Array | None = None,
+            history_states: jax.Array | None = None,
         ) -> DecoderOutput:
             return block_remat_fn(
                 DecoderLayer(
@@ -707,7 +720,7 @@ class Transformer(hk.Module):
                     num_layers=config.num_layers,
                 )
             )(
-                h,
+                hidden_states,
                 mask,
                 segment_ids,
                 segment_ids_k,
@@ -717,75 +730,83 @@ class Transformer(hk.Module):
                 seqpack_layout,
                 layer_remat_fn,
                 padding_mask,
-                history,
+                history_states,
             )
 
-        first_candidate_only_layer = config.num_layers - len(config.candidate_only_layers)
-        carry_candidates = False
-        if config.candidate_only_layers:
-            assert config.candidate_only_layers == tuple(
-                range(first_candidate_only_layer, config.num_layers)
-            ), "candidate_only_layers not top K"
-            assert not config.debug_tensor_dump_output_folder, "No dumps in candidate-only blocks"
+        num_candidate_only_layers = config.num_candidate_only_layers
+        candidate_only_attn_impl = (
+            config.attn_config.candidate_only_attn_impl if config.attn_config else None
+        )
+        assert 0 <= num_candidate_only_layers <= config.num_layers
+        assert num_candidate_only_layers or candidate_only_attn_impl is None
+
+        if num_candidate_only_layers:
+            assert config.use_layer_stack, "Candidate-only layers need use_layer_stack=True"
+            assert not config.debug_tensor_dump_output_folder, "No dumps in candidate-only layers"
 
             is_candidate = segment_ids == -1
-            if seqpack_layout is None:
-                assert isinstance(config.attn_config, RecsysAttentionConfig)
-                attn_config = config.attn_config
-                num_candidates = (
-                    T - attn_config.num_user_prefix_tokens - attn_config.history_seq_len
+            use_candidate_only_kernel = candidate_only_attn_impl is not None
+            if use_candidate_only_kernel and candidate_start is None:
+                raise ValueError(
+                    "candidate_only_attn_impl with use_seqpack needs seqpack_candidate_packing. "
+                    "Otherwise set candidate_only_attn_impl=None."
                 )
-            elif seqpack_layout.candidate_token_to_slot is not None:
-                num_candidates = seqpack_layout.candidate_token_to_slot.shape[-1]
+
+            def split_history_and_candidates(
+                hidden_states: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                if use_candidate_only_kernel:
+                    return hidden_states[:, :candidate_start], hidden_states[:, candidate_start:]
+                return hidden_states, hidden_states
+
+            def run_candidate_only_layer(
+                candidate_states: jax.Array, *, history_states: jax.Array, **layer_kwargs
+            ) -> DecoderOutput:
+                if use_candidate_only_kernel:
+                    return run_decoder_layer(
+                        candidate_states, history_states=history_states, **layer_kwargs
+                    )
+
+                decoder_output = run_decoder_layer(candidate_states, **layer_kwargs)
+                return replace(
+                    decoder_output,
+                    output=jnp.where(
+                        is_candidate[..., None], decoder_output.output, history_states
+                    ),
+                )
+
+            if use_candidate_only_kernel:
+                num_candidates = T - candidate_start
+                candidate_only_stats_mask = padding_mask[:, candidate_start:] * (num_candidates / T)
             else:
-                num_candidates = None
-            carry_candidates = is_training and num_candidates is not None
-
-            if carry_candidates:
-                candidate_stats_mask = padding_mask[:, -num_candidates:] * (num_candidates / T)
-            else:
-                candidate_stats_mask = padding_mask * is_candidate
-
-        def enter_candidate_only_layers(h: jax.Array) -> tuple[jax.Array, jax.Array]:
-            if carry_candidates:
-                return h[:, :-num_candidates], h[:, -num_candidates:]
-            return h, h
-
-        def candidate_only_block(*args, frozen, **kwargs) -> DecoderOutput:
-            if carry_candidates:
-                return block(*args, history=frozen, **kwargs)
-            d = block(*args, **kwargs)
-            return replace(d, output=jnp.where(is_candidate[..., None], d.output, frozen))
+                candidate_only_stats_mask = padding_mask * is_candidate
 
         if not config.use_layer_stack:
             attn_losses, ffn_losses = [], []
-            layer_block, layer_padding_mask = block, padding_mask
             for i in range(config.num_layers):
-                if i == first_candidate_only_layer:
-                    frozen, h = enter_candidate_only_layers(h)
-                    layer_block = partial(candidate_only_block, frozen=frozen)
-                    layer_padding_mask = candidate_stats_mask
-                d = layer_block(
-                    h,
+                decoder_output = run_decoder_layer(
+                    hidden_states,
                     mask,
                     segment_ids,
                     segment_ids_k,
-                    padding_mask=layer_padding_mask,
+                    padding_mask=padding_mask,
                     name=f"decoder_layer_{i}",
                     global_layer_index=i,
                     seqpack_layout=seqpack_layout,
                 )
-                h = d.output
-                attn_losses.append(d.attn_loss)
-                ffn_losses.append(d.ffn_loss)
-            d = replace(d, attn_loss=jnp.stack(attn_losses), ffn_loss=jnp.stack(ffn_losses))
+                hidden_states = decoder_output.output
+                attn_losses.append(decoder_output.attn_loss)
+                ffn_losses.append(decoder_output.ffn_loss)
+            decoder_output = replace(
+                decoder_output, attn_loss=jnp.stack(attn_losses), ffn_loss=jnp.stack(ffn_losses)
+            )
 
         else:
             num_main_layers = config.num_layers
 
             main_layer_block = partial(
                 layer_stack_block,
-                block=block,
+                block=run_decoder_layer,
                 mask=mask,
                 segment_ids=segment_ids,
                 segment_ids_k=segment_ids_k,
@@ -795,35 +816,47 @@ class Transformer(hk.Module):
                 seqpack_layout=seqpack_layout,
             )
 
-            def candidate_only_layer_block(h, *, tail_constant, **kwargs):
-                return main_layer_block(
-                    h,
-                    block=partial(candidate_only_block, frozen=tail_constant),
-                    padding_mask=candidate_stats_mask,
-                    **kwargs,
-                )
+            candidate_only_tail = None
+            if config.num_candidate_only_layers:
 
-            tail = None
-            if config.candidate_only_layers:
-                tail = layer_stack.LayerStackTail(
-                    num_layers=len(config.candidate_only_layers),
-                    layer_fn=candidate_only_layer_block,
-                    split_carry=enter_candidate_only_layers,
+                def candidate_only_stack_layer(candidate_states, *, tail_input, **stack_kwargs):
+                    return main_layer_block(
+                        candidate_states,
+                        block=partial(run_candidate_only_layer, history_states=tail_input),
+                        padding_mask=candidate_only_stats_mask,
+                        **stack_kwargs,
+                    )
+
+                candidate_only_tail = layer_stack.LayerStackTail(
+                    num_layers=config.num_candidate_only_layers,
+                    layer_fn=candidate_only_stack_layer,
+                    split_inputs=split_history_and_candidates,
                 )
             main_stack = layer_stack.layer_stack(
                 num_main_layers,
                 with_per_layer_inputs=True,
                 unroll=config.unroll_layer_stack,
                 scan_impl=jax.lax.scan,
-                tail=tail,
+                tail=candidate_only_tail,
             )
-            h, d = main_stack(main_layer_block)(h)
-            if tail is not None:
-                frozen, h = h
-            d = replace(d, output=h, attn_loss=d.attn_loss.flatten(), ffn_loss=d.ffn_loss.flatten())
+            hidden_states, decoder_output = main_stack(main_layer_block)(hidden_states)
+            if config.num_candidate_only_layers:
+                history_states, candidate_states = hidden_states
+
+                if use_candidate_only_kernel:
+                    hidden_states = jnp.concatenate([history_states, candidate_states], axis=1)
+                else:
+                    hidden_states = candidate_states
+
+            decoder_output = replace(
+                decoder_output,
+                output=hidden_states,
+                attn_loss=decoder_output.attn_loss.flatten(),
+                ffn_loss=decoder_output.ffn_loss.flatten(),
+            )
 
             if self.config.debug_tensor_dump_output_folder:
-                layer_dumps = unroll_layer_dumps(d.layer_dumps)
+                layer_dumps = unroll_layer_dumps(decoder_output.layer_dumps)
 
                 total_num_layers = config.num_layers
                 dump_block_outputs(
@@ -833,11 +866,11 @@ class Transformer(hk.Module):
                     self.config.debug_tensor_dump_n_layers,
                 )
 
-        h_final = jnp.concatenate([frozen, d.output], axis=1) if carry_candidates else d.output
+        final_hidden_states = decoder_output.output
 
         history_packed_token_scale = 1.0
         if seqpack_layout is not None and seqpack_layout.candidate_token_to_slot is not None:
-            num_tokens = h_final.shape[1]
+            num_tokens = final_hidden_states.shape[1]
             history_packed_num_tokens = (
                 num_tokens
                 - seqpack_layout.candidate_token_to_slot.shape[-1]
@@ -846,18 +879,21 @@ class Transformer(hk.Module):
             history_packed_token_scale = jnp.float32(num_tokens / history_packed_num_tokens)
 
         summarize(
-            f"{self.summarizer_prefix}attn-loss", jnp.sum(d.attn_loss) * history_packed_token_scale
+            f"{self.summarizer_prefix}attn-loss",
+            jnp.sum(decoder_output.attn_loss) * history_packed_token_scale,
         )
         summarize(
-            f"{self.summarizer_prefix}ffn-loss", jnp.sum(d.ffn_loss) * history_packed_token_scale
+            f"{self.summarizer_prefix}ffn-loss",
+            jnp.sum(decoder_output.ffn_loss) * history_packed_token_scale,
         )
 
         act_l2_mask = padding_mask if act_l2_mask is None else act_l2_mask
-        if config.candidate_only_layers:
+        if config.num_candidate_only_layers:
             act_l2_mask = act_l2_mask * is_candidate
         summarize(
             f"{self.summarizer_prefix}act-l2-loss",
-            jnp.mean(jnp.mean(h_final**2, axis=-1) * act_l2_mask) * history_packed_token_scale,
+            jnp.mean(jnp.mean(final_hidden_states**2, axis=-1) * act_l2_mask)
+            * history_packed_token_scale,
         )
 
-        return TransformerModelOutput(output=h_final)
+        return TransformerModelOutput(output=final_hidden_states)

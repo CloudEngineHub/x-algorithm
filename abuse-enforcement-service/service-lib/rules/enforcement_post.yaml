@@ -75,11 +75,6 @@ rules:
       perm: true
       policy: Cse
 
-  - id: act_requested_actions
-    when: "size(score.requested_actions) > 0"
-    then:
-      kind: act_requested_actions
-
   - id: post_no_actionable_label
     when: "true"
     then:

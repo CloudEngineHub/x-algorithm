@@ -88,6 +88,10 @@ ADS_CONVERSION_CHECKPOINT_DIR: str = os.environ.get("XREX_ADS_CONVERSION_CHECKPO
 
 AOT_CACHE_DIR: str = os.environ.get("XREX_AOT_CACHE_DIR", "")
 
+HISTORY_URL_EMBEDDING_XDS_BOOTSTRAP: str = os.environ.get(
+    "XREX_HISTORY_URL_EMBEDDING_XDS_BOOTSTRAP", ""
+)
+
 
 REPL_SOCKET_PATH: str = os.environ.get("XREX_REPL_SOCKET", "/tmp/driver.sock")
 

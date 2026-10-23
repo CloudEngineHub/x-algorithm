@@ -8,17 +8,18 @@ use super::features::{CompoundLeaf, ReplyControlLeaf, RequestLeaf};
 use super::rule::Audience::{self, Everyone, NonAuthors, NonFollowers, OnlyAuthor};
 use super::rule::{Rule, RuleCond};
 use super::*;
+use crate::hydration::inventory::Tier;
 use crate::hydration::Hydrator;
 use crate::models::{
-    ClientCapability, Placement, PostCandidate, QuoteFacts, UserCandidate, VerifyBlurSupport,
-    ViewerFeatures,
+    ClientCapability, PostCandidate, UserCandidate, VerifyBlurSupport, ViewerFeatures,
 };
 use crate::params::CountryLists;
+use crate::rules::expansion::Expansion;
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
-use crate::rules::golden_corpus::pairs;
+use crate::rules::golden_corpus::{corpus, Subject};
 use crate::rules::levels::PostRules;
-use crate::rules::test_context;
 use crate::rules::SafetyLevel;
+use crate::rules::{placed_test_context, test_context};
 use std::iter::once;
 use strum::VariantArray;
 
@@ -132,6 +133,9 @@ fn a_failed_read_is_local() {
     }
 }
 
+const FAILS_THE_NOTIFICATION: &str =
+    "FilterNotifications fails a notification whose verdict relied on a failed node";
+
 const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
     (
         "protected_author/drop",
@@ -174,19 +178,64 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         "only a subscriber the author blocked sees the exclusive post",
     ),
     (
-        "original_tweet_adult_media_propagation/blur/sensitive",
-        Hydrator::ReactedToPostSafetyLabels,
-        "the default shows the reaction post unblurred, as Tweetypie does on a failed lookup",
+        "viewer_mutes_and_does_not_follow_author/drop/viewer_mutes_author",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
     ),
     (
-        "original_tweet_gore_media_propagation/blur/violence",
-        Hydrator::ReactedToPostSafetyLabels,
-        "the default shows the reaction post unblurred, as Tweetypie does on a failed lookup",
+        "no_confirmed_email/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
     ),
     (
-        "protected_original_author/drop",
-        Hydrator::ReactedToAuthorSafety,
-        "the default shows the reaction post, as Tweetypie does on a failed lookup",
+        "no_confirmed_phone/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "no_default_profile_image/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "no_new_users/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "no_not_followed_by/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "only_people_i_follow/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "not_graduated_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "agatha_spam_top_user_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "engagement_spammer_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "blink_worst_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "downrank_spam_reply_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
     ),
 ];
 
@@ -196,20 +245,29 @@ fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
     let mut accepted = Vec::new();
     let user = wired_user_rules().into_iter().map(|rule| {
         let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
-        (rule.name(), limits, rule.requirements())
+        (rule.name(), limits, rule.requirements(), Hydrators::empty())
     });
     let post = wired_rules().into_iter().map(|rule| {
         let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
-        (rule.name(), limits, rule.requirements())
+        let shown = rule.requirements().iter().filter(|node| {
+            node.relation()
+                .and_then(Expansion::of)
+                .is_some_and(|expansion| {
+                    let spec = expansion.spec();
+                    spec.on_failure.tier() == Tier::BestEffort && spec.rules.contains(&rule)
+                })
+        });
+        let shown = shown.fold(Hydrators::empty(), Hydrators::with);
+        (rule.name(), limits, rule.requirements(), shown)
     });
-    for (name, limits, requirements) in user.chain(post) {
+    for (name, limits, requirements, shown) in user.chain(post) {
         for node in requirements.iter().filter(|node| node.is_best_effort()) {
             match ACCEPTED_BEST_EFFORT_READS
                 .iter()
                 .find(|&&(by, accepted, _)| by == name && accepted == node)
             {
                 Some(&(by, node, _)) => accepted.push((by, node)),
-                None if limits => {}
+                None if limits || shown.contains(node) => {}
                 None => unaccepted.push((name.clone(), node)),
             }
         }
@@ -266,29 +324,32 @@ fn the_rule_evaluator_is_faithful() {
                 .map(|&hydrator| Hydrators::of(hydrator)),
         )
         .collect();
-    for (viewer, fetched) in pairs() {
+    for case in corpus() {
+        let (user, post) = match case.subject {
+            Subject::Post(post) => (UserCandidate::author_of(&post), Some(post)),
+            Subject::User(user) => (user, None),
+        };
         for &failed in &failures {
-            let candidate = PostCandidate {
+            let user = UserCandidate {
                 failed,
-                ..fetched.clone()
-            };
-            let author = UserCandidate {
-                user: candidate.author.clone(),
-                viewer_relationship: candidate.viewer_relationship,
-                failed,
+                ..user.clone()
             };
             faithful(
                 &user_rules,
-                &RuleContext::new(
-                    &viewer,
-                    &author,
-                    Placement::Standalone,
-                    QuoteFacts::default(),
-                    &country_lists,
-                ),
+                &RuleContext::new(&case.viewer, &user, case.placement, &country_lists),
                 failed,
             );
-            faithful(&rules, &test_context(&viewer, &candidate), failed);
+            if let Some(post) = &post {
+                let candidate = PostCandidate {
+                    failed,
+                    ..post.clone()
+                };
+                faithful(
+                    &rules,
+                    &placed_test_context(&case.viewer, &candidate, case.placement),
+                    failed,
+                );
+            }
         }
     }
 }
@@ -488,7 +549,7 @@ fn every_client_capability_is_live() {
 }
 
 #[test]
-fn only_the_quote_pass_reads_a_pair_edge() {
+fn only_the_quote_pass_reads_quote_facts() {
     let mut readers = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let PostRules { user, post } = level.spec().rules.lists();
@@ -499,17 +560,20 @@ fn only_the_quote_pass_reads_a_pair_edge() {
         for rule in post {
             rule.when.leaves(&mut read);
         }
-        let reads_a_pair_edge = read
-            .iter()
-            .any(|leaf| matches!(leaf, Predicate::PairEdge(_)));
-        if reads_a_pair_edge && level != SafetyLevel::QuotedTweetRules {
+        let reads_quote_facts = read.iter().any(|leaf| {
+            matches!(
+                leaf,
+                Predicate::PairEdge(_) | Predicate::AuthorFacts(AuthorFactsLeaf::IsSelfQuote)
+            )
+        });
+        if reads_quote_facts && level != SafetyLevel::QuotedTweetRules {
             readers.push(level);
         }
     }
     assert_eq!(
         readers,
         Vec::<SafetyLevel>::new(),
-        "a pair edge is hydrated only for the quote pass's inner-quoted candidates"
+        "quote facts are hydrated only for the quote pass's inner-quoted authors"
     );
 }
 
@@ -529,9 +593,14 @@ fn every_post_rule_reads_the_post() {
     let reads_the_post = |leaf: &Predicate| match leaf {
         Predicate::Request(_)
         | Predicate::ViewerAccount(_)
+        | Predicate::ViewerLabel(_)
+        | Predicate::NotificationFilter(_)
         | Predicate::AuthorFacts(_)
         | Predicate::AuthorSafety(_)
         | Predicate::AuthorLabels(_)
+        | Predicate::AuthorProfile(_)
+        | Predicate::AuthorEmail(_)
+        | Predicate::AuthorPhone(_)
         | Predicate::Relationship(_)
         | Predicate::PairEdge(_) => false,
         Predicate::PostFacts(_)
@@ -579,7 +648,9 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
         | ActionSpec::Tombstone(_)
         | ActionSpec::SoftIntervention(_)
         | ActionSpec::Appealable(_) => true,
-        ActionSpec::MediaRestriction(_) | ActionSpec::LimitedEngagement(_) => false,
+        ActionSpec::MediaRestriction(_)
+        | ActionSpec::LimitedEngagement(_)
+        | ActionSpec::LabelInterstitial(_) => false,
     };
     let disjoint = |user: Audience, post: Audience| match (user, post) {
         (OnlyAuthor, NonAuthors | NonFollowers) | (NonAuthors | NonFollowers, OnlyAuthor) => true,

@@ -2,11 +2,11 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::codec::{self, DecodeAttempt};
-use super::lookup::{LookupError, ManhattanLookup};
+use super::codec;
+use super::lookup::{LookupError, LookupResults, ManhattanLookup};
 use super::metrics::{self, ManhattanResult, SourceOutcome};
 use super::mh_client::ManhattanLabelFetcher;
-use super::types::{FailureKind, LabelSource, ManhattanOutcome};
+use super::types::{FailureKind, LabelSource};
 use tonic::async_trait;
 
 pub(crate) struct ManhattanSource {
@@ -21,7 +21,7 @@ impl ManhattanSource {
 
 #[async_trait]
 impl ManhattanLookup for ManhattanSource {
-    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
+    async fn get(&self, ids: &[u64]) -> LookupResults {
         let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
@@ -37,15 +37,15 @@ impl ManhattanLookup for ManhattanSource {
                 for (i, &tweet_id) in ids.iter().enumerate() {
                     match fetch_results.get(i) {
                         Some(Ok(raw_items)) => match codec::decode_raw_labels(raw_items) {
-                            DecodeAttempt::Success(label_map) => {
+                            Some(label_map) => {
                                 successes += 1;
-                                results.insert(tweet_id, ManhattanOutcome::Resolved(label_map));
+                                results.insert(tweet_id, Ok(label_map));
                             }
-                            DecodeAttempt::Panic => {
+                            None => {
                                 failures += 1;
                                 results.insert(
                                     tweet_id,
-                                    ManhattanOutcome::Failure(LookupError::new(
+                                    Err(LookupError::new(
                                         FailureKind::ManhattanDecode,
                                         "decode panic",
                                     )),
@@ -56,17 +56,14 @@ impl ManhattanLookup for ManhattanSource {
                             failures += 1;
                             results.insert(
                                 tweet_id,
-                                ManhattanOutcome::Failure(LookupError::new(
-                                    FailureKind::ManhattanFetch,
-                                    e.to_string(),
-                                )),
+                                Err(LookupError::new(FailureKind::ManhattanFetch, e.to_string())),
                             );
                         }
                         None => {
                             failures += 1;
                             results.insert(
                                 tweet_id,
-                                ManhattanOutcome::Failure(LookupError::new(
+                                Err(LookupError::new(
                                     FailureKind::ManhattanFetch,
                                     "missing from MH response",
                                 )),
@@ -81,10 +78,7 @@ impl ManhattanLookup for ManhattanSource {
                     failures += 1;
                     results.insert(
                         tweet_id,
-                        ManhattanOutcome::Failure(LookupError::new(
-                            FailureKind::ManhattanFetch,
-                            e.to_string(),
-                        )),
+                        Err(LookupError::new(FailureKind::ManhattanFetch, e.to_string())),
                     );
                 }
                 SourceOutcome::Failure
@@ -112,7 +106,7 @@ mod tests {
     use xai_safety_label_store::types::encode_lkey;
     use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
-    use crate::safety_label_source::codec::{LkeyBytes, MvalBytes, RawSafetyLabel};
+    use crate::safety_label_source::codec::RawSafetyLabel;
     use crate::safety_label_source::mh_client::FetchResult;
 
     fn minimal_mval() -> Vec<u8> {
@@ -130,8 +124,8 @@ mod tests {
 
     fn raw_label(lt: SafetyLabelType, mval: Vec<u8>) -> RawSafetyLabel {
         RawSafetyLabel {
-            lkey: LkeyBytes(encode_lkey(lt)),
-            mval: MvalBytes(mval),
+            lkey: encode_lkey(lt),
+            mval,
         }
     }
 
@@ -207,10 +201,7 @@ mod tests {
         }
     }
 
-    async fn get_with_fetcher(
-        fetcher: FakeLabelFetcher,
-        ids: &[u64],
-    ) -> FxHashMap<u64, ManhattanOutcome> {
+    async fn get_with_fetcher(fetcher: FakeLabelFetcher, ids: &[u64]) -> LookupResults {
         ManhattanSource::new(Arc::new(fetcher)).get(ids).await
     }
 
@@ -219,7 +210,7 @@ mod tests {
         let results = get_with_fetcher(FakeLabelFetcher::new(), &[100]).await;
 
         match results.get(&100).unwrap() {
-            ManhattanOutcome::Resolved(label_map) => assert!(label_map.labels.is_empty()),
+            Ok(label_map) => assert!(label_map.labels.is_empty()),
             _ => panic!("expected hit"),
         }
     }
@@ -236,12 +227,12 @@ mod tests {
 
         assert!(matches!(
             results.get(&1).unwrap(),
-            ManhattanOutcome::Resolved(label_map)
+            Ok(label_map)
                 if label_map.labels.contains_key(&i32::from(SafetyLabelType::SPAM))
         ));
         assert!(matches!(
             results.get(&2).unwrap(),
-            ManhattanOutcome::Failure(failure)
+            Err(failure)
                 if failure.kind == FailureKind::ManhattanFetch
                     && failure.message.contains("key failed")
         ));
@@ -258,7 +249,7 @@ mod tests {
         for id in [1, 2, 3] {
             assert!(matches!(
                 results.get(&id).unwrap(),
-                ManhattanOutcome::Failure(failure)
+                Err(failure)
                     if failure.kind == FailureKind::ManhattanFetch
                         && failure.message.contains("test error")
             ));
@@ -277,17 +268,11 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 3);
-        assert!(matches!(
-            results.get(&1).unwrap(),
-            ManhattanOutcome::Resolved(_)
-        ));
-        assert!(matches!(
-            results.get(&2).unwrap(),
-            ManhattanOutcome::Resolved(_)
-        ));
+        assert!(results.get(&1).unwrap().is_ok());
+        assert!(results.get(&2).unwrap().is_ok());
         assert!(matches!(
             results.get(&3).unwrap(),
-            ManhattanOutcome::Failure(failure)
+            Err(failure)
                 if failure.kind == FailureKind::ManhattanFetch
                     && failure.message == "missing from MH response"
         ));

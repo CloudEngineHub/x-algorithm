@@ -85,6 +85,73 @@ pub(super) const PROTECTED_QUOTED_AUTHOR_DROP: UserRule = Rule {
     action: drop_post(DropAs::AuthorIsProtected),
 };
 
+pub(super) const DEACTIVATED_VIEWER_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::DeactivatedViewer,
+    audience: NonAuthors,
+    when: all![ViewerIsDeactivated],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const SUSPENDED_VIEWER_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::SuspendedViewer,
+    audience: NonAuthors,
+    when: all![ViewerIsSuspended],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const VIEWER_MUTES_AND_DOES_NOT_FOLLOW_AUTHOR_DROP_VIEWER_MUTES_AUTHOR: UserRule =
+    Rule {
+        id: RuleId::ViewerMutesAndDoesNotFollowAuthor,
+        audience: NonAuthors,
+        when: all![!ViewerLoggedOut, ViewerMutesAuthor, !ViewerFollowsAuthor],
+        action: drop_post(DropAs::ViewerMutesAuthor),
+    };
+
+pub(super) const NO_CONFIRMED_EMAIL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NoConfirmedEmail,
+    audience: NonFollowers,
+    when: all![ViewerFiltersNoConfirmedEmail, !AuthorHasConfirmedEmail],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NO_CONFIRMED_PHONE_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NoConfirmedPhone,
+    audience: NonFollowers,
+    when: all![ViewerFiltersNoConfirmedPhone, !AuthorHasVerifiedPhone],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NO_DEFAULT_PROFILE_IMAGE_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NoDefaultProfileImage,
+    audience: NonFollowers,
+    when: all![
+        ViewerFiltersDefaultProfileImage,
+        AuthorHasDefaultProfileImage
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NO_NEW_USERS_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NoNewUsers,
+    audience: NonFollowers,
+    when: all![ViewerFiltersNewUsers, AuthorIsNewAccount],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NO_NOT_FOLLOWED_BY_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NoNotFollowedBy,
+    audience: NonFollowers,
+    when: all![ViewerFiltersNotFollowedBy, !AuthorFollowsViewer],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const ONLY_PEOPLE_I_FOLLOW_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::OnlyPeopleIFollow,
+    audience: NonFollowers,
+    when: all![ViewerMentionFilterIsFollowing],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
 pub(super) const NSFW_USER_AUTHOR_DROP_NSFW_MEDIA: UserRule = Rule {
     id: RuleId::NsfwUserAuthor,
     audience: NonAuthors,
@@ -173,5 +240,44 @@ pub(super) const DO_NOT_AMPLIFY_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
     id: RuleId::DoNotAmplifyUserLabel,
     audience: NonFollowers,
     when: all![AuthorHasLabel(AuthorLabel::DoNotAmplify)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const NOT_GRADUATED_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::NotGraduatedUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::NotGraduated)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const AGATHA_SPAM_TOP_USER_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::AgathaSpamTopUserUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::AgathaSpamTopUser)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const ENGAGEMENT_SPAMMER_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::EngagementSpammerUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::EngagementSpammer)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const BLINK_WORST_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::BlinkWorstUserLabel,
+    audience: NonFollowers,
+    when: all![
+        AuthorHasLabel(AuthorLabel::BlinkWorst),
+        ViewerHasUqfEnabled,
+        !ViewerHasBlinkLabel
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const DOWNRANK_SPAM_REPLY_USER_LABEL_DROP_UNSPECIFIED: UserRule = Rule {
+    id: RuleId::DownrankSpamReplyUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::DownrankSpamReply)],
     action: drop_post(DropAs::UnspecifiedReason),
 };

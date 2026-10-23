@@ -1,11 +1,14 @@
-use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError, RawHydrationBatch};
+use super::viewer::is_younger_than;
+use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::fallback_cache::{Column, FallbackCache};
-use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
+use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet, AuthorProfile};
+use std::time::Duration;
 use strum::VariantArray;
-use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
+use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, UserResponseState};
 use xai_x_thrift::user_labels::LabelValue;
 
 pub(crate) type DecodedAuthor = (AuthorFeatures, AuthorLabelSet);
+pub(crate) type DecodedActor = (DecodedAuthor, AuthorProfile);
 pub(crate) type AuthorFallbackCache = FallbackCache<DecodedAuthor>;
 
 pub(crate) fn fallback_cache(capacity: usize) -> AuthorFallbackCache {
@@ -71,7 +74,8 @@ impl AuthorNotFound {
                         Hydrated::NotFound => (author, Hydrated::Found(erased_author())),
                         decoded @ (Hydrated::Found(_)
                         | Hydrated::Partial(_)
-                        | Hydrated::Failed(_)) => (author, decoded),
+                        | Hydrated::Failed
+                        | Hydrated::Unanswered) => (author, decoded),
                     })
                     .collect(),
             ),
@@ -101,7 +105,8 @@ pub(crate) fn author_batch(
                     evaluable_author_features(result)
                 }
                 Hydrated::NotFound => Hydrated::NotFound,
-                Hydrated::Failed(error) => Hydrated::Failed(error),
+                Hydrated::Failed => Hydrated::Failed,
+                Hydrated::Unanswered => Hydrated::Unanswered,
             };
             (author, decoded)
         })
@@ -109,11 +114,46 @@ pub(crate) fn author_batch(
     HydrationBatch::from_hydrated(authors)
 }
 
+pub(crate) fn actor_batch(
+    users: RawHydrationBatch<GizmoduckUserResult>,
+) -> RawHydrationBatch<DecodedActor> {
+    let actors = users
+        .into_hydrated()
+        .into_iter()
+        .map(|(actor, user)| {
+            let decoded = match user {
+                Hydrated::Found(result) | Hydrated::Partial(result) => {
+                    let profile = result.user.as_ref().map(author_profile).unwrap_or_default();
+                    match evaluable_author_features(result) {
+                        Hydrated::Found(author) => Hydrated::Found((author, profile)),
+                        Hydrated::Partial(author) => Hydrated::Partial((author, profile)),
+                        Hydrated::NotFound => Hydrated::NotFound,
+                        Hydrated::Failed => Hydrated::Failed,
+                        Hydrated::Unanswered => Hydrated::Unanswered,
+                    }
+                }
+                Hydrated::NotFound => Hydrated::NotFound,
+                Hydrated::Failed => Hydrated::Failed,
+                Hydrated::Unanswered => Hydrated::Unanswered,
+            };
+            (actor, decoded)
+        })
+        .collect();
+    HydrationBatch::from_hydrated(actors)
+}
+
+const NEW_AUTHOR_AGE: Duration = Duration::from_secs(72 * 60 * 60);
+
+fn author_profile(user: &GizmoduckUser) -> AuthorProfile {
+    AuthorProfile {
+        has_default_profile_image: !user.profile.has_profile_image,
+        is_new_account: is_younger_than(user.created_at_msec, NEW_AUTHOR_AGE),
+    }
+}
+
 fn evaluable_author_features(result: GizmoduckUserResult) -> Hydrated<DecodedAuthor> {
     match result.response_state {
-        Some(UserResponseState::Failed | UserResponseState::Filtered) => {
-            Hydrated::Failed(HydrationError::Error)
-        }
+        Some(UserResponseState::Failed | UserResponseState::Filtered) => Hydrated::Failed,
         Some(
             UserResponseState::NotFound
             | UserResponseState::SoftUser
@@ -182,6 +222,11 @@ const fn gizmoduck_label(label: AuthorLabel) -> LabelValue {
         AuthorLabel::ReadOnly => LabelValue::READ_ONLY,
         AuthorLabel::ImpersonationHighPrecision => LabelValue::IMPERSONATION_HIGH_PRECISION,
         AuthorLabel::DoNotAmplify => LabelValue::DO_NOT_AMPLIFY,
+        AuthorLabel::NotGraduated => LabelValue::NOT_GRADUATED,
+        AuthorLabel::AgathaSpamTopUser => LabelValue::AGATHA_SPAM_TOP_USER,
+        AuthorLabel::EngagementSpammer => LabelValue::ENGAGEMENT_SPAMMER,
+        AuthorLabel::BlinkWorst => LabelValue::BLINK_WORST,
+        AuthorLabel::DownrankSpamReply => LabelValue::DOWNRANK_SPAM_REPLY,
     }
 }
 
@@ -220,14 +265,8 @@ mod tests {
                 Some(UserResponseState::NoScreenNameUser),
                 Hydrated::NotFound,
             ),
-            (
-                Some(UserResponseState::Failed),
-                Hydrated::Failed(HydrationError::Error),
-            ),
-            (
-                Some(UserResponseState::Filtered),
-                Hydrated::Failed(HydrationError::Error),
-            ),
+            (Some(UserResponseState::Failed), Hydrated::Failed),
+            (Some(UserResponseState::Filtered), Hydrated::Failed),
         ] {
             let author = evaluable_author_features(GizmoduckUserResult {
                 response_state: state,
@@ -260,7 +299,8 @@ mod tests {
             Hydrated::Found(_) => Hydrated::Found(()),
             Hydrated::Partial(_) => Hydrated::Partial(()),
             Hydrated::NotFound => Hydrated::NotFound,
-            Hydrated::Failed(error) => Hydrated::Failed(error.clone()),
+            Hydrated::Failed => Hydrated::Failed,
+            Hydrated::Unanswered => Hydrated::Unanswered,
         }
     }
 
