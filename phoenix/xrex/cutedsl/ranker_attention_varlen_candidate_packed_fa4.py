@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import jax
+import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
 from xrex.cutedsl.ranker_attention_candidate_only_fa4 import candidate_attention_fwd_bwd
@@ -48,24 +49,41 @@ def ranker_attention_varlen_candidate_packed_fa4(
         )
 
     def forward(q, k, v, cand_cu, key_starts, key_counts, bs_args):
-        out, lse = varlen_forward(kernels, q, k, v, bs_args)
+        out, lse, softmax_stats = varlen_forward(kernels, q, k, v, bs_args)
         cand_o, cand_lse = cand_forward(*candidate_inputs(q, k, v, cand_cu, key_starts, key_counts))
-        return out.at[0, region_start:].set(cand_o), lse, cand_lse
+        return out.at[0, region_start:].set(cand_o), lse, softmax_stats, cand_lse
 
     @jax.custom_vjp
     def attention(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
         return forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)[0]
 
     def attention_fwd(q, k, v, cand_cu, key_starts, key_counts, *bs_args):
-        out, lse, cand_lse = forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)
-        out = checkpoint_name(out, "cutedsl_attn_outputs")
+        out, lse, softmax_stats, cand_lse = forward(
+            q, k, v, cand_cu, key_starts, key_counts, bs_args
+        )
+        out_bits = jax.lax.bitcast_convert_type(jax.lax.optimization_barrier(out), jnp.uint16)
+        out_bits = checkpoint_name(out_bits, "cutedsl_attn_outputs")
+        out = jax.lax.bitcast_convert_type(out_bits, out.dtype)
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
+        softmax_stats = tuple(checkpoint_name(t, "cutedsl_attn_outputs") for t in softmax_stats)
         cand_lse = checkpoint_name(cand_lse, "cutedsl_attn_outputs")
-        return out, (q, k, v, cand_cu, key_starts, key_counts, out, lse, cand_lse, bs_args)
+        return out, (
+            q,
+            k,
+            v,
+            cand_cu,
+            key_starts,
+            key_counts,
+            out,
+            lse,
+            softmax_stats,
+            cand_lse,
+            bs_args,
+        )
 
     def attention_bwd(res, g):
-        q, k, v, cand_cu, key_starts, key_counts, out, lse, cand_lse, bs_args = res
-        dq, dk, dv = varlen_backward(kernels, q, k, v, out, lse, bs_args, g)
+        q, k, v, cand_cu, key_starts, key_counts, out, lse, softmax_stats, cand_lse, bs_args = res
+        dq, dk, dv = varlen_backward(kernels, q, k, v, out, lse, softmax_stats, bs_args, g)
         dq_cand, dk_keys, dv_keys, dk_self, dv_self = cand_backward(
             *candidate_inputs(q, k, v, cand_cu, key_starts, key_counts),
             out[0, region_start:],

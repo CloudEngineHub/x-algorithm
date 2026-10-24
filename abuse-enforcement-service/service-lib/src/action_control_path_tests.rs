@@ -670,31 +670,25 @@ async fn global_dry_run_records_only_like_the_other_two_sources() {
     }
 }
 
-const RULES_WITH_A_CSE_SUSPEND: &str = r#"
-for_entity: user
-rules:
-  - id: user_in_allowlist
-    when: user_allowlist.is_allowlisted
-    then: { kind: skip, reason: user_in_allowlist }
-  - id: user_not_found
-    when: "!user.present"
-    then: { kind: skip, reason: user_not_found }
-  - id: very_high_follower_count
-    when: cred.follower_count >= 12345.67
-    then: { kind: skip, reason: very_high_follower_count }
-  - id: high_follower_count
-    when: cred.follower_count >= 12.34
-    then: { kind: skip, reason: high_follower_count }
-  - id: pagerank_skipped
-    when: cred.is_high || cred.score >= 50.0
-    then: { kind: skip, reason: pagerank_skipped }
-  - id: act_cse_label
+fn rules_with_a_cse_suspend() -> String {
+    let mut yaml = String::from("for_entity: user\nrules:\n");
+    for c in safety_checks::USER_CHECKS {
+        yaml.push_str(&format!(
+            "  - id: {}\n    when: {:?}\n    then: {{ kind: skip, reason: {} }}\n",
+            c.id, c.when, c.reason
+        ));
+    }
+    yaml.push_str(
+        r#"  - id: act_cse_label
     when: '"cse_label" in score.labels'
     then: { kind: act_suspend_user, perm: true, policy: "Cse" }
   - id: terminal
     when: "true"
     then: { kind: skip, reason: no_match }
-"#;
+"#,
+    );
+    yaml
+}
 
 #[tokio::test]
 async fn a_cse_action_chosen_by_the_rules_leaves_a_live_page_setting_acting() {
@@ -702,7 +696,7 @@ async fn a_cse_action_chosen_by_the_rules_leaves_a_live_page_setting_acting() {
     let b = bed_with(
         vec![live("SomeHead", None, vec![SUSPEND])],
         on_config(false, None),
-        RULES_WITH_A_CSE_SUSPEND,
+        &rules_with_a_cse_suspend(),
     )
     .await;
     let t = b
@@ -726,7 +720,7 @@ async fn a_cse_action_chosen_by_the_rules_leaves_a_live_page_setting_acting() {
 #[tokio::test]
 async fn a_rules_eval_error_leaves_a_live_page_setting_acting() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let rules = RULES_WITH_A_CSE_SUSPEND.replace(
+    let rules = rules_with_a_cse_suspend().replace(
         r#"'"cse_label" in score.labels'"#,
         r#"'int("not a number") == 1'"#,
     );
@@ -1376,9 +1370,9 @@ async fn a_fact_gated_suspend_that_fires_acts_over_a_held_liveness_check() {
 }
 
 
-const REPLY_HEAD: &str = "GrokDistilledReplyAuthor";
-const REPLY_MODEL: &str = "reply_bot_v1_2";
-const REPLY_LABEL: &str = "grok_distilled_reply_author";
+const REPLY_HEAD: &str = "ReplyHead";
+const REPLY_MODEL: &str = "reply_model_v1";
+const REPLY_LABEL: &str = "reply_head_label";
 
 fn listing(b: &TestBed, topic: &str, labels: &[&str], negative: &[&str]) -> ScoreResultProcessor {
     ScoreResultProcessor {
@@ -1704,7 +1698,7 @@ fn assert_logged_with_hide(t: &Trace, because: &str) {
 #[tokio::test]
 async fn a_row_rollout_hides_replies_inside_it_and_logs_the_rest() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
-    let place = |a: Account| action_control::rollout_bucket(REPLY_HEAD, a.user_id());
+    let place = |a: Account| action_control::rollout_bucket("", REPLY_HEAD, a.user_id());
     let (mut low, mut high) = (Account::Clean, Account::HasPhoenixSkip);
     assert_ne!(place(low), place(high));
     if place(low) > place(high) {

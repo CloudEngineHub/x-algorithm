@@ -824,7 +824,7 @@ class Trainer(Config):
 
     def checksum_dict(self):
         unwrapped_state = unwrap_tree(self.state)
-        checksums = self.compute_checksums_jit(unwrapped_state)
+        checksums = jax.device_get(self.compute_checksums_jit(unwrapped_state))
         return checksum.get_checksum_dict(
             unwrapped_state,
             self.state_sharding,

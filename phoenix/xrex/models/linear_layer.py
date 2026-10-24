@@ -33,8 +33,10 @@ class LinearImpl(hk.Module):
         b_init: Optional[hk.initializers.Initializer] = None,
         pspec: Optional[P] = None,
         name: Optional[str] = None,
+        dot: Callable[[jax.Array, jax.Array], jax.Array] = jnp.dot,
     ):
         super().__init__(name=name)
+        self.dot = dot
         self.input_size = None
         self.output_size = output_size
         self.with_bias = with_bias
@@ -77,7 +79,7 @@ class LinearImpl(hk.Module):
         if output_columns is not None:
             w = output_columns(w)
 
-        out = jnp.dot(inputs, w.astype(fprop_dtype))
+        out = self.dot(inputs, w.astype(fprop_dtype))
 
         if self.with_bias:
             b = get_parameter("b", [self.output_size], jnp.float32, init=self.b_init, pspec=P())

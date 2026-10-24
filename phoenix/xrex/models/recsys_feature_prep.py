@@ -2,6 +2,7 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
+import functools
 import math
 import typing
 from typing import Any, Literal, NamedTuple
@@ -357,15 +358,29 @@ def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.A
 
 
 def _project_hash(embedding: jax.Array, name: str, config: FeaturePrepConfig) -> jax.Array:
-    proj = _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
-    return jnp.dot(embedding.astype(proj.dtype), proj)
+    return _project_hashes(embedding, [name], config)
+
+
+def _project_hashes(
+    embeddings: jax.Array, names: list[str], config: FeaturePrepConfig
+) -> jax.Array:
+    projections = [
+        _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
+        for name in names
+    ]
+    return jnp.dot(embeddings.astype(projections[0].dtype), jnp.concatenate(projections))
 
 
 def _embed_categorical(
-    values: jax.Array, cardinality: int, name: str, config: FeaturePrepConfig
+    values: jax.Array,
+    cardinality: int,
+    name: str,
+    config: FeaturePrepConfig,
+    *,
+    one_hot_dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array:
     table = _get_emb_table(name, cardinality, config.emb_size, config)
-    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality)
+    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality, dtype=one_hot_dtype)
     return jnp.dot(one_hot, table)
 
 
@@ -586,10 +601,13 @@ def _add_context_features(
     is_training: bool = True,
 ) -> jax.Array:
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
+    embed_categorical_in_fprop_dtype = functools.partial(
+        _embed_categorical, one_hot_dtype=fprop_dtype
+    )
 
     if config.enable_product_surface:
         ps = _cast_jax(batch_seq["product_surface"])
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             ps, config.product_surface_cardinality, f"{prefix}_product_surface_emb", config
         ).astype(fprop_dtype)
 
@@ -599,7 +617,7 @@ def _add_context_features(
         buckets = _compute_post_age_bucket_linear(
             impr_ts, creation_ts, config.post_age_granularity_mins
         )
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             buckets, config.post_age_cardinality, f"{prefix}_post_age_emb", config
         ).astype(fprop_dtype)
 
@@ -607,7 +625,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             tz = _cast_jax(cat_features)[:, :, CategoricalFeature.timezoneSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 tz, config.timezone_cardinality, f"{prefix}_timezone_emb", config
             ).astype(fprop_dtype)
 
@@ -651,7 +669,7 @@ def _add_context_features(
                 hour = _dither_hour_forward(
                     hour, config.hour_of_day_dither_fraction, config.hour_of_day_cardinality - 1
                 )
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 hour, config.hour_of_day_cardinality, f"{prefix}_hour_of_day_emb", config
             ).astype(fprop_dtype)
 
@@ -659,7 +677,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             dow = _cast_jax(cat_features)[:, :, CategoricalFeature.localDayOfWeekSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 dow, config.day_of_week_cardinality, f"{prefix}_day_of_week_emb", config
             ).astype(fprop_dtype)
 
@@ -671,14 +689,14 @@ def _add_context_features(
                 followed = bool_features[:, :, BoolFeature.isAuthorFollowedByViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     followed, 2, f"{prefix}_is_author_followed_by_viewer_emb", config
                 ).astype(fprop_dtype)
             if config.enable_is_author_following_viewer:
                 following = bool_features[:, :, BoolFeature.isAuthorFollowingViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     following, 2, f"{prefix}_is_author_following_viewer_emb", config
                 ).astype(fprop_dtype)
 
@@ -716,11 +734,9 @@ def _add_context_features(
         bools = batch_seq.get("bool_features")
         if bools is not None and bools.shape[-1] > BoolFeature.isStalePost14d.value:
             is_stale = _cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(jnp.int32)
-            emb_table = _get_emb_table(
-                f"{prefix}_is_stale_post_14d_emb", 2, config.emb_size, config
-            )
-            one_hot = jax.nn.one_hot(jnp.clip(is_stale, 0, 1), 2)
-            result = result + jnp.dot(one_hot, emb_table).astype(fprop_dtype)
+            result = result + embed_categorical_in_fprop_dtype(
+                is_stale, 2, f"{prefix}_is_stale_post_14d_emb", config
+            ).astype(fprop_dtype)
 
     return result
 
@@ -1049,19 +1065,13 @@ def _build_seq_tokens(
     result = jnp.zeros((B, S, D), dtype=fprop_dtype)
 
     if config.enable_post_embedding:
-        post_reshaped = post_embeddings.reshape(B, S, num_item_hashes, -1)
-        for i in range(num_item_hashes):
-            h = post_reshaped[:, :, i, :]
-            result = result + _project_hash(h, f"{prefix}_post_hash_{i}_proj", config).astype(
-                fprop_dtype
-            )
+        post_names = [f"{prefix}_post_hash_{i}_proj" for i in range(num_item_hashes)]
+        post_tokens = _project_hashes(post_embeddings.reshape(B, S, -1), post_names, config)
+        result = result + post_tokens.astype(fprop_dtype)
 
-    author_reshaped = author_embeddings.reshape(B, S, num_author_hashes, -1)
-    for i in range(num_author_hashes):
-        h = author_reshaped[:, :, i, :]
-        result = result + _project_hash(h, f"{prefix}_author_hash_{i}_proj", config).astype(
-            fprop_dtype
-        )
+    author_names = [f"{prefix}_author_hash_{i}_proj" for i in range(num_author_hashes)]
+    author_tokens = _project_hashes(author_embeddings.reshape(B, S, -1), author_names, config)
+    result = result + author_tokens.astype(fprop_dtype)
 
     padding_mask = (post_hashes[:, :, 0] != 0).reshape(B, S).astype(jnp.bool_)
 

@@ -29,10 +29,11 @@ rules:
       kind: skip
       reason: high_follower_count
 
+  # Prod uses a different credibility score threshold; this is a mock value to reduce gaming.
   - id: pagerank_skipped
     when: >
       cred.is_high
-      || cred.score >= 50.0
+      || cred.score >= 12.34
     then:
       kind: skip
       reason: pagerank_skipped

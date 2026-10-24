@@ -1338,6 +1338,9 @@ class PhoenixKafkaDataset(PhoenixDataset):
             self.history_url_embedding_negative_ttl_s,
         )
 
+    def exports_python_otel(self, shard_index: int, num_shards: int) -> bool:
+        return True
+
     def make(
         self,
         *,
@@ -1449,7 +1452,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
         self._reset_event: Event = threading.Event()
         _kafka_reset_event = self._reset_event
 
-        if self.export_metrics:
+        if self.export_metrics and self.exports_python_otel(shard_index, num_shards):
             try:
                 _init_otel_metrics(
                     otel_endpoint=self.otel_endpoint,

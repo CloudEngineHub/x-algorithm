@@ -8,6 +8,7 @@ import numpy.typing as npt
 from xrex.data.recsys.ads_late_window import (
     ADS_LATE_WINDOW_TWIN_HEAD_INDICES,
     ADS_LATE_WINDOW_TWIN_SUPPRESSOR,
+    ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES,
 )
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
@@ -69,7 +70,8 @@ def build_trained_candidate_mask(
     app_ct = _head_indicator(MMP_CLICK_CONDITIONED_ACTION_INDICES, num_actions)
     app_vt = _head_indicator(MMP_CLICK_VIEW_THROUGH_ACTION_INDICES, num_actions)
     twins = _head_indicator(ADS_LATE_WINDOW_TWIN_HEAD_INDICES, num_actions)
-    engagement = ~(web_ct | web_vt | app_ct | app_vt | twins)
+    vt_twins = _head_indicator(ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES, num_actions)
+    engagement = ~(web_ct | web_vt | app_ct | app_vt | twins | vt_twins)
 
     suppressor_index = list(range(num_actions))
     for twin, suppressor in ADS_LATE_WINDOW_TWIN_SUPPRESSOR.items():
@@ -84,4 +86,5 @@ def build_trained_candidate_mask(
         | (app_ct & early & keep_app & app_click)
         | (app_vt & early & keep_app & ~app_click)
         | (twins & late & click & no_early_counterpart & kept)
+        | (vt_twins & late & keep_web & ~click & no_early_counterpart)
     )

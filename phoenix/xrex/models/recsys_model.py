@@ -2,6 +2,7 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import typing
@@ -24,7 +25,10 @@ from xrex.data.recsys.ads_head_masking import (
     FRESH_STREAM_ID,
     LATE_SPLIT_STREAM_ID,
 )
-from xrex.data.recsys.ads_late_window import ADS_LATE_WINDOW_TWIN_HEAD_INDICES
+from xrex.data.recsys.ads_late_window import (
+    ADS_LATE_WINDOW_TWIN_HEAD_INDICES,
+    ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES,
+)
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
     CLICK_CONDITIONED_ACTION_INDICES,
@@ -267,6 +271,38 @@ def packed_per_user_history_event_count(
     ends = starts + history_slot_len[:, None, :]
     in_slot = (pos >= starts) & (pos < ends)
     return jnp.sum(has_event[:, :, None] * in_slot, axis=1)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def take_candidate_slots(
+    num_rows: int,
+    embeddings: jax.Array,
+    candidate_positions: jax.Array,
+    candidate_token_to_slot: jax.Array,
+) -> jax.Array:
+    del num_rows, candidate_token_to_slot
+    return jnp.take_along_axis(embeddings, candidate_positions[:, :, None], axis=1)
+
+
+def _take_candidate_slots_fwd(num_rows, embeddings, candidate_positions, candidate_token_to_slot):
+    slot_maps = (candidate_positions, candidate_token_to_slot)
+    return take_candidate_slots(num_rows, embeddings, *slot_maps), slot_maps
+
+
+def _take_candidate_slots_bwd(num_rows, slot_maps, d_candidates):
+    candidate_positions, candidate_token_to_slot = slot_maps
+    d_region = jnp.take_along_axis(
+        d_candidates, candidate_token_to_slot[:, :, None], axis=1, mode="fill", fill_value=0
+    )
+    is_invalid_slot = (candidate_positions == num_rows - 1)[:, :, None]
+    d_last_row = jnp.sum(d_candidates, axis=1, where=is_invalid_slot)
+    d_region = d_region.at[:, -1].set(d_last_row)
+    num_region_tokens = candidate_token_to_slot.shape[1]
+    d_embeddings = jnp.pad(d_region, ((0, 0), (num_rows - num_region_tokens, 0), (0, 0)))
+    return d_embeddings, None, None
+
+
+take_candidate_slots.defvjp(_take_candidate_slots_fwd, _take_candidate_slots_bwd)
 
 
 @configclass
@@ -629,7 +665,9 @@ def metric_prauc(
     bucket = jnp.searchsorted(auc_thresholds, p, side="right", method="scan_unrolled")
     bucket = jnp.where(jnp.isnan(p), 0, bucket)
     weights = jnp.stack([valid_mask.reshape(-1), valid_y.reshape(-1)], axis=1).astype(jnp.float32)
-    hist = jnp.zeros((auc_thresholds.shape[0] + 1, 2), jnp.float32).at[bucket].add(weights)
+    num_buckets = auc_thresholds.shape[0] + 1
+    bucket = jnp.where(weights[:, 0] != 0, bucket, num_buckets)
+    hist = jnp.zeros((num_buckets, 2), jnp.float32).at[bucket].add(weights, mode="drop")
     cleared = jnp.cumsum(hist[::-1], axis=0)[::-1]
     sum_pred, sum_pred_y = cleared[1:].T
     precisions = sum_pred_y / jnp.maximum(sum_pred, 1e-6)
@@ -669,7 +707,10 @@ def metric_ndcg(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.
         return jnp.where(idcg > 0, dcg / idcg, 1.0)
 
     ndcg_scores = jax.vmap(compute_single_ndcg)(p, y, valid_mask)
+    return _mean_ndcg(ndcg_scores, valid_mask)
 
+
+def _mean_ndcg(ndcg_scores: jax.Array, valid_mask: jax.Array) -> jax.Array:
     valid_queries = jnp.sum(valid_mask, axis=1) >= 1
     num_valid_queries = jnp.sum(valid_queries)
     return jnp.where(
@@ -679,21 +720,40 @@ def metric_ndcg(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.
     )
 
 
+def metric_ndcg_masks(p: jax.Array, y: jax.Array, masks: jax.Array) -> jax.Array:
+    item_weight = jnp.max(masks, axis=0)
+    pred_order = jnp.argsort(-jnp.where(item_weight > 0, p * item_weight, -jnp.inf), axis=-1)
+    ideal_order = jnp.argsort(-(y * item_weight), axis=-1)
+    in_mask = jnp.moveaxis(masks > 0, 0, -1)
+    valid_y = jnp.moveaxis(y * masks, 0, -1)
+
+    def dcg(order: jax.Array) -> jax.Array:
+        sorted_gains = jnp.take_along_axis(valid_y, order[..., None], axis=1)
+        sorted_in_mask = jnp.take_along_axis(in_mask, order[..., None], axis=1)
+        rank = jnp.cumsum(sorted_in_mask, axis=1, dtype=jnp.float32)
+        return jnp.sum(jnp.where(sorted_in_mask, sorted_gains / jnp.log2(rank + 1), 0.0), axis=1)
+
+    idcg = dcg(ideal_order)
+    ndcg_scores = jnp.where(idcg > 0, dcg(pred_order) / idcg, 1.0)
+    return jax.vmap(_mean_ndcg, in_axes=(1, 0))(ndcg_scores, masks)
+
+
 def metric_calib(p: jnp.ndarray, y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
     num_pos = (valid_mask * y).sum() + _CALIB_POS_BASE
     num_prob_pos = (valid_mask * p).sum()
     return jnp.where(num_pos > 0, num_prob_pos / jnp.maximum(num_pos, 1), 0.0)
 
 
-def engagement_metrics(p, y, masks, auc_thresholds):
-    return jnp.array(
-        [
-            jax.vmap(f, in_axes=(None, None, 0))(p, y, masks)
-            for f in (metric_loss, metric_rce, metric_ndcg, metric_ratio_pos, metric_calib)
-        ]
-        + [jax.vmap(metric_prauc, in_axes=(None, None, 0, None))(p, y, masks, auc_thresholds)]
-        + [jax.vmap(metric_num_tokens, in_axes=(None, 0))(y, masks)]
-    )
+def engagement_metrics(p, y, masks, auc_thresholds, *, ndcg_shared_sorts: bool):
+    def per_mask(metric):
+        return jax.vmap(metric, in_axes=(None, None, 0))(p, y, masks)
+
+    loss, rce = per_mask(metric_loss), per_mask(metric_rce)
+    ndcg = metric_ndcg_masks(p, y, masks) if ndcg_shared_sorts else per_mask(metric_ndcg)
+    ratio_pos, calib = per_mask(metric_ratio_pos), per_mask(metric_calib)
+    prauc = jax.vmap(metric_prauc, in_axes=(None, None, 0, None))(p, y, masks, auc_thresholds)
+    num_tokens = jax.vmap(metric_num_tokens, in_axes=(None, 0))(y, masks)
+    return jnp.array([loss, rce, ndcg, ratio_pos, calib, prauc, num_tokens])
 
 
 def get_probs_and_labels(
@@ -720,16 +780,19 @@ def metrics_calc(
     mask_values: list[jax.Array],
     stats: dict,
     per_head_mask_values: jax.Array | None = None,
+    ndcg_shared_sorts: bool = False,
 ):
     auc_thresholds = jnp.geomspace(_INITIAL_AUC_THRESHOLD, 1.0, num=_NUM_AUC_THRESHOLDS)
     if per_head_mask_values is None:
-        res = jax.vmap(engagement_metrics, in_axes=(0, 0, None, None))(
-            jnp.stack(p_list), jnp.stack(y_list), jnp.stack(mask_values), auc_thresholds
-        )
+        masks, masks_axis = jnp.stack(mask_values), None
     else:
-        res = jax.vmap(engagement_metrics, in_axes=(0, 0, 0, None))(
-            jnp.stack(p_list), jnp.stack(y_list), per_head_mask_values, auc_thresholds
-        )
+        masks, masks_axis = per_head_mask_values, 0
+    res = jax.vmap(
+        functools.partial(engagement_metrics, ndcg_shared_sorts=ndcg_shared_sorts),
+        in_axes=(0, 0, masks_axis, None),
+    )(jnp.stack(p_list), jnp.stack(y_list), masks, auc_thresholds)
+    if ndcg_shared_sorts:
+        stats["ndcg_negative_weights"] = jnp.sum(masks < 0, dtype=jnp.float32)
     stats.update(
         {
             f"{eng_name}_{mask_key}_{name}": res[i][j][k]
@@ -1124,6 +1187,7 @@ class RecsysAggregatedModelConfig(Config):
     metric_group: str = "default"
 
     metric_mask_keys: list[str] | None = None
+    metrics_ndcg_shared_sorts: bool = False
 
     conversion_delay_slice_thresholds_s: tuple[int, ...] = ()
 
@@ -2209,6 +2273,9 @@ def build_metric_masks(
         masks["late_split_no_early"] = mask * jnp.prod(
             trained[:, :, jnp.array(ADS_LATE_WINDOW_TWIN_HEAD_INDICES)], axis=-1
         )
+        masks["late_split_non_clicked_no_early"] = mask * jnp.prod(
+            trained[:, :, jnp.array(ADS_LATE_WINDOW_VT_TWIN_HEAD_INDICES)], axis=-1
+        )
         masks["fresh_home_website_clicks"] = (
             masks["fresh"] * home_timeline_mask * website_clicks_objective
         )
@@ -2319,6 +2386,7 @@ class RecsysAggregatedModel(hk.Module):
             mask_values,
             stats,
             per_head_mask_values=per_head_mask_values,
+            ndcg_shared_sorts=self.config.metrics_ndcg_shared_sorts,
         )
 
         metrics_calc_global_num_tokens(masks, stats)
@@ -4023,7 +4091,14 @@ class RecsysAggregatedModel(hk.Module):
             else:
                 user_embeddings = out_embeddings[:, 0, :]
 
-        if seqpack_layout is not None:
+        if seqpack_layout is not None and seqpack_layout.candidate_token_to_slot is not None:
+            out_embeddings = take_candidate_slots(
+                out_embeddings.shape[1],
+                out_embeddings,
+                cast_jax(seqpack_layout.candidate_positions),
+                cast_jax(seqpack_layout.candidate_token_to_slot),
+            )
+        elif seqpack_layout is not None:
             out_embeddings = jnp.take_along_axis(
                 out_embeddings, cast_jax(seqpack_layout.candidate_positions)[:, :, None], axis=1
             )

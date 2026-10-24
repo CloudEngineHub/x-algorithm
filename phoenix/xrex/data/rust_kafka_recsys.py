@@ -53,6 +53,8 @@ class RustKafkaDataset(PhoenixKafkaDataset):
 
     drop_update_window_secs: float = 30.0
 
+    python_otel_on_last_shard_only: bool = False
+
     def _warn_ignored_inherited_fields(self) -> None:
         problems: list[tuple[str, object, str]] = []
 
@@ -498,6 +500,9 @@ class RustKafkaDataset(PhoenixKafkaDataset):
         thread = threading.Thread(target=watcher, name="rust-kafka-control-watcher", daemon=True)
         thread.start()
         return thread
+
+    def exports_python_otel(self, shard_index: int, num_shards: int) -> bool:
+        return not self.python_otel_on_last_shard_only or shard_index == num_shards - 1
 
     def redistribution_reader_count(self, num_shards: int) -> int:
         if num_shards < 1 or (

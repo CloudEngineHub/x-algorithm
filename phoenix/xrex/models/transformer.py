@@ -19,6 +19,7 @@ from jax.sharding import PartitionSpec as P
 from xai_configlib import Config, configclass
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
 from xrex.models.attention import AttentionConfig
+from xrex.models.fp8 import Fp8Dot, Fp8Gemms
 from xrex.models.layers import (
     CandidateOnlyAttention,
     Linear,
@@ -27,12 +28,17 @@ from xrex.models.layers import (
 )
 from xrex.models.normalization import RMSNorm
 from xrex.models.remat import (
+    ATTN_FP8_T,
+    DENSE_GELU_FP8_T,
+    NORM_STATS,
+    POST_ATTN_RESIDUAL,
     RematType,
+    checkpoint_as_bits,
     custom_remat_policy,
 )
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
-from xrex.utils import layer_stack
+from xrex.utils import gpu, layer_stack
 from xrex.utils.gpu import peak_tflops
 from xrex.utils.sharding import with_sharding_constraint_unless_manual
 from xrex.utils.utils import (
@@ -81,6 +87,7 @@ class TransformerConfig(Config):
 
     use_remat: bool = True
     remat_policy: RematType = RematType.WHOLE
+    fp8_gemms: Fp8Gemms = Fp8Gemms.OFF
     prevent_cse: bool = True
     remat_boundary: str = "block"
 
@@ -96,6 +103,7 @@ class TransformerConfig(Config):
     def __post_init__(self):
         if isinstance(self.data_axis, list):
             self.data_axis = tuple(self.data_axis)
+        self.fp8_gemms = Fp8Gemms(self.fp8_gemms)
 
     @property
     def ffn_dim(self):
@@ -152,6 +160,8 @@ class MHABlock(hk.Module):
     config: AttentionConfig
     scale_config: ScaleConfig
     sharding_context: ShardingContext
+    fp8_gemms: Fp8Gemms = Fp8Gemms.OFF
+    fp8_remat_saves: bool = False
 
     @hk.transparent
     def __call__(
@@ -182,6 +192,8 @@ class MHABlock(hk.Module):
                     scale_config=self.scale_config,
                     w_init=initializer,
                     sharding_context=self.sharding_context,
+                    fp8_gemms=self.fp8_gemms,
+                    out_proj_fp8_input_name=ATTN_FP8_T if self.fp8_remat_saves else None,
                 )(
                     input_to_query,
                     input_to_key,
@@ -240,6 +252,8 @@ class DenseBlock(hk.Module):
     sharding_context: ShardingContext = None
     checkpoint_name_prefix: str = "dense_"
     suffix_name: str = ""
+    fp8_gemms: Fp8Gemms = Fp8Gemms.OFF
+    fp8_remat_saves: bool = False
 
     @hk.transparent
     def __call__(
@@ -274,6 +288,7 @@ class DenseBlock(hk.Module):
         activation_sharding = NamedSharding(self.sharding_context.mesh, activation_spec)
 
         if self.config.gated_mlp:
+            fp8_dot = Fp8Dot(self.fp8_gemms)
             if self.config.merge_gate_up:
                 h = Linear(
                     ffn_size_ * 2,
@@ -284,6 +299,7 @@ class DenseBlock(hk.Module):
                     lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
                     init_scale=self.scale_config.ffn_init_scale,
                     name="gate_up_proj" + self.suffix_name,
+                    dot=fp8_dot,
                 )(inputs)
 
                 h = jnp.reshape(h, (batch_size, seq_len, -1, 2))
@@ -302,6 +318,7 @@ class DenseBlock(hk.Module):
                     lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
                     init_scale=self.scale_config.ffn_init_scale,
                     name="up_proj" + self.suffix_name,
+                    dot=fp8_dot,
                 )(inputs)
                 h_gate = Linear(
                     ffn_size_,
@@ -312,6 +329,7 @@ class DenseBlock(hk.Module):
                     lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
                     init_scale=self.scale_config.ffn_init_scale,
                     name="gate_proj" + self.suffix_name,
+                    dot=fp8_dot,
                 )(inputs)
                 h_up = checkpoint_name(h_up, f"{self.checkpoint_name_prefix}up_proj")
                 h_gate = checkpoint_name(h_gate, f"{self.checkpoint_name_prefix}gate_proj")
@@ -327,8 +345,12 @@ class DenseBlock(hk.Module):
                 init_scale=self.scale_config.ffn_init_scale,
                 sharding_context=self.sharding_context,
                 name="down_proj" + self.suffix_name,
+                dot=fp8_dot,
             )(combined)
         else:
+            gelu_fp8_name = DENSE_GELU_FP8_T if self.fp8_remat_saves else None
+            down_dot = Fp8Dot(self.fp8_gemms, transposed_input_checkpoint_name=gelu_fp8_name)
+            up_dot = Fp8Dot(self.fp8_gemms, fuse_gradient_amax=self.fp8_remat_saves)
             h_up = Linear(
                 ffn_size_,
                 w_init=initializer,
@@ -337,8 +359,10 @@ class DenseBlock(hk.Module):
                 pspec=weights_pspec,
                 lr_multiplier=self.scale_config.hidden_lr_multiplier(model_size),
                 name="up_proj" + self.suffix_name,
+                dot=up_dot,
             )(inputs)
-            h_up = checkpoint_name(h_up, f"{self.checkpoint_name_prefix}up_proj")
+            checkpoint_fn = checkpoint_as_bits if self.fp8_remat_saves else checkpoint_name
+            h_up = checkpoint_fn(h_up, f"{self.checkpoint_name_prefix}up_proj")
             h_up = gelu_fn(h_up, approximate=True)
             h_dense = Linear(
                 model_size,
@@ -348,6 +372,7 @@ class DenseBlock(hk.Module):
                 lr_multiplier=self.scale_config.ffn_output_lr_multiplier(ffn_size_, gated_mlp=True),
                 sharding_context=self.sharding_context,
                 name="down_proj" + self.suffix_name,
+                dot=down_dot,
             )(h_up)
 
         h_dense = checkpoint_name(h_dense, f"{self.checkpoint_name_prefix}outputs_individual")
@@ -373,6 +398,8 @@ class FFNLayer(hk.Module):
     ffn_config: FeedForwardConfig
     scale_config: ScaleConfig
     sharding_context: ShardingContext = None
+    fp8_gemms: Fp8Gemms = Fp8Gemms.OFF
+    fp8_remat_saves: bool = False
 
     @hk.transparent
     def __call__(
@@ -392,6 +419,8 @@ class FFNLayer(hk.Module):
                 data_axis=data_axis,
                 sharding_context=self.sharding_context,
                 checkpoint_name_prefix="dense_",
+                fp8_gemms=self.fp8_gemms,
+                fp8_remat_saves=self.fp8_remat_saves,
             )(h, is_training)
             return h
 
@@ -419,6 +448,8 @@ class DecoderLayer(hk.Module):
     num_layers: int = None
     pre_attn_norm_name: str = "pre_attn_norm"
     pre_ffn_norm_name: str = "pre_ffn_norm"
+    fp8_gemms: Fp8Gemms = Fp8Gemms.OFF
+    fp8_remat_saves: bool = False
 
     def __call__(
         self,
@@ -443,6 +474,7 @@ class DecoderLayer(hk.Module):
         )
         if remat_fn is None:
             remat_fn = remat_less
+        norm_stats_name = NORM_STATS if self.fp8_remat_saves else None
 
         assert inputs.ndim == 3, f"Expected 3D array but got shape {inputs.shape=}"
         activation_pspec = self.sharding_context.sharding_specs(
@@ -456,7 +488,7 @@ class DecoderLayer(hk.Module):
         def run_attn_layer(h_attn_in: jax.Array, history_states: jax.Array | None):
             if self.pre_norm:
                 pre_attn_norm = layer_norm(name=self.pre_attn_norm_name)
-                h_ln = pre_attn_norm(h_attn_in)
+                h_ln = pre_attn_norm(h_attn_in, stats_name=norm_stats_name)
                 if history_states is not None:
                     history_states = pre_attn_norm(history_states)
             else:
@@ -468,6 +500,8 @@ class DecoderLayer(hk.Module):
                 config=self.attn_config,
                 scale_config=self.scale_config,
                 sharding_context=self.sharding_context,
+                fp8_gemms=self.fp8_gemms,
+                fp8_remat_saves=self.fp8_remat_saves,
             )(
                 h_ln,
                 mask,
@@ -477,7 +511,8 @@ class DecoderLayer(hk.Module):
                 seqpack_layout=seqpack_layout,
                 history_states=history_states,
             )
-            h_attn = checkpoint_name(attn_outputs.output, "attn_outputs")
+            checkpoint_fn = checkpoint_as_bits if self.fp8_remat_saves else checkpoint_name
+            h_attn = checkpoint_fn(attn_outputs.output, "attn_outputs")
 
             with jax.named_scope("attn_loss"), set_xla_metadata(_xla_collective_group="metrics"):
                 if padding_mask is None:
@@ -497,6 +532,8 @@ class DecoderLayer(hk.Module):
         )
 
         residual = residual + h_attn
+        if self.fp8_remat_saves and gpu.bf16_arithmetic_is_native(jax.devices()[0]):
+            residual = checkpoint_as_bits(residual, POST_ATTN_RESIDUAL, barrier=False)
         residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
         attn_post_ln_output = residual
@@ -506,7 +543,7 @@ class DecoderLayer(hk.Module):
 
         def run_ffn_layer(h_ffn_in: jax.Array):
             if self.pre_norm:
-                h_ln = layer_norm(name=self.pre_ffn_norm_name)(h_ffn_in)
+                h_ln = layer_norm(name=self.pre_ffn_norm_name)(h_ffn_in, stats_name=norm_stats_name)
             else:
                 h_ln = h_ffn_in
             h_ln = with_sharding_constraint_unless_manual(h_ln, activation_pspec)
@@ -516,6 +553,8 @@ class DecoderLayer(hk.Module):
                 ffn_config=self.ffn_config,
                 scale_config=self.scale_config,
                 sharding_context=self.sharding_context,
+                fp8_gemms=self.fp8_gemms,
+                fp8_remat_saves=self.fp8_remat_saves,
             )(
                 h_ln=h_ln,
                 is_training=is_training,
@@ -693,6 +732,9 @@ class Transformer(hk.Module):
             policy=custom_remat_policy(config.remat_policy),
             prevent_cse=config.prevent_cse,
         )
+        fp8_remat_saves = config.fp8_gemms == Fp8Gemms.ALL and (
+            config.use_remat and config.remat_policy == RematType.SAVE_H100_QKV_ATTN_FFN
+        )
 
         def run_decoder_layer(
             hidden_states,
@@ -704,6 +746,7 @@ class Transformer(hk.Module):
             global_layer_index: Optional[jax.Array] = None,
             seqpack_layout: SequencePackedLayout | None = None,
             history_states: jax.Array | None = None,
+            fp8_gemms: Fp8Gemms = config.fp8_gemms,
         ) -> DecoderOutput:
             return block_remat_fn(
                 DecoderLayer(
@@ -718,6 +761,8 @@ class Transformer(hk.Module):
                     debug_tensor_dump_n_tokens=self.config.debug_tensor_dump_n_tokens,
                     layer_norm_eps=config.layer_norm_eps,
                     num_layers=config.num_layers,
+                    fp8_gemms=fp8_gemms,
+                    fp8_remat_saves=fp8_remat_saves,
                 )
             )(
                 hidden_states,
@@ -762,12 +807,11 @@ class Transformer(hk.Module):
             def run_candidate_only_layer(
                 candidate_states: jax.Array, *, history_states: jax.Array, **layer_kwargs
             ) -> DecoderOutput:
+                run_layer = partial(run_decoder_layer, fp8_gemms=Fp8Gemms.OFF, **layer_kwargs)
                 if use_candidate_only_kernel:
-                    return run_decoder_layer(
-                        candidate_states, history_states=history_states, **layer_kwargs
-                    )
+                    return run_layer(candidate_states, history_states=history_states)
 
-                decoder_output = run_decoder_layer(candidate_states, **layer_kwargs)
+                decoder_output = run_layer(candidate_states)
                 return replace(
                     decoder_output,
                     output=jnp.where(

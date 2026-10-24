@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     )
 
 _LN2 = math.log(2)
+_MAX_FUSED_SHARD_WIDTH = 32
 
 
 @configclass
@@ -101,10 +102,11 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
 
         async_emb = recsys_async_emb.kernel_bindings(context)
         row_sharded = recsys_async_emb.is_row_sharded(context)
-        if not row_sharded and 32 % context.shard_width != 0:
+        if not row_sharded and _MAX_FUSED_SHARD_WIDTH % context.shard_width != 0:
             raise ValueError(
-                f"the fused rowwise Adagrad update needs a row shard that divides a warp, "
-                f"got shard_width={context.shard_width} (emb_width={context.emb_width})"
+                "the fused rowwise Adagrad update needs shard_width to divide "
+                f"{_MAX_FUSED_SHARD_WIDTH}, got shard_width={context.shard_width} "
+                f"(emb_width={context.emb_width})"
             )
 
         metrics: dict[str, jax.Array] = {}

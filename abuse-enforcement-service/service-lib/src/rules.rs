@@ -1425,7 +1425,13 @@ rules:
     #[test]
     fn mock_cred_score_skips() {
         let mut f = base_facts();
-        f.cred_mut().score = Some(7.5);
+        let boundary = MOCK_USER_RULES_YAML
+            .split("cred.score >=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("the mock cred rule reads `cred.score >= N`");
+        f.cred_mut().score = Some(boundary);
         assert_eq!(d(&f), Decision::Skip("cred_skip".into()));
     }
 
@@ -1441,23 +1447,19 @@ rules:
 
                     #[test]
     fn a_paste_using_the_retired_generic_dispatch_never_acts() {
-        let kind = concat!("act_requested", "_actions");
-        let field = concat!("score.requested", "_actions");
-        let yaml = format!(
-            "for_entity: user\nrules:\n  - id: x\n    when: \"true\"\n    then: {{kind: {kind}}}\n"
-        );
-        let err = CompiledRules::from_yaml(&yaml).unwrap_err();
+        let yaml = "for_entity: user\nrules:\n  - id: x\n    when: \"true\"\n    then: {kind: act_requested_actions}\n";
+        let err = CompiledRules::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, RuleCompileError::Yaml(_)), "{err:?}");
         let cache = RulesCache::new();
-        let kept = cache.resolve(EntityType::User, Some(&Arc::from(yaml.as_str())));
+        let kept = cache.resolve(EntityType::User, Some(&Arc::from(yaml)));
         assert_eq!(
             kept.rule_ids().last(),
             Some("act_suspend"),
             "the baked pipeline stays"
         );
         for when in [
-            format!("size({field}) > 0"),
-            "score.policy_version == '3'".into(),
+            "size(score.requested_actions) > 0",
+            "score.policy_version == '3'",
         ] {
             let yaml = format!(
                 "for_entity: user\nrules:\n  - id: retired\n    when: \"{when}\"\n    then: {{kind: skip, reason: r}}\n  - id: fallthrough\n    when: \"true\"\n    then: {{kind: skip, reason: t}}\n"

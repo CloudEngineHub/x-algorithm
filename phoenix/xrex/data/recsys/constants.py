@@ -371,6 +371,24 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsUpperFunnelConversionViewThrough": [
         "AdsUpperFunnelConversionViewThrough",
     ],
+    "IsAttributedKeyViewConversionDelayed": [
+        "AdsAttributedKeyViewConversionDelayed",
+    ],
+    "IsAttributedViewConversionDelayed": [
+        "AdsAttributedViewConversionDelayed",
+    ],
+    "IsPurchaseConversionViewThroughDelayed": [
+        "AdsPurchaseConversionViewThroughDelayed",
+    ],
+    "IsAddToCartConversionViewThroughDelayed": [
+        "AdsAddToCartConversionViewThroughDelayed",
+    ],
+    "IsCheckoutInitiatedConversionViewThroughDelayed": [
+        "AdsCheckoutInitiatedConversionViewThroughDelayed",
+    ],
+    "IsSignUpConversionViewThroughDelayed": [
+        "AdsSignUpConversionViewThroughDelayed",
+    ],
 }
 
 ads_slim_engagement_to_action_types = {

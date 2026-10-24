@@ -6,10 +6,17 @@ pub const BAND_RECORD_VERSION: u32 = 1;
 
 pub const ROLLOUT_ALL_BP: u32 = 10_000;
 
-pub fn rollout_bucket(head: &str, author_id: i64) -> u32 {
+pub fn rollout_bucket(salt: &str, head: &str, author_id: i64) -> u32 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let id = author_id.to_string();
-    for b in head.bytes().chain([b'/']).chain(id.bytes()) {
+    let salt_sep: &[u8] = if salt.is_empty() { b"" } else { b"/" };
+    for b in salt
+        .bytes()
+        .chain(salt_sep.iter().copied())
+        .chain(head.bytes())
+        .chain([b'/'])
+        .chain(id.bytes())
+    {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -21,8 +28,8 @@ pub fn rollout_bucket(head: &str, author_id: i64) -> u32 {
     (h % u64::from(ROLLOUT_ALL_BP)) as u32
 }
 
-pub fn in_rollout(rollout_bp: Option<u32>, head: &str, author_id: i64) -> bool {
-    rollout_bp.is_none_or(|bp| bp >= ROLLOUT_ALL_BP || rollout_bucket(head, author_id) < bp)
+pub fn in_rollout(rollout_bp: Option<u32>, salt: &str, head: &str, author_id: i64) -> bool {
+    rollout_bp.is_none_or(|bp| bp >= ROLLOUT_ALL_BP || rollout_bucket(salt, head, author_id) < bp)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -379,8 +386,8 @@ impl ActionControlRecord {
         }
     }
 
-            pub fn rollout_takes(&self, author_id: i64) -> bool {
-        in_rollout(self.rollout_bp, &self.head, author_id)
+                pub fn rollout_takes(&self, salt: &str, author_id: i64) -> bool {
+        in_rollout(self.rollout_bp, salt, &self.head, author_id)
     }
 
             pub fn parse_strict(bytes: &[u8]) -> Result<Self, String> {
@@ -854,7 +861,7 @@ mod tests {
         assert_eq!(r.rollout_bp, None);
         assert_eq!(serde_json::to_string(&r).unwrap(), json);
         assert_eq!(r.schema_version(), ROWS_RECORD_VERSION);
-        assert!((0..10_000).all(|id| r.rollout_takes(id)));
+        assert!((0..10_000).all(|id| r.rollout_takes("", id) && r.rollout_takes("s", id)));
     }
 
     #[test]
@@ -879,42 +886,92 @@ mod tests {
 
     #[test]
     fn rollout_buckets_are_pinned() {
-        assert_eq!(rollout_bucket("GrokDistilledReplyAuthor", 0), 2_438);
-        assert_eq!(rollout_bucket("GrokDistilledReplyAuthor", 12), 9_745);
+        assert_eq!(rollout_bucket("", "ReplyHead", 0), 5_681);
+        assert_eq!(rollout_bucket("", "ReplyHead", 12), 6_175);
         assert_eq!(
-            rollout_bucket("GrokDistilledReplyAuthor", 1_234_567_890_123_456_789),
-            2_051
+            rollout_bucket("", "ReplyHead", 1_234_567_890_123_456_789),
+            1_110
         );
-        assert_eq!(rollout_bucket("H", -1), 4_141);
-        assert!((0..1_000).all(|id| rollout_bucket("H", id) < ROLLOUT_ALL_BP));
+        assert_eq!(rollout_bucket("", "H", -1), 4_141);
+        assert_eq!(rollout_bucket("test-salt", "ReplyHead", 0), 721);
+        assert_eq!(rollout_bucket("test-salt", "ReplyHead", 12), 7_891);
+        assert_eq!(rollout_bucket("test-salt", "H", -1), 6_715);
+        for salt in ["", "test-salt"] {
+            assert!((0..1_000).all(|id| rollout_bucket(salt, "H", id) < ROLLOUT_ALL_BP));
+        }
+    }
+
+            #[test]
+    fn an_empty_salt_keeps_the_unsalted_buckets() {
+        fn unsalted(head: &str, author_id: i64) -> u32 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in format!("{head}/{author_id}").bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            h ^= h >> 33;
+            (h % u64::from(ROLLOUT_ALL_BP)) as u32
+        }
+        for head in ["ReplyHead", "H", "A"] {
+            for id in (-1_000..1_000).chain([i64::MIN, i64::MAX, 1_234_567_890_123_456_789]) {
+                assert_eq!(
+                    rollout_bucket("", head, id),
+                    unsalted(head, id),
+                    "{head}/{id}"
+                );
+            }
+        }
+    }
+
+            #[test]
+    fn a_salt_redraws_every_rollout() {
+        let both = (0..100_000i64)
+            .filter(|&id| {
+                in_rollout(Some(5_000), "", "ReplyHead", id)
+                    && in_rollout(Some(5_000), "test-salt", "ReplyHead", id)
+            })
+            .count();
+        assert!(
+            (23_500..26_500).contains(&both),
+            "{both} of 100,000 in both 50% rollouts"
+        );
     }
 
     #[test]
     fn a_larger_rollout_keeps_every_account_of_a_smaller_one() {
         let steps = [0, 100, 500, 3_000, 5_000, 10_000];
         let n = 200_000i64;
-        let mut inside_before: Vec<bool> = vec![false; n as usize];
-        for bp in steps {
-            let mut count = 0usize;
-            for id in 0..n {
-                let inside = in_rollout(Some(bp), "GrokDistilledReplyAuthor", id * 7_919 + 1);
+        for salt in ["", "test-salt"] {
+            let mut inside_before: Vec<bool> = vec![false; n as usize];
+            for bp in steps {
+                let mut count = 0usize;
+                for id in 0..n {
+                    let inside = in_rollout(Some(bp), salt, "ReplyHead", id * 7_919 + 1);
+                    assert!(
+                        inside || !inside_before[id as usize],
+                        "account {id} left at {bp} bp (salt {salt:?})"
+                    );
+                    inside_before[id as usize] = inside;
+                    count += usize::from(inside);
+                }
+                let share = count as f64 / n as f64;
+                let want = f64::from(bp) / 10_000.0;
                 assert!(
-                    inside || !inside_before[id as usize],
-                    "account {id} left at {bp} bp"
+                    (share - want).abs() < 0.004,
+                    "{bp} bp took {share} (salt {salt:?})"
                 );
-                inside_before[id as usize] = inside;
-                count += usize::from(inside);
             }
-            let share = count as f64 / n as f64;
-            let want = f64::from(bp) / 10_000.0;
-            assert!((share - want).abs() < 0.004, "{bp} bp took {share}");
         }
         assert!(
-            (0..n).all(|id| !in_rollout(Some(0), "H", id)),
+            (0..n).all(|id| !in_rollout(Some(0), "", "H", id)),
             "0 takes nobody"
         );
         assert!(
-            (0..n).all(|id| in_rollout(None, "H", id)),
+            (0..n).all(|id| in_rollout(None, "", "H", id)),
             "absent takes everybody"
         );
     }
@@ -922,7 +979,9 @@ mod tests {
     #[test]
     fn heads_draw_their_rollouts_apart() {
         let both = (0..100_000i64)
-            .filter(|&id| in_rollout(Some(1_000), "A", id) && in_rollout(Some(1_000), "B", id))
+            .filter(|&id| {
+                in_rollout(Some(1_000), "", "A", id) && in_rollout(Some(1_000), "", "B", id)
+            })
             .count();
         assert!(
             (500..1_500).contains(&both),

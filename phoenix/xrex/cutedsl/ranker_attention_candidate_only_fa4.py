@@ -166,6 +166,7 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         jnp.float32 if dkv_postprocess else jnp.bfloat16,
     )
     dq_accum_shape = (bwd_num_heads, bwd_rows_padded * hdr)
+    bwd_accumulators = [jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32), dkv_out, dkv_out]
 
     @cute.jit
     def launch_bwd(
@@ -204,11 +205,7 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
 
     bwd_call = cutlass_call(
         launch_bwd,
-        output_shape_dtype=[
-            jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),
-            dkv_out,
-            dkv_out,
-        ],
+        output_shape_dtype=bwd_accumulators,
         input_output_aliases={9: 0, 10: 1, 11: 2},
         use_static_tensors=False,
         softmax_scale=cutlass.Float32(sm_scale),
@@ -289,9 +286,7 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
         bwd_cu_rows = cu_q if q_heads_per_bwd_head == 1 else cu_q * q_heads_per_bwd_head
         bwd_do = fold_q_heads(do)
         dpsum, lse_log2 = pre_call(fold_q_heads(o), bwd_do, fold_q_heads(lse).T, bwd_cu_rows)
-        dq_accum = zeros_after(dq_accum_shape, jnp.float32, do)
-        dk_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)
-        dv_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)
+        dq_accum_init, dk_init, dv_init = zeros_after(do, *bwd_accumulators)
         dq_accum, dk_keys, dv_keys = bwd_call(
             fold_q_heads(q),
             k_keys,
@@ -302,7 +297,7 @@ def candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):
             bwd_cu_rows,
             cu_k,
             used_k,
-            dq_accum,
+            dq_accum_init,
             dk_init,
             dv_init,
         )

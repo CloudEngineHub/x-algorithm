@@ -33,7 +33,7 @@
 # Copyright 2026 X.AI Corp.
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -195,6 +195,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]] = None,
         stream: cuda.CUstream = None,
     ):
         self._check_type(
@@ -217,6 +218,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(mLSE is not None)
             else None
         )
+        if const_expr(mSoftmaxStats is not None):
+            mSoftmaxStats = tuple(
+                layout_utils.select(t, LSE_layout_transpose) for t in mSoftmaxStats
+            )
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
@@ -269,6 +274,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+            if const_expr(mSoftmaxStats is not None):
+                mSoftmaxStats = tuple(
+                    pack_gqa_layout(t, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                    for t in mSoftmaxStats
+                )
 
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
@@ -372,6 +382,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
+            mSoftmaxStats,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -418,6 +429,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -611,6 +623,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tiled_mma_pv,
                 mO,
                 mLSE,
+                mSoftmaxStats,
                 sQ,
                 sK,
                 sVt,
@@ -917,6 +930,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_pv: cute.TiledMma,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sVt: cute.Tensor,
@@ -1212,6 +1226,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                row_max=softmax.row_max,
+                row_scale=row_scale,
+                mSoftmaxStats=mSoftmaxStats,
             )
 
             tile_scheduler.advance_to_next_work()

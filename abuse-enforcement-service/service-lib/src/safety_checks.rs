@@ -39,7 +39,7 @@ pub const USER_CHECKS: &[SafetyCheck] = &[
     SafetyCheck {
         id: "pagerank_skipped",
         reason: "pagerank_skipped",
-        when: "cred.is_high || cred.score >= 50.0",
+        when: "cred.is_high || cred.score >= 12.34",
     },
 ];
 
@@ -67,7 +67,7 @@ pub const POST_CHECKS: &[SafetyCheck] = &[
     SafetyCheck {
         id: "pagerank_skipped",
         reason: "pagerank_skipped",
-        when: "(cred.is_high || cred.score >= 50.0) && !score.skip_author_credibility_prechecks",
+        when: "(cred.is_high || cred.score >= 12.34) && !score.skip_author_credibility_prechecks",
     },
 ];
 

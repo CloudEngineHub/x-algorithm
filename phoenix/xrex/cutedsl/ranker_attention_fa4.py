@@ -20,6 +20,32 @@ def cutedsl_arch():
     raise NotImplementedError(f"cutedsl ranker attention: unsupported compute capability {major}.x")
 
 
+def attention_delta(out, grad_out, padded_len):
+    batch, seq_len, heads, dim = out.shape
+    grad_out = grad_out.astype(out.dtype)
+    pad = ((0, 0), (0, padded_len - seq_len), (0, 0), (0, 0))
+    out_tiles = jnp.pad(out, pad).reshape(-1, 32, dim)
+    grad_tiles = jnp.pad(grad_out, pad).reshape(-1, 32, dim)
+    dots = jnp.einsum(
+        "bid,bjd->bij",
+        out_tiles,
+        grad_tiles,
+        preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return (
+        jnp.diagonal(dots, axis1=-2, axis2=-1).reshape(batch, padded_len, heads).transpose(0, 2, 1)
+    )
+
+
+def pad_softmax_stats(softmax_stats, padded_len):
+    if not softmax_stats or softmax_stats[0].shape[-1] == padded_len:
+        return softmax_stats
+    pad = ((0, 0), (0, 0), (0, padded_len - softmax_stats[0].shape[-1]))
+    row_max, inv_sum = softmax_stats
+    return jnp.pad(row_max, pad, constant_values=jnp.inf), jnp.pad(inv_sum, pad)
+
+
 def build_dense_block_sparse_layout(seq_len, hist_len, num_q_heads, hist_valid_len):
     block = 128
     cand_len = seq_len - hist_len
@@ -180,6 +206,7 @@ def fwd_launcher(arch, head_dim, qhead_per_kvhead, use_pack_gqa, score_mod):
         mValidLower: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
+        *softmax_stats,
         softmax_scale: cutlass.Float32,
     ):
         bs = BlockSparseTensors(
@@ -197,16 +224,29 @@ def fwd_launcher(arch, head_dim, qhead_per_kvhead, use_pack_gqa, score_mod):
             valid_block_upper=mValidUpper,
             valid_block_lower=mValidLower,
         )
-        fa_fwd(
-            mQ,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            softmax_scale,
-            blocksparse_tensors=bs,
-            stream=stream,
-        )
+        if cutlass.const_expr(len(softmax_stats) == 2):
+            fa_fwd(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                softmax_scale,
+                blocksparse_tensors=bs,
+                mSoftmaxStats=softmax_stats,
+                stream=stream,
+            )
+        else:
+            fa_fwd(
+                mQ,
+                mK,
+                mV,
+                mO,
+                mLSE,
+                softmax_scale,
+                blocksparse_tensors=bs,
+                stream=stream,
+            )
 
     return launch_fwd
 
@@ -227,12 +267,14 @@ def ranker_attention_fa4(
     import cutlass.cute as cute
     from cutlass.jax import cutlass_call
 
+    from xrex.cutedsl.ranker_attention_varlen_fa4 import zeros_after
     from xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
     from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
     from xrex.cutedsl.ranker_fa4.utils import create_cap_scoremods
 
     arch = cutedsl_arch()
+    centered_stats = arch in (90, 100)
     score_mod, score_mod_bwd = create_cap_scoremods(cap, cap_method)
     cap_key = (float(cap), cap_method) if score_mod is not None else None
     if score_mod is not None and arch == 80:
@@ -301,7 +343,8 @@ def ranker_attention_fa4(
             output_shape_dtype=[
                 jax.ShapeDtypeStruct(q_shape, jnp.bfloat16),
                 jax.ShapeDtypeStruct(lse_shape, jnp.float32),
-            ],
+            ]
+            + ([jax.ShapeDtypeStruct(lse_shape, jnp.float32)] * 2 if centered_stats else []),
             use_static_tensors=False,
             softmax_scale=cutlass.Float32(sm_scale),
         )
@@ -431,11 +474,10 @@ def ranker_attention_fa4(
             mDiagIdx: cute.Tensor,
             mValidUpper: cute.Tensor,
             mValidLower: cute.Tensor,
-            mdQa: cute.Tensor,
-            mdKa: cute.Tensor,
-            mdVa: cute.Tensor,
+            *rest,
             softmax_scale: cutlass.Float32,
         ):
+            mdQa, mdKa, mdVa = rest[-3], rest[-2], rest[-1]
             bs = BlockSparseTensors(
                 mask_block_cnt=mMaskCnt,
                 mask_block_idx=mMaskIdx,
@@ -451,20 +493,37 @@ def ranker_attention_fa4(
                 valid_block_upper=mValidUpper,
                 valid_block_lower=mValidLower,
             )
-            fa_bwd(
-                mQ,
-                mK,
-                mV,
-                mdO,
-                mLSE,
-                mdPsum,
-                mdQa,
-                mdKa,
-                mdVa,
-                softmax_scale,
-                blocksparse_tensors=bs,
-                stream=stream,
-            )
+            if cutlass.const_expr(centered_stats):
+                fa_bwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mdO,
+                    mLSE,
+                    mdPsum,
+                    mdQa,
+                    mdKa,
+                    mdVa,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    mSoftmaxStats=(rest[0], rest[1]),
+                    stream=stream,
+                )
+            else:
+                fa_bwd(
+                    mQ,
+                    mK,
+                    mV,
+                    mdO,
+                    mLSE,
+                    mdPsum,
+                    mdQa,
+                    mdKa,
+                    mdVa,
+                    softmax_scale,
+                    blocksparse_tensors=bs,
+                    stream=stream,
+                )
 
         bwd_call = cutlass_call(
             launch_bwd,
@@ -473,7 +532,9 @@ def ranker_attention_fa4(
                 dkv_out,
                 dkv_out,
             ],
-            input_output_aliases={14: 0, 15: 1, 16: 2},
+            input_output_aliases=(
+                {16: 0, 17: 1, 18: 2} if centered_stats else {14: 0, 15: 1, 16: 2}
+            ),
             use_static_tensors=False,
             softmax_scale=cutlass.Float32(sm_scale),
         )
@@ -564,8 +625,7 @@ def ranker_attention_fa4(
             post_dk_call=post_dk_call,
             post_dv_call=post_dv_call,
             dKV_postprocess=dKV_postprocess,
-            dkv_shape=dkv_out.shape,
-            dkv_dtype=dkv_out.dtype,
+            dkv_out=dkv_out,
         )
 
     c = _FA4_KERNEL_CACHE[cache_key]
@@ -574,26 +634,28 @@ def ranker_attention_fa4(
     def _attention(q, k, v, *bs_args):
         fbs = bs_args[:6]
         valid_bounds = bs_args[12:]
-        out, _lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
+        out, *_stats = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
         return out
 
     def _attention_fwd(q, k, v, *bs_args):
         fbs = bs_args[:6]
         valid_bounds = bs_args[12:]
-        out, lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
+        out, lse, *softmax_stats = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
         out = checkpoint_name(out, "cutedsl_attn_outputs")
         lse = checkpoint_name(lse, "cutedsl_attn_outputs")
-        return out, (q, k, v, out, lse, bs_args)
+        softmax_stats = tuple(checkpoint_name(t, "cutedsl_attn_outputs") for t in softmax_stats)
+        return out, (q, k, v, out, lse, softmax_stats, bs_args)
 
     def _attention_bwd(res, g):
-        q, k, v, out, lse, bs_args = res
+        q, k, v, out, lse, softmax_stats, bs_args = res
         bbs = bs_args[6:12]
         valid_bounds = bs_args[12:]
 
-        dpsum, lse_log2, dq_accum_init = c["pre_call"](out, g.astype(out.dtype), lse)
+        _, lse_log2, dq_accum_init = c["pre_call"](out, g.astype(out.dtype), lse)
+        dpsum = attention_delta(out, g, sr_q)
+        softmax_stats = pad_softmax_stats(softmax_stats, sr_q)
 
-        dk_init = jnp.zeros(c["dkv_shape"], dtype=c["dkv_dtype"])
-        dv_init = jnp.zeros_like(dk_init)
+        dk_init, dv_init = zeros_after(g, c["dkv_out"], c["dkv_out"])
         dq_accum, dk, dv = c["bwd_call"](
             q,
             k,
@@ -603,6 +665,7 @@ def ranker_attention_fa4(
             dpsum,
             *bbs,
             *valid_bounds,
+            *softmax_stats,
             dq_accum_init,
             dk_init,
             dv_init,

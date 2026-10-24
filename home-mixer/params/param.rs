@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-22T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-10-23T16:00:34Z
 use xai_feature_switches::param;
 
 param!(
@@ -868,7 +868,7 @@ param!(
     EnableAdsFunnelTrace,
     bool,
     "rust_home_mixer_enable_ads_funnel_trace",
-    false
+    true
 );
 
 param!(

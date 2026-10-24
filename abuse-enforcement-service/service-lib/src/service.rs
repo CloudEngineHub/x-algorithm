@@ -4743,4 +4743,47 @@ mod tests {
         assert!(note.ends_with(']'));
         assert!(note.contains("[env: "));
     }
+
+                #[tokio::test]
+    async fn the_router_refuses_every_protected_operation_without_a_key() {
+        use utoipa::OpenApi;
+        let mut cfg: crate::config::Config = clap::Parser::parse_from::<_, &str>(["bin"]);
+        cfg.api_keys_json = Some(r#"{"test":"tok-test"}"#.into());
+        let keys = crate::auth::ApiKeys::from_config(&cfg).unwrap();
+        let router = crate::build_api_router(test_state(json!({}), None, None).await, keys);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let doc = serde_json::to_value(crate::api_doc::ApiDoc::openapi()).unwrap();
+        let mut checked = 0;
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            let concrete = path
+                .replace("{entity_type}", "user")
+                .replace("{entity_id}", "1")
+                .replace("{user_id}", "1")
+                .replace("{run_id}", "run-1")
+                .replace("{change}", "stop")
+                .replace("{field}", "dry_run");
+            for (method, op) in item.as_object().unwrap() {
+                let protected = op
+                    .get("security")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                let method = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).unwrap();
+                let mut req = client.request(method.clone(), format!("http://{addr}{concrete}"));
+                if method != reqwest::Method::GET && method != reqwest::Method::DELETE {
+                    req = req.json(&json!({}));
+                }
+                let status = req.send().await.unwrap().status();
+                assert_eq!(
+                    status == reqwest::StatusCode::UNAUTHORIZED,
+                    protected,
+                    "{method} {path} answered {status}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "only {checked} operations in the API doc");
+    }
 }

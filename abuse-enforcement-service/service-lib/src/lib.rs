@@ -58,7 +58,6 @@ use crate::dedup_cache::{DedupCheck, DedupSlot};
 use anyhow::{Context, Result};
 use axum::Router;
 
-use clap::Parser;
 use futures::future::join_all;
 use prost::Message;
 use serde::Deserialize;
@@ -70,7 +69,6 @@ use xai_kafka::{
     KafkaConsumerConfigBuilder, KafkaMessage, KafkaProducer, KafkaProducerConfigBuilder,
     apply_auth_config, resolve_kafka_brokers, run_batch_consumer, self_delete_pod,
 };
-use xai_service_runner::{ServerBuilder, ServerInfo};
 
 #[allow(deprecated)]
 use xai_strato::{Strato, StratoClientConfig};
@@ -93,7 +91,6 @@ use crate::strato::{
 };
 
 const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
-const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 
 #[derive(Debug, Deserialize)]
@@ -1402,6 +1399,9 @@ fn env_info(ctx: &EnforcementCtx) -> BTreeMap<String, String> {
     BTreeMap::from([("env".to_owned(), ctx.action_control.env.clone())])
 }
 
+// A decision that carries a policy version comes from an upstream decision
+// producer that is not part of this release. Such decisions act only
+// through their head's action-control rows.
 fn is_factory_message(score: &abuse_proto::ScoreResult) -> bool {
     !score.policy_version.is_empty()
 }
@@ -2400,14 +2400,26 @@ async fn finish_state(
     ));
     head_guard.spawn_refresh(dynamic_config.clone());
 
-    let action_control = Arc::new(action_control::ActionControl::new(
-        Arc::new(action_control::ManhattanControlStore::new(
-            mh_client.clone(),
-            mh_tenant.clone(),
-        )),
-        std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned()),
-        std::env::var("HOSTNAME").unwrap_or_default(),
-    ));
+    let rollout_salt = std::env::var(action_control::ROLLOUT_SALT_ENV).unwrap_or_default();
+    info!(
+        "action control: rollout buckets are {}",
+        if rollout_salt.is_empty() {
+            "unsalted"
+        } else {
+            "salted"
+        }
+    );
+    let action_control = Arc::new(
+        action_control::ActionControl::new(
+            Arc::new(action_control::ManhattanControlStore::new(
+                mh_client.clone(),
+                mh_tenant.clone(),
+            )),
+            std::env::var("NAMESPACE").unwrap_or_else(|_| "local".to_owned()),
+            std::env::var("HOSTNAME").unwrap_or_default(),
+        )
+        .with_rollout_salt(rollout_salt),
+    );
     if dynamic_config.action_control_config().ignore_store {
         warn!(
             "action control: GrowthBook {}.ignore_store is set; page records are ignored and recording-only heads follow the GrowthBook rules",
@@ -3491,47 +3503,6 @@ fn spawn_config_refresh_with(
             }
         }
     })
-}
-
-pub async fn serve(router: Router, state: Arc<service::AppState>, cfg: Config) -> Result<()> {
-    let server = ServerBuilder::new(cfg.port)
-        .merge(router)
-        .drain_period(Duration::from_secs(cfg.drain_period_secs))
-        .info(ServerInfo::new(SERVICE_NAME, SERVICE_VERSION))
-        .on_ready(|| async {
-            info!("Server ready and accepting requests");
-        });
-    spawn_config_refresh(&state, server.shutdown_signal());
-    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());
-    let served = server.run().await;
-    let kafka = shutdown_kafka_startup(&state, kafka).await;
-    served?;
-    kafka
-}
-
-pub async fn run() -> Result<()> {
-    init_runtime_globals();
-
-    let cfg = Config::parse();
-    let (state, cfg) = build_state(cfg).await?;
-    let api_keys = auth::ApiKeys::from_config(&cfg)?;
-    if api_keys.is_empty() {
-        warn!(
-            "API_KEYS_JSON is empty — every request to the protected admin \
-             endpoints (/action, /config*, /allowlist*) will return 401"
-        );
-    } else {
-        info!(
-            key_ids = ?api_keys.configured_key_ids(),
-            "api-key auth configured for protected admin endpoints"
-        );
-    }
-    let router = Router::new()
-        .nest("/api", build_api_router(state.clone(), api_keys))
-        .merge(build_docs_router());
-    serve(router, state, cfg).await?;
-    info!("Server shutdown complete");
-    Ok(())
 }
 
 #[cfg(test)]

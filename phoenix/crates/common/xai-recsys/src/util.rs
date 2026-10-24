@@ -40,6 +40,8 @@ pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
     tweet_id == WEB_CONV_FAKE_TWEET_ID || has_conv_bit
 }
 
+pub const WEB_CONV_URL_ID_COLUMN: &str = "webConvUrlId";
+
 pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
     ids.filter(|ids| {
         ids.asset_id.len() == ids.author_id.len()
@@ -473,6 +475,7 @@ pub struct InputBuffer {
     pub user_conversion_history_hashes: Vec<i32>,
     pub candidate_account_hashes: Vec<i32>,
     pub history_post_ids: Vec<i64>,
+    pub history_web_conv_url_ids: Vec<(u32, i64)>,
     pub history_semantic_ids: Vec<u16>,
     pub candidate_semantic_ids: Vec<u16>,
     pub num_history: usize,
@@ -1208,6 +1211,7 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             history_post_ids,
+            history_web_conv_url_ids: Vec::new(),
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
@@ -1373,6 +1377,7 @@ impl InputBuffer {
                     user_conversion_history_hashes,
                     candidate_account_hashes,
                     history_post_ids: vec![0i64; history_seq_len],
+                    history_web_conv_url_ids: Vec::new(),
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
                     candidate_semantic_ids,
                     num_history: 0,
@@ -1399,6 +1404,8 @@ impl InputBuffer {
         let col_repost_count = typed_column::<Int64Array>(&batch, REPOST_COUNT_SEQ_COLUMN);
         let col_quote_count = typed_column::<Int64Array>(&batch, QUOTE_COUNT_SEQ_COLUMN);
         let col_view_count = typed_column::<Int64Array>(&batch, VIEW_COUNT_SEQ_COLUMN);
+        let col_web_conv_url_id = typed_column::<Int64Array>(&batch, WEB_CONV_URL_ID_COLUMN);
+        let mut history_web_conv_url_ids = Vec::new();
         let col_web_conv_tracking_integration =
             typed_column::<Int32Array>(&batch, WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN);
         let col_web_conv_time_on_site = [
@@ -1496,6 +1503,12 @@ impl InputBuffer {
                 && !code.is_null(row_idx)
             {
                 history_web_conv_tracking_integration[valid_entry_count] = code.value(row_idx);
+            }
+            if let Some(url_id) = col_web_conv_url_id
+                && !url_id.is_null(row_idx)
+                && url_id.value(row_idx) != 0
+            {
+                history_web_conv_url_ids.push((valid_entry_count as u32, url_id.value(row_idx)));
             }
 
             stamp_engagement_counts(
@@ -1659,6 +1672,7 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             history_post_ids,
+            history_web_conv_url_ids,
             history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
@@ -2460,6 +2474,68 @@ mod tests {
             );
             assert_eq!(0, history_cat(&buf, row));
         }
+    }
+
+    #[test]
+    fn columnar_history_web_conv_url_ids_follow_kept_positions() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let to_bytes = |batch: &RecordBatch| {
+            let mut bytes = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(batch).unwrap();
+            writer.finish().unwrap();
+            bytes
+        };
+        let ids = || -> Vec<Arc<dyn arrow::array::Array>> {
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 0, 13, 14])),
+                Arc::new(Int64Array::from(vec![21i64, 22, 23, 24])),
+            ]
+        };
+        let id_fields = || {
+            vec![
+                Field::new("tweetId", DataType::Int64, false),
+                Field::new("authorId", DataType::Int64, false),
+            ]
+        };
+        let mut fields = id_fields();
+        fields.push(Field::new(WEB_CONV_URL_ID_COLUMN, DataType::Int64, true));
+        let mut columns = ids();
+        columns.push(Arc::new(Int64Array::from(vec![
+            Some(-1_392_645_021_888_827_343i64),
+            Some(99),
+            None,
+            Some(7),
+        ])));
+        let with_column = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let without_column =
+            RecordBatch::try_new(Arc::new(Schema::new(id_fields())), ids()).unwrap();
+
+        let model_config = test_history_model_config();
+        let compute = |batch: &RecordBatch| {
+            InputBuffer::compute_from_columnar_bytes(
+                &model_config,
+                &to_bytes(batch),
+                &pb::CandidateSet::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let buf = compute(&with_column);
+        assert_eq!(buf.num_history, 3);
+        assert_eq!(
+            buf.history_web_conv_url_ids,
+            vec![(0, -1_392_645_021_888_827_343), (2, 7)]
+        );
+        assert!(compute(&without_column).history_web_conv_url_ids.is_empty());
     }
 
     #[test]

@@ -39,6 +39,7 @@ const SAVE_BUDGET: Duration = Duration::from_secs(110);
 pub const HISTORY_PKEY_PREFIX: &str = "action_control_history:";
 pub const CONFIG_KEY: &str = "action_control";
 pub const DRY_RUN_LABEL_PREFIX: &str = "dry_run__";
+pub const ROLLOUT_SALT_ENV: &str = "ACTION_CONTROL_ROLLOUT_SALT";
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
@@ -717,6 +718,7 @@ pub struct ActionControl {
     save_budget: Duration,
     pub env: String,
     pub pod: String,
+        rollout_salt: String,
     seen_guard: Mutex<HashMap<String, Instant>>,
     seen_tx: mpsc::Sender<SeenWrite>,
     seen_rx: Mutex<Option<mpsc::Receiver<SeenWrite>>>,
@@ -884,12 +886,18 @@ impl ActionControl {
             save_budget: SAVE_BUDGET,
             env,
             pod,
+            rollout_salt: String::new(),
             seen_guard: Mutex::new(HashMap::new()),
             seen_tx,
             seen_rx: Mutex::new(Some(seen_rx)),
             #[cfg(test)]
             age_offset: Mutex::new(Duration::ZERO),
         }
+    }
+
+            pub fn with_rollout_salt(mut self, salt: String) -> Self {
+        self.rollout_salt = salt;
+        self
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -1003,6 +1011,7 @@ impl ActionControl {
                 factory: input.factory,
                 stale,
                 author_id: input.author_id,
+                rollout_salt: &self.rollout_salt,
             },
             &claim(),
             cfg,
@@ -1105,6 +1114,7 @@ impl ActionControl {
                 factory: input.factory,
                 stale,
                 author_id: input.author_id,
+                rollout_salt: &self.rollout_salt,
             },
             &claim,
             cfg,
@@ -5888,7 +5898,7 @@ mod tests {
         let mut inside = 0;
         for id in 0..4_000i64 {
             let r = by_author(&ac, id);
-            if in_rollout(Some(500), "H", id) {
+            if in_rollout(Some(500), "", "H", id) {
                 inside += 1;
                 assert_eq!((r.mode, r.forced), (ControlMode::Live, None), "{id}");
             } else {
@@ -5902,9 +5912,35 @@ mod tests {
             assert_eq!(r.page_actions, vec![SUSPEND], "{id}");
             let keys = r.info_keys();
             assert!(keys.contains(&("rollout_bp".into(), "500".into())));
-            assert!(keys.contains(&("rollout_bucket".into(), rollout_bucket("H", id).to_string())));
+            assert!(keys.contains(&(
+                "rollout_bucket".into(),
+                rollout_bucket("", "H", id).to_string()
+            )));
         }
         assert!((120..280).contains(&inside), "{inside} of 4,000 inside 5%");
+    }
+
+            #[tokio::test]
+    async fn a_salted_pod_places_accounts_by_the_salted_bucket() {
+        let store = Arc::new(MemControlStore::default());
+        store.put_record(&record("H", None, None, ControlMode::Rows, vec![]));
+        store.put_record(&ActionControlRecord {
+            rollout_bp: Some(5_000),
+            ..row_rec("H", LevelRow::Missing, ControlMode::Live, vec![SUSPEND])
+        });
+        let ac = ActionControl::new(store, "prod".into(), "pod-0".into())
+            .with_rollout_salt("test-salt".into());
+        ac.refresh().await.unwrap();
+        let mut moved = 0;
+        for id in 0..2_000i64 {
+            let r = by_author(&ac, id);
+            let inside = in_rollout(Some(5_000), "test-salt", "H", id);
+            assert_eq!(r.forced.is_none(), inside, "{id}");
+            let bucket = rollout_bucket("test-salt", "H", id).to_string();
+            assert!(r.info_keys().contains(&("rollout_bucket".into(), bucket)));
+            moved += usize::from(inside != in_rollout(Some(5_000), "", "H", id));
+        }
+        assert!(moved > 0, "the salt changes which accounts are inside");
     }
 
     #[tokio::test]
@@ -5970,7 +6006,7 @@ mod tests {
         assert_eq!((low.rollout_bp, low.v), (None, ROWS_RECORD_VERSION));
         assert_eq!(stored(LevelRow::High).rollout_bp, None);
         let r = by_author(&ac, 7);
-        assert_eq!(r.forced.is_none(), in_rollout(Some(100), "H", 7));
+        assert_eq!(r.forced.is_none(), in_rollout(Some(100), "", "H", 7));
     }
 
     #[tokio::test]
@@ -6130,7 +6166,7 @@ mod tests {
         };
         let on = set_at(&ac, on, NOW_MS + ROLLOUT_WAIT_MS).await;
         assert!(on.is_ok(), "{on:?}");
-        assert!(in_rollout(Some(500), "H", 7) == by_author(&ac, 7).forced.is_none());
+        assert!(in_rollout(Some(500), "", "H", 7) == by_author(&ac, 7).forced.is_none());
     }
 
             async fn log_only_at_now() -> (Arc<ActionControl>, Arc<MemControlStore>) {

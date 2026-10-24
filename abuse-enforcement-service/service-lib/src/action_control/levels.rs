@@ -179,6 +179,7 @@ pub(super) struct RowContext<'a> {
     pub factory: bool,
     pub stale: bool,
         pub author_id: i64,
+        pub rollout_salt: &'a str,
 }
 
 fn logged(
@@ -290,8 +291,11 @@ pub(super) fn resolve_rows(
         return Some(logged(matched, actions, Some(why), outcome));
     }
     if let Some(bp) = record.rollout_bp {
-        let inside = record.rollout_takes(m.author_id);
-        outcome.rollout = Some((bp, rollout_bucket(&record.head, m.author_id)));
+        let inside = record.rollout_takes(m.rollout_salt, m.author_id);
+        outcome.rollout = Some((
+            bp,
+            rollout_bucket(m.rollout_salt, &record.head, m.author_id),
+        ));
         metrics::ACTION_CONTROL_ROLLOUT_TOTAL
             .with_label_values(&[
                 record.head.as_str(),

@@ -453,6 +453,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]] = None,
         stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
@@ -483,6 +484,13 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        if const_expr(mSoftmaxStats is not None):
+            assert not self.is_split_kv, "Centered statistics require an unsplit forward"
+            assert self.q_dtype.width == 16, "Centered statistics require 16-bit Q/K/V"
+            mSoftmaxStats = tuple(
+                cute.make_tensor(t.iterator, cute.select(t.layout, mode=LSE_layout_transpose))
+                for t in mSoftmaxStats
+            )
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
@@ -612,6 +620,11 @@ class FlashAttentionForwardSm100:
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+            if const_expr(mSoftmaxStats is not None):
+                mSoftmaxStats = tuple(
+                    pack_gqa_layout(t, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+                    for t in mSoftmaxStats
+                )
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
@@ -794,6 +807,7 @@ class FlashAttentionForwardSm100:
             mV,
             mO,
             mLSE,
+            mSoftmaxStats,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -840,6 +854,7 @@ class FlashAttentionForwardSm100:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1284,6 +1299,7 @@ class FlashAttentionForwardSm100:
                 sScale,
                 mO,
                 mLSE,
+                mSoftmaxStats,
                 sO,
                 pipeline_s_p_o,
                 pipeline_o_acc,
@@ -2230,6 +2246,7 @@ class FlashAttentionForwardSm100:
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         sO: cute.Tensor,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
@@ -2493,11 +2510,25 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx, split_idx])
                     else:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
+                if const_expr(mSoftmaxStats is not None):
+                    if const_expr(not seqlen.has_cu_seqlens_q):
+                        stat_rows = tuple(t[None, head_idx, batch_idx] for t in mSoftmaxStats)
+                    else:
+                        stat_rows = tuple(
+                            cute.domain_offset((offset,), t[None, head_idx]) for t in mSoftmaxStats
+                        )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (
                         m_block * self.q_stage + stage
                     ) * self.cta_group_size + mma_tile_coord_v
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
+                    if const_expr(mSoftmaxStats is not None):
+                        saved_max = row_max if not acc_O_mn_row_is_zero_or_nan else Float32.inf
+                        saved_inv_sum = (
+                            cute.arch.rcp_approx(row_sum)
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else Float32(0.0)
+                        )
                     LN2 = math.log(2.0)
                     lse = (
                         (
@@ -2519,6 +2550,14 @@ class FlashAttentionForwardSm100:
                         gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
                         if tidx < seqlen_q - m_tile_idx * self.m_block_size:
                             gLSE[tidx] = lse
+                            if const_expr(mSoftmaxStats is not None):
+                                for stat_idx in cutlass.range_constexpr(2):
+                                    gStat = cute.local_tile(
+                                        stat_rows[stat_idx], (self.m_block_size,), (m_tile_idx,)
+                                    )
+                                    gStat[tidx] = (
+                                        saved_max if const_expr(stat_idx == 0) else saved_inv_sum
+                                    )
                     else:
                         idx = m_tile_idx * self.m_block_size + tidx
                         if idx < seqlen_q:
@@ -2532,6 +2571,12 @@ class FlashAttentionForwardSm100:
                                 assumed_align=4,
                             )
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+                            if const_expr(mSoftmaxStats is not None):
+                                for stat_idx in cutlass.range_constexpr(2):
+                                    ptr = utils.elem_pointer(stat_rows[stat_idx], ((h_idx, m_idx),))
+                                    cute.make_tensor(ptr, (1,))[0] = (
+                                        saved_max if const_expr(stat_idx == 0) else saved_inv_sum
+                                    )
 
             work_tile = tile_scheduler.advance_to_next_work()
 

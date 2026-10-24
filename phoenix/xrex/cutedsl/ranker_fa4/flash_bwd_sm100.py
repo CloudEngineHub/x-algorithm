@@ -33,7 +33,7 @@
 # Copyright 2026 X.AI Corp.
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -453,6 +453,7 @@ class FlashAttentionBackwardSm100:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]] = None,
         stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
@@ -489,6 +490,11 @@ class FlashAttentionBackwardSm100:
             for t in (mLSE, mdPsum, mdQaccum)
         ]
 
+        if const_expr(mSoftmaxStats is not None):
+            assert mCuSeqlensQ is None and mCuSeqlensK is None
+            mSoftmaxStats = tuple(
+                layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in mSoftmaxStats
+            )
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
         else:
@@ -906,6 +912,7 @@ class FlashAttentionBackwardSm100:
             tma_tensor_Kt,
             tma_tensor_V,
             mLSE,
+            mSoftmaxStats,
             mdPsum,
             tma_tensor_dO,
             tma_tensor_dOt,
@@ -979,6 +986,7 @@ class FlashAttentionBackwardSm100:
         mKt: Optional[cute.Tensor],
         mV: cute.Tensor,
         mLSE: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         mdPsum: cute.Tensor,
         mdO: cute.Tensor,
         mdOt: Optional[cute.Tensor],
@@ -1490,6 +1498,7 @@ class FlashAttentionBackwardSm100:
                 tdVtdV,
                 tdKtdK,
                 sLSE,
+                mSoftmaxStats,
                 sdPsum,
                 mdV,
                 mdK,
@@ -2593,6 +2602,7 @@ class FlashAttentionBackwardSm100:
         tdVtdV: cute.Tensor,
         tdKtdK: cute.Tensor,
         sLSE: cute.Tensor,
+        mSoftmaxStats: Optional[Tuple[cute.Tensor, cute.Tensor]],
         sdPsum: cute.Tensor,
         mdV: cute.Tensor,
         mdK: cute.Tensor,
@@ -2854,36 +2864,54 @@ class FlashAttentionBackwardSm100:
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
-                    if const_expr(not self.shuffle_LSE):
-                        if const_expr(stage > 0 or not prefetch_LSE):
-                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
-                        tSrLSE = tSrLSE_s2r
+                    if const_expr(mSoftmaxStats is not None):
+                        row = m_block * self.tile_m + tScS_t2r[lane_idx, stage, 0, 0][1]
+                        row_max_lane, inv_sum_lane = Float32.inf, Float32(0.0)
+                        if row < seqlen.seqlen_q:
+                            row_max_lane = mSoftmaxStats[0][row, head_idx, batch_idx]
+                            inv_sum_lane = mSoftmaxStats[1][row, head_idx, batch_idx]
                     else:
-                        tSrLSE = tSsLSE_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                        tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                         if const_expr(not self.shuffle_LSE):
-                            lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            if const_expr(stage > 0 or not prefetch_LSE):
+                                cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                            tSrLSE = tSrLSE_s2r
                         else:
-                            lse_pair = (
-                                utils.shuffle_sync(tSrLSE, offset=2 * v),
-                                utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            tSrLSE = tSsLSE_cur[lane_idx]
+                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                        if const_expr(mSoftmaxStats is not None):
+                            for lane in cutlass.range_constexpr(2):
+                                idx = 2 * v + lane
+                                row_max = utils.shuffle_sync(row_max_lane, offset=idx)
+                                inv_sum = utils.shuffle_sync(inv_sum_lane, offset=idx)
+                                centered = tSrS_cur[idx] - row_max
+                                tSrS_cur[idx] = (
+                                    cute.math.exp2(centered * softmax_scale_log2, fastmath=True)
+                                    * inv_sum
+                                )
+                        else:
+                            if const_expr(not self.shuffle_LSE):
+                                lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            else:
+                                lse_pair = (
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v),
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                                )
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
+                                (softmax_scale_log2, softmax_scale_log2),
+                                (-lse_pair[0], -lse_pair[1]),
                             )
-                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
-                            ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
-                            (softmax_scale_log2, softmax_scale_log2),
-                            (-lse_pair[0], -lse_pair[1]),
-                        )
-                        tSrS_cur[2 * v] = (
-                            Float32(0.0)
-                            if lse_pair[0] == -Float32.inf
-                            else cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
-                        )
-                        tSrS_cur[2 * v + 1] = (
-                            Float32(0.0)
-                            if lse_pair[1] == -Float32.inf
-                            else cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                        )
+                            tSrS_cur[2 * v] = (
+                                Float32(0.0)
+                                if lse_pair[0] == -Float32.inf
+                                else cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                            )
+                            tSrS_cur[2 * v + 1] = (
+                                Float32(0.0)
+                                if lse_pair[1] == -Float32.inf
+                                else cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                            )
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()

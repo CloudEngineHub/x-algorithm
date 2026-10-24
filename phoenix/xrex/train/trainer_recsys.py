@@ -32,6 +32,7 @@ from jax import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import (
     NamedSharding,
+    SingleDeviceSharding,
 )
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import DictKey, GetAttrKey, SequenceKey
@@ -73,7 +74,8 @@ from xrex.data.streaming.kafkaloader import PhoenixKafkaDataset, report_training
 from xrex.eval.eval_utils import report_forward_eval_results
 from xrex.eval.metrics_recsys import merge_report_extras
 from xrex.eval.recsys_eval import RecsysTwoTowerEval, run_recsys_evals
-from xrex.models.compress_token_ids import compress_token_ids
+from xrex.models.compress_token_ids import compress_token_ids, compress_token_ids_by_search
+from xrex.models.fp8 import Fp8Gemms, check_compiled_fp8_gemms
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.recsys_embedding import (
     EmbTable,
@@ -104,6 +106,7 @@ from xrex.train.trainer import (
 from xrex.utils import recsys_async_emb
 from xrex.utils.aot import JittedOrCompiled
 from xrex.utils.checkpointing import wait_until_finished
+from xrex.utils.coalesced_device_put import device_put_coalesced, precompile_device_put_coalesced
 from xrex.utils.gpu import peak_tflops
 from xrex.utils.metrics import norm_metrics
 from xrex.utils.utils import (
@@ -329,6 +332,84 @@ def _write_all_bytes(path: str, mv: memoryview, chunk_size: int = 1 << 30) -> No
         )
 
 
+_CHECKSUM_PARTS_KV_DIR = "recsys-shm-checksum-parts"
+_ROW_SHARDED_CHECKSUM_KEYS = ("emb_table", "post_embeddings.embeddings")
+
+
+def _shard_position(value: jax.Array) -> tuple[int, int, int] | None:
+    index = value.addressable_shards[0].index
+    sharded_axes = [axis for axis, index_slice in enumerate(index) if index_slice != slice(None)]
+    if not sharded_axes:
+        return None
+    axis = sharded_axes[0]
+    width = index[axis].stop - index[axis].start
+    return axis, index[axis].start // width, value.shape[axis] // width
+
+
+def _local_checksums(
+    write_items: Sequence[tuple[str, jax.Array, npt.NDArray]], checksum_replicated: bool
+) -> tuple[dict[str, int], dict[str, list[int]]]:
+    checksums, parts = {}, {}
+    for key, value, arr in write_items:
+        arr_bytes = np.ndarray(shape=arr.nbytes, dtype=np.uint8, buffer=arr)
+        shard_position = _shard_position(value)
+        if shard_position is None:
+            if checksum_replicated:
+                checksums[key] = xai_recsys_engine.adler32_parallel(arr_bytes)
+        elif key in _ROW_SHARDED_CHECKSUM_KEYS:
+            parts[key] = [xai_recsys_engine.adler32_parallel(arr_bytes), arr.nbytes]
+        else:
+            _, shard_index, _ = shard_position
+            shard_row_bytes, row_bytes = arr.shape[1] * arr.itemsize, value.shape[1] * arr.itemsize
+            parts[key] = xai_recsys_engine.adler32_shard_partial(
+                arr_bytes,
+                shard_row_bytes,
+                shard_index,
+                row_bytes,
+                128,
+            ).tolist()
+    return checksums, parts
+
+
+def _combine_checksums(
+    write_items: Sequence[tuple[str, jax.Array, npt.NDArray]],
+    checksums: dict[str, int],
+    parts_by_process: Sequence[dict[str, list[int]]],
+) -> dict[str, int]:
+    combined = {}
+    for key, value, _ in write_items:
+        shard_position = _shard_position(value)
+        if shard_position is None:
+            combined[key] = checksums[key]
+            continue
+        _, _, num_shards = shard_position
+        first_process_of_each_shard = parts_by_process[:: len(parts_by_process) // num_shards]
+        shard_parts = [process_parts[key] for process_parts in first_process_of_each_shard]
+        if key in _ROW_SHARDED_CHECKSUM_KEYS:
+            checksum = shard_parts[0][0]
+            for shard_checksum, length in shard_parts[1:]:
+                checksum = xai_recsys_engine.adler32_combine_py(checksum, shard_checksum, length)
+        else:
+            checksum = xai_recsys_engine.adler32_combine_partials(
+                np.array(shard_parts, dtype=np.uint32), value.nbytes
+            )
+        combined[key] = checksum
+    return combined
+
+
+_ALLOCATOR_ROUNDING_BYTES = 256
+_ALLOCATOR_SPLIT_BYTES = 128 << 20
+_ANCHOR_BYTES = 64 << 20
+_SMALL_BUFFER_REGION_BYTES = 256 << 20
+
+
+def _device_zeros(num_bytes: int, device: jax.Device) -> jax.Array:
+    zeros = jax.jit(
+        lambda: jnp.zeros((num_bytes,), jnp.uint8), out_shardings=SingleDeviceSharding(device)
+    )
+    return zeros().block_until_ready()
+
+
 def _read_checkpoint_kafka_config(ctx) -> tuple[str | None, int | None]:
     if ctx.checkpoint is None:
         return None, None
@@ -403,7 +484,7 @@ class RecsysTrainer(Trainer):
     )
     _candidate_size_round: int = field(default=0, init=False, repr=False)
     _async_emb_lookup_pin: jax.Array | None = field(default=None, init=False, repr=False)
-    _small_buffer_anchor: jax.Array | None = field(default=None, init=False, repr=False)
+    _allocator_anchors: list[jax.Array] = field(default_factory=list, init=False, repr=False)
     _batch_pipeline: BatchPipelineState = field(
         default_factory=BatchPipelineState, init=False, repr=False
     )
@@ -963,6 +1044,17 @@ class RecsysTrainer(Trainer):
             batch["user_ip_hashes"][drop_mask] = 0
         return n_dropped
 
+    def _precompile_batch_transfer(self) -> None:
+        if len(self.mesh.local_devices) != 1:
+            return
+        microbatch_size = self.read_bsz_per_process // self.num_microbatch
+        candidate_sizes = self.seqpack_candidate_count if self.seqpack_candidate_packing else [None]
+        for candidate_tokens_per_user in candidate_sizes:
+            microbatch = self.example_data(microbatch_size, candidate_tokens_per_user)
+            precompile_device_put_coalesced(
+                [microbatch] * self.num_microbatch, self.mesh.local_devices[0]
+            )
+
     def dataset_with_prepare(
         self,
         dataset: Iterator[tuple[RecsysFeaturesBatch, dict[int, int] | None]],
@@ -986,12 +1078,19 @@ class RecsysTrainer(Trainer):
             microbatches.append((batch, offsets))
             if len(microbatches) == self.num_microbatch:
                 candidate_tokens_per_user = self._step_candidate_tokens_per_user(
-                    [b for b, _ in microbatches]
+                    [microbatch for microbatch, _ in microbatches]
                 )
-                microbatches = [
-                    (self.transform_batch(b, candidate_tokens_per_user), o) for b, o in microbatches
+                packed_batches = [
+                    self.transform_batch(microbatch, candidate_tokens_per_user)
+                    for microbatch, _ in microbatches
                 ]
-                for packed, packed_offsets in microbatches:
+                if len(self.mesh.local_devices) == 1 and all(
+                    isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(packed_batches)
+                ):
+                    packed_batches = device_put_coalesced(
+                        packed_batches, self.mesh.local_devices[0], self._alloc.empty
+                    )
+                for packed, (_, packed_offsets) in zip(packed_batches, microbatches, strict=True):
                     yield self.local_global_hack(super().prepare_data(packed)), packed_offsets
                 microbatches = []
 
@@ -1060,13 +1159,14 @@ class RecsysTrainer(Trainer):
             shmem_s = self._pending_shmem_ckpt_write_s
             gc_s = self._pending_gc_collect_s
             rank_logger.info(
-                "save_checkpoint timings: checksum=%.2fs, shmem_write=%.2fs, gc_collect=%.2fs",
+                "save_checkpoint timings: background_checksum=%.2fs, shmem_write=%.2fs, "
+                "gc_collect=%.2fs",
                 ckpt_s or 0,
                 shmem_s or 0,
                 gc_s or 0,
             )
             if ckpt_s is not None:
-                metrics["save_checkpoint/checksum_s"] = ckpt_s
+                metrics["save_checkpoint/background_checksum_s"] = ckpt_s
                 self._pending_checksum_s = None
             if shmem_s is not None:
                 metrics["save_checkpoint/background_shmem_write_s"] = shmem_s
@@ -1188,6 +1288,15 @@ class RecsysTrainer(Trainer):
         ):
             if self.empty_history_augmentation_rate > 0:
                 raise ValueError("Redistribution requires one consumed batch per training step")
+        if (
+            isinstance(self.dataset, PhoenixKafkaDataset)
+            and ctx.rank == ctx.world_size - 1
+            and not self.dataset.exports_python_otel(data_rank, data_world_size)
+        ):
+            raise ValueError(
+                f"python_otel_on_last_shard_only: rank {ctx.rank} reports training metrics from "
+                f"shard {data_rank} of {data_world_size}, which starts no Python OTel exporter"
+            )
 
         assert elapsed_samples >= self.dataloader_offset, (
             f"elapsed_samples {elapsed_samples} < dataloader_offset {self.dataloader_offset}"
@@ -1240,6 +1349,7 @@ class RecsysTrainer(Trainer):
                 if self.max_steps is None or data_end < self.max_steps:
                     self.max_steps: int | None = data_end
 
+        self._precompile_batch_transfer()
         self.train_dataset = self.dataset_thread_iterator(train_dataset)
 
     def create_embedding_init_data(self) -> RecsysEmbeddingsParameter:
@@ -1782,13 +1892,12 @@ class RecsysTrainer(Trainer):
         )
 
         def dedup_tokens(token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-            unique_tokens, segment_ids = compress_token_ids(
-                token_ids, fill_size=ctx.num_unique, fill_value=self._emb_hash_vocab
+            return compress_token_ids_by_search(
+                token_ids,
+                fill_size=ctx.num_unique,
+                mesh=ctx.mesh,
+                token_ids_spec=P(None, ctx.data_axis, None),
             )
-            segment_ids = jax.lax.with_sharding_constraint(
-                segment_ids.reshape(token_ids.shape), P(None, ctx.data_axis, None)
-            )
-            return unique_tokens, segment_ids
 
         unique_tokens = segment_ids = None
         if self.num_microbatch == 1 and not self.use_row_emb:
@@ -1899,7 +2008,6 @@ class RecsysTrainer(Trainer):
             if not self.use_row_emb:
                 token_ids, gradients = jax.lax.optimization_barrier((token_ids, gradients))
                 unique_tokens, segment_ids = dedup_tokens(token_ids)
-                gradients, unique_tokens = jax.lax.optimization_barrier((gradients, unique_tokens))
             (
                 emb_grad_norm,
                 emb_valid_step,
@@ -2013,8 +2121,6 @@ class RecsysTrainer(Trainer):
         assert self._batch_pipeline.reserve is not None
         try:
             if self._async_emb_lookup_pin is None:
-                if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:
-                    self._reserve_small_buffer_region()
                 state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(
                     state, self._lookup_hash_fields(data)
                 )
@@ -2036,18 +2142,57 @@ class RecsysTrainer(Trainer):
 
         return state, metrics, extras
 
+    def _pin_step_scratch(self) -> bool:
+        if jax.default_backend() != "gpu" or not self.enable_aot:
+            return False
+        scratch_sizes = [
+            step_jit.jitted.memory_analysis().temp_size_in_bytes
+            for step_jit in self._async_emb_step_jits.values()
+        ]
+        block_bytes, smallest_scratch_bytes = max(scratch_sizes), min(scratch_sizes)
+        if block_bytes - smallest_scratch_bytes >= min(
+            smallest_scratch_bytes, _ALLOCATOR_SPLIT_BYTES
+        ):
+            rank_logger.warning(
+                "Step scratch not pinned: its sizes %s differ enough for a smaller scratch to "
+                "split the block",
+                scratch_sizes,
+            )
+            return False
+        anchors = []
+        for device in self.mesh.local_devices:
+            low, block, high = (
+                _device_zeros(num_bytes, device)
+                for num_bytes in (_ANCHOR_BYTES, block_bytes, _ANCHOR_BYTES)
+            )
+            low_ptr, block_ptr, high_ptr = (
+                buffer.unsafe_buffer_pointer() for buffer in (low, block, high)
+            )
+            rounded_block_bytes = block_bytes + -block_bytes % _ALLOCATOR_ROUNDING_BYTES
+            if (block_ptr, block_ptr + rounded_block_bytes) != (low_ptr + _ANCHOR_BYTES, high_ptr):
+                rank_logger.warning(
+                    "Step scratch not pinned: its block is not between its anchors on %s "
+                    "(low %#x, block %#x, high %#x)",
+                    device,
+                    low_ptr,
+                    block_ptr,
+                    high_ptr,
+                )
+                return False
+            anchors.extend((low, high))
+            del block
+        self._allocator_anchors = anchors
+        rank_logger.info("Pinned a free %d-byte block for the step scratch", block_bytes)
+        return True
+
     def _reserve_small_buffer_region(self) -> None:
-        region_bytes, anchor_bytes = 256 << 20, 64 << 20
-        data_axis = ("stage", *self.model_config.model_config.data_axis)
-        sharding = NamedSharding(self.mesh, P(data_axis))
-        num_devices = math.prod(self.mesh.shape[a] for a in data_axis)
-        zeros = jax.jit(
-            lambda n: jnp.zeros((n,), jnp.uint8), static_argnums=0, out_shardings=sharding
+        for device in self.mesh.local_devices:
+            region = _device_zeros(_SMALL_BUFFER_REGION_BYTES, device)
+            self._allocator_anchors.append(_device_zeros(_ANCHOR_BYTES, device))
+            del region
+        rank_logger.info(
+            "Reserved a free %d-byte region for small buffers", _SMALL_BUFFER_REGION_BYTES
         )
-        region = zeros(region_bytes * num_devices)
-        region.block_until_ready()
-        self._small_buffer_anchor = zeros(anchor_bytes * num_devices).block_until_ready()
-        del region
 
     def _lookup_hash_fields(
         self, data: tuple[RecsysFeaturesBatch, ...]
@@ -2340,6 +2485,15 @@ class RecsysTrainer(Trainer):
 
         self.update_jit = self.async_emb_update
 
+    def compile_or_load(self, phases: set[str] | None = None) -> None:
+        super().compile_or_load(phases)
+        if phases is not None or not self._async_emb_step_jits or jax.default_backend() != "gpu":
+            return
+        gemms = self.model_config.model_config.fp8_gemms
+        if gemms != Fp8Gemms.OFF:
+            for step in self._async_emb_step_jits.values():
+                check_compiled_fp8_gemms(step.name(), step.jitted.as_text(), gemms)
+
     def create_executable(self) -> None:
         if self.num_microbatch < 1 or self.bs_per_device % self.num_microbatch:
             raise ValueError(
@@ -2407,6 +2561,11 @@ class RecsysTrainer(Trainer):
                 raise ValueError("page_rl needs a dataset with page_records=True")
             if self.seqpack_candidate_packing:
                 raise ValueError("page_rl does not support seqpack_candidate_packing")
+        if self.model_config.model_config.fp8_gemms != Fp8Gemms.OFF and not self.forward_only:
+            if not self.use_async_emb:
+                raise ValueError("fp8_gemms requires use_async_emb=True")
+            if not self.enable_aot:
+                raise ValueError("fp8_gemms requires enable_aot=True")
 
         self._init_shmem_write_pool()
         self._free_ports()
@@ -3017,7 +3176,9 @@ class RecsysTrainer(Trainer):
 
     def next_data_batch(self):
         if self._shmem_write_future is not None and self._shmem_write_future.done():
-            self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()
+            self._pending_shmem_ckpt_write_s, self._pending_checksum_s = (
+                self._shmem_write_future.result()
+            )
             self._shmem_write_future = None
 
         if not self.use_async_emb:
@@ -3034,6 +3195,9 @@ class RecsysTrainer(Trainer):
             return FetchedBatch(batch, dict(self.offsets_to_commit), dataset.get_data_position())
 
         if self._batch_pipeline.reserve is None:
+            if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:
+                if not self._pin_step_scratch():
+                    self._reserve_small_buffer_region()
             self._batch_pipeline.reserve = fetch()
 
         self._batch_pipeline.current = self._batch_pipeline.reserve
@@ -3106,12 +3270,11 @@ class RecsysTrainer(Trainer):
     def _write_shmem_checkpoint(
         self,
         write_items: list[tuple[str, typing.Any, npt.NDArray]],
-        checksums: dict,
         data_pos: typing.Any,
         prefix: str,
         stub: typing.Any,
         bundle_files: list | None = None,
-    ) -> float:
+    ) -> tuple[float, float]:
         start = time.perf_counter()
         proc_idx = jax.process_index()
         proc_count = jax.process_count()
@@ -3167,10 +3330,28 @@ class RecsysTrainer(Trainer):
 
         from jax._src.distributed import global_state as _jax_dist
 
-        assert _jax_dist.client is not None, "JAX distributed not initialized"
-        _jax_dist.client.wait_at_barrier(f"recsys-save-checkpoint2-{prefix}", timeout_in_ms=300_000)
+        client = _jax_dist.client
+        assert client is not None, "JAX distributed not initialized"
+        checksum_start = time.perf_counter()
+        checksums, local_parts = _local_checksums(write_items, checksum_replicated=has_engine)
+        checksum_s = time.perf_counter() - checksum_start
+        client.key_value_set(
+            f"{_CHECKSUM_PARTS_KV_DIR}/{proc_idx}",
+            json.dumps([prefix, local_parts]),
+            allow_overwrite=True,
+        )
+        client.wait_at_barrier(f"recsys-save-checkpoint2-{prefix}", timeout_in_ms=300_000)
 
         if has_engine:
+            published = dict(client.key_value_dir_get(f"{_CHECKSUM_PARTS_KV_DIR}/"))
+            parts_by_process = []
+            for process in range(proc_count):
+                published_prefix, process_parts = json.loads(
+                    published[f"{_CHECKSUM_PARTS_KV_DIR}/{process}"]
+                )
+                assert published_prefix == prefix, f"stale checksum parts of process {process}"
+                parts_by_process.append(process_parts)
+            checksums = _combine_checksums(write_items, checksums, parts_by_process)
             with open(f"{OUT_PATH}/.{prefix}/checksums.0.json", "w") as f:
                 json.dump(
                     {
@@ -3206,7 +3387,7 @@ class RecsysTrainer(Trainer):
                     shutil.rmtree(f"{OUT_PATH}/.{name}/{x}", ignore_errors=True)
             os.rename(f"{OUT_PATH}/.{name}", f"{OUT_PATH}/{name}")
 
-        return time.perf_counter() - start
+        return time.perf_counter() - start, checksum_s
 
     def save_checkpoint(self, *args, **kwargs):
         if self.forward_only:
@@ -3223,6 +3404,11 @@ class RecsysTrainer(Trainer):
             self.state = self.state._replace(params=live_params)
 
     def _save_checkpoint_current_params(self, *args, **kwargs):
+        if not gc.get_freeze_count():
+            gc.collect()
+            gc.freeze()
+            rank_logger.info("Froze %d objects for cyclic GC", gc.get_freeze_count())
+
         dataset = self.dataset
         assert isinstance(dataset, PhoenixDataset), f"Got {type(dataset)}"
         assert isinstance(self.state, RecsysTrainingState), f"Got {type(self.state)}"
@@ -3323,21 +3509,24 @@ class RecsysTrainer(Trainer):
             prefix = "/".join(checkpoint_path.split("/")[-2:])
             wait_until_finished()
             if self._shmem_write_future is not None:
-                self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()
+                self._pending_shmem_ckpt_write_s, self._pending_checksum_s = (
+                    self._shmem_write_future.result()
+                )
                 self._shmem_write_future = None
             multihost_utils.sync_global_devices("recsys-save-checkpoint1")
             stub = copy_pb2_grpc.CopyStub(self._copy_port_channel(port))
 
+            serving_state = self.state.purge_opt_state()
             if not hasattr(self, "host_state") or self.host_state is None:
-                self.host_state = jax.device_put(self.state, self.host_sharding)
+                self.host_state = jax.device_put(
+                    serving_state, self.host_sharding.purge_opt_state()
+                )
             else:
-                self.state, self.host_state = self.offload_state(self.state, self.host_state)
+                self.host_state = self.offload_state(serving_state, self.host_state)
             jax.block_until_ready(self.host_state)
 
             assert isinstance(self.state, RecsysTrainingState)
-            host_state = unwrap_tree(self.host_state)
-            host_state = host_state.purge_opt_state()
-            host_state = tree_to_dict(host_state)
+            host_state = tree_to_dict(unwrap_tree(self.host_state))
 
             ep = self.mesh.shape["expert"]
 
@@ -3365,102 +3554,6 @@ class RecsysTrainer(Trainer):
                         pe_padded.sharding.with_memory_kind("pinned_host"),
                     )
 
-            start_checksum = time.perf_counter()
-            checksums = {}
-
-            for key in host_state:
-                value = host_state[key]
-                if value is None:
-                    continue
-                shards = value.addressable_shards
-                if len(shards) != 1:
-                    continue
-                shard = shards[0]
-                sharded = [(x.start, x.stop, x.step) != (None,) * 3 for x in shard.index]
-                shard_data = _unsafe_jax2np(shard.data)
-                shard_bytes = np.ndarray(shape=shard_data.nbytes, dtype=np.uint8, buffer=shard_data)
-
-                if not any(sharded):
-                    checksums[key] = xai_recsys_engine.adler32_parallel(
-                        np.ascontiguousarray(shard_bytes)
-                    )
-                elif key in ("emb_table", "post_embeddings.embeddings"):
-                    local_checksum = xai_recsys_engine.adler32_parallel(
-                        np.ascontiguousarray(shard_bytes)
-                    )
-                    local_len = shard_bytes.nbytes
-
-                    all_checksums = multihost_utils.process_allgather(
-                        np.array([local_checksum], dtype=np.uint32), tiled=True
-                    )
-                    local_len_parts = np.array([local_len], dtype=np.uint64).view(np.uint32)
-                    all_lens_split = multihost_utils.process_allgather(
-                        local_len_parts.reshape(1, 2), tiled=True
-                    )
-
-                    i = sharded.index(True)
-                    delta = shard.index[i].stop - shard.index[i].start
-                    num_shards = value.shape[i] // delta
-                    n = jax.process_count()
-                    processes_per_shard = n // num_shards
-
-                    shard_info = []
-                    for proc_idx in range(n):
-                        proc_shard_idx = proc_idx // processes_per_shard
-                        if proc_idx % processes_per_shard == 0:
-                            ck = int(all_checksums[proc_idx])
-                            len_lo = int(all_lens_split[proc_idx, 0])
-                            len_hi = int(all_lens_split[proc_idx, 1])
-                            length = len_lo | (len_hi << 32)
-                            shard_info.append((proc_shard_idx, ck, length))
-                    shard_info.sort(key=lambda x: x[0])
-
-                    combined = shard_info[0][1]
-                    for _, ck, length in shard_info[1:]:
-                        combined = xai_recsys_engine.adler32_combine_py(combined, ck, length)
-                    checksums[key] = combined
-                else:
-                    i = sharded.index(True)
-                    delta = shard.index[i].stop - shard.index[i].start
-                    shard_idx = shard.index[i].start // delta
-                    num_shards = value.shape[i] // delta
-                    total_cols = value.shape[1]
-                    shard_width = delta
-                    num_rows = value.shape[0]
-
-                    local_partial = xai_recsys_engine.adler32_shard_partial(
-                        np.ascontiguousarray(shard_bytes),
-                        shard_width * shard_data.dtype.itemsize,
-                        shard_idx,
-                        total_cols * shard_data.dtype.itemsize,
-                        128,
-                    )
-
-                    all_partials_flat = multihost_utils.process_allgather(
-                        local_partial.astype(np.uint32), tiled=True
-                    )
-                    all_partials_2d = all_partials_flat.reshape(-1, 2)
-
-                    n = jax.process_count()
-                    processes_per_shard = n // num_shards
-                    unique_partials = []
-                    for proc_idx in range(n):
-                        if proc_idx % processes_per_shard == 0:
-                            proc_shard_idx = proc_idx // processes_per_shard
-                            unique_partials.append((proc_shard_idx, all_partials_2d[proc_idx]))
-
-                    unique_partials.sort(key=lambda x: x[0])
-                    partials_array = np.stack([p[1] for p in unique_partials], axis=0).astype(
-                        np.uint32
-                    )
-
-                    total_len = num_rows * total_cols * shard_data.dtype.itemsize
-                    checksums[key] = xai_recsys_engine.adler32_combine_partials(
-                        partials_array, total_len
-                    )
-
-            self._pending_checksum_s = time.perf_counter() - start_checksum
-
             write_items: list[tuple[str, typing.Any, npt.NDArray]] = []
             for key in host_state:
                 value = host_state[key]
@@ -3478,7 +3571,6 @@ class RecsysTrainer(Trainer):
             self._shmem_write_future = self._shmem_write_pool.submit(
                 self._write_shmem_checkpoint,
                 write_items,
-                checksums,
                 data_pos,
                 prefix,
                 stub,

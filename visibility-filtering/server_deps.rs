@@ -493,7 +493,7 @@ fn build_cache_warmer(stratoserver: StratoGrpc) -> Option<Arc<CacheWarmer>> {
 
 const STRATO_REQUEST_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 const STRATO_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
-const STRATO_APERTURE_SIZE: usize = 16;
+const STRATO_APERTURE_SIZE: usize = 32;
 const STRATOSERVER_MAX_BATCH_SIZE: usize = 250;
 const XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 

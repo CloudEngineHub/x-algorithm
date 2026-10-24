@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import math
 from dataclasses import fields as dc_fields
-from typing import Optional, Type, TypeAlias
+from functools import partial
+from typing import Callable, Optional, Type, TypeAlias
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from xrex.cutedsl.qk_norm_rope_backward import (
+    qk_norm_rope_backward,
+    qk_norm_rope_backward_supported,
+)
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
 from xrex.models.attention import (
     Attention,
@@ -17,9 +24,10 @@ from xrex.models.attention import (
     PallasAttention,
     import_attention_fa3,
 )
+from xrex.models.fp8 import Fp8Dot, Fp8Gemms
 from xrex.models.linear_layer import LinearConfig, LinearImpl
 from xrex.models.model_utils import get_parameter
-from xrex.models.normalization import all_heads_qk_norm
+from xrex.models.normalization import all_heads_qk_norm, qk_norm, rms_normalize
 from xrex.models.recsys_attention import (
     CutedslRankerAttention,
     CutedslRankerCandidateOnlyAttention,
@@ -34,47 +42,22 @@ from xrex.utils.model import MemoryModelOutput
 from xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual
 
 
-class RotaryEmbedding(hk.Module):
-    def __init__(
-        self,
-        dim: int,
-        name: Optional[str] = None,
-        base_exponent: int = 10000,
-    ):
-        super().__init__(name)
-        self.dim = dim
-        self.base_exponent = base_exponent
-        assert self.dim % 2 == 0
+def rope_angles(
+    dim: int, base_exponent: int, seq_len: int, positions: jax.Array | None = None
+) -> jax.Array:
+    assert dim % 2 == 0, dim
+    exponents = jnp.arange(0, dim, 2, dtype=jnp.float32)
+    inv_freq = jnp.asarray(1.0 / (base_exponent ** (exponents / dim)), dtype=jnp.float32)
+    if positions is None:
+        positions = jnp.arange(seq_len, dtype=jnp.float32)[None]
+    return jnp.einsum("bi,j->bij", positions, inv_freq)
 
-    def __call__(
-        self,
-        x: jax.Array,
-        seq_dim: int,
-        offset: int | jax.Array,
-        t: Optional[jax.Array] = None,
-    ) -> jax.Array:
-        fprop_dtype = x.dtype
-        x = x.astype(jnp.float32)
-        exponents = jnp.arange(0, self.dim, 2, dtype=jnp.float32)
-        inv_freq = jnp.asarray(
-            1.0 / (self.base_exponent ** (exponents / self.dim)), dtype=jnp.float32
-        )
 
-        if jnp.shape(offset) == ():
-            offset = jnp.expand_dims(offset, 0)
-
-        if t is None:
-            t = jnp.arange(x.shape[seq_dim], dtype=jnp.float32) + jnp.expand_dims(offset, -1)
-        else:
-            t = t + jnp.expand_dims(offset, -1)
-
-        phase = jnp.einsum("bi,j->bij", t, inv_freq)
-        phase = jnp.tile(phase, reps=(1, 2))[:, :, None, :]
-
-        x = x * jnp.cos(phase) + rotate_half(x) * jnp.sin(phase)
-
-        x = x.astype(fprop_dtype)
-        return x
+def apply_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    cos, sin = (jnp.tile(factor, (1, 2))[:, :, None] for factor in (cos, sin))
+    fprop_dtype = x.dtype
+    x = x.astype(jnp.float32)
+    return (x * cos + rotate_half(x) * sin).astype(fprop_dtype)
 
 
 class Linear(LinearImpl):
@@ -90,6 +73,7 @@ class Linear(LinearImpl):
         init_scale: float = 1.0,
         sharding_context: ShardingContext | None = None,
         name: Optional[str] = None,
+        dot: Callable[[jax.Array, jax.Array], jax.Array] = jnp.dot,
     ):
         assert sharding_context is not None
 
@@ -108,6 +92,7 @@ class Linear(LinearImpl):
             b_init=b_init,
             pspec=pspec,
             name=name,
+            dot=dot,
         )
 
 
@@ -124,6 +109,8 @@ class MultiHeadAttention(hk.Module):
         sharding_context: ShardingContext | None = None,
         name: Optional[str] = None,
         name_suffix: str = "",
+        fp8_gemms: Fp8Gemms = Fp8Gemms.OFF,
+        out_proj_fp8_input_name: Optional[str] = None,
     ):
         super().__init__(name=name)
         assert sharding_context is not None, "sharding_context is required."
@@ -131,6 +118,8 @@ class MultiHeadAttention(hk.Module):
         self.config = config
         self.scale_config = scale_config
         self.sharding_context = sharding_context
+        self.fp8_gemms = fp8_gemms
+        self.out_proj_fp8_input_name = out_proj_fp8_input_name
 
         if w_init is None:
             w_init = hk.initializers.VarianceScaling(self.scale_config.attn_init_scale**2)
@@ -181,9 +170,16 @@ class MultiHeadAttention(hk.Module):
             ),
         )
         qkv_weights_pspec = P(None, None)
+        fused_qk_norm_rope = False
         if self.config.qkv_merge:
             qkv = self._qkv_proj(input_size)(input_to_query)
-            query_heads, key_heads, value_heads = self._qkv_split(qkv)
+            fused_qk_norm_rope = self._fused_qk_norm_rope_supported(qkv, qkv_pspec)
+            if fused_qk_norm_rope:
+                query_heads, key_heads, value_heads = self._fused_qk_norm_rope(
+                    qkv, positions, qkv_pspec
+                )
+            else:
+                query_heads, key_heads, value_heads = self._qkv_split(qkv)
 
         else:
             query_heads = projection(
@@ -222,9 +218,10 @@ class MultiHeadAttention(hk.Module):
             key_heads = with_sharding_constraint_unless_manual(key_heads, qkv_pspec)
             value_heads = with_sharding_constraint_unless_manual(value_heads, qkv_pspec)
 
-        query_heads = checkpoint_name(query_heads, "query_heads")
-        key_heads = checkpoint_name(key_heads, "key_heads")
-        value_heads = checkpoint_name(value_heads, "value_heads")
+        if not fused_qk_norm_rope:
+            query_heads = checkpoint_name(query_heads, "query_heads")
+            key_heads = checkpoint_name(key_heads, "key_heads")
+            value_heads = checkpoint_name(value_heads, "value_heads")
 
         activation_with_qheads_pspec = self.sharding_context.sharding_specs(
             NamedShape(key_heads.shape, names=("batch_attn", "replicated", "q_head", "hidden")),
@@ -243,18 +240,18 @@ class MultiHeadAttention(hk.Module):
             for x in (key_heads, value_heads)
         )
 
-        add_rope = self.config.rotary
-
-        if self.config.qk_norm:
-            qk_lr = self.scale_config.qk_norm_lr_multiplier()
-            wd_mask = self.scale_config.ln_weight_decay_mask
-            query_heads = all_heads_qk_norm("q_norm", qk_lr, weight_decay_mask=wd_mask)(query_heads)
-            key_heads = all_heads_qk_norm("k_norm", qk_lr, weight_decay_mask=wd_mask)(key_heads)
-
-        if add_rope:
-            key_heads, query_heads = self._apply_rope(key_heads, query_heads, positions=positions)
-            query_heads = checkpoint_name(query_heads, "query_heads_rope")
-            key_heads = checkpoint_name(key_heads, "key_heads_rope")
+        if not fused_qk_norm_rope:
+            if self.config.qk_norm:
+                query_heads, key_heads = (
+                    all_heads_qk_norm(name, self.scale_config)(heads)
+                    for name, heads in (("q_norm", query_heads), ("k_norm", key_heads))
+                )
+            if self.config.rotary:
+                key_heads, query_heads = self._apply_rope(
+                    key_heads, query_heads, positions=positions
+                )
+                query_heads = checkpoint_name(query_heads, "query_heads_rope")
+                key_heads = checkpoint_name(key_heads, "key_heads_rope")
 
         if self.config.attn_impl == "recsys_flash_attn":
             raise NotImplementedError(
@@ -292,6 +289,8 @@ class MultiHeadAttention(hk.Module):
         attn_output = attn
 
         if self.config.attn_output_gate:
+            if self.fp8_gemms != Fp8Gemms.OFF:
+                raise NotImplementedError("FP8 GEMMs with attn_output_gate are not implemented yet")
             z = projection(
                 input_to_query,
                 head_size=self.config.key_size,
@@ -351,24 +350,12 @@ class MultiHeadAttention(hk.Module):
             pspec=P(None, None),
             lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size),
             sharding_context=self.sharding_context,
+            dot=Fp8Dot(self.fp8_gemms),
         )
 
     def _qkv_split(self, qkv: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         num_kv_heads = self.config.num_kv_heads
-        num_q_per_kv = self.config.num_q_heads // num_kv_heads
         qkv = jnp.reshape(qkv, (*qkv.shape[:2], num_kv_heads, -1, self.config.key_size))
-
-        def slicing(input):
-            b, s, _, _, d = input.shape
-            query_heads = input[:, :, :, :num_q_per_kv]
-            key_heads = input[:, :, :, num_q_per_kv : num_q_per_kv + 1]
-            value_heads = input[:, :, :, num_q_per_kv + 1 :]
-            return (
-                query_heads.reshape(b, s, -1, d),
-                key_heads.reshape(b, s, -1, d),
-                value_heads.reshape(b, s, -1, d),
-            )
-
         qkv_pspec = P(
             self.data_axis,
             self.sharding_context.logical_axis_to_physical(
@@ -379,24 +366,68 @@ class MultiHeadAttention(hk.Module):
             ),
         )
         return shard_map_unless_manual(
-            slicing, out_specs=(qkv_pspec,) * 3, in_specs=qkv_pspec, mesh=self.sharding_context.mesh
+            _split_merged_qkv,
+            out_specs=(qkv_pspec,) * 3,
+            in_specs=qkv_pspec,
+            mesh=self.sharding_context.mesh,
         )(qkv)
 
-    @hk.transparent
     def _apply_rope(self, *heads: jax.Array, positions: jax.Array | None) -> tuple[jax.Array, ...]:
-        t: jax.Array | None = None
-        if positions is not None:
-            t = positions[..., 0].astype(jnp.float32)
+        angles = self._rope_angles(heads[0].shape[1], positions)
+        cos, sin = jnp.cos(angles), jnp.sin(angles)
+        return tuple(apply_rope(x, cos, sin) for x in heads)
 
-        match self.config.rope_type:
-            case "1d":
-                rotate = RotaryEmbedding(
-                    dim=self.config.key_size,
-                    base_exponent=self.config.rope_base_exponent,
-                )
-                return tuple(rotate(x, 1, 0, t) for x in heads)
-            case _:
-                raise NotImplementedError(f"Rope type {self.config.rope_type} is not supported")
+    def _rope_angles(self, seq_len: int, positions: jax.Array | None) -> jax.Array:
+        if self.config.rope_type != "1d":
+            raise NotImplementedError(f"Rope type {self.config.rope_type} is not supported")
+        first_positions = None if positions is None else positions[..., 0].astype(jnp.float32)
+        config = self.config
+        return rope_angles(config.key_size, config.rope_base_exponent, seq_len, first_positions)
+
+    def _fused_qk_norm_rope_supported(self, qkv: jax.Array, qkv_pspec: P) -> bool:
+        config, ctx = self.config, self.sharding_context
+        heads_split = ctx.logical_group_size("kv_head", config.attn_sharding_namespace) > 1
+        rows = qkv.shape[:2]
+        if not jax.sharding.get_abstract_mesh().manual_axes:
+            rows = NamedSharding(ctx.mesh, P(*qkv_pspec[:2])).shard_shape(rows)
+        return (
+            config.qk_norm
+            and config.rotary
+            and not heads_split
+            and qk_norm_rope_backward_supported(
+                math.prod(rows),
+                config.num_q_heads,
+                config.num_kv_heads,
+                config.key_size,
+                qkv.dtype,
+                jax.devices()[0],
+            )
+        )
+
+    @hk.transparent
+    def _fused_qk_norm_rope(
+        self, qkv: jax.Array, positions: jax.Array | None, qkv_pspec: P
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        config = self.config
+        qkv = jnp.reshape(qkv, (*qkv.shape[:2], config.num_kv_heads, -1, config.key_size))
+        q_norm, k_norm = (qk_norm(name, self.scale_config) for name in ("q_norm", "k_norm"))
+        angles = jnp.broadcast_to(
+            self._rope_angles(qkv.shape[1], positions), (*qkv.shape[:2], config.key_size // 2)
+        )
+        rows_pspec = P(*qkv_pspec[:2])
+        return shard_map_unless_manual(
+            partial(_qk_norm_rope, eps=q_norm.eps),
+            out_specs=(qkv_pspec,) * 3,
+            in_specs=(qkv_pspec, P(None), P(None), rows_pspec, rows_pspec),
+            mesh=self.sharding_context.mesh,
+            check_vma=False,
+        )(
+            qkv,
+            q_norm.gain(config.num_q_heads * config.key_size),
+            k_norm.gain(config.num_kv_heads * config.key_size),
+            jnp.cos(angles),
+            jnp.sin(angles),
+        )
 
     @hk.transparent
     def _get_attn_impl(
@@ -495,6 +526,11 @@ class MultiHeadAttention(hk.Module):
             init_scale=init_scale,
             rms_clip_axes=rms_clip_axes,
             name=name,
+            dot=Fp8Dot(
+                self.fp8_gemms,
+                input_is_materialized=True,
+                transposed_input_checkpoint_name=self.out_proj_fp8_input_name,
+            ),
         )
         embeddings = final_projection(x)
         return embeddings
@@ -526,6 +562,7 @@ class MultiHeadAttention(hk.Module):
             init_scale=init_scale,
             sharding_context=self.sharding_context,
             rms_clip_axes=rms_clip_axes,
+            dot=Fp8Dot(self.fp8_gemms),
         )(x)
 
         *leading_dims, _ = x.shape
@@ -584,10 +621,8 @@ class CandidateOnlyAttention(MultiHeadAttention):
         )
 
         if config.qk_norm:
-            qk_lr = self.scale_config.qk_norm_lr_multiplier()
-            wd_mask = self.scale_config.ln_weight_decay_mask
-            query_heads = all_heads_qk_norm("q_norm", qk_lr, weight_decay_mask=wd_mask)(query_heads)
-            k_norm = all_heads_qk_norm("k_norm", qk_lr, weight_decay_mask=wd_mask)
+            query_heads = all_heads_qk_norm("q_norm", self.scale_config)(query_heads)
+            k_norm = all_heads_qk_norm("k_norm", self.scale_config)
             candidate_keys, history_keys = k_norm(candidate_keys), k_norm(history_keys)
 
         if config.rotary:
@@ -658,6 +693,62 @@ class CandidateOnlyAttention(MultiHeadAttention):
                 raise ValueError(
                     f"Unknown candidate_only_attn_impl {self.config.candidate_only_attn_impl!r}"
                 )
+
+
+def _split_merged_qkv(qkv: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    num_q_per_kv = qkv.shape[3] - 2
+    query_heads = qkv[:, :, :, :num_q_per_kv]
+    key_heads = qkv[:, :, :, num_q_per_kv : num_q_per_kv + 1]
+    value_heads = qkv[:, :, :, num_q_per_kv + 1 :]
+    return tuple(
+        heads.reshape(*qkv.shape[:2], -1, qkv.shape[-1])
+        for heads in (query_heads, key_heads, value_heads)
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(5,))
+def _qk_norm_rope(
+    qkv: jax.Array,
+    q_gain: jax.Array,
+    k_gain: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return _qk_norm_rope_fwd(qkv, q_gain, k_gain, cos, sin, eps)[0]
+
+
+def _qk_norm_rope_fwd(qkv, q_gain, k_gain, cos, sin, eps):
+    query_heads, key_heads, value_heads = _split_merged_qkv(qkv)
+    query_heads = checkpoint_name(query_heads, "query_heads")
+    key_heads = checkpoint_name(key_heads, "key_heads")
+    value_heads = checkpoint_name(value_heads, "value_heads")
+
+    def norm_rope(heads, gain):
+        normed = rms_normalize(heads.reshape(*heads.shape[:2], -1), gain, eps)
+        return apply_rope(normed.reshape(heads.shape), cos, sin)
+
+    outputs = (
+        checkpoint_name(norm_rope(query_heads, q_gain), "query_heads_rope"),
+        checkpoint_name(norm_rope(key_heads, k_gain), "key_heads_rope"),
+        value_heads,
+    )
+    return outputs, (query_heads, key_heads, q_gain, k_gain, cos, sin)
+
+
+def _qk_norm_rope_bwd(eps, residuals, cotangents):
+    query_heads, key_heads, q_gain, k_gain, cos, sin = residuals
+    dq, dk, dv = cotangents
+    dqkv, dq_gain, dk_gain = qk_norm_rope_backward(
+        *(x.reshape(-1, *x.shape[2:]) for x in (dq, query_heads, dk, key_heads, dv, cos, sin)),
+        q_gain,
+        k_gain,
+        eps=eps,
+    )
+    return dqkv.reshape(*key_heads.shape[:2], *dqkv.shape[1:]), dq_gain, dk_gain, None, None
+
+
+_qk_norm_rope.defvjp(_qk_norm_rope_fwd, _qk_norm_rope_bwd)
 
 
 def rotate_half(
