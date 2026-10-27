@@ -5,34 +5,24 @@ use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets, StatsReceiverExt};
 
-use crate::caller_identity::{self, Endpoint};
+use crate::caller_identity;
 use crate::hydration::{Cause, Hydrators, Lookup, INBOUND_ALLOWANCE};
 use crate::models::{Evaluation, Verdict};
 use crate::rules::SafetyLevel;
 use crate::treatment;
 
-const REQUESTS: &str = "filter_tweets_requests";
-const LATENCY_MS: &str = "filter_tweets_latency_ms";
-pub(crate) const BATCH_SIZE: &str = "filter_tweets_batch_size";
-const VERDICTS: &str = "filter_tweets_verdicts";
-const VERDICTS_BY_RULE: &str = "filter_tweets_verdicts_by_rule";
-const EVALUATED_CANDIDATES: &str = "filter_tweets_evaluated_candidates";
+const REQUESTS: &str = "vf_requests";
+const LATENCY_MS: &str = "vf_request_latency_ms";
+const DEADLINE: &str = "vf_request_deadline";
+const BATCH_SIZE: &str = "vf_request_batch_size";
+const VERDICTS: &str = "vf_verdicts";
+const VERDICTS_BY_RULE: &str = "vf_verdicts_by_rule";
+const EVALUATED_CANDIDATES: &str = "vf_evaluated_candidates";
 const FAIL_OPEN_DEFAULTS_NONE: &str = "none";
 const UNRESOLVED_TWEETS: &str = "vf_unresolved_tweets";
-const LOGGED_OUT_VIEWER: &str = "filter_tweets_logged_out_viewer";
-const VIEWER_ID_NORMALIZED: &str = "filter_tweets_viewer_id_normalized";
-const PHASE_MS: &str = "filter_tweets_phase_ms";
-const DEADLINE: &str = "filter_tweets_deadline";
-const DEADLINE_REMAINING_MS: &str = "filter_tweets_deadline_remaining_ms";
-const DEADLINE_OVERRUN_MS: &str = "filter_tweets_deadline_overrun_ms";
-const EVALUATE_TWEETS_REQUESTS: &str = "evaluate_tweets_requests";
-const EVALUATE_TWEETS_LATENCY_MS: &str = "evaluate_tweets_latency_ms";
-const EVALUATE_TWEETS_DEADLINE: &str = "evaluate_tweets_deadline";
-const LOOKUP_REQUESTS: &str = "safety_labels_lookup_requests";
-const LOOKUP_LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
-const LOOKUP_DEADLINE: &str = "safety_labels_lookup_deadline";
-const NOTIFICATION_REQUESTS: &str = "filter_notifications_requests";
-const NOTIFICATION_LATENCY_MS: &str = "filter_notifications_latency_ms";
+const LOGGED_OUT_VIEWER: &str = "vf_logged_out_viewer";
+const VIEWER_ID_NORMALIZED: &str = "vf_viewer_id_normalized";
+const PHASE_MS: &str = "vf_phase_ms";
 const NOTIFICATION_RESULTS: &str = "filter_notifications_results";
 const REQUESTS_BY_CALLER: &str = "vf_requests_by_caller";
 const LATENCY_BY_CALLER_MS: &str = "vf_request_latency_by_caller_ms";
@@ -43,6 +33,45 @@ const UNKNOWN_IDENTITY: &str = "unknown";
 pub enum Rpc {
     FilterTweets,
     EvaluateTweets,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Endpoint {
+    FilterTweets,
+    EvaluateTweets,
+    GetSafetyLabels,
+    FilterNotifications,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RequestLevel {
+    Named(SafetyLevel),
+    Unknown,
+    Absent,
+}
+
+impl RequestLevel {
+    pub(crate) fn of(level: Option<SafetyLevel>) -> Self {
+        level.map_or(Self::Unknown, Self::Named)
+    }
+}
+
+impl From<RequestLevel> for &'static str {
+    fn from(level: RequestLevel) -> Self {
+        match level {
+            RequestLevel::Named(level) => level.into(),
+            RequestLevel::Unknown => "unknown",
+            RequestLevel::Absent => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum NotificationKind {
+    Follow,
+    FollowRequestAccepted,
 }
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
@@ -58,8 +87,8 @@ pub(crate) enum RequestOutcome {
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum DeadlineOutcome {
     Absent,
-    Within(Duration),
-    Overrun(Duration),
+    Within,
+    Overrun,
     CancelledEarly,
     CancelledAtDeadline,
     CancelledNoDeadline,
@@ -75,12 +104,11 @@ impl DeadlineOutcome {
             (RequestOutcome::Started | RequestOutcome::Failure, _) => None,
             (RequestOutcome::Success, None) => Some(Self::Absent),
             (RequestOutcome::Cancelled, None) => Some(Self::CancelledNoDeadline),
-            (RequestOutcome::Success, Some(deadline)) => {
-                Some(match deadline.checked_sub(elapsed) {
-                    Some(remaining) => Self::Within(remaining),
-                    None => Self::Overrun(elapsed - deadline),
-                })
-            }
+            (RequestOutcome::Success, Some(deadline)) => Some(if elapsed <= deadline {
+                Self::Within
+            } else {
+                Self::Overrun
+            }),
             (RequestOutcome::Cancelled, Some(deadline)) => {
                 Some(if elapsed + INBOUND_ALLOWANCE < deadline {
                     Self::CancelledEarly
@@ -109,41 +137,29 @@ pub(crate) fn record_viewer_state(raw: Option<u64>, normalized: Option<u64>) {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AggregatedVerdicts {
-    pub mix: HashMap<&'static str, u64>,
-    pub by_rule: HashMap<(&'static str, &'static str), u64>,
-}
-
-pub(crate) fn aggregate_verdicts<'a>(
-    verdicts: impl IntoIterator<Item = &'a Verdict>,
-) -> AggregatedVerdicts {
-    let mut out = AggregatedVerdicts::default();
-    for verdict in verdicts {
-        *out.mix.entry(treatment::metric_label(verdict)).or_default() += 1;
-        for row in treatment::decided_rows(verdict) {
-            *out.by_rule.entry(row).or_default() += 1;
-        }
-    }
-    out
-}
-
 pub(crate) fn record_verdicts<'a>(
-    rpc: Rpc,
+    endpoint: Endpoint,
     safety_level: SafetyLevel,
     verdicts: impl IntoIterator<Item = &'a Verdict>,
 ) {
-    let aggregated = aggregate_verdicts(verdicts);
+    let mut mix: HashMap<&str, u64> = HashMap::new();
+    let mut by_rule: HashMap<(&str, &str), u64> = HashMap::new();
+    for verdict in verdicts {
+        *mix.entry(treatment::metric_label(verdict)).or_default() += 1;
+        for row in treatment::decided_rows(verdict) {
+            *by_rule.entry(row).or_default() += 1;
+        }
+    }
     let level = <&str>::from(safety_level);
-    let rpc = rpc.into();
-    for (action, count) in &aggregated.mix {
+    let rpc = endpoint.into();
+    for (action, count) in &mix {
         incr_nonzero(
             VERDICTS,
             &[("action", action), ("safety_level", level), ("rpc", rpc)],
             *count,
         );
     }
-    for ((rule, action), count) in &aggregated.by_rule {
+    for ((rule, action), count) in &by_rule {
         incr_nonzero(
             VERDICTS_BY_RULE,
             &[
@@ -157,8 +173,36 @@ pub(crate) fn record_verdicts<'a>(
     }
 }
 
-pub(crate) fn record_unresolved<'a>(
-    rpc: Rpc,
+pub(crate) fn record_sent<'a>(
+    endpoint: Endpoint,
+    safety_level: SafetyLevel,
+    evaluations: impl Iterator<Item = &'a Evaluation> + Clone,
+    unevaluated: usize,
+) {
+    static LOOKUP_FAILED: Verdict = Verdict::lookup_failed();
+    record_verdicts(
+        endpoint,
+        safety_level,
+        evaluations
+            .clone()
+            .map(Evaluation::verdict)
+            .chain(std::iter::repeat_n(&LOOKUP_FAILED, unevaluated)),
+    );
+    match endpoint {
+        Endpoint::FilterTweets | Endpoint::EvaluateTweets => {
+            record_unresolved(endpoint, safety_level, evaluations.clone());
+        }
+        Endpoint::GetSafetyLabels | Endpoint::FilterNotifications => {}
+    }
+    record_fail_open_defaults(
+        endpoint,
+        safety_level,
+        evaluations.map(Evaluation::fail_open_defaults),
+    );
+}
+
+fn record_unresolved<'a>(
+    endpoint: Endpoint,
     safety_level: SafetyLevel,
     evaluations: impl IntoIterator<Item = &'a Evaluation>,
 ) {
@@ -172,7 +216,7 @@ pub(crate) fn record_unresolved<'a>(
         *counts.entry(unresolved).or_default() += 1;
     }
     let level = <&str>::from(safety_level);
-    let rpc = rpc.into();
+    let rpc = endpoint.into();
     for ((lookup, cause), count) in counts {
         incr(
             UNRESOLVED_TWEETS,
@@ -187,8 +231,8 @@ pub(crate) fn record_unresolved<'a>(
     }
 }
 
-pub(crate) fn record_fail_open_defaults(
-    rpc: Rpc,
+fn record_fail_open_defaults(
+    endpoint: Endpoint,
     safety_level: SafetyLevel,
     fail_open_defaults: impl IntoIterator<Item = Hydrators>,
 ) {
@@ -202,7 +246,7 @@ pub(crate) fn record_fail_open_defaults(
         }
     }
     let level = <&str>::from(safety_level);
-    let rpc = rpc.into();
+    let rpc = endpoint.into();
     incr_nonzero(
         EVALUATED_CANDIDATES,
         &[
@@ -226,37 +270,39 @@ pub(crate) fn record_fail_open_defaults(
     }
 }
 
-fn families(endpoint: Endpoint) -> (&'static str, &'static str, Option<&'static str>) {
-    match endpoint {
-        Endpoint::FilterTweets => (REQUESTS, LATENCY_MS, Some(DEADLINE)),
-        Endpoint::EvaluateTweets => (
-            EVALUATE_TWEETS_REQUESTS,
-            EVALUATE_TWEETS_LATENCY_MS,
-            Some(EVALUATE_TWEETS_DEADLINE),
-        ),
-        Endpoint::GetSafetyLabels => (LOOKUP_REQUESTS, LOOKUP_LATENCY_MS, Some(LOOKUP_DEADLINE)),
-    }
-}
-
 pub(crate) async fn observe_request<R, T, F>(
     endpoint: Endpoint,
+    level: RequestLevel,
     request: Request<R>,
-    handle: impl FnOnce(Request<R>, Option<Duration>) -> F,
+    handle: impl FnOnce(Request<R>, xai_x_rpc::CallContext) -> F,
 ) -> Result<T, Status>
 where
     F: Future<Output = Result<T, Status>>,
 {
+    let entered = tokio::time::Instant::now();
     let grpc_timeout = parse_grpc_timeout(request.metadata());
-    let (requests, _, _) = families(endpoint);
-    incr(requests, &[("outcome", RequestOutcome::Started.into())], 1);
+    incr(
+        REQUESTS,
+        &[
+            ("rpc", endpoint.into()),
+            ("safety_level", level.into()),
+            ("outcome", RequestOutcome::Started.into()),
+        ],
+        1,
+    );
     let mut guard = RequestMetricsGuard {
         endpoint,
+        level,
         caller_identity: caller_identity::identity(&request),
         grpc_timeout,
         start: Instant::now(),
         outcome: RequestOutcome::Cancelled,
     };
-    let result = handle(request, grpc_timeout).await;
+    let result = handle(
+        request,
+        crate::hydration::request_context(entered, grpc_timeout),
+    )
+    .await;
     guard.outcome = if result.is_ok() {
         RequestOutcome::Success
     } else {
@@ -286,6 +332,7 @@ pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
 
 struct RequestMetricsGuard {
     endpoint: Endpoint,
+    level: RequestLevel,
     caller_identity: Option<String>,
     grpc_timeout: Option<Duration>,
     start: Instant,
@@ -319,41 +366,21 @@ fn millis(d: Duration) -> f64 {
 
 impl RequestMetricsGuard {
     fn emit(&self, sr: &dyn StatsReceiverExt, elapsed: Duration) {
-        let (requests, latency_ms, deadline) = families(self.endpoint);
         let outcome: &str = self.outcome.into();
-        sr.incr(requests, &[("outcome", outcome)], 1);
-        sr.observe_vm(latency_ms, &[], millis(elapsed));
+        let rpc = ("rpc", self.endpoint.into());
+        let level = ("safety_level", self.level.into());
+        sr.incr(REQUESTS, &[rpc, level, ("outcome", outcome)], 1);
         let caller = (
             "caller_identity",
             self.caller_identity.as_deref().unwrap_or(UNKNOWN_IDENTITY),
         );
-        let rpc = ("rpc", <&str>::from(self.endpoint));
         sr.incr(REQUESTS_BY_CALLER, &[caller, rpc, ("outcome", outcome)], 1);
         if let RequestOutcome::Success = self.outcome {
+            sr.observe_vm(LATENCY_MS, &[rpc], millis(elapsed));
             sr.observe_vm(LATENCY_BY_CALLER_MS, &[caller, rpc], millis(elapsed));
         }
-        let Some(deadline) = deadline else {
-            return;
-        };
-        let Some(deadline_outcome) = DeadlineOutcome::of(self.outcome, self.grpc_timeout, elapsed)
-        else {
-            return;
-        };
-        sr.incr(deadline, &[("outcome", deadline_outcome.into())], 1);
-        if !matches!(self.endpoint, Endpoint::FilterTweets) {
-            return;
-        }
-        match deadline_outcome {
-            DeadlineOutcome::Within(remaining) => {
-                sr.observe_vm(DEADLINE_REMAINING_MS, &[], millis(remaining));
-            }
-            DeadlineOutcome::Overrun(overrun) => {
-                sr.observe_vm(DEADLINE_OVERRUN_MS, &[], millis(overrun));
-            }
-            DeadlineOutcome::Absent
-            | DeadlineOutcome::CancelledEarly
-            | DeadlineOutcome::CancelledAtDeadline
-            | DeadlineOutcome::CancelledNoDeadline => {}
+        if let Some(deadline) = DeadlineOutcome::of(self.outcome, self.grpc_timeout, elapsed) {
+            sr.incr(DEADLINE, &[rpc, level, ("outcome", deadline.into())], 1);
         }
     }
 }
@@ -363,28 +390,6 @@ impl Drop for RequestMetricsGuard {
         if let Some(sr) = global_stats_receiver() {
             self.emit(&*sr, self.start.elapsed());
         }
-    }
-}
-
-pub(crate) fn record_notification_request(
-    notification_type: &str,
-    outcome: RequestOutcome,
-    elapsed: Duration,
-) {
-    incr(
-        NOTIFICATION_REQUESTS,
-        &[
-            ("notification_type", notification_type),
-            ("outcome", outcome.into()),
-        ],
-        1,
-    );
-    if let RequestOutcome::Success = outcome {
-        observe_vm(
-            NOTIFICATION_LATENCY_MS,
-            &[("notification_type", notification_type)],
-            millis(elapsed),
-        );
     }
 }
 
@@ -409,8 +414,13 @@ pub(crate) fn record_notification_results(
     }
 }
 
-pub(crate) fn record_batch_size(metric: &str, size: usize) {
-    observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);
+pub(crate) fn record_batch_size(endpoint: Endpoint, size: usize) {
+    observe(
+        BATCH_SIZE,
+        &[("rpc", endpoint.into())],
+        size as f64,
+        HistogramBuckets::Bucket50To500,
+    );
 }
 
 pub(crate) fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {
@@ -516,21 +526,12 @@ mod tests {
         MediaRestriction, Withholding,
     };
     use crate::quote::QUOTE_PASS;
+    use crate::rules::fixtures::allow;
     use crate::rules::RuleId;
     use crate::safety_label_source::metrics::EXPIRED_LABELS;
-    use std::fs;
-    use std::path::Path;
     use xai_visibility_filtering::models::FilteredReason;
     use xai_visibility_filtering::vf_client::FILTER_TWEETS_LATENCY_VM_METRIC;
     use xai_x_thrift::action::InterstitialReason;
-
-    fn allow() -> Verdict {
-        Verdict::Shown {
-            notice: None,
-            media: None,
-            engagement: None,
-        }
-    }
 
     fn drop_by(rule: &'static str) -> Verdict {
         Verdict::Withheld(Decided {
@@ -549,35 +550,29 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_evaluated_candidates_unresolved_tweets_and_deadline_metrics() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
-        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
-        let path = if Path::new(cargo).exists() { cargo } else { ws };
-        let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(dashboard.contains(&format!(
-            "FT_EVALUATED_CANDIDATES_METRIC = \"{EVALUATED_CANDIDATES}\""
-        )));
+    fn dashboard_generator_pins_the_server_metrics() {
+        let dashboard =
+            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
+        for (constant, family) in [
+            ("VF_REQUESTS_METRIC", REQUESTS),
+            ("VF_REQUEST_LATENCY_METRIC", LATENCY_MS),
+            ("VF_REQUEST_DEADLINE_METRIC", DEADLINE),
+            ("VF_REQUEST_BATCH_SIZE_METRIC", BATCH_SIZE),
+            ("VF_VERDICTS_METRIC", VERDICTS),
+            ("VF_VERDICTS_BY_RULE_METRIC", VERDICTS_BY_RULE),
+            ("VF_EVALUATED_CANDIDATES_METRIC", EVALUATED_CANDIDATES),
+            ("VF_PHASE_METRIC", PHASE_MS),
+            ("UNRESOLVED_TWEETS_METRIC", UNRESOLVED_TWEETS),
+            ("EXPIRED_LABELS_METRIC", EXPIRED_LABELS),
+        ] {
+            assert!(
+                dashboard.contains(&format!("{constant} = \"{family}\"")),
+                "{constant}"
+            );
+        }
         assert!(dashboard.contains(&format!(
             "FT_FAIL_OPEN_DEFAULTS_FILTER = 'fail_open_defaults!~\"{FAIL_OPEN_DEFAULTS_NONE}|\"'"
         )));
-        assert!(dashboard.contains(&format!(
-            "UNRESOLVED_TWEETS_METRIC = \"{UNRESOLVED_TWEETS}\""
-        )));
-        assert!(dashboard.contains(&format!("FT_DEADLINE_METRIC = \"{DEADLINE}\"")));
-        assert!(dashboard.contains(&format!("EXPIRED_LABELS_METRIC = \"{EXPIRED_LABELS}\"")));
-        assert!(dashboard.contains(&format!(
-            "ET_REQUESTS_METRIC = \"{EVALUATE_TWEETS_REQUESTS}\""
-        )));
-        assert!(dashboard.contains(&format!(
-            "ET_LATENCY_METRIC = \"{EVALUATE_TWEETS_LATENCY_MS}\""
-        )));
-        assert!(dashboard.contains(&format!(
-            "ET_DEADLINE_METRIC = \"{EVALUATE_TWEETS_DEADLINE}\""
-        )));
-        assert!(dashboard.contains(&format!(
-            "LOOKUP_LATENCY_VM_METRIC = \"{LOOKUP_LATENCY_MS}\""
-        )));
-        assert!(dashboard.contains(&format!("LOOKUP_DEADLINE_METRIC = \"{LOOKUP_DEADLINE}\"")));
         assert!(dashboard.contains(&format!("QUOTE_PASS_METRIC = \"{QUOTE_PASS}\"")));
         assert!(dashboard.contains(&format!(
             "REQUESTS_BY_CALLER_METRIC = \"{REQUESTS_BY_CALLER}\""
@@ -597,7 +592,6 @@ mod tests {
         assert!(dashboard.contains(&format!(
             "REQUESTS_BY_CALLER_NON_SUCCESS_FILTER = 'outcome=~\"{failure}|{cancelled}\"'"
         )));
-        assert!(dashboard.contains(&format!("FT_PHASE_METRIC = \"{PHASE_MS}\"")));
         let hydration: &str = Stage::Hydration.into();
         assert!(dashboard.contains(&format!("{{stage=\"{hydration}\",")));
         assert!(dashboard.contains(&format!(
@@ -607,7 +601,7 @@ mod tests {
             DeadlineOutcome::CancelledEarly,
             DeadlineOutcome::CancelledAtDeadline,
             DeadlineOutcome::CancelledNoDeadline,
-            DeadlineOutcome::Overrun(Duration::ZERO),
+            DeadlineOutcome::Overrun,
         ] {
             let outcome: &str = outcome.into();
             assert!(dashboard.contains(&format!("'outcome=\"{outcome}\"'")));
@@ -638,70 +632,74 @@ mod tests {
     }
 
     #[test]
-    fn each_endpoint_emits_its_request_deadline_and_caller_series() {
+    fn each_outcome_emits_its_request_deadline_and_caller_series() {
         let recorded = Recorded::default();
-        for endpoint in [
-            Endpoint::FilterTweets,
-            Endpoint::EvaluateTweets,
-            Endpoint::GetSafetyLabels,
+        for outcome in [
+            RequestOutcome::Success,
+            RequestOutcome::Failure,
+            RequestOutcome::Cancelled,
         ] {
-            for outcome in [
-                RequestOutcome::Success,
-                RequestOutcome::Failure,
-                RequestOutcome::Cancelled,
-            ] {
-                let guard = RequestMetricsGuard {
-                    endpoint,
-                    caller_identity: None,
-                    grpc_timeout: Some(Duration::from_millis(400)),
-                    start: Instant::now(),
-                    outcome,
-                };
-                guard.emit(&recorded, Duration::from_millis(100));
-            }
+            let guard = RequestMetricsGuard {
+                endpoint: Endpoint::FilterNotifications,
+                level: RequestLevel::Named(SafetyLevel::NotificationsFollow),
+                caller_identity: None,
+                grpc_timeout: Some(Duration::from_millis(400)),
+                start: Instant::now(),
+                outcome,
+            };
+            guard.emit(&recorded, Duration::from_millis(100));
         }
         assert_eq!(
             recorded.0.into_inner().unwrap(),
             [
-                "incr filter_tweets_requests{outcome=success}",
-                "observe_vm filter_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_tweets,outcome=success}",
-                "observe_vm vf_request_latency_by_caller_ms{caller_identity=unknown,rpc=filter_tweets}",
-                "incr filter_tweets_deadline{outcome=within}",
-                "observe_vm filter_tweets_deadline_remaining_ms{}",
-                "incr filter_tweets_requests{outcome=failure}",
-                "observe_vm filter_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_tweets,outcome=failure}",
-                "incr filter_tweets_requests{outcome=cancelled}",
-                "observe_vm filter_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_tweets,outcome=cancelled}",
-                "incr filter_tweets_deadline{outcome=cancelled_early}",
-                "incr evaluate_tweets_requests{outcome=success}",
-                "observe_vm evaluate_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=evaluate_tweets,outcome=success}",
-                "observe_vm vf_request_latency_by_caller_ms{caller_identity=unknown,rpc=evaluate_tweets}",
-                "incr evaluate_tweets_deadline{outcome=within}",
-                "incr evaluate_tweets_requests{outcome=failure}",
-                "observe_vm evaluate_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=evaluate_tweets,outcome=failure}",
-                "incr evaluate_tweets_requests{outcome=cancelled}",
-                "observe_vm evaluate_tweets_latency_ms{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=evaluate_tweets,outcome=cancelled}",
-                "incr evaluate_tweets_deadline{outcome=cancelled_early}",
-                "incr safety_labels_lookup_requests{outcome=success}",
-                "observe_vm safety_labels_lookup_latency_ms_vm{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=get_safety_labels,outcome=success}",
-                "observe_vm vf_request_latency_by_caller_ms{caller_identity=unknown,rpc=get_safety_labels}",
-                "incr safety_labels_lookup_deadline{outcome=within}",
-                "incr safety_labels_lookup_requests{outcome=failure}",
-                "observe_vm safety_labels_lookup_latency_ms_vm{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=get_safety_labels,outcome=failure}",
-                "incr safety_labels_lookup_requests{outcome=cancelled}",
-                "observe_vm safety_labels_lookup_latency_ms_vm{}",
-                "incr vf_requests_by_caller{caller_identity=unknown,rpc=get_safety_labels,outcome=cancelled}",
-                "incr safety_labels_lookup_deadline{outcome=cancelled_early}",
+                "incr vf_requests{rpc=filter_notifications,safety_level=notifications_follow,outcome=success}",
+                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_notifications,outcome=success}",
+                "observe_vm vf_request_latency_ms{rpc=filter_notifications}",
+                "observe_vm vf_request_latency_by_caller_ms{caller_identity=unknown,rpc=filter_notifications}",
+                "incr vf_request_deadline{rpc=filter_notifications,safety_level=notifications_follow,outcome=within}",
+                "incr vf_requests{rpc=filter_notifications,safety_level=notifications_follow,outcome=failure}",
+                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_notifications,outcome=failure}",
+                "incr vf_requests{rpc=filter_notifications,safety_level=notifications_follow,outcome=cancelled}",
+                "incr vf_requests_by_caller{caller_identity=unknown,rpc=filter_notifications,outcome=cancelled}",
+                "incr vf_request_deadline{rpc=filter_notifications,safety_level=notifications_follow,outcome=cancelled_early}",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn each_endpoint_counts_started_and_its_outcome_at_one_level() {
+        for (endpoint, level, label) in [
+            (
+                Endpoint::FilterTweets,
+                RequestLevel::Named(SafetyLevel::TimelineHome),
+                "timeline_home",
+            ),
+            (Endpoint::EvaluateTweets, RequestLevel::Unknown, "unknown"),
+            (Endpoint::GetSafetyLabels, RequestLevel::Absent, "none"),
+            (
+                Endpoint::FilterNotifications,
+                RequestLevel::Named(SafetyLevel::NotificationsWriterV2),
+                "notifications_writer_v2",
+            ),
+        ] {
+            thread_recorded::start();
+            let served = observe_request(endpoint, level, Request::new(()), |_, _| async {
+                Ok::<_, Status>(())
+            })
+            .await;
+            assert!(served.is_ok());
+            let recorded: Vec<Vec<(String, String)>> = thread_recorded::take(REQUESTS)
+                .into_iter()
+                .map(|sample| sample.labels)
+                .collect();
+            let rpc: &str = endpoint.into();
+            let labels = |outcome: &str| {
+                [("rpc", rpc), ("safety_level", label), ("outcome", outcome)]
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .to_vec()
+            };
+            assert_eq!(recorded, [labels("started"), labels("success")], "{rpc}");
+        }
     }
 
     #[test]
@@ -730,11 +728,11 @@ mod tests {
         );
         assert_eq!(
             of(RequestOutcome::Success, 400),
-            Some(DeadlineOutcome::Within(Duration::ZERO))
+            Some(DeadlineOutcome::Within)
         );
         assert_eq!(
             of(RequestOutcome::Success, 401),
-            Some(DeadlineOutcome::Overrun(Duration::from_millis(1)))
+            Some(DeadlineOutcome::Overrun)
         );
         assert_eq!(of(RequestOutcome::Failure, 5), None);
     }
@@ -762,24 +760,46 @@ mod tests {
             media: None,
             engagement: Some(limit_by("conversation_control")),
         };
-        let aggregated = aggregate_verdicts([&a, &b, &d, &both, &limit_only]);
+        let recorded = |family: &str| {
+            thread_recorded::start();
+            record_verdicts(
+                Endpoint::FilterTweets,
+                SafetyLevel::FilterAll,
+                [&a, &b, &d, &both, &limit_only],
+            );
+            let mut counts: Vec<(Option<String>, String, f64)> = thread_recorded::take(family)
+                .into_iter()
+                .map(|sample| {
+                    (
+                        sample.label("rule").map(str::to_owned),
+                        sample.label("action").unwrap().to_owned(),
+                        sample.value,
+                    )
+                })
+                .collect();
+            counts.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+            counts
+        };
+        let row = |rule: Option<&str>, action: &str, count: f64| {
+            (rule.map(str::to_owned), action.to_owned(), count)
+        };
 
-        assert_eq!(aggregated.mix.get("allow"), Some(&2));
-        assert_eq!(aggregated.mix.get("drop"), Some(&1));
-        assert_eq!(aggregated.mix.get("tweet_interstitial"), Some(&1));
-        assert_eq!(aggregated.mix.get("limited_engagement"), Some(&1));
-        assert_eq!(aggregated.mix.values().sum::<u64>(), 5);
-        assert_eq!(aggregated.by_rule.values().sum::<u64>(), 4);
-        assert_eq!(aggregated.by_rule.get(&("nsfw_media", "drop")), Some(&1));
         assert_eq!(
-            aggregated.by_rule.get(&("nsfw_media", "interstitial")),
-            Some(&1)
+            recorded(VERDICTS),
+            [
+                row(None, "allow", 2.0),
+                row(None, "drop", 1.0),
+                row(None, "limited_engagement", 1.0),
+                row(None, "tweet_interstitial", 1.0),
+            ]
         );
         assert_eq!(
-            aggregated
-                .by_rule
-                .get(&("conversation_control", "limited_engagement")),
-            Some(&2)
+            recorded(VERDICTS_BY_RULE),
+            [
+                row(Some("conversation_control"), "limited_engagement", 2.0),
+                row(Some("nsfw_media"), "drop", 1.0),
+                row(Some("nsfw_media"), "interstitial", 1.0),
+            ]
         );
     }
 

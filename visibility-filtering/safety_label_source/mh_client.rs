@@ -6,7 +6,7 @@ use xai_manhattan::s2s::S2sConfig;
 use xai_manhattan::{Key, LkeySelector, ManhattanError, NativeManhattanClient, Tenant};
 use xai_safety_label_store::types::encode_pkey;
 
-use super::codec::RawSafetyLabel;
+use super::decode::RawSafetyLabel;
 
 const SCAN_LIMIT: u32 = 512;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);

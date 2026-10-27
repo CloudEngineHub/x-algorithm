@@ -7,13 +7,10 @@ use crate::models::{
     ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
     SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
 };
-use crate::params::limited_actions_copy::tests::BUNDLE;
-use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
-use crate::quote::QuotePassMode;
-use crate::retweet::hydrate_and_evaluate;
-use crate::rules::{RuleEngine, SafetyLevel};
+use crate::quote::{QuotePassMode, QuotePassRunner};
+use crate::rules::{NoTrace, RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tonic::{Request, Status};
@@ -169,7 +166,7 @@ impl<S: Sources + 'static> Scenario<S> {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
         let post_evaluator = PostEvaluator::new(sources, rule_engine, caches);
-        let (hydrated, outcomes) = hydrate_and_evaluate(&post_evaluator, self.request(raw)).await;
+        let (hydrated, outcomes) = post_evaluator.run(self.request(raw), &mut NoTrace).await;
         Evaluated {
             outcomes,
             retweet_sources: hydrated.retweet_sources(),
@@ -199,14 +196,19 @@ pub(crate) struct Wire {
 
 impl Wire {
     pub(crate) fn new(sources: Arc<dyn Sources>) -> Self {
-        Self::serving(sources, FallbackCaches::default(), None, QuotePassMode::Off)
+        Self::serving(
+            sources,
+            FallbackCaches::default(),
+            None,
+            QuotePassRunner::new(QuotePassMode::Off),
+        )
     }
 
     pub(crate) fn serving(
         sources: Arc<dyn Sources>,
         fallback_caches: FallbackCaches,
         comparator: Option<Box<dyn EntryComparator>>,
-        quote_pass: QuotePassMode,
+        quote_pass: QuotePassRunner,
     ) -> Self {
         let post_evaluator = Arc::new(PostEvaluator::new(
             sources,
@@ -216,20 +218,12 @@ impl Wire {
         let endpoint = EvaluateTweetsEndpoint::new(
             Arc::clone(&post_evaluator),
             ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json(BUNDLE),
             comparator,
             quote_pass,
         );
         Self {
             post_evaluator,
             endpoint,
-        }
-    }
-
-    pub(crate) fn quote_pass_permits(self, permits: usize) -> Self {
-        Self {
-            endpoint: self.endpoint.with_quote_pass_permits(permits),
-            ..self
         }
     }
 

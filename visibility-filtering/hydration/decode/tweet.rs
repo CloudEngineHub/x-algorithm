@@ -3,7 +3,7 @@ use crate::models::{
     AuthorId, MediaFeature, NsfwFeature, PureCore, ReactionContext, ReplyTo, TweetFeatures, TweetId,
 };
 use std::num::NonZeroU64;
-use xai_core_entities::entities::{EditControl, EditControlInitial, PureCoreData, TakedownReason};
+use xai_core_entities::entities::{PureCoreData, TakedownReason};
 
 #[derive(Clone)]
 pub(crate) struct CachedTweet {
@@ -139,7 +139,7 @@ impl CachedTweetRow {
             is_nullcast,
             community_id,
             trusted_friends_list_id,
-            edit_control: _,
+            latest_edit_tweet_id,
             exclusive_conversation_author_id,
             article_id,
             narrowcast_place_id,
@@ -160,7 +160,7 @@ impl CachedTweetRow {
             is_trusted_friends_tweet: trusted_friends_list_id.is_some(),
             trusted_friends_list_id: trusted_friends_list_id.unwrap_or_default(),
             community_id: *community_id,
-            latest_edit_tweet_id: tweet.latest_edit_tweet_id().map(stored_id),
+            latest_edit_tweet_id: latest_edit_tweet_id.map(stored_id),
             exclusive_conversation_author_id: exclusive_conversation_author_id.map(stored_id),
             article_id: *article_id,
             sparse: is_sparse.then(|| {
@@ -201,12 +201,7 @@ impl CachedTweetRow {
             trusted_friends_list_id: self
                 .is_trusted_friends_tweet
                 .then_some(self.trusted_friends_list_id),
-            edit_control: self.latest_edit_tweet_id.map(|latest| {
-                EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![read_id(latest)],
-                    ..Default::default()
-                })
-            }),
+            latest_edit_tweet_id: self.latest_edit_tweet_id.map(read_id),
             exclusive_conversation_author_id: self.exclusive_conversation_author_id.map(read_id),
             article_id: self.article_id,
             narrowcast_place_id,
@@ -257,7 +252,6 @@ mod tests {
     use crate::models::Placement;
     use crate::rules::fixtures::{candidate, dropped, logged_out_viewer};
     use crate::rules::{RuleEngine, SafetyLevel};
-    use xai_core_entities::entities::EditControlEdit;
     use xai_visibility_filtering::models::FilteredReason;
 
     #[test]
@@ -331,10 +325,7 @@ mod tests {
             ..Default::default()
         };
         let stale = TweetFeatures {
-            edit_control: Some(EditControl::Initial(EditControlInitial {
-                edit_tweet_ids: vec![0],
-                ..Default::default()
-            })),
+            latest_edit_tweet_id: Some(0),
             ..Default::default()
         };
         let engine = RuleEngine::for_tests();
@@ -369,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_row_reads_as_its_tweet_with_only_the_latest_edit() {
+    fn a_cached_row_reads_as_its_tweet() {
         let tweet = TweetFeatures {
             media: MediaFeature {
                 has_media: true,
@@ -386,13 +377,7 @@ mod tests {
             is_nullcast: true,
             community_id: NonZeroU64::new(500),
             trusted_friends_list_id: Some(8),
-            edit_control: Some(EditControl::Edit(EditControlEdit {
-                initial_tweet_id: 10,
-                edit_control_initial: Some(EditControlInitial {
-                    edit_tweet_ids: vec![10, 20, 30],
-                    ..Default::default()
-                }),
-            })),
+            latest_edit_tweet_id: Some(30),
             exclusive_conversation_author_id: Some(7),
             article_id: NonZeroU64::new(8),
             narrowcast_place_id: Some(0xa000_0000_0000_0001),
@@ -402,21 +387,7 @@ mod tests {
             }),
         };
 
-        let cached = CachedTweetRow::new(&tweet).features();
-
-        assert_eq!(
-            cached,
-            TweetFeatures {
-                edit_control: Some(EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![30],
-                    ..Default::default()
-                })),
-                ..tweet.clone()
-            }
-        );
-        for id in [10, 20, 30] {
-            assert_eq!(cached.is_superseded_edit(id), tweet.is_superseded_edit(id));
-        }
+        assert_eq!(CachedTweetRow::new(&tweet).features(), tweet);
         assert_eq!(
             CachedTweetRow::new(&TweetFeatures::default()).features(),
             TweetFeatures::default()

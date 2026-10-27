@@ -1,26 +1,14 @@
+use super::{HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver};
 use crate::hydration::Hydrators;
 use crate::metrics as ft_metrics;
 use crate::metrics::Rpc;
 use crate::models::{
     Decided, Evaluation, EvaluationKey, PlacedCandidate, TweetId, Verdict, Withholding,
 };
-use crate::post_evaluator::{
-    HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver,
-};
-use crate::rules::{NoTrace, PolicyTrace};
+use crate::rules::PolicyTrace;
 use std::collections::{HashMap, HashSet};
 
 const RETWEET_SOURCES: &str = "evaluate_tweets_retweet_sources";
-
-pub(crate) async fn evaluate_merging_sources(
-    post_evaluator: &PostEvaluator,
-    request: PostBatch,
-) -> Vec<PostEvaluation> {
-    let hydrated = post_evaluator
-        .hydrate(request, Some(Rpc::EvaluateTweets))
-        .await;
-    without_selections(merge_sources(post_evaluator, &hydrated, &mut NoTrace))
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeSelection {
@@ -39,63 +27,29 @@ pub(crate) struct Traced {
     pub(crate) selections: HashMap<EvaluationKey, MergeSelection>,
 }
 
+impl PostObserver for Traced {
+    const TOTAL: bool = true;
+
+    fn record(&mut self, key: EvaluationKey, trace: PolicyTrace) {
+        self.policies.insert(key, trace);
+    }
+
+    fn select(&mut self, key: EvaluationKey, selection: MergeSelection) {
+        self.selections.insert(key, selection);
+    }
+}
+
 pub(crate) async fn hydrate_and_trace(
     post_evaluator: &PostEvaluator,
     request: PostBatch,
 ) -> (HydratedRequest, Vec<PostEvaluation>, Traced) {
     let rpc = request.rpc;
     let mut traced = Traced::default();
-    let (hydrated, selected) =
-        hydrate_and_select(post_evaluator, request, &mut traced.policies).await;
-    let outcomes = selected
-        .into_iter()
-        .map(|(outcome, selection)| {
-            traced.selections.insert(outcome.key(), selection);
-            outcome
-        })
-        .collect();
+    let (hydrated, outcomes) = post_evaluator.run(request, &mut traced).await;
     if rpc == Rpc::EvaluateTweets {
         trace_unmerged_sources(post_evaluator, &hydrated, &mut traced);
     }
     (hydrated, outcomes, traced)
-}
-
-#[cfg(test)]
-pub(crate) async fn hydrate_and_evaluate(
-    post_evaluator: &PostEvaluator,
-    request: PostBatch,
-) -> (HydratedRequest, Vec<PostEvaluation>) {
-    let (hydrated, selected) = hydrate_and_select(post_evaluator, request, &mut NoTrace).await;
-    (hydrated, without_selections(selected))
-}
-
-async fn hydrate_and_select<O: PostObserver>(
-    post_evaluator: &PostEvaluator,
-    request: PostBatch,
-    observer: &mut O,
-) -> (HydratedRequest, Vec<(PostEvaluation, MergeSelection)>) {
-    match request.rpc {
-        Rpc::FilterTweets => {
-            let hydrated = post_evaluator.hydrate(request, None).await;
-            let selected = post_evaluator
-                .evaluate_in_request_order(&hydrated, observer)
-                .into_iter()
-                .map(|outcome| (outcome, MergeSelection::RequestedOnly))
-                .collect();
-            (hydrated, selected)
-        }
-        Rpc::EvaluateTweets => {
-            let hydrated = post_evaluator
-                .hydrate(request, Some(Rpc::EvaluateTweets))
-                .await;
-            let selected = merge_sources(post_evaluator, &hydrated, observer);
-            (hydrated, selected)
-        }
-    }
-}
-
-fn without_selections(selected: Vec<(PostEvaluation, MergeSelection)>) -> Vec<PostEvaluation> {
-    selected.into_iter().map(|(outcome, _)| outcome).collect()
 }
 
 fn trace_unmerged_sources(
@@ -120,21 +74,18 @@ fn trace_unmerged_sources(
     }
 }
 
-fn merge_sources<O: PostObserver>(
+pub(super) fn merge_sources<O: PostObserver>(
     post_evaluator: &PostEvaluator,
     hydrated: &HydratedRequest,
     observer: &mut O,
-) -> Vec<(PostEvaluation, MergeSelection)> {
+) -> Vec<PostEvaluation> {
     let (in_batch, fetched) = source_ids(hydrated);
     if in_batch.is_empty() && fetched.is_empty() {
-        return post_evaluator
-            .evaluate_in_request_order(hydrated, observer)
-            .into_iter()
-            .map(|outcome| {
-                let selection = requested_selection(&outcome.evaluation);
-                (outcome, selection)
-            })
-            .collect();
+        let outcomes = post_evaluator.evaluate_in_request_order(hydrated, observer);
+        for outcome in &outcomes {
+            observer.select(outcome.key(), requested_selection(&outcome.evaluation));
+        }
+        return outcomes;
     }
     ft_metrics::incr_nonzero(
         RETWEET_SOURCES,
@@ -158,14 +109,17 @@ fn merge_sources<O: PostObserver>(
             Some((source_id, source.evaluation))
         })
         .collect();
-    let mut merged: Vec<(PostEvaluation, MergeSelection)> =
-        Vec::with_capacity(hydrated.candidates().len());
+    let mut merged: Vec<PostEvaluation> = Vec::with_capacity(hydrated.candidates().len());
     for candidate in hydrated.candidates() {
         let key = candidate.key();
         let selected = match outcomes.remove(&key) {
-            Some(outcome) => merge_source(outcome, &sources),
-            None => match merged.iter().rfind(|(prior, _)| prior.key() == key) {
-                Some(selected) => selected.clone(),
+            Some(outcome) => {
+                let (selected, selection) = merge_source(outcome, &sources);
+                observer.select(key, selection);
+                selected
+            }
+            None => match merged.iter().rfind(|prior| prior.key() == key) {
+                Some(prior) => prior.clone(),
                 None => continue,
             },
         };
@@ -1312,12 +1266,8 @@ Flock blocks-rev[30]"
     #[tokio::test]
     async fn a_requested_stale_source_is_dropped_standalone_and_kept_as_its_retweets_source() {
         use crate::rules::fixtures::dropped;
-        use xai_core_entities::entities::{EditControl, EditControlInitial};
         let superseded = TweetFeatures {
-            edit_control: Some(EditControl::Initial(EditControlInitial {
-                edit_tweet_ids: vec![5, 6],
-                ..Default::default()
-            })),
+            latest_edit_tweet_id: Some(6),
             ..Default::default()
         };
         let scenario = Scenario::new(

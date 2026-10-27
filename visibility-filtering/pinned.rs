@@ -3,30 +3,18 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 pub(crate) fn assert_pinned(path: &str, rendered: &str) {
-    assert_all_pinned([(path.to_owned(), rendered.to_owned())]);
-}
-
-pub(crate) fn assert_all_pinned(files: impl IntoIterator<Item = (String, String)>) {
-    let stale: Vec<String> = files
-        .into_iter()
-        .filter_map(|(path, rendered)| {
-            let pinned = match fs::read_to_string(crate_path(&path)) {
-                Ok(pinned) => Some(pinned),
-                Err(e) if e.kind() == ErrorKind::NotFound => None,
-                Err(e) => panic!("{path}: {e}"),
-            };
-            if pinned.as_deref() == Some(rendered.as_str()) {
-                return None;
-            }
-            write_output(&path, &rendered);
-            Some(first_difference(&path, pinned.as_deref(), &rendered))
-        })
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "{} pinned file(s) differ from what the tests render: run scripts/bless and review the diff\n{}",
-        stale.len(),
-        stale.join("\n")
+    let pinned = match fs::read_to_string(crate_path(path)) {
+        Ok(pinned) => Some(pinned),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => panic!("{path}: {e}"),
+    };
+    if pinned.as_deref() == Some(rendered) {
+        return;
+    }
+    write_output(path, rendered);
+    panic!(
+        "pinned file differs from what the test renders: run scripts/bless and review the diff\n{}",
+        first_difference(path, pinned.as_deref(), rendered)
     );
 }
 

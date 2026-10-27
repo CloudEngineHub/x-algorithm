@@ -1,12 +1,18 @@
 use crate::models::{
-    Decided, DropReason, EmergencyCopy, FosnrReason, LabelInterstitial, LimitedEngagement,
-    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
-    PublicInterest, TombstoneReason, Verdict, Withholding,
+    Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
+    LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
+    Withholding,
 };
 use crate::params::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
-use crate::params::{LimitedActionType, LimitedActionsPolicies};
+use crate::params::LimitedActionsPolicies;
+use crate::post_evaluator::PostEvaluation;
 use crate::quote::Rerendered;
-use crate::rules::SafetyLevel;
+use crate::result_label::{label, state_label, Class, Label, NONE};
+use crate::rules::{RerenderReason, RuleId, SafetyLevel};
+use std::sync::Arc;
+use vf_pb::tweet_evaluation::Outcome as TweetEvaluationOutcome;
+use vf_pb::NotificationDropReason;
 use xai_visibility_filtering::graphql_results::translate;
 use xai_visibility_filtering::links;
 use xai_visibility_filtering::models::FilteredReason;
@@ -151,7 +157,16 @@ pub(crate) fn thrift_action(
 }
 
 pub(crate) fn rerendered_state(rerendered: &Rerendered) -> TweetFieldsResultState {
-    TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(rerendered.reason.clone()))
+    use ThriftFilteredReason as T;
+    let reason = match rerendered.reason {
+        RerenderReason::AuthorDeactivated => T::AuthorIsDeactivated(true),
+        RerenderReason::AuthorInactive => T::AuthorAccountIsInactive(true),
+        RerenderReason::AuthorSuspended => T::AuthorIsSuspended(true),
+        RerenderReason::AuthorBlocksViewer => T::AuthorBlockViewer(true),
+        RerenderReason::AuthorProtected => T::AuthorIsProtected(true),
+        RerenderReason::Unspecified => T::UnspecifiedReason(true),
+    };
+    TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason))
 }
 
 pub(crate) fn thrift_result_state(
@@ -597,7 +612,7 @@ fn limited_engagement_reason(reason: LimitedEngagementReason) -> action::Limited
     }
 }
 
-pub(crate) fn proto_action(verdict: Verdict) -> (vf_pb::Action, Option<vf_pb::FilteredReason>) {
+pub(crate) fn proto_action(verdict: &Verdict) -> (vf_pb::Action, Option<vf_pb::FilteredReason>) {
     let (kind, filtered_reason) = match verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(reason),
@@ -704,14 +719,140 @@ pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
     decided_rows(verdict).next().map(|(rule, _)| rule)
 }
 
+pub(crate) fn filter_tweets_result(outcome: PostEvaluation) -> vf_pb::TweetVisibilityResult {
+    let (action, filtered_reason) = proto_action(outcome.evaluation.verdict());
+    vf_pb::TweetVisibilityResult {
+        tweet_id: outcome.tweet_id.0,
+        action: Some(action),
+        filtered_reason,
+        safety_labels: outcome.safety_labels.map(Arc::unwrap_or_clone),
+    }
+}
+
+pub(crate) fn evaluate_tweets_outcome(
+    evaluation: Option<&Evaluation>,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> TweetEvaluationOutcome {
+    match evaluation
+        .and_then(|evaluation| evaluate_tweets_state(evaluation, level, policies))
+        .map(|state| xai_x_thrift::serialize_compact(&state))
+    {
+        Some(Ok(bytes)) => TweetEvaluationOutcome::ResultStateThriftCompact(bytes.into()),
+        Some(Err(_)) | None => TweetEvaluationOutcome::Failed(vf_pb::Failed {}),
+    }
+}
+
+pub(crate) fn evaluate_tweets_state(
+    evaluation: &Evaluation,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> Option<TweetFieldsResultState> {
+    match evaluation {
+        Evaluation::Complete { verdict, .. } => Some(thrift_result_state(verdict, level, policies)),
+        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => None,
+    }
+}
+
+pub(crate) fn evaluate_tweets_label(
+    evaluation: &Evaluation,
+    level: SafetyLevel,
+    policies: &LimitedActionsPolicies,
+) -> Label {
+    if let Evaluation::NotFound(_) = evaluation {
+        label(Class::NotFound, NONE)
+    } else {
+        evaluate_tweets_state(evaluation, level, policies)
+            .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
+    }
+}
+
+pub(crate) fn notification_result(
+    evaluation: Option<&Evaluation>,
+) -> (
+    vf_pb::NotificationVisibilityResult,
+    (&'static str, &'static str),
+) {
+    use vf_pb::notification_visibility_result::Outcome;
+    let dropped = |reason: NotificationDropReason| {
+        (
+            Outcome::Dropped(vf_pb::Dropped {
+                reason: Some(reason.into()),
+            }),
+            ("dropped", notification_reason_label(reason)),
+        )
+    };
+    let (outcome, labels) = match evaluation {
+        Some(
+            Evaluation::Complete {
+                verdict,
+                fail_open_defaults,
+            }
+            | Evaluation::Partial {
+                verdict,
+                fail_open_defaults,
+            },
+        ) if fail_open_defaults.is_empty() => match verdict {
+            Verdict::Withheld(Decided { id, .. }) => dropped(notification_drop_reason(*id)),
+            Verdict::Shown { .. } => (Outcome::Allowed(vf_pb::Allowed {}), ("allowed", "none")),
+        },
+        Some(Evaluation::NotFound(_)) => dropped(NotificationDropReason::ActorNotFound),
+        Some(Evaluation::Complete { .. } | Evaluation::Partial { .. } | Evaluation::Failed(_))
+        | None => (Outcome::Failed(vf_pb::Failed {}), ("failed", "none")),
+    };
+    (
+        vf_pb::NotificationVisibilityResult {
+            outcome: Some(outcome),
+        },
+        labels,
+    )
+}
+
+const NOTIFICATION_DROP_REASONS: [(RuleId, NotificationDropReason); 4] = [
+    (
+        RuleId::SuspendedAuthor,
+        NotificationDropReason::ActorSuspended,
+    ),
+    (
+        RuleId::ProtectedAuthor,
+        NotificationDropReason::ActorProtected,
+    ),
+    (
+        RuleId::ViewerBlocksAuthor,
+        NotificationDropReason::RecipientBlocksActor,
+    ),
+    (
+        RuleId::ViewerMutesAndDoesNotFollowAuthor,
+        NotificationDropReason::RecipientMutesActor,
+    ),
+];
+
+fn notification_drop_reason(rule: RuleId) -> NotificationDropReason {
+    NOTIFICATION_DROP_REASONS
+        .iter()
+        .find(|&&(id, _)| id == rule)
+        .map_or(NotificationDropReason::Unspecified, |&(_, reason)| reason)
+}
+
+fn notification_reason_label(reason: NotificationDropReason) -> &'static str {
+    match reason {
+        NotificationDropReason::Unspecified => "unspecified",
+        NotificationDropReason::ActorNotFound => "actor_not_found",
+        NotificationDropReason::ActorSuspended => "actor_suspended",
+        NotificationDropReason::ActorProtected => "actor_protected",
+        NotificationDropReason::RecipientBlocksActor => "recipient_blocks_actor",
+        NotificationDropReason::RecipientMutesActor => "recipient_mutes_actor",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::Rpc;
     use crate::rules::fixtures::{
-        appealed, label_interstitial, limited_for, noticed, with_label_interstitial,
+        appealed, dropped, label_interstitial, limited_for, noticed, tombstoned,
+        with_label_interstitial,
     };
-    use crate::rules::RuleId;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::graphql_results::{
         is_dropped_media_blur, resolve_blurred_image_interstitial,
@@ -727,28 +868,11 @@ mod tests {
         )])
     }
 
-    fn dropped(reason: FilteredReason) -> Verdict {
-        Verdict::Withheld(Decided {
-            value: Withholding::Drop(DropReason::Legacy(reason)),
-            id: RuleId::FilterAll,
-            by: "rule",
-        })
-    }
-
-    fn tombstoned(reason: TombstoneReason) -> Verdict {
-        Verdict::Withheld(Decided {
-            value: Withholding::Tombstone(reason),
-            id: RuleId::FilterAll,
-            by: "rule",
-        })
-    }
-
     #[test]
     fn decided_by_names_the_deciding_rule_or_why_the_rules_never_ran() {
         use crate::hydration::{Hydrator, Hydrators, Lookup};
-        use crate::models::Evaluation;
         use crate::rules::fixtures::allow;
-        let suspended = dropped(FilteredReason::AuthorIsSuspended);
+        let suspended = dropped(FilteredReason::AuthorIsSuspended, "rule");
         for (evaluation, rule) in [
             (Evaluation::complete(allow()), None),
             (Evaluation::complete(suspended.clone()), Some("rule")),
@@ -871,7 +995,7 @@ mod tests {
         let proto_drop = Kind::Drop(vf_pb::DropReason {});
         let tombstone = |reason, code| {
             (
-                tombstoned(reason),
+                tombstoned(reason, "rule"),
                 Projected {
                     thrift: Action::Tombstone(Tombstone::new(
                         Some(action::TombstoneReason(code)),
@@ -912,7 +1036,7 @@ mod tests {
                 },
             ),
             (
-                dropped(FilteredReason::AuthorIsSuspended),
+                dropped(FilteredReason::AuthorIsSuspended, "rule"),
                 Projected {
                     thrift: thrift_drop(Some(action::DropReason::SuspendedAuthor(true))),
                     proto: proto_drop,
@@ -1126,7 +1250,7 @@ mod tests {
                 expected.rows,
                 "{name}"
             );
-            let (proto, reason) = proto_action(verdict);
+            let (proto, reason) = proto_action(&verdict);
             assert_eq!(proto.kind, Some(expected.proto), "{name}");
             assert_eq!(reason, expected.reason.map(Into::into), "{name}");
         }
@@ -1275,7 +1399,7 @@ mod tests {
     fn drop_reasons_without_a_canonical_form_drop_without_a_reason() {
         assert_eq!(
             thrift_action(
-                &dropped(FilteredReason::AuthorIsProtected),
+                &dropped(FilteredReason::AuthorIsProtected, "rule"),
                 TimelineHome,
                 &policies()
             ),
@@ -1283,7 +1407,7 @@ mod tests {
         );
         assert_eq!(
             thrift_action(
-                &dropped(FilteredReason::UnspecifiedReason),
+                &dropped(FilteredReason::UnspecifiedReason, "rule"),
                 FilterAll,
                 &policies()
             ),
@@ -1305,7 +1429,7 @@ mod tests {
             FilteredReason::TweetIsNullcast,
         ];
         for reason in lossy {
-            let verdict = dropped(reason);
+            let verdict = dropped(reason, "rule");
             assert_eq!(
                 thrift_action(&verdict, TimelineHome, &policies()),
                 thrift_drop(None),
@@ -1344,19 +1468,19 @@ mod tests {
         };
         let mut cases = vec![
             (
-                dropped(FilteredReason::TweetIsBounced),
+                dropped(FilteredReason::TweetIsBounced, "rule"),
                 filtered(T::TweetIsBounced(true)),
             ),
             (
-                dropped(FilteredReason::AuthorBlockViewer),
+                dropped(FilteredReason::AuthorBlockViewer, "rule"),
                 filtered(T::AuthorBlockViewer(true)),
             ),
             (
-                dropped(FilteredReason::AuthorIsProtected),
+                dropped(FilteredReason::AuthorIsProtected, "rule"),
                 filtered(T::AuthorIsProtected(true)),
             ),
             (
-                dropped(FilteredReason::AuthorIsSuspended),
+                dropped(FilteredReason::AuthorIsSuspended, "rule"),
                 filtered(T::AuthorIsSuspended(true)),
             ),
             (shown(None, None), found(None)),
@@ -1366,14 +1490,14 @@ mod tests {
             ),
         ];
         for verdict in [
-            dropped(FilteredReason::AuthorIsDeactivated),
-            dropped(FilteredReason::ExclusiveTweet),
+            dropped(FilteredReason::AuthorIsDeactivated, "rule"),
+            dropped(FilteredReason::ExclusiveTweet, "rule"),
             Verdict::Withheld(Decided {
                 value: Withholding::Drop(DropReason::NsfwViewer(NsfwViewerDropReason::IsUnderage)),
                 id: RuleId::FilterAll,
                 by: "rule",
             }),
-            tombstoned(TombstoneReason::LocalRegulations),
+            tombstoned(TombstoneReason::LocalRegulations, "rule"),
         ] {
             cases.push((verdict.clone(), filtered(safety_result(&verdict))));
         }
@@ -1414,15 +1538,8 @@ mod tests {
 
     #[test]
     fn dashboard_generator_pins_the_rpc_and_verdict_mix_labels() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
-        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
-        let path = if std::path::Path::new(cargo).exists() {
-            cargo
-        } else {
-            ws
-        };
         let dashboard =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
         let filter_tweets = <&str>::from(Rpc::FilterTweets);
         assert!(dashboard.contains(&format!("FT_RPC_FILTER = 'rpc=~\"{filter_tweets}|\"'")));
         let actions = dashboard
@@ -1564,5 +1681,100 @@ mod tests {
             let (resname, _) = public_interest_copy(reason);
             assert!(translate(resname, "en").is_some(), "{reason:?} {resname}");
         }
+    }
+
+    #[test]
+    fn each_evaluation_sends_and_labels_as_vf_counts_it() {
+        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::rules::fixtures::allow;
+        let shown = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
+        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
+            ThriftFilteredReason::AuthorIsSuspended(true),
+        ));
+        let cases = [
+            (
+                Evaluation::complete(allow()),
+                Some(&shown),
+                ("allow", "none"),
+            ),
+            (
+                Evaluation::complete(dropped(FilteredReason::AuthorIsSuspended, "rule")),
+                Some(&suspended),
+                ("drop", "author_is_suspended"),
+            ),
+            (
+                Evaluation::Partial {
+                    verdict: dropped(FilteredReason::AuthorIsSuspended, "rule"),
+                    fail_open_defaults: Hydrators::of(Hydrator::Follows),
+                },
+                None,
+                ("failed", "none"),
+            ),
+            (
+                Evaluation::NotFound(Lookup::Author),
+                None,
+                ("not_found", "none"),
+            ),
+            (Evaluation::Failed(Lookup::Tweet), None, ("failed", "none")),
+        ];
+        let policies = LimitedActionsPolicies::default();
+        let level = SafetyLevel::TimelineHomeHydration;
+        for (evaluation, sent, (class, reason)) in &cases {
+            assert_eq!(
+                evaluate_tweets_state(evaluation, level, &policies).as_ref(),
+                *sent,
+                "{evaluation:?}"
+            );
+            assert_eq!(
+                evaluate_tweets_label(evaluation, level, &policies),
+                ((*class).to_owned(), (*reason).to_owned()),
+                "{evaluation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_level_82_rerender_sends_tweetypies_filtered_reason() {
+        use crate::rules::QuoteEntries;
+        use strum::VariantArray;
+        use ThriftFilteredReason as T;
+        let sent: Vec<(SafetyLevel, RuleId, TweetFieldsResultState)> = SafetyLevel::VARIANTS
+            .iter()
+            .flat_map(|&level| {
+                let rerenders = match level.spec().quote_entries {
+                    QuoteEntries::Judged { rerenders } => rerenders,
+                    QuoteEntries::NotJudged => &[],
+                };
+                rerenders.iter().map(move |&(by, reason)| {
+                    (level, by, rerendered_state(&Rerendered { by, reason }))
+                })
+            })
+            .collect();
+        let expected: Vec<_> = [
+            (RuleId::DeactivatedAuthor, T::AuthorIsDeactivated(true)),
+            (RuleId::ErasedAuthor, T::AuthorIsDeactivated(true)),
+            (RuleId::OffboardedAuthor, T::AuthorAccountIsInactive(true)),
+            (RuleId::SuspendedAuthor, T::AuthorIsSuspended(true)),
+            (
+                RuleId::QuotedAuthorBlocksQuotingAuthor,
+                T::AuthorBlockViewer(true),
+            ),
+            (RuleId::ViewerBlocksAuthor, T::UnspecifiedReason(true)),
+            (
+                RuleId::QuotedViewerMutesAuthorNotFollowing,
+                T::UnspecifiedReason(true),
+            ),
+            (RuleId::ProtectedQuotedAuthor, T::AuthorIsProtected(true)),
+        ]
+        .into_iter()
+        .map(|(rule, reason)| {
+            (
+                SafetyLevel::TimelineHomeHydration,
+                rule,
+                TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason)),
+            )
+        })
+        .collect();
+        assert_eq!(sent, expected);
     }
 }

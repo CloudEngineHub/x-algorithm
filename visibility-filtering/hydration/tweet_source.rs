@@ -1,3 +1,4 @@
+use crate::clients::strato;
 use crate::models::{MediaFeature, NsfwFeature, ReactionContext, TweetFeatures};
 use crate::thrift_read::{read_fields, skip_elements, SKIP_DEPTH};
 use anyhow::{anyhow, Result};
@@ -8,11 +9,10 @@ use thrift::protocol::{TInputProtocol, TType};
 use xai_core_entities::entities::{
     EditControl, ExclusiveTweetControl, TakedownReason, TrustedFriendsControl,
 };
-use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead, StratoResult};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
 
 const COLUMN: &str = "tweetypie/federated/tweetForVisibility.Tweet";
-const OPERATION: &str = "fetch";
 
 pub(crate) struct TweetSource {
     pub(crate) grpc_client: Arc<StratoGrpc>,
@@ -20,38 +20,25 @@ pub(crate) struct TweetSource {
 
 impl TweetSource {
     pub(crate) async fn get_tweet_values(&self, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
-        let calls = tweet_ids
+        let keys = tweet_ids
             .iter()
-            .map(|tweet_id| {
-                (
-                    COLUMN.to_string(),
-                    OPERATION.to_string(),
-                    vec![encode(&(*tweet_id, ()))],
-                )
-            })
-            .collect();
-
-        let result_batch = self.grpc_client.batch_call(calls, None).await;
+            .map(|tweet_id| (COLUMN, encode(&(*tweet_id, ()))));
+        let result_batch = strato::fetch_each(&self.grpc_client, keys, None).await;
         tweet_ids.iter().copied().zip(result_batch).collect()
     }
 }
 
 pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
-    match std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
+    let result = std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
         .map_err(|_| anyhow!("MVal decoder panicked"))?
-    {
-        Ok(StratoResult::Ok { value: None, .. }) => Ok(None),
-        Ok(StratoResult::Ok {
-            value: Some(tweet), ..
-        }) => tweet
-            .project()
-            .map(Some)
-            .ok_or_else(|| anyhow!("tweet value without coreData")),
-        Ok(StratoResult::Err { code, message }) => {
-            Err(anyhow!("Strato error code {code}: {message}"))
-        }
-        Err(e) => Err(anyhow!("MVal decode error: {e}")),
-    }
+        .map_err(|e| anyhow!("MVal decode error: {e}"))?;
+    let Some(tweet) = strato::row(result)? else {
+        return Ok(None);
+    };
+    tweet
+        .project()
+        .map(Some)
+        .ok_or_else(|| anyhow!("tweet value without coreData"))
 }
 
 #[derive(Default)]
@@ -108,7 +95,7 @@ impl Tweet {
             },
             community_id: self.community_id,
             trusted_friends_list_id: self.trusted_friends_list_id,
-            edit_control: self.edit_control,
+            latest_edit_tweet_id: self.edit_control.as_ref().and_then(latest_edit_tweet_id),
             exclusive_conversation_author_id: self
                 .exclusive_tweet_control
                 .map(|control| control.conversation_author_id),
@@ -117,6 +104,14 @@ impl Tweet {
             reaction_context: self.reaction_context,
         })
     }
+}
+
+fn latest_edit_tweet_id(control: &EditControl) -> Option<u64> {
+    let initial = match control {
+        EditControl::Initial(initial) => initial,
+        EditControl::Edit(edit) => edit.edit_control_initial.as_ref()?,
+    };
+    initial.edit_tweet_ids.last().copied()
 }
 
 fn media_feature(entities: Vec<Media>) -> MediaFeature {
@@ -330,13 +325,13 @@ fn read_id_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift::{self, Bool, List, Str, Struct, I64};
-    use crate::clients::strato_answer::{found, no_row};
+    use crate::clients::strato::answer::Thrift::{self, Bool, List, Str, Struct, I64};
+    use crate::clients::strato::answer::{found, no_row};
     use crate::thrift_read::tests::assert_skips_like_thrift;
     use std::collections::BTreeSet;
     use thrift::protocol::TType;
     use thrift::OrderedFloat;
-    use xai_core_entities::entities::{EditControlInitial, MediaEntity};
+    use xai_core_entities::entities::{EditControlEdit, EditControlInitial, MediaEntity};
     use xai_x_thrift::media_common::{MediaCategory, MediaKey, OwnershipInfo};
     use xai_x_thrift::media_entity::ColorValue;
     use xai_x_thrift::media_information::{
@@ -633,12 +628,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
-            edit_control: Some(EditControl::Initial(EditControlInitial {
-                edit_tweet_ids: vec![tweet_id.cast_unsigned()],
-                editable_until_msecs: Some(editable_until_msecs),
-                edits_remaining: Some(5),
-                is_edit_eligible: Some(true),
-            })),
+            latest_edit_tweet_id: Some(tweet_id.cast_unsigned()),
             ..Default::default()
         };
         (bytes, features)
@@ -705,11 +695,6 @@ mod tests {
             has_dmca_media: true,
             ..Default::default()
         };
-        let edit_control = Some(EditControl::Initial(EditControlInitial {
-            edit_tweet_ids: vec![TWEET_ID as u64],
-            edits_remaining: Some(4),
-            ..Default::default()
-        }));
 
         assert_eq!(
             decode_fixture(&bytes),
@@ -723,7 +708,7 @@ mod tests {
                 is_nullcast: true,
                 community_id: NonZeroU64::new(500),
                 trusted_friends_list_id: Some(TRUSTED_FRIENDS_LIST_ID as u64),
-                edit_control,
+                latest_edit_tweet_id: Some(TWEET_ID as u64),
                 exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
                 article_id: NonZeroU64::new(ARTICLE_ID as u64),
                 narrowcast_place_id: Some(0x7f00_0000_0000_0001),
@@ -1094,10 +1079,37 @@ mod tests {
         ];
         for (name, latest_edit, expected) in rows {
             let mut features = decode_fixture(&recorded(name));
-            assert_eq!(features.latest_edit_tweet_id(), Some(latest_edit), "{name}");
-            features.edit_control = None;
+            assert_eq!(features.latest_edit_tweet_id, Some(latest_edit), "{name}");
+            features.latest_edit_tweet_id = None;
             assert_eq!(features, expected, "{name}");
         }
         assert_eq!(decode_tweet(&recorded("deleted")).unwrap(), None);
+    }
+
+    #[test]
+    fn the_latest_edit_is_the_last_id_of_the_initial_edit_chain() {
+        let initial = |ids: Vec<u64>| EditControlInitial {
+            edit_tweet_ids: ids,
+            ..Default::default()
+        };
+        for (control, latest) in [
+            (EditControl::Initial(initial(vec![20])), Some(20)),
+            (
+                EditControl::Edit(EditControlEdit {
+                    initial_tweet_id: 10,
+                    edit_control_initial: Some(initial(vec![10, 20, 30])),
+                }),
+                Some(30),
+            ),
+            (
+                EditControl::Edit(EditControlEdit {
+                    initial_tweet_id: 10,
+                    edit_control_initial: None,
+                }),
+                None,
+            ),
+        ] {
+            assert_eq!(latest_edit_tweet_id(&control), latest, "{control:?}");
+        }
     }
 }

@@ -179,6 +179,7 @@ def pbroadcast(x, axis_name, source):
 
 
 _CANDIDATE_SIZE_AGREEMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000
+_LOOKUP_CHUNK_BYTES = 4 << 30
 
 
 def _pad_axis(x: jax.Array, axis: int, length: int | None) -> jax.Array:
@@ -842,6 +843,14 @@ class RecsysTrainer(Trainer):
         token_ndim = token_ids.ndim
         if self.use_row_emb:
             token_ids = self._row_embedding_token_ids(token_ids)
+            ep = self.mesh.shape["expert"]
+            bytes_per_user = (
+                ep
+                * math.prod(token_ids.shape[1:])
+                * embedding_table_param.x.shape[1]
+                * embedding_table_param.x.dtype.itemsize
+            )
+            users_per_chunk = max(1, _LOOKUP_CHUNK_BYTES // bytes_per_user)
 
             @shard_map(
                 mesh=self.mesh,
@@ -850,13 +859,26 @@ class RecsysTrainer(Trainer):
                 check_vma=False,
             )
             def lookup_rows(table, ids):
-                ids = jax.lax.all_gather(ids, "expert", axis=0, tiled=True)
+                ids = jax.lax.all_gather(ids, "expert", axis=0)
                 local_ids = ids - jax.lax.axis_index("expert") * table.shape[0]
-                values = jnp.take(table, local_ids, axis=0, mode="clip")
-                values = jnp.where(
-                    ((local_ids >= 0) & (local_ids < table.shape[0]))[..., None], values, 0
+                users = local_ids.shape[1]
+                chunk = min(users_per_chunk, users)
+                num_chunks = -(-users // chunk)
+                pad = [(0, 0), (0, num_chunks * chunk - users)] + [(0, 0)] * (local_ids.ndim - 2)
+                local_ids = jnp.pad(local_ids, pad, constant_values=-1)
+                chunks = jnp.moveaxis(
+                    local_ids.reshape(ep, num_chunks, chunk, *local_ids.shape[2:]), 1, 0
                 )
-                return jax.lax.psum_scatter(values, "expert", scatter_dimension=0, tiled=True)
+
+                def one(chunk_ids):
+                    values = jnp.take(table, chunk_ids, axis=0, mode="clip")
+                    values = jnp.where(
+                        ((chunk_ids >= 0) & (chunk_ids < table.shape[0]))[..., None], values, 0
+                    )
+                    return jax.lax.psum_scatter(values, "expert", scatter_dimension=0)
+
+                out = jax.lax.map(one, chunks)
+                return out.reshape(num_chunks * chunk, *out.shape[2:])[:users]
 
             return replace(embedding_table_param, x=lookup_rows(embedding_table_param.x, token_ids))
 
@@ -1014,11 +1036,6 @@ class RecsysTrainer(Trainer):
         )
         return batch
 
-    def _maybe_inject_global_neg_embeddings(
-        self, batch: RecsysFeaturesBatch
-    ) -> RecsysFeaturesBatch:
-        return batch
-
     def _empty_history_augmentation_period(self) -> int:
         rate = self.empty_history_augmentation_rate
         return max(1, int(1.0 / rate)) if rate > 0 else 0
@@ -1064,8 +1081,6 @@ class RecsysTrainer(Trainer):
         history_user_drop_rate = self.empty_history_user_dropout_rate
         microbatches: list[tuple[RecsysFeaturesBatch, dict[int, int] | None]] = []
         for i, (batch, offsets) in enumerate(dataset):
-            batch = self._maybe_inject_global_neg_embeddings(batch)
-
             if history_user_drop_rate > 0.0:
                 if i % self.num_microbatch == 0:
                     self._last_history_user_dropout_bsz = 0
@@ -3454,7 +3469,6 @@ class RecsysTrainer(Trainer):
                 self.state = self.state._replace(offset_values=offsets_values)
 
         self.maybe_build_retrieval_post_embeddings()
-        self.maybe_build_gen_recs_post_embeddings()
 
         force_disk_save = bool(kwargs.pop("force_disk_save", False))
         state_step = int(np.asarray(self.state.step).item())
@@ -4146,9 +4160,6 @@ class RecsysTrainer(Trainer):
             build_done - build_start,
             int(ids_reused),
         )
-
-    def maybe_build_gen_recs_post_embeddings(self) -> None:
-        pass
 
     def _eval_embeddings_fn(
         self,

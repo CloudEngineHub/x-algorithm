@@ -1037,7 +1037,7 @@ mod tests {
                     .iter()
                     .map(|c| (
                         c.post.tweet_features.exclusive_conversation_author_id,
-                        c.post.edges.contains(Hydrator::SuperFollowsExclusive)
+                        c.edges.contains(Hydrator::SuperFollowsExclusive)
                     ))
                     .collect::<Vec<_>>(),
                 [exclusive, exclusive, exclusive, (None, false)]
@@ -1084,8 +1084,8 @@ mod tests {
                 .candidates
                 .iter()
                 .map(|c| (
-                    c.post.edges.contains(Hydrator::SuperFollowsExclusive),
-                    c.post.edges.contains(Hydrator::SuperFollowsRoot)
+                    c.edges.contains(Hydrator::SuperFollowsExclusive),
+                    c.edges.contains(Hydrator::SuperFollowsRoot)
                 ))
                 .collect::<Vec<_>>(),
             [(true, false), (false, true)]
@@ -1138,9 +1138,9 @@ mod tests {
                 .iter()
                 .map(|c| {
                     (
-                        c.post.edges.contains(Hydrator::RootFollowsViewer),
-                        c.post.edges.contains(Hydrator::SuperFollowsRoot),
-                        c.post.edges.contains(Hydrator::ViewerFollowsRoot),
+                        c.edges.contains(Hydrator::RootFollowsViewer),
+                        c.edges.contains(Hydrator::SuperFollowsRoot),
+                        c.edges.contains(Hydrator::ViewerFollowsRoot),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1219,11 +1219,8 @@ mod tests {
             .hydrate(&[raw(1, None)])
             .await;
         assert_eq!(
-            hydrated.candidates[0].viewer_relationship,
-            crate::models::ViewerRelationship {
-                follows: true,
-                ..Default::default()
-            }
+            hydrated.candidates[0].edges,
+            crate::models::EdgeSet::default().with(Hydrator::Follows)
         );
         assert!(hydrated.failed_ids.is_empty());
     }
@@ -1254,11 +1251,7 @@ mod tests {
             hydrated
                 .candidates
                 .iter()
-                .map(|c| {
-                    c.post
-                        .edges
-                        .contains(Hydrator::RootFollowsViewerSecondDegree)
-                })
+                .map(|c| c.edges.contains(Hydrator::RootFollowsViewerSecondDegree))
                 .collect::<Vec<_>>()
         };
         let level = SafetyLevel::TimelineHomeHydration;
@@ -1448,7 +1441,7 @@ mod tests {
                 hydrated
                     .candidates
                     .iter()
-                    .all(|c| !c.post.edges.contains(BlockedByConversationRootPost)),
+                    .all(|c| !c.edges.contains(BlockedByConversationRootPost)),
                 "{name}"
             );
             assert_eq!(
@@ -2156,13 +2149,13 @@ mod tests {
         assert_eq!(sources.keys(Source::GizmoduckActor), [vec![10, 20, 30]]);
         assert!(matches!(
             hydration.user(AuthorId(10)),
-            Some(HydratedUser::Resolved { user, viewer_relationship, failed })
-                if user.features.is_suspended && !viewer_relationship.blocks && failed.is_empty()
+            Some(HydratedUser::Resolved { user, edges, failed })
+                if user.features.is_suspended && !edges.contains(Hydrator::Blocks) && failed.is_empty()
         ));
         assert!(matches!(
             hydration.user(AuthorId(20)),
-            Some(HydratedUser::Resolved { viewer_relationship, failed, .. })
-                if viewer_relationship.blocks && failed.is_empty()
+            Some(HydratedUser::Resolved { edges, failed, .. })
+                if edges.contains(Hydrator::Blocks) && failed.is_empty()
         ));
         assert!(matches!(
             hydration.user(AuthorId(30)),

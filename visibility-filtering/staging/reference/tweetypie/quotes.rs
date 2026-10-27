@@ -6,7 +6,7 @@ use crate::models::{EvaluationKey, Placement, TweetId};
 use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
 use crate::result_label::{Class, NONE, label};
-use crate::rules::SafetyLevel;
+use crate::rules::{QuoteEntries, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::timeout;
@@ -114,15 +114,11 @@ fn quote_comparisons(
     outcomes: &[PostEvaluation],
     quote_passes: &[QuotePass],
 ) -> Option<QuoteComparisons> {
-    match safety_level {
-        SafetyLevel::TimelineHomeHydration => {}
-        SafetyLevel::FilterAll
-        | SafetyLevel::TimelineHome
-        | SafetyLevel::TimelineHomeRecommendations
-        | SafetyLevel::ImmersiveExpandedRecommendations
-        | SafetyLevel::QuotedTweetRules
-        | SafetyLevel::NotificationsFollow
-        | SafetyLevel::NotificationsWriterV2 => return None,
+    if !matches!(
+        safety_level.spec().quote_entries,
+        QuoteEntries::Judged { .. }
+    ) {
+        return None;
     }
     let mut outers = Vec::new();
     for outcome in outcomes {
@@ -177,7 +173,8 @@ mod tests {
     use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};
     use crate::quote::{PassOutcome, Rerendered};
     use crate::result_label::Failure;
-    use crate::rules::RuleId;
+    use crate::rules::{RerenderReason, RuleId};
+    use strum::VariantArray;
     use xai_strato::strato_thrift::StratoResult;
     use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;
     use xai_x_thrift::get_tweet_fields::{
@@ -319,14 +316,10 @@ mod tests {
                 ]
             ))
         );
-        for level in [
-            SafetyLevel::FilterAll,
-            SafetyLevel::TimelineHome,
-            SafetyLevel::TimelineHomeRecommendations,
-            SafetyLevel::ImmersiveExpandedRecommendations,
-            SafetyLevel::QuotedTweetRules,
-        ] {
-            assert!(selected(level, &request).is_none(), "{level:?}");
+        for &level in SafetyLevel::VARIANTS {
+            if !matches!(level.spec().quote_entries, QuoteEntries::Judged { .. }) {
+                assert!(selected(level, &request).is_none(), "{level:?}");
+            }
         }
         assert!(selected(SafetyLevel::TimelineHomeHydration, &request[..1]).is_none());
         let passes = [QuotePass {
@@ -360,7 +353,6 @@ mod tests {
 
     #[test]
     fn the_quote_pass_lens_compares_the_pass_result_and_names_its_outcome() {
-        static AUTHOR_IS_SUSPENDED: FilteredReason = FilteredReason::AuthorIsSuspended(true);
         let tp = TpResult {
             label: pair("drop", "author_is_suspended"),
             result: None,
@@ -378,7 +370,7 @@ mod tests {
         }));
         let dropped = PassOutcome::Dropped(Rerendered {
             by: RuleId::SuspendedAuthor,
-            reason: &AUTHOR_IS_SUSPENDED,
+            reason: RerenderReason::AuthorSuspended,
         });
         for (outcome, lens, vf, quote_pass) in [
             (

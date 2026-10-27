@@ -6,6 +6,7 @@ use tonic::async_trait;
 use xai_strato::{encode, StratoGrpc};
 
 use super::metrics::{self, WarmKeyResult};
+use crate::clients::strato;
 
 const WARM_COLUMN_PATH: &str = "visibility/baseTweetSafetyLabelMap";
 const WARM_CHANNEL_CAPACITY: usize = 1024;
@@ -30,18 +31,10 @@ impl StratoWarmFetcher {
 #[async_trait]
 impl WarmFetcher for StratoWarmFetcher {
     async fn fetch(&self, ids: &[u64]) -> usize {
-        let calls = ids
+        let keys = ids
             .iter()
-            .map(|id| {
-                (
-                    WARM_COLUMN_PATH.to_string(),
-                    "fetch".to_string(),
-                    vec![encode(&(id.cast_signed(), ()))],
-                )
-            })
-            .collect();
-        self.grpc
-            .batch_call(calls, None)
+            .map(|id| (WARM_COLUMN_PATH, encode(&(id.cast_signed(), ()))));
+        strato::fetch_each(&self.grpc, keys, None)
             .await
             .iter()
             .filter(|result| result.is_err())

@@ -1,14 +1,12 @@
 use crate::hydration::{request_context, Cause, Unresolved};
-use crate::metrics::{self as ft_metrics, Rpc};
+use crate::metrics::{self as ft_metrics, Endpoint};
 use crate::models::{Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, Verdict};
 use crate::post_evaluator::{AuthorJudgement, PostBatch, PostEvaluation, PostEvaluator};
-use crate::retweet;
-use crate::rules::{QuoteEntries, RuleId, SafetyLevel};
+use crate::rules::{NoTrace, QuoteEntries, RerenderReason, RuleId, SafetyLevel};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;
 
 pub(crate) const QUOTE_PASS: &str = "vf_quote_pass";
 const SHED: &str = "shed";
@@ -49,7 +47,7 @@ impl PassOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rerendered {
     pub(crate) by: RuleId,
-    pub(crate) reason: &'static ThriftFilteredReason,
+    pub(crate) reason: RerenderReason,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,14 +115,6 @@ impl QuotePassRunner {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_permits(self, permits: usize) -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(permits)),
-            ..self
-        }
-    }
-
     pub(crate) async fn serve(
         &self,
         post_evaluator: &PostEvaluator,
@@ -137,7 +127,7 @@ impl QuotePassRunner {
                 QuotePassMode::Shadow => quoted_authors(&request),
             },
         };
-        let outcomes = retweet::evaluate_merging_sources(post_evaluator, request).await;
+        let (_, outcomes) = post_evaluator.run(request, &mut NoTrace).await;
         (outcomes, pending)
     }
 
@@ -290,7 +280,7 @@ fn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {
     let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {
         return None;
     };
-    let (_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;
+    let &(_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;
     Some(Rerendered { by, reason })
 }
 
@@ -307,7 +297,7 @@ fn record(level: SafetyLevel, passes: &[QuotePass]) {
         );
     }
     ft_metrics::record_verdicts(
-        Rpc::EvaluateTweets,
+        Endpoint::EvaluateTweets,
         SafetyLevel::QuotedTweetRules,
         passes.iter().filter_map(|pass| match pass.outcome {
             PassOutcome::Dropped(_) | PassOutcome::Passed => {
@@ -374,9 +364,18 @@ mod tests {
     }
 
     impl Served {
-        fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {
+        fn new(
+            world: Arc<InMemorySources>,
+            caches: FallbackCaches,
+            quote_pass: QuotePassRunner,
+        ) -> Self {
             let (captured, compared) = unbounded_channel();
-            let wire = Wire::serving(world, caches, Some(Box::new(Captured(captured))), mode);
+            let wire = Wire::serving(
+                world,
+                caches,
+                Some(Box::new(Captured(captured))),
+                quote_pass,
+            );
             Self { wire, compared }
         }
 
@@ -460,22 +459,29 @@ mod tests {
         viewer_id: Option<u64>,
         tweets: Vec<vf_pb::TweetData>,
     ) -> (Vec<Outcome>, Vec<QuotePass>) {
-        Served::new(world, FallbackCaches::default(), mode)
+        Served::new(world, FallbackCaches::default(), QuotePassRunner::new(mode))
             .serve(viewer_id, tweets)
             .await
     }
 
-    fn dropped(rule: &str, reason: ThriftFilteredReason) -> PassOutcome {
+    fn one_permit() -> QuotePassRunner {
+        QuotePassRunner {
+            mode: QuotePassMode::Shadow,
+            permits: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn dropped(rule: &str, reason: RerenderReason) -> PassOutcome {
         PassOutcome::Dropped(Rerendered {
             by: RuleId::of_rule_name(rule).unwrap(),
-            reason: Box::leak(Box::new(reason)),
+            reason,
         })
     }
 
     fn erased_drop() -> PassOutcome {
         dropped(
             "erased_author/drop/inactive",
-            ThriftFilteredReason::AuthorIsDeactivated(true),
+            RerenderReason::AuthorDeactivated,
         )
     }
 
@@ -515,17 +521,14 @@ mod tests {
             case(
                 "deactivated",
                 world().user(QUOTED_AUTHOR, author(deactivated.clone())),
-                dropped(
-                    "deactivated_author/drop",
-                    ThriftFilteredReason::AuthorIsDeactivated(true),
-                ),
+                dropped("deactivated_author/drop", RerenderReason::AuthorDeactivated),
             ),
             case(
                 "erased",
                 world().user(QUOTED_AUTHOR, author(erased)),
                 dropped(
                     "erased_author/drop/inactive",
-                    ThriftFilteredReason::AuthorIsDeactivated(true),
+                    RerenderReason::AuthorDeactivated,
                 ),
             ),
             case(
@@ -533,39 +536,33 @@ mod tests {
                 world().user(QUOTED_AUTHOR, author(offboarded)),
                 dropped(
                     "offboarded_author/drop/inactive",
-                    ThriftFilteredReason::AuthorAccountIsInactive(true),
+                    RerenderReason::AuthorInactive,
                 ),
             ),
             case(
                 "suspended",
                 world().user(QUOTED_AUTHOR, suspended()),
-                dropped(
-                    "suspended_author/drop",
-                    ThriftFilteredReason::AuthorIsSuspended(true),
-                ),
+                dropped("suspended_author/drop", RerenderReason::AuthorSuspended),
             ),
             case(
                 "quoted author blocks quoting author",
                 world().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),
                 dropped(
                     "quoted_author_blocks_quoting_author/drop/author_block_viewer",
-                    ThriftFilteredReason::AuthorBlockViewer(true),
+                    RerenderReason::AuthorBlocksViewer,
                 ),
             ),
             case(
                 "viewer blocks author",
                 world().edge(Graph::Blocks, VIEWER, QUOTED_AUTHOR),
-                dropped(
-                    "viewer_blocks_author/drop",
-                    ThriftFilteredReason::UnspecifiedReason(true),
-                ),
+                dropped("viewer_blocks_author/drop", RerenderReason::Unspecified),
             ),
             case(
                 "viewer mutes author",
                 world().edge(Graph::Mutes, VIEWER, QUOTED_AUTHOR),
                 dropped(
                     "quoted_viewer_mutes_author_not_following/drop",
-                    ThriftFilteredReason::UnspecifiedReason(true),
+                    RerenderReason::Unspecified,
                 ),
             ),
             case(
@@ -573,7 +570,7 @@ mod tests {
                 world().user(QUOTED_AUTHOR, protected()),
                 dropped(
                     "protected_quoted_author/drop",
-                    ThriftFilteredReason::AuthorIsProtected(true),
+                    RerenderReason::AuthorProtected,
                 ),
             ),
             case(
@@ -613,23 +610,20 @@ mod tests {
                 deleted_inner().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),
                 dropped(
                     "quoted_author_blocks_quoting_author/drop/author_block_viewer",
-                    ThriftFilteredReason::AuthorBlockViewer(true),
+                    RerenderReason::AuthorBlocksViewer,
                 ),
             ),
             case(
                 "deleted inner of a deactivated author",
                 deleted_inner().user(QUOTED_AUTHOR, author(deactivated)),
-                dropped(
-                    "deactivated_author/drop",
-                    ThriftFilteredReason::AuthorIsDeactivated(true),
-                ),
+                dropped("deactivated_author/drop", RerenderReason::AuthorDeactivated),
             ),
             case(
                 "deleted inner of a protected author",
                 deleted_inner().user(QUOTED_AUTHOR, protected()),
                 dropped(
                     "protected_quoted_author/drop",
-                    ThriftFilteredReason::AuthorIsProtected(true),
+                    RerenderReason::AuthorProtected,
                 ),
             ),
             case(
@@ -809,7 +803,7 @@ mod tests {
         let (_, passes) = serve(Arc::new(world), QuotePassMode::Shadow, Some(VIEWER), tweets).await;
         let protected_drop = dropped(
             "protected_quoted_author/drop",
-            ThriftFilteredReason::AuthorIsProtected(true),
+            RerenderReason::AuthorProtected,
         );
         assert_eq!(
             passes
@@ -830,7 +824,11 @@ mod tests {
             quote_with_outer(),
         )
         .await;
-        let mut shadow = Served::new(world, FallbackCaches::default(), QuotePassMode::Shadow);
+        let mut shadow = Served::new(
+            world,
+            FallbackCaches::default(),
+            QuotePassRunner::new(QuotePassMode::Shadow),
+        );
         let started = Instant::now();
         let served = shadow.outcomes(Some(VIEWER), quote_with_outer()).await;
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -848,12 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_finished_pass_frees_its_permit_for_the_next_request() {
-        let mut served = Served::new(
-            Arc::new(world()),
-            FallbackCaches::default(),
-            QuotePassMode::Shadow,
-        );
-        served.wire = served.wire.quote_pass_permits(1);
+        let mut served = Served::new(Arc::new(world()), FallbackCaches::default(), one_permit());
         for request in ["first", "second"] {
             let (_, passes) = served.serve(Some(VIEWER), quote_with_outer()).await;
             assert_eq!(
@@ -867,12 +860,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_running_pass_holds_its_permit_until_it_ends() {
         let world = Arc::new(world().fault(Source::FlockUserPair, Fault::Hangs));
-        let mut served = Served::new(
-            Arc::clone(&world),
-            FallbackCaches::default(),
-            QuotePassMode::Shadow,
-        );
-        served.wire = served.wire.quote_pass_permits(1);
+        let mut served = Served::new(Arc::clone(&world), FallbackCaches::default(), one_permit());
         thread_recorded::start();
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
@@ -911,7 +899,11 @@ mod tests {
             tweets: Some(tweet_fallback_cache(8)),
             authors: None,
         };
-        let mut served = Served::new(Arc::clone(&world), caches, QuotePassMode::Shadow);
+        let mut served = Served::new(
+            Arc::clone(&world),
+            caches,
+            QuotePassRunner::new(QuotePassMode::Shadow),
+        );
         let (_, passes) = served
             .serve(Some(VIEWER), vec![tweet_data(INNER, Some(OUTER))])
             .await;
@@ -935,11 +927,11 @@ mod tests {
         let mut served = Served::new(
             Arc::new(world()),
             FallbackCaches::default(),
-            QuotePassMode::Shadow,
+            QuotePassRunner::new(QuotePassMode::Shadow),
         );
         thread_recorded::start();
         let (_, passes) = served.serve(Some(VIEWER), quote_with_outer()).await;
-        let hydrations = thread_recorded::take("filter_tweets_phase_ms")
+        let hydrations = thread_recorded::take("vf_phase_ms")
             .iter()
             .filter(|sample| sample.label("stage") == Some("hydration"))
             .count();

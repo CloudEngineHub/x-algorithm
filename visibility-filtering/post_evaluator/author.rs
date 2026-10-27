@@ -1,11 +1,11 @@
 use super::{PostBatch, PostEvaluator};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::{
-    Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, Owner,
+    Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, RequestRows,
     Unresolved,
 };
-use crate::models::{AuthorId, Decided, Evaluation, EvaluationKey, Verdict};
-use crate::rules::{RuleId, SafetyLevel};
+use crate::models::{AuthorId, Evaluation, EvaluationKey};
+use crate::rules::SafetyLevel;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -51,42 +51,27 @@ impl AuthorJudgement {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UserResult {
-    Allowed,
-    Dropped(RuleId),
-    NotFound,
-    Failed,
-}
-
-impl UserResult {
-    fn of(evaluation: Evaluation) -> Self {
-        match evaluation {
-            Evaluation::Complete {
-                verdict,
-                fail_open_defaults,
-            }
-            | Evaluation::Partial {
-                verdict,
-                fail_open_defaults,
-            } if fail_open_defaults.is_empty() => match verdict {
-                Verdict::Withheld(Decided { id, .. }) => Self::Dropped(id),
-                Verdict::Shown { .. } => Self::Allowed,
-            },
-            Evaluation::Complete { .. }
-            | Evaluation::Partial { .. }
-            | Evaluation::NotFound(_)
-            | Evaluation::Failed(_) => Self::Failed,
-        }
-    }
-}
-
 impl PostEvaluator {
     pub(crate) async fn evaluate_authors(
         &self,
         mut request: PostBatch,
     ) -> HashMap<EvaluationKey, AuthorJudgement> {
         let level = request.safety_level;
+        if !self.rule_engine.judges_only_users(level) {
+            warn!(
+                ?level,
+                "authors evaluated at a level of post rules; failing them"
+            );
+            let failed = AuthorJudgement::Unresolved(Unresolved {
+                lookup: Lookup::Tweet,
+                cause: Cause::Failed,
+            });
+            return request
+                .candidates
+                .iter()
+                .map(|placed| (placed.key(), failed.clone()))
+                .collect();
+        }
         let hydration = self
             .rule_engine
             .plan(level)
@@ -95,17 +80,7 @@ impl PostEvaluator {
                 request.hydration_request(None, &FallbackCaches::default()),
             )
             .await;
-        let admitted = self
-            .rule_engine
-            .admit_users(level, &hydration)
-            .inspect_err(|error| {
-                warn!(
-                    ?error,
-                    ?level,
-                    "hydration not admitted by its level's policy; failing its authors"
-                );
-            })
-            .ok();
+        let admitted = self.rule_engine.admit(level, &hydration);
         request
             .candidates
             .iter()
@@ -116,7 +91,7 @@ impl PostEvaluator {
                     }
                     Some(HydratedTweet::Resolved { .. }) | None => admitted
                         .as_ref()
-                        .and_then(|admitted| admitted.post(placed.tweet_id(), placed.placement))
+                        .and_then(|admitted| admitted.author(placed.tweet_id(), placed.placement))
                         .map_or_else(
                             || {
                                 AuthorJudgement::Unresolved(Unresolved {
@@ -137,20 +112,19 @@ impl PostEvaluator {
             .collect()
     }
 
-    pub(crate) async fn post_authors(&self, tweet_ids: &[u64]) -> Vec<AuthorId> {
-        let cores = self.sources.pure_cores(Owner::Request, tweet_ids).await;
-        tweet_ids
-            .iter()
-            .filter_map(|id| Some(cores.hydrated(id)?.value()?.author_id))
-            .collect()
-    }
-
     pub(crate) async fn evaluate_users(
         &self,
         level: SafetyLevel,
         viewer_id: u64,
         users: Vec<AuthorId>,
-    ) -> HashMap<AuthorId, UserResult> {
+    ) -> HashMap<AuthorId, Option<Evaluation>> {
+        if level.spec().rows != RequestRows::Users {
+            warn!(
+                ?level,
+                "users evaluated at a level of post rows; failing them"
+            );
+            return users.into_iter().map(|id| (id, None)).collect();
+        }
         let hydration = self
             .rule_engine
             .plan(level)
@@ -163,21 +137,17 @@ impl PostEvaluator {
             .viewer_failed()
             .intersection(VIEWER_LOOKUPS)
             .is_empty();
-        let admitted = self
-            .rule_engine
-            .admit_users(level, &hydration)
-            .inspect_err(|error| warn!(?error, ?level, "user hydration not admitted"))
-            .ok();
+        let admitted = self.rule_engine.admit(level, &hydration);
         users
             .into_iter()
             .map(|id| {
                 let result = match (&admitted, hydration.user(id)) {
-                    _ if viewer_failed => UserResult::Failed,
-                    (_, Some(HydratedUser::Unresolved(Cause::NotFound))) => UserResult::NotFound,
-                    (Some(admitted), _) => admitted
-                        .user(id)
-                        .map_or(UserResult::Failed, |user| UserResult::of(user.evaluate())),
-                    (None, _) => UserResult::Failed,
+                    _ if viewer_failed => None,
+                    (_, Some(HydratedUser::Unresolved(Cause::NotFound))) => {
+                        Some(Evaluation::NotFound(Lookup::Author))
+                    }
+                    (Some(admitted), _) => admitted.user(id).map(|user| user.evaluate()),
+                    (None, _) => None,
                 };
                 (id, result)
             })
@@ -340,9 +310,9 @@ mod tests {
             .await;
         let admitted = post_evaluator
             .rule_engine
-            .admit_users(SafetyLevel::QuotedTweetRules, &hydration)
+            .admit(SafetyLevel::QuotedTweetRules, &hydration)
             .unwrap();
-        let author = admitted.post(TweetId(2), quoted(2, 9).placement).unwrap();
+        let author = admitted.author(TweetId(2), quoted(2, 9).placement).unwrap();
         assert_eq!(
             author.user_candidate().failed,
             Hydrators::of(Hydrator::AuthorBlocksOuterAuthor)

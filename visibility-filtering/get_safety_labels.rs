@@ -1,6 +1,5 @@
-use crate::caller_identity::Endpoint;
-use crate::safety_label_source::metrics::{self, BatchStage};
-use crate::safety_label_source::types::FailureKind;
+use crate::safety_label_source::metrics;
+use crate::safety_label_source::remote::FailureKind;
 use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
 use prost::bytes::BufMut;
@@ -28,9 +27,12 @@ impl GetSafetyLabelsEndpoint {
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
     ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
-        crate::metrics::observe_request(Endpoint::GetSafetyLabels, request, |request, _| {
-            self.handle_inner(request)
-        })
+        crate::metrics::observe_request(
+            crate::metrics::Endpoint::GetSafetyLabels,
+            crate::metrics::RequestLevel::Absent,
+            request,
+            |request, _| self.handle_inner(request),
+        )
         .await
     }
 
@@ -46,7 +48,10 @@ impl GetSafetyLabelsEndpoint {
             .collect::<FxHashSet<_>>()
             .into_iter()
             .collect();
-        metrics::record_batch_size(BatchStage::Request, unique_ids.len());
+        crate::metrics::record_batch_size(
+            crate::metrics::Endpoint::GetSafetyLabels,
+            unique_ids.len(),
+        );
 
         let resolved = self.safety_label_source.get(&unique_ids).await;
         let (response, failure_counts) =

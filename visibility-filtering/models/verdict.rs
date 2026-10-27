@@ -1,5 +1,4 @@
 use crate::hydration::{Hydrators, Lookup};
-use crate::params::LimitedActionType;
 use crate::rules::RuleId;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
@@ -36,6 +35,37 @@ impl Notice {
             Self::LabelInterstitial(interstitial) => Some(interstitial.limited_engagement_reason()),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum LimitedActionType {
+    Reply,
+    Retweet,
+    QuoteTweet,
+    Like,
+    React,
+    SendViaDm,
+    AddToBookmarks,
+    AddToMoment,
+    PinToProfile,
+    ViewTweetActivity,
+    ShareTweetVia,
+    Follow,
+    ListsAddRemove,
+    MuteConversation,
+    Embed,
+    ViewHiddenReplies,
+    HideCommunityTweet,
+    CopyLink,
+    VoteOnPoll,
+    RemoveFromCommunity,
+    ShowRetweetActionMenu,
+    ReplyDownVote,
+    Autoplay,
+    EditTweet,
+    Highlight,
+    ViewPostEngagements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +322,7 @@ impl Evaluation {
         }
     }
 
+    #[cfg(test)]
     pub fn into_verdict(self) -> Verdict {
         match self {
             Self::Complete { verdict, .. } | Self::Partial { verdict, .. } => verdict,

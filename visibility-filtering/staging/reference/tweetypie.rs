@@ -2,7 +2,7 @@ use super::{
     ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
 };
 use crate::config::ENV_REFERENCE;
-use crate::evaluate_tweets::{Sends, evaluate_tweets_request};
+use crate::evaluate_tweets::evaluate_tweets_request;
 use crate::hydration::{HYDRATION_TIMEOUT, request_context};
 use crate::models::viewer::Client;
 use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId, Verdict};
@@ -12,10 +12,8 @@ use crate::quote::QuotePass;
 use crate::result_label::{
     Class, Failure, Label, NONE, failed, label, quote_label, renders_alike, state_label,
 };
-use crate::retweet;
-use crate::rules::SafetyLevel;
+use crate::rules::{NoTrace, SafetyLevel};
 use crate::server_deps::init_client_with_retry;
-use crate::staging::reference::vf_service::resolve_build_sha;
 use crate::treatment;
 use anyhow::Context;
 use futures::future::join;
@@ -195,6 +193,28 @@ fn required_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} must be set when {ENV_REFERENCE}=tweetypie"))
 }
 
+const BUILD_SHA_LEN: usize = 12;
+
+fn resolve_build_sha(compiled: &str, image: Option<&str>) -> String {
+    if let Some(sha) = sha_prefix(compiled) {
+        return sha.to_owned();
+    }
+    if let Some(image) = image
+        && let Some(tag) = image.rsplit(':').next()
+        && let Some(sha) = sha_prefix(tag)
+    {
+        return sha.to_owned();
+    }
+    let mut fallback = compiled.to_owned();
+    fallback.truncate(BUILD_SHA_LEN);
+    fallback
+}
+
+fn sha_prefix(s: &str) -> Option<&str> {
+    s.get(..BUILD_SHA_LEN)
+        .filter(|prefix| prefix.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 pub(super) struct TweetypieReference {
     tweetypie: StratoGrpc,
     post_evaluator: Arc<PostEvaluator>,
@@ -285,10 +305,10 @@ impl TweetypieReference {
             SAFETY_LEVEL,
             candidates,
         );
-        let rust = request_context(Instant::now(), None).scope(retweet::evaluate_merging_sources(
-            &self.post_evaluator,
-            request,
-        ));
+        let rust = request_context(Instant::now(), None).scope(async {
+            let (_, outcomes) = self.post_evaluator.run(request, &mut NoTrace).await;
+            outcomes
+        });
         let tp = timeout(
             TWEETYPIE_TIMEOUT,
             get_tweet_fields(&self.tweetypie, &client, &tweet_ids),
@@ -533,13 +553,12 @@ fn vf_status(evaluation: &Evaluation) -> &'static str {
     }
 }
 
-pub(crate) fn vf_label(outcome: &PostEvaluation, level: SafetyLevel) -> Label {
-    Sends::new(
+fn vf_label(outcome: &PostEvaluation, level: SafetyLevel) -> Label {
+    treatment::evaluate_tweets_label(
         &outcome.evaluation,
         level,
         &LimitedActionsPolicies::default(),
     )
-    .label()
 }
 
 #[cfg(test)]
@@ -549,8 +568,6 @@ mod tests {
     use crate::models::{Decided, DropReason, Withholding};
     use crate::rules::RuleId;
     use crate::rules::fixtures::CLIENT_CLASSES;
-    use std::fs;
-    use std::path::Path;
     use strum::VariantArray;
     use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;
     use xai_x_thrift::action::{
@@ -839,21 +856,15 @@ mod tests {
         let vf = outcome(shown());
         let compared = compared(&tp, Some(&vf));
         let bucket = compared.bucket();
-        let emitted = json!({
+        let mut emitted = json!({
             "compare_metric": COMPARE,
             "compare_labels": bucket.counter_labels("abc123def456").map(|(key, _)| key),
             "record": compared.to_json(&bucket, "abc123def456", Some("xai-vf-service-cand--abcde-0")),
         });
-        let cargo = format!("{}/{GOLDEN_RECORD}", env!("CARGO_MANIFEST_DIR"));
-        let path = if Path::new(&cargo).exists() {
-            cargo
-        } else {
-            format!("crates/x-product/xai-visibility-filtering-service/{GOLDEN_RECORD}")
-        };
-        let on_disk: Value = serde_json::from_str(
-            &fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}")),
-        )
-        .unwrap();
-        assert_eq!(emitted, on_disk);
+        emitted.sort_all_objects();
+        crate::pinned::assert_pinned(
+            GOLDEN_RECORD,
+            &(serde_json::to_string_pretty(&emitted).unwrap() + "\n"),
+        );
     }
 }

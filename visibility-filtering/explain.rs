@@ -2,13 +2,14 @@ pub use crate::hydration::{Hydrator, Hydrators, Lookup};
 pub use crate::metrics::Rpc;
 pub use crate::models::viewer::Client;
 pub use crate::models::{
-    AuthorLabel, ClientCapability, Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement,
-    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
-    TombstoneReason, TweetId, Verdict, VerifyBlurSupport, ViewerAge, ViewerProfile, Withholding,
+    AuthorLabel, ClientCapability, Decided, DropReason, Evaluation, FosnrReason, LimitedActionType,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice,
+    NsfwViewerDropReason, TombstoneReason, TweetId, Verdict, VerifyBlurSupport, ViewerAge,
+    ViewerProfile, Withholding,
 };
-pub use crate::params::{CountryList, LimitedActionType};
+pub use crate::params::CountryList;
 pub use crate::post_card::{Author, CardMedia, CardMediaKind, PostCard};
-pub use crate::retweet::MergeSelection;
+pub use crate::post_evaluator::MergeSelection;
 pub use crate::rules::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
@@ -18,18 +19,16 @@ pub use crate::rules::{
     ViewerAccountLeaf, Witness,
 };
 
-use crate::evaluate_tweets::{evaluate_tweets_request, Sends};
+use crate::evaluate_tweets::evaluate_tweets_request;
 use crate::filter_tweets::filter_tweets_request;
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{test_users_metadata, Sources};
 use crate::hydration::{request_context, HydratedTweet, Hydration};
 use crate::models::{EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, Viewer};
-use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_card::PostCards;
-use crate::post_evaluator::{HydratedRequest, PostEvaluator};
+use crate::post_evaluator::{self, HydratedRequest, PostEvaluator};
 use crate::result_label::{label, state_label, Class, NONE};
-use crate::retweet;
 use crate::rules::RuleEngine;
 use crate::server_deps::{self, CacheWarming};
 use crate::treatment;
@@ -44,7 +43,6 @@ pub struct Explainer {
     cards: Arc<dyn PostCards>,
     post_evaluator: PostEvaluator,
     client_switches: ClientSwitches,
-    copy: LimitedActionsCopy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,7 +301,6 @@ impl Explainer {
             serving.fallback_caches,
             serving.country_lists,
             serving.client_switches,
-            serving.limited_actions_copy,
         )
     }
 
@@ -329,14 +326,12 @@ impl Explainer {
         fallback_caches: FallbackCaches,
         country_lists: Arc<CountryLists>,
         client_switches: ClientSwitches,
-        copy: LimitedActionsCopy,
     ) -> Self {
         let rule_engine = RuleEngine::with_country_lists(country_lists);
         Self {
             cards: Arc::clone(&sources) as Arc<dyn PostCards>,
             post_evaluator: PostEvaluator::new(sources, rule_engine, Arc::new(fallback_caches)),
             client_switches,
-            copy,
         }
     }
 
@@ -369,6 +364,7 @@ impl Explainer {
             Rpc::FilterTweets => (
                 None,
                 filter_tweets_request(
+                    self.post_evaluator.rule_engine(),
                     &self.client_switches,
                     viewer_id,
                     ask.country.clone(),
@@ -393,7 +389,7 @@ impl Explainer {
         request_context(Instant::now(), None)
             .scope(async {
                 let (hydrated, outcomes, mut traced) =
-                    retweet::hydrate_and_trace(&self.post_evaluator, request).await;
+                    post_evaluator::hydrate_and_trace(&self.post_evaluator, request).await;
                 let source_tweet_id = hydrated
                     .hydration()
                     .tweet(requested.tweet_id())
@@ -439,7 +435,6 @@ impl Explainer {
                     ask.viewer.map(NonZeroU64::get),
                     level.country_code.as_deref(),
                     verdict.limited_engagement_reasons(),
-                    &self.copy,
                     None,
                 );
                 Judgement::Judged {
@@ -447,7 +442,11 @@ impl Explainer {
                     decided_by: treatment::decided_by(verdict),
                     fail_open: evaluation.fail_open_defaults(),
                     failed: level.hydrated.hydration().failed_nodes(TweetId(ask.post)),
-                    sent: Sends::new(evaluation, level.route.level, &policies).result_state(),
+                    sent: treatment::evaluate_tweets_state(
+                        evaluation,
+                        level.route.level,
+                        &policies,
+                    ),
                 }
             }
             Evaluation::NotFound(lookup) => Judgement::NotFound(*lookup),
@@ -549,7 +548,7 @@ impl Explainer {
                         hydration.planned(),
                         candidate.failed,
                         node,
-                        candidate.viewer_relationship.get(node).unwrap_or(false),
+                        candidate.edges.contains(node),
                     )
                 })
                 .fold(Seen::NotHydrated, Seen::union)
@@ -572,7 +571,6 @@ mod tests {
     use crate::clients::socialgraph_client::Graph;
     use crate::filter_tweets::FilterTweetsEndpoint;
     use crate::hydration::sources::{suspended, InMemorySources};
-    use crate::params::limited_actions_copy::tests::BUNDLE;
     use crate::scenario::{tweet_data, Wire};
     use strum::VariantArray;
     use vf_pb::tweet_evaluation::Outcome;
@@ -616,7 +614,6 @@ mod tests {
             FallbackCaches::default(),
             Arc::new(CountryLists::starting_at_default()),
             ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json(BUNDLE),
         )
         .explain(&ask)
         .await;
@@ -734,7 +731,7 @@ mod tests {
                     };
                     assert_eq!(
                         (result.action.unwrap(), result.filtered_reason.clone()),
-                        treatment::proto_action(level.provenance.evaluation.verdict().clone()),
+                        treatment::proto_action(level.provenance.evaluation.verdict()),
                         "{route:?}"
                     );
                 }

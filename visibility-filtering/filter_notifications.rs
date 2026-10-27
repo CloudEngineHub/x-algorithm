@@ -1,19 +1,12 @@
-use crate::metrics::{self, parse_grpc_timeout, RequestOutcome};
-use crate::models::AuthorId;
-use crate::post_evaluator::{PostEvaluator, UserResult};
-use crate::rules::{RuleId, SafetyLevel};
+use crate::metrics::{self, Endpoint, NotificationKind, RequestLevel};
+use crate::models::{AuthorId, Evaluation};
+use crate::post_evaluator::PostEvaluator;
+use crate::rules::SafetyLevel;
+use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use vf_pb::NotificationDropReason as DropReason;
 use xai_visibility_filtering_proto as vf_pb;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-enum NotificationKind {
-    Follow,
-    FollowRequestAccepted,
-}
 
 impl NotificationKind {
     fn parse(kind: Option<&vf_pb::notification::Kind>) -> Result<Self, Status> {
@@ -80,74 +73,6 @@ impl Notifications {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NotificationResult {
-    Allowed,
-    Dropped(DropReason),
-    Failed,
-}
-
-impl NotificationResult {
-    fn of(result: UserResult) -> Self {
-        match result {
-            UserResult::Allowed => Self::Allowed,
-            UserResult::Dropped(rule) => Self::Dropped(drop_reason(rule)),
-            UserResult::NotFound => Self::Dropped(DropReason::ActorNotFound),
-            UserResult::Failed => Self::Failed,
-        }
-    }
-
-    fn labels(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Allowed => ("allowed", "none"),
-            Self::Dropped(reason) => ("dropped", reason_label(reason)),
-            Self::Failed => ("failed", "none"),
-        }
-    }
-
-    fn into_proto(self) -> vf_pb::NotificationVisibilityResult {
-        use vf_pb::notification_visibility_result::Outcome;
-        let outcome = match self {
-            Self::Allowed => Outcome::Allowed(vf_pb::Allowed {}),
-            Self::Dropped(reason) => Outcome::Dropped(vf_pb::Dropped {
-                reason: Some(reason.into()),
-            }),
-            Self::Failed => Outcome::Failed(vf_pb::Failed {}),
-        };
-        vf_pb::NotificationVisibilityResult {
-            outcome: Some(outcome),
-        }
-    }
-}
-
-const DROP_REASONS: [(RuleId, DropReason); 4] = [
-    (RuleId::SuspendedAuthor, DropReason::ActorSuspended),
-    (RuleId::ProtectedAuthor, DropReason::ActorProtected),
-    (RuleId::ViewerBlocksAuthor, DropReason::RecipientBlocksActor),
-    (
-        RuleId::ViewerMutesAndDoesNotFollowAuthor,
-        DropReason::RecipientMutesActor,
-    ),
-];
-
-fn drop_reason(rule: RuleId) -> DropReason {
-    DROP_REASONS
-        .iter()
-        .find(|&&(id, _)| id == rule)
-        .map_or(DropReason::Unspecified, |&(_, reason)| reason)
-}
-
-fn reason_label(reason: DropReason) -> &'static str {
-    match reason {
-        DropReason::Unspecified => "unspecified",
-        DropReason::ActorNotFound => "actor_not_found",
-        DropReason::ActorSuspended => "actor_suspended",
-        DropReason::ActorProtected => "actor_protected",
-        DropReason::RecipientBlocksActor => "recipient_blocks_actor",
-        DropReason::RecipientMutesActor => "recipient_mutes_actor",
-    }
-}
-
 pub struct FilterNotificationsEndpoint {
     post_evaluator: Arc<PostEvaluator>,
 }
@@ -161,57 +86,53 @@ impl FilterNotificationsEndpoint {
         &self,
         request: Request<vf_pb::FilterNotificationsRequest>,
     ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {
-        let entered = tokio::time::Instant::now();
-        let context =
-            crate::hydration::request_context(entered, parse_grpc_timeout(request.metadata()));
-        let request = request.into_inner();
-        let notifications = Notifications::parse(&request).inspect_err(|_| {
-            let kind = SafetyLevel::from_notification_thrift(request.safety_level)
-                .and_then(NotificationKind::of_level);
-            let notification_type = kind.map_or("unknown", <&str>::from);
-            metrics::record_notification_request(
-                notification_type,
-                RequestOutcome::Failure,
-                entered.elapsed(),
+        let level = RequestLevel::of(
+            SafetyLevel::from_notification_thrift(request.get_ref().safety_level)
+                .filter(|&level| NotificationKind::of_level(level).is_some()),
+        );
+        let endpoint = Endpoint::FilterNotifications;
+        metrics::observe_request(endpoint, level, request, |request, context| async move {
+            metrics::record_batch_size(endpoint, request.get_ref().notifications.len());
+            let notifications = Notifications::parse(request.get_ref())?;
+            let mut actors = notifications.actors.clone();
+            actors.sort_unstable_by_key(|actor| actor.0);
+            actors.dedup();
+            let by_actor: HashMap<AuthorId, Option<Evaluation>> = if actors.is_empty() {
+                HashMap::new()
+            } else {
+                context
+                    .scope(self.post_evaluator.evaluate_users(
+                        notifications.level,
+                        notifications.recipient_id,
+                        actors,
+                    ))
+                    .await
+            };
+            let evaluation = |actor: &AuthorId| by_actor.get(actor).and_then(Option::as_ref);
+            metrics::record_sent(
+                endpoint,
+                notifications.level,
+                notifications.actors.iter().filter_map(evaluation),
+                notifications
+                    .actors
+                    .iter()
+                    .filter(|&actor| evaluation(actor).is_none())
+                    .count(),
             );
-        })?;
-        let notification_type: &str = notifications.kind.into();
-        let mut actors = notifications.actors.clone();
-        actors.sort_unstable_by_key(|actor| actor.0);
-        actors.dedup();
-        let by_actor: HashMap<AuthorId, UserResult> = if actors.is_empty() {
-            HashMap::new()
-        } else {
-            context
-                .scope(self.post_evaluator.evaluate_users(
-                    notifications.level,
-                    notifications.recipient_id,
-                    actors,
-                ))
-                .await
-        };
-        let results: Vec<NotificationResult> = notifications
-            .actors
-            .iter()
-            .map(|actor| {
-                NotificationResult::of(by_actor.get(actor).copied().unwrap_or(UserResult::Failed))
-            })
-            .collect();
-        metrics::record_notification_results(
-            notification_type,
-            results.iter().map(|result| result.labels()),
-        );
-        metrics::record_notification_request(
-            notification_type,
-            RequestOutcome::Success,
-            entered.elapsed(),
-        );
-        Ok(Response::new(vf_pb::FilterNotificationsResponse {
-            results: results
-                .into_iter()
-                .map(NotificationResult::into_proto)
-                .collect(),
-        }))
+            let results: Vec<_> = notifications
+                .actors
+                .iter()
+                .map(|actor| treatment::notification_result(evaluation(actor)))
+                .collect();
+            metrics::record_notification_results(
+                notifications.kind.into(),
+                results.iter().map(|&(_, labels)| labels),
+            );
+            Ok(Response::new(vf_pb::FilterNotificationsResponse {
+                results: results.into_iter().map(|(result, _)| result).collect(),
+            }))
+        })
+        .await
     }
 }
 
@@ -221,7 +142,9 @@ mod tests {
     use crate::clients::socialgraph_client::Graph;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{found_user, suspended, Fault, InMemorySources};
+    use crate::metrics::thread_recorded;
     use crate::rules::RuleEngine;
+    use vf_pb::NotificationDropReason as DropReason;
     use xai_core_entities::entities::{
         GizmoduckAdvancedFilters, GizmoduckMuteSettings, GizmoduckUser, GizmoduckUserResult, Label,
         Labels, MentionFilter,
@@ -378,6 +301,113 @@ mod tests {
         let (seen, sources) = filter(world(), FOLLOW, RECIPIENT, vec![]).await;
         assert_eq!(seen, Ok(vec![]));
         assert!(sources.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_level_without_notifications_counts_as_an_unknown_level_failure() {
+        let requests = |outcome| {
+            [
+                ("rpc", "filter_notifications"),
+                ("safety_level", "unknown"),
+                ("outcome", outcome),
+            ]
+            .to_vec()
+        };
+        for (family, expected) in [
+            (
+                "vf_requests",
+                vec![requests("started"), requests("failure")],
+            ),
+            (
+                "vf_requests_by_caller",
+                vec![vec![
+                    ("caller_identity", "unknown"),
+                    ("rpc", "filter_notifications"),
+                    ("outcome", "failure"),
+                ]],
+            ),
+        ] {
+            thread_recorded::start();
+            let (seen, _) = filter(world(), 8, RECIPIENT, vec![follow(ACTOR)]).await;
+            assert_eq!(seen, Err(tonic::Code::InvalidArgument));
+            let recorded: Vec<Vec<(String, String)>> = thread_recorded::take(family)
+                .into_iter()
+                .map(|sample| sample.labels)
+                .collect();
+            let expected: Vec<Vec<(String, String)>> = expected
+                .iter()
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .map(|&(label, value)| (label.to_owned(), value.to_owned()))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(recorded, expected, "{family}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_notification_counts_in_the_verdict_families_and_unresolves_nothing() {
+        let row = |value: &str, count: f64| {
+            (
+                value.to_owned(),
+                "notifications_follow".to_owned(),
+                "filter_notifications".to_owned(),
+                count,
+            )
+        };
+        for (family, label, judged, unevaluated) in [
+            (
+                "vf_verdicts",
+                "action",
+                vec![row("allow", 2.0), row("drop", 2.0)],
+                vec![row("drop", 2.0)],
+            ),
+            (
+                "vf_verdicts_by_rule",
+                "rule",
+                vec![row("not_found", 1.0), row("suspended_author/drop", 1.0)],
+                vec![row("lookup_failed", 2.0)],
+            ),
+            (
+                "vf_evaluated_candidates",
+                "fail_open_defaults",
+                vec![row("none", 4.0)],
+                vec![],
+            ),
+            ("vf_unresolved_tweets", "lookup", vec![], vec![]),
+        ] {
+            for (sources, actors, expected) in [
+                (
+                    world(),
+                    &[ACTOR, SUSPENDED_ACTOR, ACTOR, MISSING_ACTOR][..],
+                    judged,
+                ),
+                (
+                    world().fault(Source::GizmoduckViewer, Fault::Fails),
+                    &[ACTOR, ACTOR],
+                    unevaluated,
+                ),
+            ] {
+                thread_recorded::start();
+                follows(sources, actors).await;
+                let mut recorded: Vec<(String, String, String, f64)> =
+                    thread_recorded::take(family)
+                        .into_iter()
+                        .map(|sample| {
+                            (
+                                sample.label(label).unwrap().to_owned(),
+                                sample.label("safety_level").unwrap().to_owned(),
+                                sample.label("rpc").unwrap().to_owned(),
+                                sample.value,
+                            )
+                        })
+                        .collect();
+                recorded.sort_by(|x, y| x.0.cmp(&y.0));
+                assert_eq!(recorded, expected, "{family} {actors:?}");
+            }
+        }
     }
 
     #[tokio::test]

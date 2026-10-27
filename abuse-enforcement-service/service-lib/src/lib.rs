@@ -567,7 +567,7 @@ async fn run_enforcement_inner(
                     .into(),
             );
         }
-        match safety_checks::first_page_stop(facts.entity_type, &facts) {
+        match safety_checks::first_page_stop(facts.entity_type, &facts, control.author_skips) {
             Ok(Some(check)) => (Decision::Skip(check.reason.to_owned()), check.id.to_owned()),
             Ok(None) if control.page_actions.is_empty() => (
                 Decision::Skip(action_control::STATUS_NO_ACTIONS.to_owned()),

@@ -1,12 +1,12 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, FosnrReason, LabelInterstitial, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity,
-    SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict,
-    VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
+    DropReason, EdgeSet, FosnrReason, LabelInterstitial, LimitedActionType, LimitedEngagement,
+    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
+    PostCandidate, PostEntity, SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures,
+    UserEntity, Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
+    Withholding,
 };
-use crate::params::LimitedActionType;
 use crate::rules::RuleId;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
@@ -497,7 +497,7 @@ pub(crate) fn candidate() -> CandidateBuilder {
                 tweet_id: TWEET_ID,
                 ..Default::default()
             },
-            viewer_relationship: Default::default(),
+            edges: EdgeSet::default(),
             failed: Hydrators::empty(),
         },
         labels: HashSet::new(),
@@ -561,16 +561,7 @@ impl CandidateBuilder {
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
         debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
-        if let Some(slot) = self.candidate.viewer_relationship.slot(edge) {
-            *slot = true;
-        } else {
-            self.candidate.post.edges = self.candidate.post.edges.with(edge);
-        }
-        debug_assert!(self.candidate.post.edges.iter().all(|node| self
-            .candidate
-            .viewer_relationship
-            .get(node)
-            .is_none()));
+        self.candidate.edges = self.candidate.edges.with(edge);
         self
     }
 

@@ -8,7 +8,6 @@ use crate::rules::fixtures::{
 };
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use std::num::NonZeroU64;
-use xai_core_entities::entities::{EditControl, EditControlInitial};
 use xai_visibility_filtering::models::FilteredReason;
 
 pub(super) fn rows() -> Vec<Row> {
@@ -142,22 +141,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "current_edit",
-            subject: Subject::Post(tweet_candidate(|t| {
-                t.edit_control = Some(EditControl::Initial(EditControlInitial {
-                    edit_tweet_ids: vec![1],
-                    ..Default::default()
-                }))
-            })),
+            subject: Subject::Post(tweet_candidate(|t| t.latest_edit_tweet_id = Some(1))),
             expect: vec![(TimelineHome, Role::NonFollower, allow())],
         },
     ]
 }
 
 fn stale_candidate() -> PostCandidate {
-    tweet_candidate(|t| {
-        t.edit_control = Some(EditControl::Initial(EditControlInitial {
-            edit_tweet_ids: vec![1, 2],
-            ..Default::default()
-        }))
-    })
+    tweet_candidate(|t| t.latest_edit_tweet_id = Some(2))
 }

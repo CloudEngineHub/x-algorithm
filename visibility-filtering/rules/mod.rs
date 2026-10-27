@@ -2,6 +2,7 @@ mod author_rules;
 #[cfg(test)]
 mod catalog;
 mod context;
+mod defaults;
 pub mod engine;
 mod expansion;
 #[cfg(test)]
@@ -18,10 +19,11 @@ use crate::models::{Placement, PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
-pub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};
+pub use defaults::Effect;
+pub use engine::RuleEngine;
 pub(crate) use expansion::Expansion;
 pub(crate) use rule_spec::observed::NoTrace;
-pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
+pub use rule_spec::observed::{NodeKind, NodeTrace, PolicyTrace, RowTrace, Skip, Witness};
 pub(crate) use rule_spec::RuleId;
 pub use rule_spec::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
@@ -30,8 +32,8 @@ pub use rule_spec::{
     RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
     TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
-pub(crate) use safety_level::QuoteEntries;
 pub use safety_level::SafetyLevel;
+pub(crate) use safety_level::{QuoteEntries, RerenderReason};
 
 #[cfg(test)]
 pub(crate) fn test_context<'a>(

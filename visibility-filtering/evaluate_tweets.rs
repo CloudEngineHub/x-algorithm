@@ -1,11 +1,8 @@
-use crate::caller_identity::Endpoint;
-use crate::metrics::{self as ft_metrics, Rpc};
-use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId, Verdict};
-use crate::params::limited_actions_copy::LimitedActionsCopy;
-use crate::params::{ClientSwitches, LimitedActionsPolicies};
+use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, Rpc};
+use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId};
+use crate::params::ClientSwitches;
 use crate::post_evaluator::{normalize_viewer_id, PostBatch, PostEvaluation, PostEvaluator};
-use crate::quote::{Passes, QuotePassMode, QuotePassRunner};
-use crate::result_label::{label, state_label, Class, Label, NONE};
+use crate::quote::{Passes, QuotePassRunner};
 use crate::rules::{QuoteEntries, SafetyLevel};
 use crate::treatment;
 use std::sync::Arc;
@@ -14,9 +11,6 @@ use vf_pb::tweet_evaluation::Outcome;
 use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
-use xai_x_thrift::tweet_service::TweetFieldsResultState;
-
-const BATCH_SIZE: &str = "evaluate_tweets_batch_size";
 
 pub(crate) trait EntryComparator: Send + Sync {
     fn compare(
@@ -33,7 +27,6 @@ pub(crate) trait EntryComparator: Send + Sync {
 pub struct EvaluateTweetsEndpoint {
     post_evaluator: Arc<PostEvaluator>,
     client_switches: ClientSwitches,
-    limited_actions_copy: LimitedActionsCopy,
     comparator: Option<Arc<dyn EntryComparator>>,
     quote_pass: QuotePassRunner,
 }
@@ -42,24 +35,14 @@ impl EvaluateTweetsEndpoint {
     pub(crate) fn new(
         post_evaluator: Arc<PostEvaluator>,
         client_switches: ClientSwitches,
-        limited_actions_copy: LimitedActionsCopy,
         comparator: Option<Box<dyn EntryComparator>>,
-        quote_pass: QuotePassMode,
+        quote_pass: QuotePassRunner,
     ) -> Self {
         Self {
             post_evaluator,
             client_switches,
-            limited_actions_copy,
             comparator: comparator.map(Arc::from),
-            quote_pass: QuotePassRunner::new(quote_pass),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_quote_pass_permits(self, permits: usize) -> Self {
-        Self {
-            quote_pass: self.quote_pass.with_permits(permits),
-            ..self
+            quote_pass,
         }
     }
 
@@ -67,16 +50,22 @@ impl EvaluateTweetsEndpoint {
         &self,
         request: Request<vf_pb::EvaluateTweetsRequest>,
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-        let entered = tokio::time::Instant::now();
+        let level = ThriftLevel(request.get_ref().safety_level);
+        let safety_level = if ThriftLevel::ENUM_VALUES.contains(&level) {
+            SafetyLevel::from_thrift(level)
+                .ok_or_else(|| Status::unimplemented("safety level has no Rust policy"))
+        } else {
+            Err(Status::invalid_argument("unknown safety level"))
+        };
         ft_metrics::observe_request(
             Endpoint::EvaluateTweets,
+            RequestLevel::of(safety_level.as_ref().ok().copied()),
             request,
-            |request, grpc_timeout| async move {
-                let context = crate::hydration::request_context(entered, grpc_timeout);
+            |request, context| async move {
                 let twitter_context =
                     xai_twittercontext::extract_twitter_context(request.metadata());
                 context
-                    .scope(self.handle_inner(request.into_inner(), twitter_context))
+                    .scope(self.handle_inner(request.into_inner(), twitter_context, safety_level))
                     .await
                     .map(Response::new)
             },
@@ -88,15 +77,10 @@ impl EvaluateTweetsEndpoint {
         &self,
         req: vf_pb::EvaluateTweetsRequest,
         twitter_context: Option<TwitterContextViewer>,
+        safety_level: Result<SafetyLevel, Status>,
     ) -> Result<vf_pb::EvaluateTweetsResponse, Status> {
-        let level = ThriftLevel(req.safety_level);
-        if !ThriftLevel::ENUM_VALUES.contains(&level) {
-            return Err(Status::invalid_argument("unknown safety level"));
-        }
-        let Some(safety_level) = SafetyLevel::from_thrift(level) else {
-            return Err(Status::unimplemented("safety level has no Rust policy"));
-        };
-        ft_metrics::record_batch_size(BATCH_SIZE, req.tweets.len());
+        ft_metrics::record_batch_size(Endpoint::EvaluateTweets, req.tweets.len());
+        let safety_level = safety_level?;
         let judges_quote_entries = matches!(
             safety_level.spec().quote_entries,
             QuoteEntries::Judged { .. }
@@ -157,28 +141,20 @@ impl EvaluateTweetsEndpoint {
                 Answer::NotJudged | Answer::Unpaired => None,
             })
         };
-        let unpaired = Verdict::lookup_failed();
-        ft_metrics::record_verdicts(
-            Rpc::EvaluateTweets,
+        ft_metrics::record_sent(
+            Endpoint::EvaluateTweets,
             safety_level,
-            answers.iter().filter_map(|answer| match answer {
-                Answer::NotJudged => None,
-                Answer::Unpaired => Some(&unpaired),
-                Answer::Evaluated(evaluation) => Some(evaluation.verdict()),
-            }),
-        );
-        ft_metrics::record_unresolved(Rpc::EvaluateTweets, safety_level, evaluations());
-        ft_metrics::record_fail_open_defaults(
-            Rpc::EvaluateTweets,
-            safety_level,
-            evaluations().map(Evaluation::fail_open_defaults),
+            evaluations(),
+            answers
+                .iter()
+                .filter(|answer| matches!(answer, Answer::Unpaired))
+                .count(),
         );
         let policies = self.client_switches.limited_actions_policies(
             twitter_context.as_ref(),
             viewer_id,
             country_code.as_deref(),
             evaluations().flat_map(|evaluation| evaluation.verdict().limited_engagement_reasons()),
-            &self.limited_actions_copy,
             xai_stats_receiver::global_stats_receiver().as_deref(),
         );
         let results = answers
@@ -186,10 +162,14 @@ impl EvaluateTweetsEndpoint {
             .map(|answer| {
                 let outcome = match answer {
                     Answer::NotJudged => Outcome::NotEvaluated(vf_pb::NotEvaluated {}),
-                    Answer::Evaluated(evaluation) => {
-                        evaluated_outcome(Sends::new(evaluation, safety_level, &policies))
+                    Answer::Evaluated(evaluation) => treatment::evaluate_tweets_outcome(
+                        Some(evaluation),
+                        safety_level,
+                        &policies,
+                    ),
+                    Answer::Unpaired => {
+                        treatment::evaluate_tweets_outcome(None, safety_level, &policies)
                     }
-                    Answer::Unpaired => Outcome::Failed(vf_pb::Failed {}),
                 };
                 vf_pb::TweetEvaluation {
                     outcome: Some(outcome),
@@ -249,69 +229,13 @@ pub(crate) fn evaluate_tweets_request(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Sends<'a> {
-    evaluation: &'a Evaluation,
-    level: SafetyLevel,
-    policies: &'a LimitedActionsPolicies,
-}
-
-impl<'a> Sends<'a> {
-    pub(crate) fn new(
-        evaluation: &'a Evaluation,
-        level: SafetyLevel,
-        policies: &'a LimitedActionsPolicies,
-    ) -> Self {
-        Self {
-            evaluation,
-            level,
-            policies,
-        }
-    }
-
-    pub(crate) fn result_state(self) -> Option<TweetFieldsResultState> {
-        match self.evaluation {
-            Evaluation::Complete { verdict, .. } => Some(treatment::thrift_result_state(
-                verdict,
-                self.level,
-                self.policies,
-            )),
-            Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => None,
-        }
-    }
-
-    pub(crate) fn label(self) -> Label {
-        match self.evaluation {
-            Evaluation::Complete { verdict, .. } => state_label(&treatment::thrift_result_state(
-                verdict,
-                self.level,
-                self.policies,
-            )),
-            Evaluation::NotFound(_) => label(Class::NotFound, NONE),
-            Evaluation::Partial { .. } | Evaluation::Failed(_) => label(Class::Failed, NONE),
-        }
-    }
-}
-
-fn evaluated_outcome(sends: Sends<'_>) -> Outcome {
-    match sends
-        .result_state()
-        .map(|state| xai_x_thrift::serialize_compact(&state))
-    {
-        Some(Ok(bytes)) => Outcome::ResultStateThriftCompact(bytes.into()),
-        Some(Err(_)) | None => Outcome::Failed(vf_pb::Failed {}),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
-    use crate::models::{TweetFeatures, VerifyBlurSupport};
-    use crate::retweet;
-    use crate::rules::RuleEngine;
-    use crate::rules::RuleId;
+    use crate::models::TweetFeatures;
+    use crate::rules::{NoTrace, RuleEngine, RuleId};
     use crate::scenario::{tweet_data, Wire};
     use std::collections::HashMap;
     use xai_core_entities::entities::{
@@ -732,12 +656,8 @@ mod tests {
                     .to_vec(),
                 rpc,
             };
-            let counted = [
-                post_evaluator.run(request(Rpc::FilterTweets)).await,
-                retweet::evaluate_merging_sources(&post_evaluator, request(Rpc::EvaluateTweets))
-                    .await,
-            ];
-            for outcomes in counted {
+            for rpc in [Rpc::FilterTweets, Rpc::EvaluateTweets] {
+                let (_, outcomes) = post_evaluator.run(request(rpc), &mut NoTrace).await;
                 assert!(
                     outcomes[1]
                         .evaluation
@@ -795,14 +715,12 @@ mod tests {
     fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
         use crate::models::LimitedEngagementReason::ConversationControl;
         use crate::models::{Decided, LimitedEngagement, MediaRestriction, Verdict};
-        use crate::params::limited_actions_copy::tests::BUNDLE;
         use crate::rules::fixtures::limited;
         use xai_x_thrift::action::{
             AnyInterstitial, CtaLimitedActionPrompt, Interstitial, InterstitialReason,
             LimitedAction, LimitedActionCtaType, LimitedActionPrompt, LimitedActionsPolicy,
             LimitedEngagements, TweetInterstitial,
         };
-        let copy = LimitedActionsCopy::from_json(BUNDLE);
         let limit = limited(ConversationControl, "rule");
         let composite = Verdict::Shown {
             notice: None,
@@ -830,7 +748,6 @@ mod tests {
                 None,
                 None,
                 [ConversationControl],
-                &copy,
                 None,
             );
             let thrift_limit = LimitedEngagements::new(
@@ -868,11 +785,11 @@ mod tests {
             ] {
                 let evaluation = Evaluation::complete(verdict.clone());
                 assert_eq!(
-                    evaluated_outcome(Sends::new(
-                        &evaluation,
+                    treatment::evaluate_tweets_outcome(
+                        Some(&evaluation),
                         SafetyLevel::TimelineHomeHydration,
                         &policies
-                    )),
+                    ),
                     found(action),
                     "{language:?} {verdict:?}"
                 );
@@ -880,58 +797,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn each_evaluation_sends_and_labels_as_vf_counts_it() {
-        use crate::hydration::{Hydrator, Hydrators, Lookup};
-        use crate::rules::fixtures::{allow, dropped};
-        use xai_visibility_filtering::models::FilteredReason;
-        let shown = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
-        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
-            ThriftFilteredReason::AuthorIsSuspended(true),
-        ));
-        let cases = [
-            (
-                Evaluation::complete(allow()),
-                Some(&shown),
-                ("allow", "none"),
-            ),
-            (
-                Evaluation::complete(dropped(FilteredReason::AuthorIsSuspended, "rule")),
-                Some(&suspended),
-                ("drop", "author_is_suspended"),
-            ),
-            (
-                Evaluation::Partial {
-                    verdict: dropped(FilteredReason::AuthorIsSuspended, "rule"),
-                    fail_open_defaults: Hydrators::of(Hydrator::Follows),
-                },
-                None,
-                ("failed", "none"),
-            ),
-            (
-                Evaluation::NotFound(Lookup::Author),
-                None,
-                ("not_found", "none"),
-            ),
-            (Evaluation::Failed(Lookup::Tweet), None, ("failed", "none")),
-        ];
-        let policies = LimitedActionsPolicies::default();
-        for (evaluation, sent, (class, reason)) in &cases {
-            let sends = Sends::new(evaluation, SafetyLevel::TimelineHomeHydration, &policies);
-            assert_eq!(sends.result_state().as_ref(), *sent, "{evaluation:?}");
-            assert_eq!(
-                sends.label(),
-                ((*class).to_owned(), (*reason).to_owned()),
-                "{evaluation:?}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn the_forwarded_client_reaches_the_fetched_source_and_no_header_gets_the_defaults() {
-        use crate::models::ClientCapability;
         use crate::rules::fixtures::CLIENT_CLASSES;
-        let wire = Wire::new(Arc::new(
+        let world = Arc::new(
             InMemorySources::default()
                 .pure_core(
                     4,
@@ -941,13 +810,13 @@ mod tests {
                         ..Default::default()
                     },
                 )
-                .tweet(6, 60),
-        ));
+                .tweet(6, 60)
+                .community_post(6, 500),
+        );
+        let wire = Wire::new(Arc::<InMemorySources>::clone(&world));
         let class = CLIENT_CLASSES
             .iter()
-            .find(|class| {
-                class.capability.verify_blur_support == Some(VerifyBlurSupport::IosNeedsUpdate)
-            })
+            .find(|class| class.capability.community_viewer_removed_limits)
             .unwrap();
         let context = TwitterContextViewer {
             client_application_id: class.app_id,
@@ -959,19 +828,9 @@ mod tests {
             viewer_id: Some(1),
             tweets: vec![tweet_data(4, None)],
         };
-        for (context, expected) in [
-            (Some(&context), class.capability),
-            (None, ClientCapability::default()),
-        ] {
-            match context {
-                Some(context) => wire.send_with_context(context, request()).await,
-                None => wire.send(request()).await,
-            }
-            .unwrap();
-            assert_eq!(
-                std::mem::take(&mut *wire.post_evaluator().client_capabilities.lock().unwrap()),
-                [expected]
-            );
-        }
+        wire.send_with_context(&context, request()).await.unwrap();
+        assert_eq!(world.keys(Source::CommunityViewerRemoved), [vec![500]]);
+        wire.send(request()).await.unwrap();
+        assert_eq!(world.keys(Source::CommunityViewerRemoved), [vec![500]]);
     }
 }

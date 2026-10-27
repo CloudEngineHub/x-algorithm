@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 4;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 5;
+pub const ROLLOUT_RECORD_VERSION: u32 = 4;
 pub const ROWS_RECORD_VERSION: u32 = 3;
 pub const BAND_RECORD_VERSION: u32 = 1;
 
@@ -56,7 +57,7 @@ impl ConfidenceLevel {
         }
     }
 
-            pub fn floor(self) -> f64 {
+                pub fn floor(self) -> f64 {
         match self {
             ConfidenceLevel::Low => 0.70,
             ConfidenceLevel::Mid => 0.85,
@@ -339,12 +340,16 @@ pub struct ActionControlRecord {
     pub confidence: Option<LevelRow>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<ConfidenceEvidence>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_override: Option<Box<EvidenceOverride>>,
                     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub admit_unlisted_labels: bool,
                         #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_bp: Option<u32>,
+                    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_threshold: Option<u32>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_high_credibility: Option<bool>,
 }
 
 impl ActionControlRecord {
@@ -367,6 +372,8 @@ impl ActionControlRecord {
         "evidence_override",
         "admit_unlisted_labels",
         "rollout_bp",
+        "follower_threshold",
+        "skip_high_credibility",
     ];
 
             pub fn uses_confidence(&self) -> bool {
@@ -376,9 +383,15 @@ impl ActionControlRecord {
             || self.mode == ControlMode::Rows
     }
 
-                pub fn schema_version(&self) -> u32 {
-        if self.rollout_bp.is_some() {
+        pub fn sets_author_skips(&self) -> bool {
+        self.follower_threshold.is_some() || self.skip_high_credibility.is_some()
+    }
+
+                    pub fn schema_version(&self) -> u32 {
+        if self.sets_author_skips() {
             ACTION_CONTROL_RECORD_VERSION
+        } else if self.rollout_bp.is_some() {
+            ROLLOUT_RECORD_VERSION
         } else if self.uses_confidence() {
             ROWS_RECORD_VERSION
         } else {
@@ -453,7 +466,7 @@ pub struct ActionControlPutRequest {
     pub confidence: Option<LevelRow>,
         #[serde(default)]
     pub evidence: Option<ConfidenceEvidence>,
-        #[serde(default)]
+            #[serde(default)]
     pub evidence_override: Option<EvidenceOverride>,
             #[serde(default)]
     pub rows: Option<RowsRequest>,
@@ -461,6 +474,36 @@ pub struct ActionControlPutRequest {
     pub admit_unlisted_labels: Option<bool>,
             #[serde(default)]
     pub rollout_bp: Option<u32>,
+            #[serde(default, skip_serializing_if = "Option::is_none", with = "keep_or_set")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<u32>, nullable))]
+    pub follower_threshold: Option<Option<u32>>,
+            #[serde(default, skip_serializing_if = "Option::is_none", with = "keep_or_set")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<bool>, nullable))]
+    pub skip_high_credibility: Option<Option<bool>>,
+}
+
+mod keep_or_set {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        v: &Option<Option<T>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        v.as_ref().and_then(Option::as_ref).serialize(s)
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FollowerSkipView {
+            pub today_threshold: u64,
+            pub ceiling: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -497,7 +540,7 @@ pub struct RowSetting {
     pub actions: Vec<PageAction>,
     #[serde(default)]
     pub evidence: Option<ConfidenceEvidence>,
-    #[serde(default)]
+        #[serde(default)]
     pub evidence_override: Option<EvidenceOverride>,
         #[serde(default)]
     pub expected_version: Option<u64>,
@@ -606,6 +649,8 @@ pub struct ActionControlListResponse {
     pub cse: CseLists,
     #[serde(default)]
     pub confidence: Option<ConfidenceView>,
+        #[serde(default)]
+    pub follower_skip: Option<FollowerSkipView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -766,7 +811,8 @@ mod tests {
                 "updated_at_ms":5,"version":2,"write_nonce":9,"confidence":"high",
                 "evidence":{"precision_lower_bound":0.95,"reads":59,"humans":0,"read_at_ms":4,"link":"l"},
                 "evidence_override":{"by":"operator@example.com","reason":"seeded","expires_at_ms":6},
-                "admit_unlisted_labels":true,"rollout_bp":500}"#,
+                "admit_unlisted_labels":true,"rollout_bp":500,"follower_threshold":250,
+                "skip_high_credibility":false}"#,
         )
         .unwrap();
         let keys: Vec<String> = serde_json::to_value(&r)
@@ -851,7 +897,86 @@ mod tests {
             4,
             "a row with a rollout is refused by images that read v: 3 rows"
         );
-        assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+        assert_eq!(l.schema_version(), ROLLOUT_RECORD_VERSION);
+    }
+
+    #[test]
+    fn a_head_record_with_author_skips_is_refused_by_older_images() {
+        let old = r#"{"v":1,"entity_type":"user","head":"H","classifier":null,"band":null,"mode":"live","actions":[{"kind":"suspend"}],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0}"#;
+        let r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            (r.follower_threshold, r.skip_high_credibility),
+            (None, None)
+        );
+        assert!(!r.sets_author_skips());
+        assert_eq!(serde_json::to_string(&r).unwrap(), old, "bytes unchanged");
+        assert_eq!(r.schema_version(), BAND_RECORD_VERSION);
+        for (threshold, credibility) in [(Some(0), None), (Some(250), None), (None, Some(false))] {
+            let mut h = r.clone();
+            h.follower_threshold = threshold;
+            h.skip_high_credibility = credibility;
+            assert_eq!(h.schema_version(), 5);
+            assert_eq!(h.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+            h.v = h.schema_version();
+            let json = serde_json::to_string(&h).unwrap();
+            let back = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
+            assert_eq!(back, h);
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let older: Vec<&String> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k == "follower_threshold" || *k == "skip_high_credibility")
+                .collect();
+            assert_eq!(older.len(), 1, "an older FIELDS list refuses {json}");
+            assert!(
+                h.v > ROLLOUT_RECORD_VERSION,
+                "and so does an older version bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_put_tells_left_out_from_null_from_a_value() {
+        let base = r#""entity_type":"post","head":"H","mode":"live","reason":"r""#;
+        let parse = |extra: &str| {
+            serde_json::from_str::<ActionControlPutRequest>(&format!("{{{base}{extra}}}"))
+        };
+        let p = parse("").unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (None, None)
+        );
+        let p = parse(r#","follower_threshold":null,"skip_high_credibility":null"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (Some(None), Some(None))
+        );
+        let p = parse(r#","follower_threshold":0,"skip_high_credibility":false"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (Some(Some(0)), Some(Some(false)))
+        );
+        let p = parse(r#","follower_threshold":2500"#).unwrap();
+        assert_eq!(p.follower_threshold, Some(Some(2500)));
+        for bad in [
+            r#","follower_threshold":-1"#,
+            r#","follower_threshold":1.5"#,
+            r#","follower_threshold":"off""#,
+            r#","skip_high_credibility":"no""#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let left_out = serde_json::to_value(parse("").unwrap()).unwrap();
+        assert!(left_out.get("follower_threshold").is_none());
+        let cleared =
+            serde_json::to_value(parse(r#","follower_threshold":null"#).unwrap()).unwrap();
+        assert_eq!(
+            cleared.get("follower_threshold"),
+            Some(&serde_json::Value::Null)
+        );
+        let set = serde_json::to_value(parse(r#","follower_threshold":0"#).unwrap()).unwrap();
+        assert_eq!(set.get("follower_threshold"), Some(&serde_json::json!(0)));
     }
 
     #[test]

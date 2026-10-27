@@ -2966,7 +2966,7 @@ pub async fn handle_backfill_run_get(
         (status = 200, description = "The same run, already started", body = BackfillRunRecord),
         (status = 400, description = "Invalid request: {error: code, detail}"),
         (status = 403, description = "not_page_key or person_required"),
-        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off, settings_not_set or lost_race"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, switched_off, settings_not_set or lost_race"),
         (status = 503, description = "Store unreachable"),
     ),
 )]
@@ -2999,7 +2999,6 @@ pub async fn handle_backfill_run_start(
                     &actor.0,
                     &cfg,
                     &state.action_control,
-                    &state.dynamic_config.action_control_config(),
                     &state.off_switch,
                     crate::now_millis(),
                 )
@@ -3048,7 +3047,7 @@ pub async fn handle_backfill_run_start(
         (status = 400, description = "confirm_required"),
         (status = 403, description = "key_not_allowed or person_required"),
         (status = 404, description = "No such run or change"),
-        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off, weak_evidence or lost_race"),
+        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off or lost_race"),
         (status = 503, description = "Store unreachable"),
     ),
 )]
@@ -3087,8 +3086,6 @@ pub async fn handle_backfill_run_change(
             who.as_deref(),
             &actor.0,
             &state.backfill.config(),
-            &state.action_control,
-            &state.dynamic_config.action_control_config(),
             &state.off_switch,
             crate::now_millis(),
         )

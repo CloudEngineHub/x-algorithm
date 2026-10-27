@@ -51,6 +51,17 @@ pub(crate) fn refuse_reference() {
     }
 }
 
+pub(crate) fn refuse_test_users_in_prod() {
+    refuse_test_users(std::env::var(ENV_APP_ENV).ok().as_deref());
+}
+
+#[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
+fn refuse_test_users(app_env: Option<&str>) {
+    if app_env == Some("prod") {
+        panic!("--test-users is staging-only, but {ENV_APP_ENV}=prod");
+    }
+}
+
 const DEFAULT_CACHE_CAPACITY: usize = 1_000_000;
 
 pub(crate) fn author_cache_capacity() -> Option<usize> {
@@ -120,8 +131,15 @@ pub(crate) fn parse_env_flag(value: Option<&str>) -> bool {
 mod tests {
     use super::{
         DEFAULT_CACHE_CAPACITY, QuotePassMode, parse_capacity, parse_env_flag, parse_quote_pass,
-        resolve_gizmoduck_client_id, resolve_twemcache_client_name,
+        refuse_test_users, resolve_gizmoduck_client_id, resolve_twemcache_client_name,
     };
+
+    #[test]
+    fn only_prod_refuses_test_users() {
+        refuse_test_users(Some("staging"));
+        refuse_test_users(None);
+        assert!(std::panic::catch_unwind(|| refuse_test_users(Some("prod"))).is_err());
+    }
 
     #[test]
     fn the_quote_pass_is_off_unless_set_to_shadow_and_refuses_any_other_value() {

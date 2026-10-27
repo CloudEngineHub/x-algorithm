@@ -236,7 +236,7 @@ impl<E: Fold> PredicateVisitor<E> for TruthOf<'_, '_, E> {
     fn relationship(self, leaf: RelationshipLeaf) -> Truth {
         let node = leaf.node();
         truth(
-            leaf.holds(self.0.acquire_relationship(node)),
+            self.0.acquire_edge(node),
             self.0.failed().intersection(Hydrators::of(node)),
         )
     }
@@ -245,7 +245,7 @@ impl<E: Fold> PredicateVisitor<E> for TruthOf<'_, '_, E> {
     fn pair_edge(self, leaf: PairEdgeLeaf) -> Truth {
         let node = leaf.node();
         truth(
-            leaf.holds(self.0.acquire_pair_edges(node)),
+            self.0.acquire_pair_edge(node),
             self.0.failed().intersection(Hydrators::of(node)),
         )
     }

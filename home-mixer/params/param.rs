@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-23T16:00:34Z
+// mirrored from config feature-switch defaults; last sync 2026-10-26T16:00:39Z
 use xai_feature_switches::param;
 
 param!(
@@ -98,7 +98,10 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec!["Experiment18Fou:0.3".to_string()]
+    vec![
+        "Experiment18Fou:0.3".to_string(),
+        "Experiment19Fou:0.3".to_string()
+    ]
 );
 param!(
     ShadowTrafficPhoenixClusterAggregationTypes,
@@ -503,7 +506,7 @@ param!(
     VMRankerSendDebiasInputs,
     bool,
     "rust_home_mixer_vm_ranker_send_debias_inputs",
-    false
+    true
 );
 param!(
     VMRankerSendPacingInputs,

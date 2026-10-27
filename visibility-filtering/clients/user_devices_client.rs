@@ -1,12 +1,11 @@
+use crate::clients::strato::{self, decode_only, EncodeOnlyCodec, ToThrift};
 use crate::thrift_read::read_fields;
-use anyhow::bail;
 use std::collections::HashSet;
 use thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TListIdentifier, TOutputProtocol, TSerializable,
     TStructIdentifier, TType,
 };
-use xai_strato::strato_thrift::{strato_decode, StratoResult};
-use xai_strato::{encode, MValCodec, StratoGrpc};
+use xai_strato::{encode, StratoGrpc};
 
 pub(crate) const CONFIRMED_EMAILS_COLUMN: &str = "notifinfra/service/getObfuscatedUserEmails";
 pub(crate) const VERIFIED_PHONES_COLUMN: &str = "notifinfra/service/getObfuscatedUserPhones";
@@ -23,58 +22,33 @@ impl UserDevicesClient {
     }
 
     pub async fn confirmed_emails(&self, user_ids: &[u64]) -> anyhow::Result<HashSet<u64>> {
-        let bytes = self
-            .grpc
-            .call(
-                CONFIRMED_EMAILS_COLUMN,
-                "fetch",
-                vec![emails_key(user_ids)],
-                None,
-            )
-            .await?;
-        users(strato_decode::<ConfirmedEmails>(&bytes)?, |emails| emails.0)
+        let bytes =
+            strato::fetch(&self.grpc, CONFIRMED_EMAILS_COLUMN, emails_key(user_ids)).await?;
+        Ok(strato::decode::<ConfirmedEmails>(&bytes)?.map_or_else(HashSet::new, |emails| emails.0))
     }
 
     pub async fn verified_phones(&self, user_ids: &[u64]) -> anyhow::Result<HashSet<u64>> {
-        let bytes = self
-            .grpc
-            .call(
-                VERIFIED_PHONES_COLUMN,
-                "fetch",
-                vec![phones_key(user_ids)],
-                None,
-            )
-            .await?;
-        users(strato_decode::<VerifiedPhones>(&bytes)?, |phones| phones.0)
-    }
-}
-
-fn users<T>(
-    result: StratoResult<T>,
-    users: impl FnOnce(T) -> HashSet<u64>,
-) -> anyhow::Result<HashSet<u64>> {
-    match result {
-        StratoResult::Ok { value, .. } => Ok(value.map(users).unwrap_or_default()),
-        StratoResult::Err { code, message } => bail!("Strato error (code {code}): {message}"),
+        let bytes = strato::fetch(&self.grpc, VERIFIED_PHONES_COLUMN, phones_key(user_ids)).await?;
+        Ok(strato::decode::<VerifiedPhones>(&bytes)?.map_or_else(HashSet::new, |phones| phones.0))
     }
 }
 
 pub(crate) fn emails_key(user_ids: &[u64]) -> Vec<u8> {
     encode(&(
-        UsersRequest {
+        EncodeOnlyCodec(UsersRequest {
             user_ids,
             purpose: Some(CORE_SERVICE),
-        },
+        }),
         (),
     ))
 }
 
 pub(crate) fn phones_key(user_ids: &[u64]) -> Vec<u8> {
     encode(&(
-        UsersRequest {
+        EncodeOnlyCodec(UsersRequest {
             user_ids,
             purpose: None,
-        },
+        }),
         (),
     ))
 }
@@ -84,21 +58,12 @@ struct UsersRequest<'a> {
     purpose: Option<i32>,
 }
 
-impl MValCodec for UsersRequest<'_> {
-    fn thrift_type() -> TType {
-        TType::Struct
-    }
-
-    #[expect(clippy::unimplemented, reason = "a request is only encoded")]
-    fn from_thrift(_proto: &mut dyn TInputProtocol) -> Self {
-        unimplemented!("a request is only encoded")
-    }
-
+impl ToThrift for UsersRequest<'_> {
     #[expect(
         clippy::unwrap_used,
         reason = "`xai_strato::encode` writes into a Vec, which cannot fail; 2^31 ids would not fit in memory first"
     )]
-    fn to_thrift(&self, proto: &mut dyn TOutputProtocol) {
+    fn write(&self, proto: &mut dyn TOutputProtocol) {
         proto
             .write_struct_begin(&TStructIdentifier::new("UsersRequest"))
             .unwrap();
@@ -177,10 +142,7 @@ impl TSerializable for ConfirmedEmails {
     }
 
     fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "a response is only decoded",
-        ))
+        Err(decode_only("ConfirmedEmails"))
     }
 }
 
@@ -203,17 +165,14 @@ impl TSerializable for VerifiedPhones {
     }
 
     fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
-        Err(thrift::new_protocol_error(
-            thrift::ProtocolErrorKind::NotImplemented,
-            "a response is only decoded",
-        ))
+        Err(decode_only("VerifiedPhones"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift;
+    use crate::clients::strato::answer::Thrift;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

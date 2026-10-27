@@ -24,7 +24,8 @@ impl RecentSearchQueriesQueryHydrator {
 #[async_trait]
 impl QueryHydrator<ScoredPostsQuery> for RecentSearchQueriesQueryHydrator {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.params.get(EnableRecentSearchQueriesHydration) && query.user_id != 0
+        (query.params.get(EnableRecentSearchQueriesHydration) || query.is_shadow_traffic)
+            && query.user_id != 0
     }
 
     async fn hydrate(&self, query: &ScoredPostsQuery) -> Result<ScoredPostsQuery, String> {

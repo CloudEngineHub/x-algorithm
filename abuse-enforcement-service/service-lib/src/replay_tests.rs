@@ -26,6 +26,8 @@ pub(crate) const ACTION_CONTROL_INFO_KEYS: &[&str] = &[
     "action_control_version",
     "action_control_lkey",
     "action_control_forced_recording",
+    "action_control_follower_threshold",
+    "action_control_skip_high_credibility",
     "matched_rule_id",
     "rules_would_rule_id",
     "rules_would_action_specs",
@@ -40,11 +42,12 @@ pub(crate) enum Account {
     Suspended,
     Deactivated,
     HasSpamHighRecall,
-    Followers5k,
-    Followers200k,
+    BetweenLimits,
+    AboveTopLimit,
     HighCred,
     NotFound,
     HasPhoenixSkip,
+    JustBelowTopLimit,
 }
 
 impl Account {
@@ -53,23 +56,25 @@ impl Account {
         Account::Suspended,
         Account::Deactivated,
         Account::HasSpamHighRecall,
-        Account::Followers5k,
-        Account::Followers200k,
+        Account::BetweenLimits,
+        Account::AboveTopLimit,
         Account::HighCred,
         Account::NotFound,
     ];
 
-        pub(crate) const EXTRA: [Account; 1] = [Account::HasPhoenixSkip];
+        pub(crate) const EXTRA: [Account; 2] = [Account::HasPhoenixSkip, Account::JustBelowTopLimit];
 
     pub(crate) fn user_id(self) -> i64 {
         1_700_100_000 + self as i64
     }
 
-    fn followers(self) -> i64 {
+            pub(crate) fn followers(self) -> i64 {
+        let view = crate::safety_checks::follower_skip_view();
         match self {
-            Account::Followers5k => 5_000,
-            Account::Followers200k => 200_000,
-            _ => 10,
+            Account::BetweenLimits => view.today_threshold as i64,
+            Account::AboveTopLimit => view.ceiling as i64 + 1,
+            Account::JustBelowTopLimit => view.ceiling as i64 - 1,
+            _ => 1,
         }
     }
 }
@@ -415,12 +420,16 @@ impl Trace {
             .collect()
     }
 
-            pub(crate) fn golden_line(&self, id: &str) -> String {
+                    pub(crate) fn golden_line(&self, id: &str) -> String {
         let dry: Vec<bool> = self.outcomes.iter().map(|o| o.dry_run).collect();
         let mut ais = self.ais.clone();
         ais.iter_mut().for_each(|(_, r)| scrub(r));
+        let mut info = self.old_info();
+        for i in &mut info {
+            i.remove("cred_follower_count");
+        }
         let hashed = serde_json::json!({
-            "info": self.old_info(),
+            "info": info,
             "outcome_status": self.outcomes.iter().map(|o| o.status.clone()).collect::<Vec<_>>(),
             "ais": ais,
         })

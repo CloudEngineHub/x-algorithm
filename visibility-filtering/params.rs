@@ -19,7 +19,6 @@ use xai_feature_switches::{
 use xai_stats_receiver::StatsReceiverExt;
 
 pub(crate) use client_switches::ClientSwitches;
-pub use limited_actions_policy::LimitedActionType;
 pub(crate) use limited_actions_policy::LimitedActionsPolicies;
 
 const SCALA_FILES: [&str; 7] = [

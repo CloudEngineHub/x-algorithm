@@ -27,7 +27,7 @@ impl Snapshot {
         keys.into_iter().find_map(|k| self.at(&k))
     }
 
-                pub(super) fn row_scope<'a>(
+    pub(super) fn row_scope<'a>(
         &'a self,
         entity: ControlEntity,
         names: &[&'a str],
@@ -69,7 +69,7 @@ impl Snapshot {
         })
     }
 
-                    pub(super) fn mover(
+    pub(super) fn mover(
         &self,
         entity: ControlEntity,
         names: &[&str],
@@ -89,7 +89,7 @@ impl Snapshot {
         }
     }
 
-                        pub(super) fn row_decider(
+    pub(super) fn row_decider(
         &self,
         entity: ControlEntity,
         names: &[&str],
@@ -126,7 +126,7 @@ impl Snapshot {
         }
     }
 
-                        pub(super) fn under_scope(
+    pub(super) fn under_scope(
         &self,
         entity: ControlEntity,
         names: &[&str],
@@ -178,8 +178,8 @@ pub(super) struct RowContext<'a> {
     pub classifier: &'a str,
     pub factory: bool,
     pub stale: bool,
-        pub author_id: i64,
-        pub rollout_salt: &'a str,
+    pub author_id: i64,
+    pub rollout_salt: &'a str,
 }
 
 fn logged(
@@ -279,17 +279,13 @@ pub(super) fn resolve_rows(
         Some("stale_snapshot")
     } else if !safety_ok(m.entity) {
         Some("safety_checks_changed")
-    } else if claim.row.level().is_some() && cfg.confidence.unreadable.is_some() {
-        Some("confidence_config_unreadable")
     } else {
         None
     };
     if forced.is_some() {
         return Some(logged(matched, actions, forced, outcome));
     }
-    if let Some(why) = evidence_floor(Some(record), claim, cfg, m.factory, &mut outcome) {
-        return Some(logged(matched, actions, Some(why), outcome));
-    }
+    judge_evidence(Some(record), claim, cfg, m.factory, &mut outcome);
     if let Some(bp) = record.rollout_bp {
         let inside = record.rollout_takes(m.rollout_salt, m.author_id);
         outcome.rollout = Some((
@@ -322,14 +318,16 @@ pub(super) fn resolve_rows(
     })
 }
 
-fn evidence_floor(
+fn judge_evidence(
     row: Option<&ActionControlRecord>,
     claim: &Claim,
     cfg: &ControlConfig,
     factory: bool,
     outcome: &mut RowOutcome,
-) -> Option<&'static str> {
-    let level = claim.row.level()?;
+) {
+    if claim.row.level().is_none() {
+        return;
+    }
     let (evidence, max_age_ms) = if factory {
         (
             claim.evidence.clone(),
@@ -342,26 +340,11 @@ fn evidence_floor(
             cfg.confidence.evidence_max_age_ms,
         )
     };
-    let supports = evidence
-        .as_ref()
-        .and_then(|e| confidence::supported_level(e, claim.now_ms, max_age_ms));
-    outcome.evidence_supports = Some(supports);
-    if supports.is_some_and(|s| s >= level) {
-        return None;
-    }
-    let overridden = row.and_then(|r| {
-        r.evidence_override
+    outcome.evidence_supports = Some(
+        evidence
             .as_ref()
-            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))
-    });
-    match overridden {
-        Some(o) => {
-            outcome.override_by = Some(o.by.clone());
-            None
-        }
-        None if evidence.is_some() => Some("evidence_below_floor"),
-        None => Some("evidence_missing"),
-    }
+            .and_then(|e| confidence::supported_level(e, claim.now_ms, max_age_ms)),
+    );
 }
 
 pub(super) fn resolve_run(
@@ -395,13 +378,12 @@ pub(super) fn resolve_run(
         Some("stale_snapshot")
     } else if !safety_ok(m.entity) {
         Some("safety_checks_changed")
-    } else if on_rows && claim.row.level().is_some() && cfg.confidence.unreadable.is_some() {
-        Some("confidence_config_unreadable")
-    } else if on_rows {
-        evidence_floor(row, claim, cfg, m.factory, &mut outcome)
     } else {
         None
     };
+    if forced.is_none() && on_rows {
+        judge_evidence(row, claim, cfg, m.factory, &mut outcome);
+    }
     Resolved {
         matched: None,
         mode: if forced.is_some() {
@@ -417,44 +399,8 @@ pub(super) fn resolve_run(
         by_row: on_rows,
         factory: m.factory,
         unlisted: false,
+        author_skips: snap.author_skips(entity, &names, m.factory),
     }
-}
-
-pub(super) fn weak_rows(
-    snap: &Snapshot,
-    entity: ControlEntity,
-    names: &[&str],
-    classifier: Option<&str>,
-    rows: &[LevelRow],
-    cfg: &ControlConfig,
-    now_ms: i64,
-) -> Vec<LevelRow> {
-    let Some((_, scope)) = snap.mover(entity, names, classifier) else {
-        return Vec::new();
-    };
-    rows.iter()
-        .copied()
-        .filter(|row| {
-            let claim = Claim {
-                row: *row,
-                unknown: false,
-                evidence: None,
-                now_ms,
-            };
-            let record = match snap.at(&level_lkey(
-                entity,
-                &scope.head,
-                scope.classifier.as_deref(),
-                *row,
-            )) {
-                Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => Some(r),
-                _ => None,
-            };
-            let mut outcome = RowOutcome::new(&claim);
-            (row.level().is_some() && cfg.confidence.unreadable.is_some())
-                || evidence_floor(record, &claim, cfg, false, &mut outcome).is_some()
-        })
-        .collect()
 }
 
 pub(super) fn for_compare(rec: &ActionControlRecord) -> ActionControlRecord {
@@ -473,8 +419,6 @@ pub(super) fn as_running(
     cfg: &ControlConfig,
     stale: bool,
     safety_ok: bool,
-    factory: bool,
-    now_ms: i64,
 ) -> ActionControlRecord {
     if rec.mode != ControlMode::Live {
         return rec;
@@ -483,63 +427,8 @@ pub(super) fn as_running(
         ControlEntity::User => EntityType::User,
         ControlEntity::Post => EntityType::Post,
     };
-    let (mut mode, _, _) = effective(&rec, entity, cfg, stale, safety_ok);
-    if let Some(level) = rec.confidence.and_then(LevelRow::level) {
-        let supports = rec.evidence.as_deref().and_then(|e| {
-            confidence::supported_level(e, now_ms, cfg.confidence.evidence_max_age_ms)
-        });
-        let overridden = rec
-            .evidence_override
-            .as_deref()
-            .is_some_and(|o| confidence::override_active(o, rec.updated_at_ms, now_ms));
-        if cfg.confidence.unreadable.is_some()
-            || (!factory && supports.is_none_or(|s| s < level) && !overridden)
-        {
-            mode = ControlMode::Recording;
-        }
-    }
+    let (mode, _, _) = effective(&rec, entity, cfg, stale, safety_ok);
     ActionControlRecord { mode, ..rec }
-}
-
-pub(super) fn evidence_harsher(
-    before: Option<&ActionControlRecord>,
-    after: &ActionControlRecord,
-    now_ms: i64,
-    max_age_ms: i64,
-) -> Vec<String> {
-    let mut why = Vec::new();
-    if after.mode != ControlMode::Live {
-        return why;
-    }
-    let supports = |r: Option<&ActionControlRecord>| {
-        r.and_then(|r| r.evidence.as_deref())
-            .and_then(|e| confidence::supported_level(e, now_ms, max_age_ms))
-    };
-    let (was, now) = (supports(before), supports(Some(after)));
-    if now > was
-        && let Some(l) = now
-    {
-        why.push(format!(
-            "new evidence lets the record act at {}",
-            l.as_str()
-        ));
-    }
-    let expiry = |r: Option<&ActionControlRecord>| {
-        r.and_then(|r| {
-            r.evidence_override
-                .as_ref()
-                .filter(|o| confidence::override_active(o, r.updated_at_ms, now_ms))
-                .map(|o| o.expires_at_ms)
-        })
-    };
-    if let Some(until) = expiry(Some(after))
-        && expiry(before).is_none_or(|was| until > was)
-    {
-        why.push(format!(
-            "an override lets the level act past its evidence floor until {until} (epoch ms)"
-        ));
-    }
-    why
 }
 
 fn acts_on_every_account(rec: &ActionControlRecord) -> bool {
@@ -548,8 +437,8 @@ fn acts_on_every_account(rec: &ActionControlRecord) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EveryAccountEnded {
-        At(i64),
-        Unknown(i64),
+    At(i64),
+    Unknown(i64),
 }
 
 impl EveryAccountEnded {
@@ -618,7 +507,6 @@ fn row_problem(
     mode: ControlMode,
     actions: &[PageAction],
     evidence: Option<&ConfidenceEvidence>,
-    evidence_override: Option<&EvidenceOverride>,
     rollout_bp: Option<u32>,
     now_ms: i64,
 ) -> Result<(), SetError> {
@@ -684,17 +572,6 @@ fn row_problem(
             return bad("invalid_evidence", p);
         }
     }
-    if let Some(ov) = evidence_override {
-        if row.level().is_none() || mode != ControlMode::Live {
-            return bad(
-                "invalid_override",
-                "an evidence override belongs on a live low, mid or high row".into(),
-            );
-        }
-        if let Some(p) = confidence::override_problem(ov, now_ms) {
-            return bad("invalid_override", p);
-        }
-    }
     if rollout_bp.is_some_and(|bp| bp > ROLLOUT_ALL_BP) {
         return bad(
             "invalid_rollout",
@@ -709,6 +586,22 @@ pub(super) fn validate_confidence(
     now_ms: i64,
 ) -> Result<(), SetError> {
     let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));
+    let row_overrides = req
+        .rows
+        .iter()
+        .flat_map(|rows| {
+            LevelRow::ALL
+                .into_iter()
+                .filter_map(move |row| rows.get(row))
+        })
+        .any(|s| s.evidence_override.is_some());
+    if req.evidence_override.is_some() || row_overrides {
+        return bad(
+            "invalid_override",
+            "evidence never keeps a row from acting, so there is no evidence override; send none"
+                .into(),
+        );
+    }
     if req.confidence.is_some() && req.band.is_some() {
         return bad(
             "invalid_scope",
@@ -735,11 +628,8 @@ pub(super) fn validate_confidence(
                     .into(),
             );
         }
-        if req.evidence.is_some() || req.evidence_override.is_some() {
-            return bad(
-                "invalid_evidence",
-                "evidence and overrides belong on a row".into(),
-            );
+        if req.evidence.is_some() {
+            return bad("invalid_evidence", "evidence belongs on a row".into());
         }
         if req.rollout_bp.is_some() {
             return bad(
@@ -756,7 +646,6 @@ pub(super) fn validate_confidence(
                         s.mode,
                         &s.actions,
                         s.evidence.as_ref(),
-                        s.evidence_override.as_ref(),
                         s.rollout_bp,
                         now_ms,
                     )?;
@@ -772,7 +661,6 @@ pub(super) fn validate_confidence(
             req.mode,
             &req.actions,
             req.evidence.as_ref(),
-            req.evidence_override.as_ref(),
             req.rollout_bp,
             now_ms,
         ),
@@ -783,10 +671,6 @@ pub(super) fn validate_confidence(
         None if req.evidence.is_some() => bad(
             "invalid_evidence",
             "evidence belongs on a low, mid or high row".into(),
-        ),
-        None if req.evidence_override.is_some() => bad(
-            "invalid_override",
-            "an evidence override belongs on a live low, mid or high row".into(),
         ),
         None => Ok(()),
     }
@@ -868,12 +752,11 @@ pub(super) fn view(cfg: &ControlConfig) -> ConfidenceView {
     }
 }
 
-
 struct RowWrite {
     row: LevelRow,
     lkey: String,
     after: ActionControlRecord,
-        prior: Option<Vec<u8>>,
+    prior: Option<Vec<u8>>,
 }
 
 struct Change {
@@ -884,7 +767,7 @@ struct Change {
 }
 
 impl ActionControl {
-                #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn set_rows(
         &self,
         req: ActionControlPutRequest,
@@ -915,7 +798,10 @@ impl ActionControl {
             .as_ref()
             .is_some_and(|r| r.mode == ControlMode::Rows);
         if ((moving || leaving) && scope_version != req.expected_version) || (leaving && !on_rows) {
-            return Err(SetError::Conflict(scope_before, scope_version));
+            return Err(SetError::Conflict(
+                scope_before.map(Box::new),
+                scope_version,
+            ));
         }
         if moving {
             let not_rules: Vec<String> = snap
@@ -943,7 +829,6 @@ impl ActionControl {
                       mode: ControlMode,
                       actions: Vec<PageAction>,
                       evidence: Option<ConfidenceEvidence>,
-                      evidence_override: Option<EvidenceOverride>,
                       rollout_bp: Option<u32>,
                       version: u64| {
             let mut rec = ActionControlRecord {
@@ -962,9 +847,11 @@ impl ActionControl {
                 write_nonce: new_nonce(),
                 confidence: row,
                 evidence: evidence.map(Box::new),
-                evidence_override: evidence_override.map(Box::new),
+                evidence_override: None,
                 admit_unlisted_labels: false,
                 rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),
+                follower_threshold: None,
+                skip_high_credibility: None,
             };
             rec.v = rec.schema_version();
             rec
@@ -984,15 +871,7 @@ impl ActionControl {
             let (setting, expected) = if moving {
                 let s = req.rows.as_ref().and_then(|rows| rows.get(row));
                 (
-                    s.map(|s| {
-                        (
-                            s.mode,
-                            s.actions.clone(),
-                            s.evidence.clone(),
-                            s.evidence_override.clone(),
-                            s.rollout_bp,
-                        )
-                    }),
+                    s.map(|s| (s.mode, s.actions.clone(), s.evidence.clone(), s.rollout_bp)),
                     s.and_then(|s| s.expected_version),
                 )
             } else {
@@ -1001,17 +880,16 @@ impl ActionControl {
                         req.mode,
                         req.actions.clone(),
                         req.evidence.clone(),
-                        req.evidence_override.clone(),
                         req.rollout_bp,
                     )),
                     req.expected_version,
                 )
             };
             if expected != version {
-                return Err(SetError::Conflict(before, version));
+                return Err(SetError::Conflict(before.map(Box::new), version));
             }
-            let (mode, actions, evidence, evidence_override, rollout_bp) =
-                setting.unwrap_or((ControlMode::Recording, Vec::new(), None, None, None));
+            let (mode, actions, evidence, rollout_bp) =
+                setting.unwrap_or((ControlMode::Recording, Vec::new(), None, None));
             writes.push(RowWrite {
                 row,
                 lkey,
@@ -1020,7 +898,6 @@ impl ActionControl {
                     mode,
                     actions,
                     evidence,
-                    evidence_override,
                     rollout_bp,
                     version.unwrap_or(0) + 1,
                 ),
@@ -1064,15 +941,7 @@ impl ActionControl {
             }
         }
 
-        let recording = record(
-            None,
-            ControlMode::Recording,
-            Vec::new(),
-            None,
-            None,
-            None,
-            0,
-        );
+        let recording = record(None, ControlMode::Recording, Vec::new(), None, None, 0);
         let has_set_aside = !factory && !snap.under_scope(entity, &names, classifier).is_empty();
         let set_aside = has_set_aside && snap.mover(entity, &names, classifier).is_none();
         let scope_write = (moving || leaving).then(|| {
@@ -1081,20 +950,24 @@ impl ActionControl {
             } else {
                 (req.mode, req.actions.clone())
             };
-            ActionControlRecord {
+            let skips = author_skips_after(&req, scope_before.as_ref());
+            let mut rec = ActionControlRecord {
                 admit_unlisted_labels: admits_unlisted_after(&req, scope_before.as_ref()),
+                follower_threshold: skips.follower_threshold,
+                skip_high_credibility: skips.skip_high_credibility,
                 ..record(
                     None,
                     mode,
                     actions,
                     None,
                     None,
-                    None,
                     scope_version.unwrap_or(0) + 1,
                 )
-            }
+            };
+            rec.v = rec.schema_version();
+            rec
         });
-        let rules_after = record(None, ControlMode::Rules, Vec::new(), None, None, None, 0);
+        let rules_after = record(None, ControlMode::Rules, Vec::new(), None, None, 0);
         let mut compare: Vec<(LevelRow, ActionControlRecord)> =
             writes.iter().map(|w| (w.row, w.after.clone())).collect();
         if let (true, Some(after)) = (leaving, &scope_write) {
@@ -1146,16 +1019,9 @@ impl ActionControl {
             }
             let judged_priors = priors
                 .into_iter()
-                .map(|prior| prior.map(|p| as_running(p, cfg, stale, safety_ok, factory, now_ms)));
+                .map(|prior| prior.map(|p| as_running(p, cfg, stale, safety_ok)));
             for judged in judged_priors {
-                let why = harsher_because(judged.as_ref(), &after, rules_specs.as_deref())
-                    .into_iter()
-                    .chain(evidence_harsher(
-                        judged.as_ref(),
-                        &after,
-                        now_ms,
-                        cfg.confidence.evidence_max_age_ms,
-                    ));
+                let why = harsher_because(judged.as_ref(), &after, rules_specs.as_deref());
                 for reason in why {
                     let reason = format!("{} row: {reason}", row.as_str());
                     if !harsher.contains(&reason) {
@@ -1169,6 +1035,13 @@ impl ActionControl {
             .and_then(|after| admits_unlisted_harsher(scope_before.as_ref(), after))
         {
             harsher.push(why.to_owned());
+        }
+        if let Some(after) = &scope_write {
+            for why in author_skips_harsher(scope_before.as_ref(), after) {
+                if !harsher.contains(&why) {
+                    harsher.push(why);
+                }
+            }
         }
         if !harsher.is_empty() && req.confirm.as_deref() != Some(CONFIRM_WORD) {
             return Err(SetError::Invalid(
@@ -1270,7 +1143,7 @@ impl ActionControl {
         })
     }
 
-                                            async fn put_back(&self, written: &[Change], err: SetError, deadline: Instant) -> SetError {
+    async fn put_back(&self, written: &[Change], err: SetError, deadline: Instant) -> SetError {
         let SetError::Store(msg) = err else {
             return err;
         };
@@ -1292,7 +1165,7 @@ impl ActionControl {
         ))
     }
 
-        async fn row_history(&self, head: &str) -> Option<Vec<ActionControlHistoryEntry>> {
+    async fn row_history(&self, head: &str) -> Option<Vec<ActionControlHistoryEntry>> {
         let pkey = format!("{HISTORY_PKEY_PREFIX}{head}");
         match tokio::time::timeout(self.scan_timeout, self.store.scan(&pkey)).await {
             Ok(Ok(rows)) => Some(
@@ -1311,7 +1184,7 @@ impl ActionControl {
         }
     }
 
-        async fn write_history(
+    async fn write_history(
         &self,
         lkey: &str,
         rec: &ActionControlRecord,
@@ -1350,10 +1223,10 @@ impl ActionControl {
         }
     }
 
-            async fn read_back_removed(&self, lkey: &str) -> Result<(), SetError> {
+    async fn read_back_removed(&self, lkey: &str) -> Result<(), SetError> {
         match self.get_record(lkey).await {
             Ok(None) => Ok(()),
-            Ok(Some((r, _))) => Err(SetError::LostRace(r)),
+            Ok(Some((r, _))) => Err(SetError::LostRace(r.map(Box::new))),
             Err(_) => Err(SetError::Store(
                 "the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it"
                     .into(),
@@ -1361,10 +1234,10 @@ impl ActionControl {
         }
     }
 
-            async fn read_back(&self, lkey: &str, rec: &ActionControlRecord) -> Result<(), SetError> {
+    async fn read_back(&self, lkey: &str, rec: &ActionControlRecord) -> Result<(), SetError> {
         match self.get_record(lkey).await {
             Ok(Some((Some(r), _))) if r.write_nonce == rec.write_nonce => Ok(()),
-            Ok(Some((Some(r), _))) => Err(SetError::LostRace(Some(r))),
+            Ok(Some((Some(r), _))) => Err(SetError::LostRace(Some(Box::new(r)))),
             Ok(_) | Err(_) => Err(SetError::Store(
                 "the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it"
                     .into(),

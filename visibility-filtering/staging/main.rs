@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use xai_visibility_filtering_service::server::{self, ServeArgs};
-use xai_visibility_filtering_service::staging::serve::{test_users_metadata, StagingServer};
+use xai_visibility_filtering_service::staging::serve::StagingServer;
 
 #[derive(Parser, Debug)]
 #[command(about = "Visibility Filtering staging tools")]
@@ -16,8 +16,6 @@ enum Command {
     Serve {
         #[command(flatten)]
         serve: ServeArgs,
-        #[arg(long)]
-        test_users: bool,
     },
 }
 
@@ -25,8 +23,6 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
-        Command::Serve { serve, test_users } => {
-            server::serve::<StagingServer>(serve, test_users.then(test_users_metadata)).await
-        }
+        Command::Serve { serve } => server::serve::<StagingServer>(serve).await,
     }
 }

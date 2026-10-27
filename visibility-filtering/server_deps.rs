@@ -20,10 +20,9 @@ use crate::models::{ClientCapability, Evaluation, PlacedCandidate, RawCandidate,
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
-use crate::rules::SafetyLevel;
-use crate::safety_label_source::lookup::RemoteSource;
-use crate::safety_label_source::manhattan::ManhattanSource;
-use crate::safety_label_source::twemcache::TwemcacheSource;
+use crate::quote::QuotePassRunner;
+use crate::rules::{NoTrace, SafetyLevel};
+use crate::safety_label_source::remote::RemoteSource;
 use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
 use crate::server::VFServer;
@@ -55,13 +54,6 @@ const READINESS_PROBE_PORT: u16 = 8081;
 pub(crate) const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
 const CLIENT_INIT_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const CLIENT_INIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(crate) fn with_metadata(strato: StratoGrpc, metadata: Option<&MetadataMap>) -> StratoGrpc {
-    match metadata {
-        Some(metadata) => strato.with_default_metadata(metadata.clone()),
-        None => strato,
-    }
-}
 
 pub(crate) async fn init_client_with_retry<T, E, Fut>(
     client: &str,
@@ -121,7 +113,6 @@ pub(crate) struct ServerDeps {
     pub(crate) init_deadline: tokio::time::Instant,
     pub(crate) post_evaluator: Arc<PostEvaluator>,
     pub(crate) client_switches: ClientSwitches,
-    limited_actions_copy: LimitedActionsCopy,
     safety_label_source: Arc<SafetyLabelSource>,
 }
 
@@ -147,7 +138,6 @@ pub(crate) struct Serving {
     pub(crate) safety_label_source: Arc<SafetyLabelSource>,
     pub(crate) client_switches: ClientSwitches,
     pub(crate) country_lists: Arc<CountryLists>,
-    pub(crate) limited_actions_copy: LimitedActionsCopy,
 }
 
 #[expect(
@@ -187,7 +177,7 @@ pub(crate) async fn serving(
     ));
     let country_lists = Arc::new(CountryLists::starting_at_default());
     country_lists.refresh(&feature_switches.load());
-    let client_switches = ClientSwitches::new(Arc::clone(&feature_switches));
+    let client_switches = ClientSwitches::new(Arc::clone(&feature_switches), limited_actions_copy);
     crate::params::spawn_refresh(
         switch_files,
         feature_switches,
@@ -202,7 +192,6 @@ pub(crate) async fn serving(
         safety_label_source,
         client_switches,
         country_lists,
-        limited_actions_copy,
     }
 }
 
@@ -215,7 +204,6 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         safety_label_source,
         client_switches,
         country_lists,
-        limited_actions_copy,
     } = serving(
         datacenter,
         metadata,
@@ -236,13 +224,12 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         init_deadline,
         post_evaluator,
         client_switches,
-        limited_actions_copy,
         safety_label_source,
     }
 }
 
 fn deterministic_aperture() -> bool {
-    std::env::var("APP_ENV").as_deref() == Ok("prod")
+    std::env::var(crate::config::ENV_APP_ENV).as_deref() == Ok("prod")
 }
 
 #[derive(Default)]
@@ -257,9 +244,8 @@ impl ServerDeps {
             evaluate_tweets: EvaluateTweetsEndpoint::new(
                 Arc::clone(&self.post_evaluator),
                 self.client_switches.clone(),
-                self.limited_actions_copy,
                 comparators.evaluate_tweets,
-                crate::config::quote_pass(),
+                QuotePassRunner::new(crate::config::quote_pass()),
             ),
             filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(
                 &self.post_evaluator,
@@ -449,15 +435,12 @@ pub(crate) async fn prod_sources(
 
     let cache_warmer = cache_warming.warmer(|| build_cache_warmer(stratoserver));
 
-    let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
-    let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
-    let mut remote = RemoteSource::new(twemcache_source, manhattan_source);
+    let mut remote = RemoteSource::new(twemcache, mh_label_client);
     if let Some(warmer) = cache_warmer {
         remote = remote.with_warmer(warmer);
     }
-    let remote = Arc::new(remote);
     let safety_label_source = Arc::new(SafetyLabelSource::new(
-        remote,
+        Arc::new(remote),
         crate::config::safety_label_cache_capacity(),
     ));
 
@@ -620,7 +603,9 @@ async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
     let mut consecutive_warm = 0u32;
     while start.elapsed() < WARM_FILTER_TWEETS_DEADLINE {
         attempts += 1;
-        let outcomes = post_evaluator.run(warm_filter_tweets_request()).await;
+        let (_, outcomes) = post_evaluator
+            .run(warm_filter_tweets_request(), &mut NoTrace)
+            .await;
         if filter_tweets_response_is_warm(&outcomes) {
             consecutive_warm += 1;
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {

@@ -18,6 +18,7 @@ from xrex.data.recsys.feature_config import (
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
+from xrex.models.fp8 import Fp8Gemms
 from xrex.models.page_rl import PAGE_PARAM_REGEX, PageRlConfig
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
@@ -328,9 +329,9 @@ def _home_direct_packed_base() -> dict:
 
 
 _H100_OVERRIDES = {
-    "bs_per_device": 512,
-    "num_microbatch": 2,
-    "ep": 128,
+    "bs_per_device": 1024,
+    "num_microbatch": 8,
+    "ep": 64,
     "use_async_emb": True,
     "overlap_step_host_work": True,
     "remat_policy": RematType.SAVE_H100_QKV_ATTN_FFN,
@@ -466,6 +467,10 @@ MODEL_CFGS = {
             **_H100_OVERRIDES,
             "seqpack_candidate_packing": True,
             "seqpack_candidate_count": [32, 128],
+            "num_candidate_only_layers": 2,
+            "candidate_only_attn_impl": "cutedsl_ranker_candidate_only_attn",
+            "fp8_gemms": Fp8Gemms.ALL,
+            "metrics_ndcg_shared_sorts": True,
         },
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
@@ -735,6 +740,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             metric_group=mparams.get("metric_group", "default"),
             enable_platform_metrics=mparams.get("enable_platform_metrics", False),
             metric_mask_keys=mparams.get("metric_mask_keys"),
+            metrics_ndcg_shared_sorts=mparams.get("metrics_ndcg_shared_sorts", False),
             conversion_delay_slice_thresholds_s=tuple(
                 mparams.get("conversion_delay_slice_thresholds_s", ())
             ),
@@ -936,6 +942,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 primer_norm=mparams.get("primer_norm", True),
                 use_remat=True,
                 remat_policy=mparams.get("remat_policy", RematType.WHOLE),
+                fp8_gemms=mparams.get("fp8_gemms", Fp8Gemms.OFF),
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
                 num_candidate_only_layers=mparams.get("num_candidate_only_layers", 0),

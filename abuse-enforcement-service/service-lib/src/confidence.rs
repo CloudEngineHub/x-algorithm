@@ -123,7 +123,7 @@ impl ConfidenceConfig {
         if last.as_deref() != Some(bad.as_str()) {
             error!(
                 value = %bad,
-                "GrowthBook action_control.{CONFIG_KEY} is malformed; every live level row records only"
+                "GrowthBook action_control.{CONFIG_KEY} is malformed; no evidence is current"
             );
             *last = Some(bad.clone());
         }
@@ -205,36 +205,11 @@ pub fn evidence_problem(ev: &ConfidenceEvidence, now_ms: i64) -> Option<String> 
     None
 }
 
-pub fn override_active(ov: &EvidenceOverride, record_updated_at_ms: i64, now_ms: i64) -> bool {
-    let written = record_updated_at_ms;
-    !ov.by.trim().is_empty()
-        && !ov.reason.trim().is_empty()
-        && now_ms < ov.expires_at_ms
-        && written < ov.expires_at_ms
-        && written <= now_ms.saturating_add(CLOCK_SKEW_MS)
-        && now_ms >= written.saturating_sub(CLOCK_SKEW_MS)
-        && ov.expires_at_ms <= written.min(now_ms).saturating_add(EVIDENCE_OVERRIDE_MAX_MS)
-}
-
-pub fn override_problem(ov: &EvidenceOverride, now_ms: i64) -> Option<String> {
-    if ov.by.trim().is_empty() || ov.by.len() > 256 {
-        return Some("evidence_override.by must name the person (1-256 bytes)".into());
-    }
-    if ov.reason.trim().is_empty() || ov.reason.len() > 1_000 {
-        return Some("evidence_override.reason must say why (1-1000 bytes)".into());
-    }
-    if ov.expires_at_ms <= now_ms || ov.expires_at_ms > now_ms + EVIDENCE_OVERRIDE_MAX_MS {
-        return Some("evidence_override.expires_at_ms must be in the next 7 days".into());
-    }
-    None
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowOutcome {
     pub row: LevelRow,
     pub unknown: bool,
     pub evidence_supports: Option<Option<ConfidenceLevel>>,
-    pub override_by: Option<String>,
     pub rollout: Option<(u32, u32)>,
 }
 
@@ -244,7 +219,6 @@ impl RowOutcome {
             row: claim.row,
             unknown: claim.unknown,
             evidence_supports: None,
-            override_by: None,
             rollout: None,
         }
     }
@@ -263,9 +237,6 @@ impl RowOutcome {
                 s.map_or("none", ConfidenceLevel::as_str).to_owned(),
             ));
         }
-        if let Some(by) = &self.override_by {
-            keys.push(("confidence_override_by".to_owned(), by.clone()));
-        }
         if let Some((bp, bucket)) = self.rollout {
             keys.push(("rollout_bp".to_owned(), bp.to_string()));
             keys.push(("rollout_bucket".to_owned(), bucket.to_string()));
@@ -281,9 +252,6 @@ pub fn logged_because(forced: Option<&str>, unknown: bool) -> &'static str {
         Some("kill_switch") => "page_control_off",
         Some("stale_snapshot") => "stale_copy",
         Some("safety_checks_changed") => "safety_checks_changed",
-        Some("evidence_missing" | "evidence_below_floor" | "confidence_config_unreadable") => {
-            "weak_evidence"
-        }
         Some("factory_rules_row") => "factory_rules_row",
         Some("ignore_store") => "ignore_store",
         Some("wrong_entity") => "wrong_entity",
@@ -298,7 +266,6 @@ pub const INFO_KEYS: &[&str] = &[
     "level_row",
     "logged_because",
     "confidence_evidence_supports",
-    "confidence_override_by",
     "rollout_bp",
     "rollout_bucket",
 ];
@@ -409,14 +376,6 @@ mod tests {
             "page_control_off"
         );
         assert_eq!(logged_because(Some("stale_snapshot"), false), "stale_copy");
-        assert_eq!(
-            logged_because(Some("evidence_missing"), false),
-            "weak_evidence"
-        );
-        assert_eq!(
-            logged_because(Some("evidence_below_floor"), false),
-            "weak_evidence"
-        );
         assert_eq!(logged_because(Some("band_ambiguous"), false), "unreadable");
         assert_eq!(
             logged_because(Some("factory_rules_row"), false),
@@ -480,73 +439,5 @@ mod tests {
                 .unwrap()
                 .contains("unknown key label_map")
         );
-    }
-
-    #[test]
-    fn overrides_need_a_person_a_reason_and_an_expiry_within_seven_days() {
-        let ov = |by: &str, reason: &str, expires: i64| EvidenceOverride {
-            by: by.into(),
-            reason: reason.into(),
-            expires_at_ms: expires,
-        };
-        let written = NOW - DAY_MS;
-        assert!(override_active(
-            &ov("operator@example.com", "seeded", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(
-            !override_active(&ov("operator@example.com", "seeded", NOW), written, NOW),
-            "expired"
-        );
-        assert!(!override_active(
-            &ov(" ", "seeded", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(!override_active(
-            &ov("operator@example.com", "", NOW + DAY_MS),
-            written,
-            NOW
-        ));
-        assert!(
-            !override_active(
-                &ov("operator@example.com", "seeded", written + 8 * DAY_MS),
-                written,
-                NOW
-            ),
-            "a stored expiry past 7 days from the write is refused"
-        );
-        let active = |expires: i64, written: i64| {
-            override_active(&ov("operator@example.com", "seeded", expires), written, NOW)
-        };
-        assert!(
-            !active(NOW + 30 * DAY_MS, NOW + 30 * DAY_MS),
-            "written past the skew"
-        );
-        assert!(
-            !active(NOW + 7 * DAY_MS, NOW + 30 * DAY_MS),
-            "written past the skew"
-        );
-        assert!(active(written + 7 * DAY_MS, written));
-        assert!(!active(written + 7 * DAY_MS + 1, written));
-        let ahead = NOW + CLOCK_SKEW_MS - 1;
-        assert!(active(NOW + 7 * DAY_MS, ahead));
-        assert!(!active(NOW + 7 * DAY_MS + 1, ahead));
-        assert!(active(NOW + CLOCK_SKEW_MS + 60_000, NOW + CLOCK_SKEW_MS));
-        assert!(!active(
-            NOW + CLOCK_SKEW_MS + 60_000,
-            NOW + CLOCK_SKEW_MS + 1
-        ));
-        assert!(
-            !active(NOW + 60_000, NOW + CLOCK_SKEW_MS - 1),
-            "expires before its write"
-        );
-        assert!(!active(ahead, ahead), "expires at its write");
-        assert!(active(ahead + 1, ahead));
-        assert!(override_problem(&ov("a", "b", NOW + 7 * DAY_MS), NOW).is_none());
-        assert!(override_problem(&ov("a", "b", NOW + 7 * DAY_MS + 1), NOW).is_some());
-        assert!(override_problem(&ov("a", "b", NOW), NOW).is_some());
-        assert!(override_problem(&ov("", "b", NOW + DAY_MS), NOW).is_some());
     }
 }

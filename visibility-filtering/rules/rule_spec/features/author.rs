@@ -18,7 +18,7 @@ impl Feature for AuthorFacts {
 impl<C: Candidate> Reads<C> for AuthorFacts {
     #[inline]
     fn read<'a>(at: At<'_, 'a, C>) -> (u64, Option<QuoteLink>) {
-        (at.author().id, at.quote().link)
+        (at.author().id, at.quote().map(|quote| quote.link))
     }
 }
 

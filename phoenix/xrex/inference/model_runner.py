@@ -822,7 +822,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         init_params.pop("use_async_emb")
         init_params.pop("seqpack_candidate_packing")
         init_params.pop("overlap_step_host_work")
-        if isinstance(t.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)):
+        if isinstance(t.model_config, RecsysTwoTowerModelConfig):
+            init_params["model_config"]["user_tower_config"]["model_config"].pop("fp8_gemms")
+        elif isinstance(t.model_config, RecsysAggregatedModelConfig):
             init_params["model_config"]["model_config"].pop("fp8_gemms")
 
         init_params["inference_batch_size"] = inference_batch_size

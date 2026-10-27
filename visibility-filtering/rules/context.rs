@@ -1,7 +1,7 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, ClientCapability, PairEdges, Placement, PostCandidate, PostEntity,
-    QuoteFacts, UserEntity, ViewerFeatures, ViewerRelationship,
+    tweet_timestamp_ms, ClientCapability, Placement, PostCandidate, PostEntity, Quote, UserEntity,
+    ViewerFeatures,
 };
 use crate::params::{CountryList, CountryLists};
 use crate::rules::rule_spec::engine::Candidate;
@@ -84,19 +84,13 @@ impl<'a, C: Candidate> RuleContext<'a, C> {
     }
 
     #[inline]
-    pub(super) fn acquire_pair_edges(&self, node: Hydrator) -> PairEdges {
-        self.reads(Hydrators::of(node)).candidate.quote().pair_edges
-    }
-
-    #[inline]
-    pub(super) fn acquire_relationship(&self, node: Hydrator) -> ViewerRelationship {
+    pub(super) fn acquire_pair_edge(&self, node: Hydrator) -> bool {
         self.reads(Hydrators::of(node))
             .candidate
-            .viewer_relationship()
+            .quote()
+            .is_some_and(|quote| quote.pair_edges.contains(node))
     }
-}
 
-impl RuleContext<'_> {
     #[inline]
     pub(super) fn acquire_edge(&self, node: Hydrator) -> bool {
         At(self.reads(Hydrators::of(node))).edge(node)
@@ -125,8 +119,14 @@ impl<'a, C: Candidate> At<'_, 'a, C> {
     }
 
     #[inline]
-    pub(super) fn quote(self) -> QuoteFacts {
+    pub(super) fn quote(self) -> Option<Quote> {
         self.0.candidate.quote()
+    }
+
+    #[inline]
+    pub(super) fn edge(self, node: Hydrator) -> bool {
+        debug_assert!(node.is_edge(), "{node:?} is not an edge node");
+        self.0.candidate.edges().contains(node)
     }
 }
 
@@ -139,21 +139,6 @@ impl<'a> At<'_, 'a> {
     #[inline]
     pub(super) fn post_facts(self) -> PostCoreFacts<'a> {
         PostCoreFacts(self.0.candidate)
-    }
-
-    #[inline]
-    pub(super) fn edge(self, node: Hydrator) -> bool {
-        debug_assert!(node.is_edge(), "{node:?} is not an edge node");
-        let candidate = self.0.candidate;
-        debug_assert!(candidate
-            .post
-            .edges
-            .iter()
-            .all(|edge| candidate.viewer_relationship.get(edge).is_none()));
-        candidate
-            .viewer_relationship
-            .get(node)
-            .unwrap_or_else(|| candidate.post.edges.contains(node))
     }
 }
 

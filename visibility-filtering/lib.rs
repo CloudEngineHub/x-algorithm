@@ -69,7 +69,6 @@ pub(crate) mod post_card;
 pub(crate) mod post_evaluator;
 pub(crate) mod quote;
 pub(crate) mod result_label;
-pub(crate) mod retweet;
 pub(crate) mod rules;
 pub(crate) mod safety_label_source;
 #[cfg(test)]
@@ -79,3 +78,4 @@ pub(crate) mod server_deps;
 pub mod staging;
 pub(crate) mod thrift_read;
 pub(crate) mod treatment;
+pub mod verdict_gate;

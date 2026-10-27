@@ -58,7 +58,7 @@ pub struct SemanticIdClient {
 }
 
 impl SemanticIdClient {
-    fn new(endpoint: &str, sid_num_levels: usize) -> Self {
+    pub fn new(endpoint: &str, sid_num_levels: usize) -> Self {
         let endpoint = Endpoint::from_shared(endpoint.to_string())
             .expect("invalid SID endpoint URL")
             .timeout(REQUEST_TIMEOUT)

@@ -1,6 +1,6 @@
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
-use super::types::{FailureKind, FallbackReason, LabelSource};
+use super::remote::{FailureKind, FallbackReason, LabelSource};
 
 const LOOKUP_TWEET_IDS: &str = "safety_labels_lookup_tweet_ids";
 const FAILURES: &str = "safety_labels_lookup_failures";
@@ -46,7 +46,6 @@ pub(crate) enum ManhattanResult {
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum BatchStage {
-    Request,
     LocalMiss,
     ManhattanFallback,
 }
@@ -146,19 +145,14 @@ fn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
     use xai_visibility_filtering::tweet_safety_label::{
         BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
     };
 
     #[test]
     fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
-        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
-        let path = if Path::new(cargo).exists() { cargo } else { ws };
-        let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let dashboard =
+            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
         for pin in [
             format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
             format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),

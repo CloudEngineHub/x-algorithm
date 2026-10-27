@@ -783,17 +783,16 @@ async fn a_run_records_only_where_a_live_record_would() {
     );
     let mut mid = bb1(Account::Clean);
     mid.confidence = abuse_proto::Confidence::Mid as i32;
-    let (t, _) = b.run_backfill(&mid).await;
-    assert_eq!(t.status, "dry_run", "{:?}", info(&t));
-    assert_eq!(
-        info(&t)["action_control_forced_recording"],
-        "evidence_missing"
-    );
-    assert!(t.ais.is_empty());
+    let (t, run_tickets) = b.run_backfill(&mid).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(run_tickets, 1);
+    assert_eq!(info(&t)["level_row"], "mid");
+    assert_eq!(info(&t)["confidence_evidence_supports"], "none");
+    assert!(!info(&t).contains_key("action_control_forced_recording"));
 }
 
 #[tokio::test]
-async fn a_factory_run_applies_the_level_floor_on_the_messages_evidence() {
+async fn a_factory_run_acts_whatever_the_messages_evidence() {
     let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
     const DAY: i64 = 86_400_000;
     let evidence = |days: i64| abuse_proto::ConfidenceEvidence {
@@ -805,7 +804,7 @@ async fn a_factory_run_applies_the_level_floor_on_the_messages_evidence() {
     };
     let mut high = bb1(Account::Clean);
     high.confidence = abuse_proto::Confidence::High as i32;
-    for factory in [true, false] {
+    async fn run_bed(factory: bool) -> TestBed {
         let b = bed(run_config(false, 10), vec![]).await;
         let mut rec = put_running(
             &b.backfill_store,
@@ -819,46 +818,45 @@ async fn a_factory_run_applies_the_level_floor_on_the_messages_evidence() {
             (backfill::RUN_PKEY.into(), RUN.into()),
             serde_json::to_vec(&rec).unwrap(),
         );
-        if !factory {
-            let (t, run_tickets) = b.run_backfill(&high).await;
-            assert_eq!(t.status, "success", "{:?}", info(&t));
-            assert_eq!(run_tickets, 1);
-            assert!(!info(&t).contains_key("level_row"), "not on rows");
-            continue;
-        }
-        for (ev, why) in [
-            (None, "evidence_missing"),
-            (Some(evidence(366)), "evidence_below_floor"),
-        ] {
-            let mut s = high.clone();
-            s.confidence_evidence = ev;
-            let (t, run_tickets) = b.run_backfill(&s).await;
-            assert_eq!(t.status, "dry_run", "{:?}", info(&t));
-            assert_eq!(info(&t)["action_control_forced_recording"], why);
-            assert_eq!(info(&t)["level_row"], "high");
-            assert!(t.ais.is_empty() && run_tickets == 0);
-        }
-        let mut s = high.clone();
-        s.confidence_evidence = Some(evidence(364));
-        let classifier_lkey = format!("user/c/{}/{}", BB1.0, BB1.1);
-        b.control_store.put_raw(&classifier_lkey, b"{not a record");
-        b.ctx.action_control.refresh().await.unwrap();
-        let (t, run_tickets) = b.run_backfill(&s).await;
-        assert_eq!(t.status, "dry_run", "{:?}", info(&t));
-        assert_eq!(info(&t)["action_control_forced_recording"], "unreadable");
-        assert!(t.ais.is_empty() && run_tickets == 0);
-        b.control_store
-            .rows
-            .lock()
-            .unwrap()
-            .retain(|(_, k), _| *k != classifier_lkey);
-        b.ctx.action_control.refresh().await.unwrap();
-        let (t, run_tickets) = b.run_backfill(&s).await;
-        assert_eq!(t.status, "success", "{:?}", info(&t));
-        assert_eq!(run_tickets, 1);
-        assert_eq!(info(&t)["confidence_evidence_supports"], "high");
-        assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
+        b
     }
+    let (t, run_tickets) = run_bed(false).await.run_backfill(&high).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(run_tickets, 1);
+    assert!(!info(&t).contains_key("level_row"), "not on rows");
+
+    for ev in [None, Some(evidence(366))] {
+        let mut s = high.clone();
+        s.confidence_evidence = ev.clone();
+        let (t, run_tickets) = run_bed(true).await.run_backfill(&s).await;
+        assert_eq!(t.status, "success", "{ev:?}: {:?}", info(&t));
+        assert_eq!(run_tickets, 1);
+        assert_eq!(info(&t)["level_row"], "high");
+        assert_eq!(info(&t)["confidence_evidence_supports"], "none");
+        assert!(!info(&t).contains_key("action_control_forced_recording"));
+    }
+
+    let b = run_bed(true).await;
+    let mut s = high.clone();
+    s.confidence_evidence = Some(evidence(364));
+    let classifier_lkey = format!("user/c/{}/{}", BB1.0, BB1.1);
+    b.control_store.put_raw(&classifier_lkey, b"{not a record");
+    b.ctx.action_control.refresh().await.unwrap();
+    let (t, run_tickets) = b.run_backfill(&s).await;
+    assert_eq!(t.status, "dry_run", "{:?}", info(&t));
+    assert_eq!(info(&t)["action_control_forced_recording"], "unreadable");
+    assert!(t.ais.is_empty() && run_tickets == 0);
+    b.control_store
+        .rows
+        .lock()
+        .unwrap()
+        .retain(|(_, k), _| *k != classifier_lkey);
+    b.ctx.action_control.refresh().await.unwrap();
+    let (t, run_tickets) = b.run_backfill(&s).await;
+    assert_eq!(t.status, "success", "{:?}", info(&t));
+    assert_eq!(run_tickets, 1);
+    assert_eq!(info(&t)["confidence_evidence_supports"], "high");
+    assert!(!info(&t).keys().any(|k| k.starts_with("rules_would")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1030,4 +1028,204 @@ async fn an_unreachable_claim_store_fails_the_decision_for_a_retry() {
     let (t, run_tickets) = b.run_backfill(&bb1(Account::Clean)).await;
     assert!(t.status.starts_with("error:"), "{}", t.status);
     assert!(t.ais.is_empty() && run_tickets == 0);
+}
+
+#[tokio::test]
+async fn a_run_skips_by_the_head_records_follower_threshold() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let at = Account::BetweenLimits.followers() as u32;
+    let holder = |t: Option<u32>, c: Option<bool>| action_control::ActionControlRecord {
+        follower_threshold: t,
+        skip_high_credibility: c,
+        ..record(BB1.0, None, None, ControlMode::Rules, vec![])
+    };
+    for (records, want) in [
+        (vec![], ["high_follower_count", "pagerank_skipped"]),
+        (
+            vec![holder(None, None)],
+            ["high_follower_count", "pagerank_skipped"],
+        ),
+        (vec![holder(Some(0), None)], ["success", "pagerank_skipped"]),
+        (
+            vec![holder(Some(at), None)],
+            ["high_follower_count", "pagerank_skipped"],
+        ),
+        (
+            vec![holder(None, Some(false))],
+            ["high_follower_count", "success"],
+        ),
+        (vec![holder(Some(0), Some(false))], ["success", "success"]),
+    ] {
+        let b = bed(run_config(false, 10), records.clone()).await;
+        put_running(
+            &b.backfill_store,
+            RUN,
+            BB1.0,
+            vec![SUSPEND],
+            vec![LevelRow::Missing],
+        );
+        for (account, want) in [Account::BetweenLimits, Account::HighCred]
+            .into_iter()
+            .zip(want)
+        {
+            let (t, run_tickets) = b.run_backfill(&bb1(account)).await;
+            assert_eq!(t.status, want, "{records:?} {account:?}");
+            assert_eq!(run_tickets, i64::from(want == "success"), "{account:?}");
+        }
+        let (t, _) = b.run_backfill(&bb1(Account::AboveTopLimit)).await;
+        assert_eq!(t.status, "very_high_follower_count");
+    }
+}
+
+#[tokio::test]
+async fn an_older_backfill_image_never_skips_fewer_accounts_than_today() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let view = safety_checks::follower_skip_view();
+    let (today, ceiling) = (view.today_threshold as u32, view.ceiling as u32);
+    let as_written = |mut r: action_control::ActionControlRecord| {
+        r.v = r.schema_version();
+        r
+    };
+    for (t, c) in [
+        (Some(0), None),
+        (Some(today), None),
+        (Some(today * 5), None),
+        (Some(ceiling - 1), Some(true)),
+        (None, Some(false)),
+        (Some(0), Some(false)),
+    ] {
+        let head = |mode: ControlMode| action_control::ActionControlRecord {
+            follower_threshold: t,
+            skip_high_credibility: c,
+            ..record(BB1.0, None, None, mode, vec![])
+        };
+        let missing_row = action_control::ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            ..record(BB1.0, None, None, ControlMode::Recording, vec![SUSPEND])
+        };
+        for records in [
+            vec![as_written(head(ControlMode::Rules))],
+            vec![as_written(head(ControlMode::Rows)), as_written(missing_row)],
+        ] {
+            let b = bed(run_config(false, 10), vec![]).await;
+            for r in &records {
+                b.control_store.put_record(r);
+            }
+            crate::action_control::test_support::refresh_as_older_image(&b.ctx.action_control)
+                .await;
+            put_running(
+                &b.backfill_store,
+                RUN,
+                BB1.0,
+                vec![SUSPEND],
+                vec![LevelRow::Missing],
+            );
+            for (account, today) in [
+                (Account::BetweenLimits, "high_follower_count"),
+                (Account::HighCred, "pagerank_skipped"),
+            ] {
+                let (tr, run_tickets) = b.run_backfill(&bb1(account)).await;
+                let what = format!("{t:?} {c:?} {:?} {account:?}", records[0].mode);
+                assert!(
+                    tr.ais.is_empty() && run_tickets == 0,
+                    "{what}: {}",
+                    tr.status
+                );
+                let recorded = tr.outcomes.last().is_some_and(|o| o.dry_run);
+                assert!(tr.status == today || recorded, "{what}: {}", tr.status);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn lifting_a_skip_a_running_backfill_reads_needs_the_confirm() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    for renamed in [false, true] {
+        let holder = if renamed { "OldEmbeddingHead" } else { BB1.0 };
+        let mut cfg = run_config(false, 10);
+        if renamed {
+            cfg.config["action_control"]["aliases"] = serde_json::json!({ BB1.0: holder });
+        }
+        let b = bed(cfg, vec![]).await;
+        put_running(
+            &b.backfill_store,
+            RUN,
+            BB1.0,
+            vec![SUSPEND],
+            vec![LevelRow::Missing],
+        );
+        let control = b.ctx.dynamic_config.action_control_config();
+        let safety = action_control::SafetyChecksByEntity {
+            user: safety_checks::status(
+                EntityType::User,
+                &b.ctx.rules_cache.resolve(EntityType::User, None),
+            ),
+            post: safety_checks::status(
+                EntityType::Post,
+                &b.ctx.rules_cache.resolve(EntityType::Post, None),
+            ),
+        };
+        let lift = |confirm: Option<&str>| action_control::ActionControlPutRequest {
+            entity_type: action_control::ControlEntity::User,
+            head: holder.into(),
+            classifier: None,
+            band: None,
+            mode: ControlMode::Rules,
+            actions: vec![],
+            reason: "lift the follower skip".into(),
+            expected_version: None,
+            confirm: confirm.map(Into::into),
+            updated_by: None,
+            confidence: None,
+            evidence: None,
+            evidence_override: None,
+            rows: None,
+            admit_unlisted_labels: None,
+            rollout_bp: None,
+            follower_threshold: Some(Some(0)),
+            skip_high_credibility: None,
+        };
+        let save = |req| {
+            b.ctx.action_control.set(
+                req,
+                "operator@example.com",
+                "page",
+                now_millis(),
+                &control,
+                &safety,
+            )
+        };
+        match save(lift(None)).await {
+            Err(action_control::SetError::Invalid("confirm_required", _)) => {}
+            other => panic!("renamed={renamed}: {other:?}"),
+        }
+        save(lift(Some("ENFORCE"))).await.unwrap();
+        let (t, run_tickets) = b.run_backfill(&bb1(Account::BetweenLimits)).await;
+        assert_eq!(t.status, "success", "renamed={renamed}");
+        assert_eq!(run_tickets, 1);
+    }
+}
+
+#[tokio::test]
+async fn a_run_stops_at_the_follower_ceiling() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let off = action_control::ActionControlRecord {
+        follower_threshold: Some(0),
+        ..record(BB1.0, None, None, ControlMode::Rules, vec![])
+    };
+    let b = bed(run_config(false, 10), vec![off]).await;
+    put_running(
+        &b.backfill_store,
+        RUN,
+        BB1.0,
+        vec![SUSPEND],
+        vec![LevelRow::Missing],
+    );
+    let (t, run_tickets) = b.run_backfill(&bb1(Account::AboveTopLimit)).await;
+    assert_eq!(t.status, "very_high_follower_count");
+    assert!(t.ais.is_empty() && run_tickets == 0);
+    let (t, run_tickets) = b.run_backfill(&bb1(Account::JustBelowTopLimit)).await;
+    assert_eq!(t.status, "success");
+    assert_eq!(run_tickets, 1);
 }

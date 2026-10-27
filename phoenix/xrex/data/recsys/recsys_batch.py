@@ -149,7 +149,6 @@ HistoryUrlEmbeddingFn = Callable[
 
 class CandidateNegativeFilter(enum.Enum):
     NONE = "none"
-    VQV_DWELL_10S = "vqv_dwell_10s"
 
 
 class CandidateNegativeMode(enum.Enum):
@@ -162,12 +161,7 @@ def _apply_candidate_negative_filter(
     actions: npt.NDArray[np.bool_],
     continuous_actions: npt.NDArray[np.float32],
 ) -> npt.NDArray[np.bool_]:
-    if filter_type == CandidateNegativeFilter.VQV_DWELL_10S:
-        vqv_idx = action_type_map["ClientTweetVideoQualityView"]
-        dwell_idx = 1
-        has_vqv = actions[:, vqv_idx]
-        dwell_secs = continuous_actions[:, dwell_idx]
-        return has_vqv & (dwell_secs >= 10.0)
+    del filter_type, continuous_actions
     return np.ones(actions.shape[0], dtype=np.bool_)
 
 
@@ -498,21 +492,31 @@ def _aux_value_label_columns(event: str) -> tuple[str, str, str]:
     )
 
 
+VALUE_LINE_ITEM_OPERAND = "line_item_id"
+VALUE_LINE_ITEM_KEY = "value_line_item_id"
+
+
 def value_label_columns(
     aux_value_events: tuple[str, ...] = (),
 ) -> tuple[tuple[str, str, type], ...]:
+    events = tuple(e for e in aux_value_events if e != VALUE_LINE_ITEM_OPERAND)
     return (
         ("value_label_valid", "valueLabelValidSeq", np.bool_),
         ("value_baseline_mean_usd", "valueBaselineMeanUsdSeq", np.float32),
         *(
             (key, column, dtype)
-            for event in aux_value_events
+            for event in events
             for key, column, dtype in zip(
                 aux_value_label_keys(event),
                 _aux_value_label_columns(event),
                 (np.float32, np.bool_, np.float32),
                 strict=True,
             )
+        ),
+        *(
+            ((VALUE_LINE_ITEM_KEY, "lineItemIdSeq", np.int32),)
+            if VALUE_LINE_ITEM_OPERAND in aux_value_events
+            else ()
         ),
     )
 
@@ -521,8 +525,8 @@ def value_label_dtypes(aux_value_events: tuple[str, ...] = ()) -> dict[str, type
     return {key: dtype for key, _, dtype in value_label_columns(aux_value_events)}
 
 
-VALUE_LABEL_COLUMNS = value_label_columns(tuple(AUX_VALUE_EVENTS))
-VALUE_LABEL_DTYPES = value_label_dtypes(tuple(AUX_VALUE_EVENTS))
+VALUE_LABEL_COLUMNS = value_label_columns((*AUX_VALUE_EVENTS, VALUE_LINE_ITEM_OPERAND))
+VALUE_LABEL_DTYPES = value_label_dtypes((*AUX_VALUE_EVENTS, VALUE_LINE_ITEM_OPERAND))
 
 
 def _read_value_labels(
@@ -536,13 +540,15 @@ def _read_value_labels(
         if column not in record_batch.schema.names:
             continue
         is_bool = dtype is np.bool_
-        arrow_type = pa.bool_() if is_bool else pa.float32()
+        is_int = dtype is np.int32
+        arrow_type = pa.bool_() if is_bool else pa.int64() if is_int else pa.float32()
         col = record_batch.column(column)
         if col.type != pa.list_(arrow_type, shape[1]):
             raise ValueError(f"{column} must have type {pa.list_(arrow_type, shape[1])}")
         values = col.values.slice(col.offset * shape[1], shape[0] * shape[1])
-        values = values.fill_null(False if is_bool else 0.0)
-        labels[key] = values.to_numpy(zero_copy_only=False).reshape(shape).astype(dtype)
+        values = values.fill_null(False if is_bool else 0 if is_int else 0.0)
+        values = values.to_numpy(zero_copy_only=False).reshape(shape)
+        labels[key] = (values & 0x7FFFFFFF if is_int else values).astype(dtype)
         labels[key][col.is_null().to_numpy(zero_copy_only=False)] = 0
     return labels
 

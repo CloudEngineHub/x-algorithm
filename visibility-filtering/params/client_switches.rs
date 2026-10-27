@@ -60,32 +60,40 @@ impl ClientSwitch {
 #[derive(Clone)]
 pub(crate) struct ClientSwitches {
     feature_switches: Arc<ArcSwap<FeatureSwitches>>,
+    copy: Arc<LimitedActionsCopy>,
 }
 
 impl ClientSwitches {
-    pub fn new(feature_switches: Arc<ArcSwap<FeatureSwitches>>) -> Self {
-        Self { feature_switches }
+    pub fn new(feature_switches: Arc<ArcSwap<FeatureSwitches>>, copy: LimitedActionsCopy) -> Self {
+        Self {
+            feature_switches,
+            copy: Arc::new(copy),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
-        Self::for_tests_with(&[])
+        Self::for_tests_with(LimitedActionsCopy::from_json(
+            crate::params::limited_actions_copy::tests::BUNDLE,
+        ))
     }
 
     #[cfg(test)]
-    pub(crate) fn for_tests_with(yamls: &[&str]) -> Self {
+    pub(crate) fn for_tests_with(copy: LimitedActionsCopy) -> Self {
         const SCALA_RULES_COPY: &str =
             include_str!("../../tests/fixtures/scala_client_switches.yml");
         const SCALA_POLICY_COPY: &str =
             include_str!("../../tests/fixtures/limited_actions_policy.yml");
         let features = [SCALA_RULES_COPY, SCALA_POLICY_COPY]
             .iter()
-            .chain(yamls)
             .flat_map(|yaml| xai_feature_switches::load_yaml_string(yaml).unwrap())
             .collect();
-        Self::new(Arc::new(ArcSwap::from_pointee(
-            FeatureSwitches::new(features).unwrap(),
-        )))
+        Self::new(
+            Arc::new(ArcSwap::from_pointee(
+                FeatureSwitches::new(features).unwrap(),
+            )),
+            copy,
+        )
     }
 
     pub fn resolve(
@@ -139,7 +147,6 @@ impl ClientSwitches {
         viewer_id: Option<u64>,
         country_code: Option<&str>,
         reasons: impl IntoIterator<Item = LimitedEngagementReason>,
-        copy: &LimitedActionsCopy,
         stats: Option<&dyn StatsReceiverExt>,
     ) -> LimitedActionsPolicies {
         let feature_switches = self.feature_switches.load();
@@ -157,7 +164,8 @@ impl ClientSwitches {
                 )
             },
             |action_type, prompt_copy| {
-                copy.prompt(action_type, prompt_copy, language, country_code)
+                self.copy
+                    .prompt(action_type, prompt_copy, language, country_code)
             },
             stats,
         )
@@ -233,7 +241,10 @@ mod tests {
         let engine = SwitchFiles::beside(fs_path.to_str().unwrap(), experiments)
             .load(None)
             .unwrap();
-        let switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(engine)));
+        let switches = ClientSwitches::new(
+            Arc::new(ArcSwap::from_pointee(engine)),
+            LimitedActionsCopy::from_json("[]"),
+        );
 
         assert!(switches.soft_nsfw_new_user_drop(Some(TEST_USER_ID), Some("us")));
         assert_eq!(impressor.impression_count("soft_nsfw_ddg_1"), 1);
@@ -346,9 +357,10 @@ mod tests {
             switches.resolve(None, Some(TEST_USER_ID), None),
             ClientCapability::default()
         );
-        let no_keys = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(
-            FeatureSwitches::null().unwrap(),
-        )));
+        let no_keys = ClientSwitches::new(
+            Arc::new(ArcSwap::from_pointee(FeatureSwitches::null().unwrap())),
+            LimitedActionsCopy::from_json("[]"),
+        );
         let web = &CLIENT_CLASSES[0];
         assert_eq!(
             no_keys.resolve(Some(&context(web.app_id, web.user_agent)), None, None),

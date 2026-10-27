@@ -6,7 +6,7 @@ use crate::hydration::hydrator::{PairEdge, UserPair};
 use crate::hydration::inventory::classify;
 use crate::hydration::relation::{quoting_author, Related};
 use crate::hydration::{candidate_count_by_key, Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
-use crate::models::{AuthorId, PairEdges, QuoteFacts, QuoteLink, TweetId};
+use crate::models::{AuthorId, EdgeSet, Quote, QuoteLink, TweetId};
 use rustc_hash::FxHashMap;
 use strum::VariantArray;
 use xai_core_entities::entities::QuotedTweet;
@@ -146,7 +146,7 @@ impl Store {
                 .filter(|_| !self.authors.request().is_incomplete(quoted))
             {
                 None => PairKey::InputFailed,
-                Some((author, _)) if author.is_protected => PairKey::Asked(UserPair {
+                Some(author) if author.features.is_protected => PairKey::Asked(UserPair {
                     source: quoting,
                     destination: quoted,
                 }),
@@ -230,7 +230,7 @@ impl Store {
     }
 
     fn quoted_entry(&self, parent: &RequestRow, outer: TweetId) -> Quoted {
-        let mut pair_edges = PairEdges::default();
+        let mut pair_edges = EdgeSet::default();
         let mut failed = Hydrators::empty();
         for node in self.callable.iter() {
             let Some((edge, fetcher)) = node
@@ -252,21 +252,18 @@ impl Store {
                     false
                 }
             };
-            match edge {
-                PairEdge::AuthorBlocksOuterAuthor => pair_edges.author_blocks_outer_author = holds,
-                PairEdge::OuterAuthorFollowsAuthor => {
-                    pair_edges.outer_author_follows_author = holds
-                }
+            if holds {
+                pair_edges = pair_edges.with(node);
             }
         }
         Quoted {
-            facts: QuoteFacts {
-                link: self.quoting_author(outer).map(|quoting| QuoteLink {
+            quote: self.quoting_author(outer).map(|quoting| Quote {
+                link: QuoteLink {
                     outer,
                     quoting_author: quoting.get(),
-                }),
+                },
                 pair_edges,
-            },
+            }),
             failed,
         }
     }

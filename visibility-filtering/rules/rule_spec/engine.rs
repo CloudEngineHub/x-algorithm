@@ -1,5 +1,5 @@
 use crate::hydration::Hydrators;
-use crate::models::{PostCandidate, QuoteFacts, UserCandidate, UserEntity, ViewerRelationship};
+use crate::models::{EdgeSet, PostCandidate, Quote, UserCandidate, UserEntity};
 use crate::rules::context::RuleContext;
 use crate::rules::rule_spec::features::leaves::{ViewerFollowsAuthor, ViewerIsAuthor};
 use crate::rules::rule_spec::inputs::{Inputs, Interpreter};
@@ -42,8 +42,8 @@ pub(in crate::rules) trait Fold: Engine {
 
 pub trait Candidate {
     fn author(&self) -> &UserEntity;
-    fn viewer_relationship(&self) -> ViewerRelationship;
-    fn quote(&self) -> QuoteFacts;
+    fn edges(&self) -> EdgeSet;
+    fn quote(&self) -> Option<Quote>;
     fn failed(&self) -> Hydrators;
 }
 
@@ -165,13 +165,13 @@ impl Candidate for PostCandidate {
     }
 
     #[inline]
-    fn viewer_relationship(&self) -> ViewerRelationship {
-        self.viewer_relationship
+    fn edges(&self) -> EdgeSet {
+        self.edges
     }
 
     #[inline]
-    fn quote(&self) -> QuoteFacts {
-        QuoteFacts::default()
+    fn quote(&self) -> Option<Quote> {
+        None
     }
 
     #[inline]
@@ -187,12 +187,12 @@ impl Candidate for UserCandidate {
     }
 
     #[inline]
-    fn viewer_relationship(&self) -> ViewerRelationship {
-        self.viewer_relationship
+    fn edges(&self) -> EdgeSet {
+        self.edges
     }
 
     #[inline]
-    fn quote(&self) -> QuoteFacts {
+    fn quote(&self) -> Option<Quote> {
         self.quote
     }
 

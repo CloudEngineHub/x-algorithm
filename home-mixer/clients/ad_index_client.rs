@@ -14,7 +14,7 @@ use xai_x_rpc::grpc_client::{ChannelBuilder, TlsMode};
 use xai_x_rpc::xds_endpoint_source::XdsEndpointSource;
 use xai_xds_client::{ServiceState, StartFrom, XdsClient};
 
-const TIMEOUT_MS: u64 = 1200;
+const TIMEOUT_MS: u64 = 1300;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const NUM_ENDPOINTS: usize = 5;
 const METRIC_NAME: &str = "AdIndexClient.get_eligible_ads";

@@ -1,34 +1,36 @@
 use super::*;
 use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, Graph};
-use crate::clients::strato_answer::{found, no_row, Thrift};
+use crate::clients::strato::answer::{found, no_row, Thrift};
 use crate::clients::{trusted_friends_client, user_devices_client, user_location_client};
 use crate::hydration::fetcher::FetcherId;
 use crate::hydration::inventory::Source;
 use crate::models::NsfwFeature;
-use crate::safety_label_source::lookup::{
-    LookupError, LookupResults, ManhattanLookup, RemoteSource, TwemcacheLookup,
-};
-use crate::safety_label_source::types::{FailureKind, TwemcacheOutcome};
+use crate::safety_label_source::decode::tests::{cached_value_not_found, mval, raw_label};
+use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
+use crate::safety_label_source::remote::{cache_key, CacheRead, RemoteSource};
 use std::fmt;
 use std::num::NonZeroU64;
 use thrift::protocol::TType;
 use tonic::{Request, Response, Status};
 use tower::util::BoxCloneSyncService;
 use tower::ServiceExt;
+use xai_cache::{KVCacheError, Key, Value};
 use xai_core_entities::entities::{
-    ApiCounts, CashtagAttachments, ConversationControlArm, EditControl, EditControlEdit,
-    EditControlInitial, EscherbirdEntityAnnotation, ExclusiveTweetControl, GizmoduckAccount,
-    GizmoduckUserResult, MediaEntities, PCFLabel, PureCoreData, ReactionContext, Safety,
-    TakedownReason, TrustedFriendsControl, UrlEntities, UserResponseState,
+    ApiCounts, CashtagAttachments, ConversationControlArm, EditControl, EscherbirdEntityAnnotation,
+    ExclusiveTweetControl, GizmoduckAccount, GizmoduckUserResult, MediaEntities, PCFLabel,
+    PureCoreData, ReactionContext, Safety, TakedownReason, TrustedFriendsControl, UrlEntities,
+    UserResponseState,
 };
 use xai_core_entities::gizmoduck_client::{
     GizmoduckClient, LookupContext, MockGizmoduckClient, UserFields, ViewerData,
 };
 use xai_core_entities::tweet_entity_service_client::{MockTESClient, TESClient};
+use xai_manhattan::ManhattanError;
 use xai_strato::strato_proto::rpc_server::{Rpc, RpcServer};
 use xai_strato::strato_proto::{result, Call3, Issue3, ResultList};
 use xai_strato::StratoGrpc;
 use xai_x_thrift::entities::ApiMediaEntity;
+use xai_x_thrift::tweet_safety_label::{PerspectivalUser, SafetyLabel, SafetyLabelType};
 use xai_x_thrift::tweets::ApiPerspective;
 
 const VIEWER: u64 = 50;
@@ -318,24 +320,30 @@ impl SocialgraphClient for Fake {
 }
 
 #[tonic::async_trait]
-impl TwemcacheLookup for Fake {
-    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
-        let outcome = |id| match id {
-            MISSING => TwemcacheOutcome::NotFound,
-            _ => TwemcacheOutcome::Miss,
-        };
-        ids.iter().map(|&id| (id, outcome(id))).collect()
+impl CacheRead for Fake {
+    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, Result<Option<Value>, KVCacheError>> {
+        let not_found = cache_key(MISSING).unwrap();
+        let value = |key: &Key| (*key == not_found).then(cached_value_not_found);
+        keys.iter()
+            .map(|key| (key.clone(), Ok(value(key))))
+            .collect()
     }
 }
 
 #[tonic::async_trait]
-impl ManhattanLookup for Fake {
-    async fn get(&self, ids: &[u64]) -> LookupResults {
-        let result = |id| match id {
-            FAILED => Err(LookupError::new(FailureKind::ManhattanFetch, "fails")),
-            _ => Ok(labels()),
+impl ManhattanLabelFetcher for Fake {
+    async fn fetch_labels(&self, tweet_ids: &[i64]) -> Result<Vec<FetchResult>, ManhattanError> {
+        let label = SafetyLabel {
+            applicable_users: Some(vec![PerspectivalUser {
+                user_id: LABELED.cast_signed(),
+            }]),
+            ..Default::default()
         };
-        ids.iter().map(|&id| (id, result(id))).collect()
+        let result = |id: i64| match id.cast_unsigned() {
+            FAILED => Err(ManhattanError::NativeProtocol("fails".to_owned())),
+            _ => Ok(vec![raw_label(SafetyLabelType::SPAM, mval(&label))]),
+        };
+        Ok(tweet_ids.iter().map(|&id| result(id)).collect())
     }
 }
 
@@ -345,7 +353,7 @@ fn labels() -> vf_pb::SafetyLabelMap {
         ..Default::default()
     };
     vf_pb::SafetyLabelMap {
-        labels: [(1, label)].into(),
+        labels: [(i32::from(SafetyLabelType::SPAM), label)].into(),
     }
 }
 
@@ -381,13 +389,7 @@ fn tweet_features() -> TweetFeatures {
         community_id: NonZeroU64::new(COMMUNITY),
         exclusive_conversation_author_id: Some(EXCLUSIVE_AUTHOR),
         trusted_friends_list_id: Some(CIRCLE),
-        edit_control: Some(EditControl::Edit(EditControlEdit {
-            initial_tweet_id: INITIAL_TWEET,
-            edit_control_initial: Some(EditControlInitial {
-                edit_tweet_ids: vec![EDIT_TWEET],
-                ..Default::default()
-            }),
-        })),
+        latest_edit_tweet_id: Some(EDIT_TWEET),
         article_id: NonZeroU64::new(ARTICLE),
         narrowcast_place_id: Some(PLACE),
         ..Default::default()
@@ -597,7 +599,7 @@ fn prod_sources() -> ProdSources {
         trusted_friends: TrustedFriendsClient::new(strato()),
         user_location: UserLocationClient::new(strato()),
         safety_labels: Arc::new(SafetyLabelSource::new(
-            Arc::new(RemoteSource::new(Arc::clone(&fake), fake)),
+            Arc::new(RemoteSource::new(Arc::clone(&fake) as _, fake)),
             None,
         )),
         communities: CommunitySource {

@@ -251,3 +251,45 @@ param!(
     "rust_home_mixer_vm_ranker_dpp_max_selected_rank",
     150
 );
+param!(
+    UserDebiasEnabled,
+    bool,
+    "rust_home_mixer_vm_ranker_user_debias_enabled",
+    false
+);
+param!(
+    UserDebiasAlpha,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_alpha",
+    0.0
+);
+param!(
+    UserDebiasClipLogit,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_clip_logit",
+    2.0
+);
+param!(
+    UserDebiasHeads,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_heads",
+    ""
+);
+param!(
+    UserDebiasHeadAlpha,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_head_alpha",
+    ""
+);
+param!(
+    UserDebiasHeadClipLogit,
+    String,
+    "rust_home_mixer_vm_ranker_user_debias_head_clip_logit",
+    ""
+);
+param!(
+    UserDebiasMaxArtifactAgeSecs,
+    f64,
+    "rust_home_mixer_vm_ranker_user_debias_max_artifact_age_secs",
+    3600.0
+);

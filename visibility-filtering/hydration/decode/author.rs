@@ -7,8 +7,18 @@ use strum::VariantArray;
 use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, UserResponseState};
 use xai_x_thrift::user_labels::LabelValue;
 
-pub(crate) type DecodedAuthor = (AuthorFeatures, AuthorLabelSet);
-pub(crate) type DecodedActor = (DecodedAuthor, AuthorProfile);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DecodedAuthor {
+    pub(crate) features: AuthorFeatures,
+    pub(crate) labels: AuthorLabelSet,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DecodedActor {
+    pub(crate) author: DecodedAuthor,
+    pub(crate) profile: AuthorProfile,
+}
+
 pub(crate) type AuthorFallbackCache = FallbackCache<DecodedAuthor>;
 
 pub(crate) fn fallback_cache(capacity: usize) -> AuthorFallbackCache {
@@ -84,13 +94,13 @@ impl AuthorNotFound {
 }
 
 fn erased_author() -> DecodedAuthor {
-    (
-        AuthorFeatures {
+    DecodedAuthor {
+        features: AuthorFeatures {
             is_erased: true,
             ..AuthorFeatures::default()
         },
-        AuthorLabelSet::default(),
-    )
+        labels: AuthorLabelSet::default(),
+    }
 }
 
 pub(crate) fn author_batch(
@@ -125,8 +135,12 @@ pub(crate) fn actor_batch(
                 Hydrated::Found(result) | Hydrated::Partial(result) => {
                     let profile = result.user.as_ref().map(author_profile).unwrap_or_default();
                     match evaluable_author_features(result) {
-                        Hydrated::Found(author) => Hydrated::Found((author, profile)),
-                        Hydrated::Partial(author) => Hydrated::Partial((author, profile)),
+                        Hydrated::Found(author) => {
+                            Hydrated::Found(DecodedActor { author, profile })
+                        }
+                        Hydrated::Partial(author) => {
+                            Hydrated::Partial(DecodedActor { author, profile })
+                        }
                         Hydrated::NotFound => Hydrated::NotFound,
                         Hydrated::Failed => Hydrated::Failed,
                         Hydrated::Unanswered => Hydrated::Unanswered,
@@ -182,10 +196,10 @@ fn author_features(user_result: GizmoduckUserResult) -> DecodedAuthor {
     user_result
         .user
         .map(|user| {
-            let mut user_labels = AuthorLabelSet::default();
+            let mut labels = AuthorLabelSet::default();
             for label in &user.labels.labels {
                 if let Some(modeled) = author_label(LabelValue(label.label_value)) {
-                    user_labels.insert(modeled);
+                    labels.insert(modeled);
                 }
             }
             let features = AuthorFeatures {
@@ -197,7 +211,7 @@ fn author_features(user_result: GizmoduckUserResult) -> DecodedAuthor {
                 is_erased: user.safety.erased,
                 is_offboarded: user.safety.offboarded,
             };
-            (features, user_labels)
+            DecodedAuthor { features, labels }
         })
         .unwrap_or_default()
 }
@@ -273,8 +287,8 @@ mod tests {
                 ..suspended.clone()
             });
             assert_eq!(shape(&author), expected, "{state:?}");
-            if let Some((features, _)) = author.value() {
-                assert!(features.is_suspended, "{state:?}");
+            if let Some(author) = author.value() {
+                assert!(author.features.is_suspended, "{state:?}");
             }
         }
     }
@@ -347,7 +361,7 @@ mod tests {
             ),
             (LabelValue::DO_NOT_AMPLIFY, AuthorLabel::DoNotAmplify),
         ] {
-            let (_, labels) = author_features(user_with_labels(&[thrift.0]));
+            let labels = author_features(user_with_labels(&[thrift.0])).labels;
             assert!(labels.has_label(variant), "{thrift:?}");
         }
 
@@ -355,10 +369,11 @@ mod tests {
             LabelValue::EGREGIOUS_NSFW,
             LabelValue::RECOMMENDATIONS_BLACKLIST,
         ] {
-            let (_, labels) = author_features(user_with_labels(&[
+            let labels = author_features(user_with_labels(&[
                 unmodelled.0,
                 LabelValue::SPAM_HIGH_RECALL.0,
-            ]));
+            ]))
+            .labels;
             let mut expected = AuthorLabelSet::default();
             expected.insert(AuthorLabel::SpamHighRecall);
             assert_eq!(labels, expected, "{unmodelled:?}");

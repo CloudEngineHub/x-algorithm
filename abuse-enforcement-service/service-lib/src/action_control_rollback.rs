@@ -115,6 +115,7 @@ mod tests {
                 labels: vec![],
             },
             confidence: None,
+            follower_skip: None,
         }
     }
 

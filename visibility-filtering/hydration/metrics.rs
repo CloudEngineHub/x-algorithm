@@ -410,15 +410,8 @@ mod tests {
 
     #[test]
     fn dashboard_generator_pins_the_key_results_fallback_cache_results_and_viewer_metrics() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
-        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
-        let path = if std::path::Path::new(cargo).exists() {
-            cargo
-        } else {
-            ws
-        };
         let dashboard =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
         assert!(dashboard.contains(&format!(
             "FALLBACK_CACHE_KEYS_METRIC = \"{FALLBACK_CACHE_KEYS}\""
         )));

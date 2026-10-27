@@ -7,17 +7,19 @@ use crate::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
 use crate::models::{
     ClientCapability, Evaluation, EvaluationKey, PlacedCandidate, Placement, TweetId,
 };
-use crate::rules::engine::AdmittedPosts;
+use crate::rules::engine::Admitted;
 use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::warn;
 use xai_visibility_filtering_proto as vf_pb;
 
 mod author;
+mod retweet;
 
-pub(crate) use author::{AuthorJudgement, UserResult};
+pub(crate) use author::AuthorJudgement;
+pub(crate) use retweet::hydrate_and_trace;
+pub use retweet::MergeSelection;
 
 pub struct PostBatch {
     pub viewer_id: Option<u64>,
@@ -86,8 +88,6 @@ pub struct PostEvaluator {
     sources: Arc<dyn Sources>,
     rule_engine: RuleEngine,
     fallback_caches: Arc<FallbackCaches>,
-    #[cfg(test)]
-    pub(crate) client_capabilities: std::sync::Mutex<Vec<ClientCapability>>,
 }
 
 impl PostEvaluator {
@@ -100,26 +100,37 @@ impl PostEvaluator {
             sources,
             rule_engine,
             fallback_caches,
-            #[cfg(test)]
-            client_capabilities: std::sync::Mutex::default(),
         }
     }
 
-    pub async fn run(&self, request: PostBatch) -> Vec<PostEvaluation> {
-        let hydrated = self.hydrate(request, None).await;
-        self.evaluate_in_request_order(&hydrated, &mut NoTrace)
+    pub(crate) fn rule_engine(&self) -> &RuleEngine {
+        &self.rule_engine
     }
 
-    pub(crate) async fn hydrate(
+    pub(crate) async fn run<O: PostObserver>(
+        &self,
+        request: PostBatch,
+        observer: &mut O,
+    ) -> (HydratedRequest, Vec<PostEvaluation>) {
+        match request.rpc {
+            Rpc::FilterTweets => {
+                let hydrated = self.hydrate(request, None).await;
+                let outcomes = self.evaluate_in_request_order(&hydrated, observer);
+                (hydrated, outcomes)
+            }
+            Rpc::EvaluateTweets => {
+                let hydrated = self.hydrate(request, Some(Rpc::EvaluateTweets)).await;
+                let outcomes = retweet::merge_sources(self, &hydrated, observer);
+                (hydrated, outcomes)
+            }
+        }
+    }
+
+    async fn hydrate(
         &self,
         mut request: PostBatch,
         posts_judged_for: Option<Rpc>,
     ) -> HydratedRequest {
-        #[cfg(test)]
-        self.client_capabilities
-            .lock()
-            .unwrap()
-            .push(request.client_capability);
         let started = Instant::now();
         let plan = self.rule_engine.plan(request.safety_level);
         let hydration = plan
@@ -163,7 +174,9 @@ impl PostEvaluator {
         observer: &mut O,
     ) -> Vec<PostEvaluation> {
         let evaluating = Instant::now();
-        let admitted = self.admit(hydrated);
+        let admitted = self
+            .rule_engine
+            .admit(hydrated.safety_level, &hydrated.hydration);
         let outcomes = hydrated
             .candidates()
             .map(|candidate| Self::outcome(hydrated, admitted.as_ref(), candidate.key(), observer))
@@ -184,7 +197,9 @@ impl PostEvaluator {
         observer: &mut O,
     ) -> HashMap<EvaluationKey, PostEvaluation> {
         let evaluating = Instant::now();
-        let admitted = self.admit(hydrated);
+        let admitted = self
+            .rule_engine
+            .admit(hydrated.safety_level, &hydrated.hydration);
         let mut outcomes = HashMap::new();
         for key in keys {
             outcomes
@@ -206,7 +221,9 @@ impl PostEvaluator {
         keys: impl IntoIterator<Item = EvaluationKey>,
         traces: &mut HashMap<EvaluationKey, PolicyTrace>,
     ) {
-        let admitted = self.admit(hydrated);
+        let admitted = self
+            .rule_engine
+            .admit(hydrated.safety_level, &hydrated.hydration);
         for key in keys {
             if !traces.contains_key(&key) {
                 Self::outcome(hydrated, admitted.as_ref(), key, traces);
@@ -214,22 +231,9 @@ impl PostEvaluator {
         }
     }
 
-    fn admit<'a>(&'a self, hydrated: &'a HydratedRequest) -> Option<AdmittedPosts<'a>> {
-        self.rule_engine
-            .admit(hydrated.safety_level, &hydrated.hydration)
-            .inspect_err(|error| {
-                warn!(
-                    ?error,
-                    level = ?hydrated.safety_level,
-                    "hydration not admitted by its level's policy; failing its candidates"
-                );
-            })
-            .ok()
-    }
-
     fn outcome<O: PostObserver>(
         hydrated: &HydratedRequest,
-        admitted: Option<&AdmittedPosts<'_>>,
+        admitted: Option<&Admitted<'_>>,
         key: EvaluationKey,
         observer: &mut O,
     ) -> PostEvaluation {
@@ -280,6 +284,9 @@ pub(crate) trait PostObserver {
     const TOTAL: bool;
 
     fn record(&mut self, key: EvaluationKey, trace: PolicyTrace);
+
+    #[inline]
+    fn select(&mut self, _: EvaluationKey, _: MergeSelection) {}
 }
 
 impl PostObserver for NoTrace {

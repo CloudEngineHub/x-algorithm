@@ -123,11 +123,29 @@ impl<E: Fold> Rule<E> {
             .union(self.when.requirements())
             .union(self.action.spec().requirements())
     }
+
+    pub(in crate::rules) fn leaves(&self, leaves: &mut Vec<Predicate>) {
+        self.audience.condition::<E>().leaves(leaves);
+        self.when.leaves(leaves);
+    }
 }
 
 impl<E: Engine> RuleCond<E> {
     pub(in crate::rules) const fn leaf(self) -> Self {
         self
+    }
+
+    pub(in crate::rules) fn leaves(self, leaves: &mut Vec<Predicate>) {
+        match self {
+            Self::Leaf(leaf) => leaves.push(E::lift(leaf)),
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.leaves(leaves);
+                }
+            }
+            Self::Not(child) => child.leaves(leaves),
+            Self::Named(named) => named.condition.leaves(leaves),
+        }
     }
 
     pub(in crate::rules) fn requirements(self) -> Hydrators {
@@ -292,19 +310,6 @@ impl<E: Engine> RuleCond<E> {
             Self::Leaf(leaf) => label(leaf),
             Self::Not(Self::Leaf(leaf)) => label(*leaf).map(|label| format!("not {label}")),
             Self::All(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => None,
-        }
-    }
-
-    pub(in crate::rules) fn leaves(self, leaves: &mut Vec<Predicate>) {
-        match self {
-            Self::Leaf(leaf) => leaves.push(E::lift(leaf)),
-            Self::All(children) | Self::Any(children) => {
-                for child in children {
-                    child.leaves(leaves);
-                }
-            }
-            Self::Not(child) => child.leaves(leaves),
-            Self::Named(named) => named.condition.leaves(leaves),
         }
     }
 

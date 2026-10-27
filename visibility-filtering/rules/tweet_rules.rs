@@ -1,5 +1,7 @@
-use crate::models::{LimitedEngagementReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport};
-use crate::params::{CountryList, LimitedActionType};
+use crate::models::{
+    LimitedActionType, LimitedEngagementReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport,
+};
+use crate::params::CountryList;
 use crate::rules::rule_spec::conditions::*;
 use crate::rules::rule_spec::leaves::*;
 use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors, NonFollowers, OnlyAuthor};
@@ -438,7 +440,7 @@ pub(super) const TRUSTED_FRIENDS_TWEET_DROP_UNSPECIFIED: Rule = Rule {
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
-pub(super) const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
+const NSFW_HIGH_PRECISION_CHANGED_AT: u64 = 1705536000000;
 
 pub(super) const NSFW_HIGH_PRECISION_BLUR_NUDITY: Rule = Rule {
     id: RuleId::NsfwHighPrecision,

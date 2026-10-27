@@ -15,15 +15,14 @@ pub mod tweet_source;
 
 use crate::metrics::Rpc;
 use crate::models::{
-    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetId,
-    UserCandidate, UserEntity, ViewerFeatures, ViewerRelationship,
+    AuthorId, ClientCapability, EdgeSet, Placement, PostCandidate, Quote, RawCandidate, TweetId,
+    UserCandidate, UserEntity, ViewerFeatures,
 };
 pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
-pub(crate) use fetcher::Owner;
 pub(crate) use hydrator::RequestRows;
 pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
@@ -139,7 +138,7 @@ pub(crate) struct Hydration {
 pub(crate) enum HydratedUser {
     Resolved {
         user: UserEntity,
-        viewer_relationship: ViewerRelationship,
+        edges: EdgeSet,
         failed: Hydrators,
     },
     Unresolved(Cause),
@@ -147,7 +146,7 @@ pub(crate) enum HydratedUser {
 
 #[derive(Clone, Copy, Default)]
 struct Quoted {
-    facts: QuoteFacts,
+    quote: Option<Quote>,
     failed: Hydrators,
 }
 
@@ -193,8 +192,8 @@ impl Hydration {
         };
         Some(UserCandidate {
             user: post.author.clone(),
-            viewer_relationship: post.viewer_relationship,
-            quote: quoted.facts,
+            edges: post.edges,
+            quote: quoted.quote,
             failed: post.failed.intersection(reads).union(quoted.failed),
         })
     }
@@ -202,7 +201,7 @@ impl Hydration {
     pub(crate) fn user_candidate(&self, id: AuthorId, reads: Hydrators) -> Option<UserCandidate> {
         let HydratedUser::Resolved {
             user,
-            viewer_relationship,
+            edges,
             failed,
         } = self.user(id)?
         else {
@@ -210,8 +209,8 @@ impl Hydration {
         };
         Some(UserCandidate {
             user: user.clone(),
-            viewer_relationship: *viewer_relationship,
-            quote: QuoteFacts::default(),
+            edges: *edges,
+            quote: None,
             failed: failed.intersection(reads),
         })
     }
@@ -239,16 +238,13 @@ impl Hydration {
     }
 
     pub(crate) fn failed_nodes(&self, post: TweetId) -> Hydrators {
-        let Some(HydratedTweet::Resolved {
-            candidate,
-            source_tweet_id,
-            ..
-        }) = self.tweet(post)
-        else {
+        let Some(candidate) = self.tweet(post).and_then(HydratedTweet::candidate) else {
             return Hydrators::empty();
         };
-        let source = source_tweet_id
-            .and_then(|source| self.tweet(source)?.candidate())
+        let source = candidate
+            .post
+            .source_tweet_id
+            .and_then(|source| self.tweet(TweetId(source))?.candidate())
             .map_or(Hydrators::empty(), |source| source.failed);
         candidate.failed.union(source)
     }
@@ -265,7 +261,6 @@ impl Hydration {
 pub(crate) enum HydratedTweet {
     Resolved {
         candidate: PostCandidate,
-        source_tweet_id: Option<TweetId>,
         safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
     },
     Unresolved {
@@ -305,23 +300,15 @@ impl HydratedTweet {
     }
 
     pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {
-        match self {
-            Self::Resolved {
-                source_tweet_id, ..
-            } => *source_tweet_id,
-            Self::Unresolved { .. } => None,
-        }
+        self.candidate()?.post.source_tweet_id.map(TweetId)
     }
 
     pub(crate) fn source_to_merge(&self) -> Option<TweetId> {
-        match self {
-            Self::Resolved {
-                candidate,
-                source_tweet_id,
-                ..
-            } if !candidate.failed.has_must_have() => *source_tweet_id,
-            Self::Resolved { .. } | Self::Unresolved { .. } => None,
-        }
+        self.candidate()
+            .filter(|candidate| !candidate.failed.has_must_have())?
+            .post
+            .source_tweet_id
+            .map(TweetId)
     }
 
     pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {

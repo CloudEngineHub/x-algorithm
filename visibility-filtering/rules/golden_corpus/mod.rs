@@ -25,8 +25,8 @@ mod tweet_state;
 
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    Decided, Evaluation, Notice, Placement, PostCandidate, TweetId, UserCandidate, Verdict,
-    ViewerFeatures, ViewerRelationship, Withholding,
+    Decided, EdgeSet, Evaluation, Notice, Placement, PostCandidate, TweetId, UserCandidate,
+    Verdict, ViewerFeatures, Withholding,
 };
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
@@ -86,10 +86,10 @@ impl Subject {
         }
     }
 
-    fn viewer_relationship_mut(&mut self) -> &mut ViewerRelationship {
+    fn edges_mut(&mut self) -> &mut EdgeSet {
         match self {
-            Subject::Post(post) => &mut post.viewer_relationship,
-            Subject::User(user) => &mut user.viewer_relationship,
+            Subject::Post(post) => &mut post.edges,
+            Subject::User(user) => &mut user.edges,
         }
     }
 }
@@ -101,14 +101,12 @@ impl Role {
             Role::NonFollower => standalone("non_follower", viewer(VIEWER_ID)),
             Role::Author => standalone("author", viewer(subject.author_id())),
             Role::Follower => {
-                subject.viewer_relationship_mut().follows = true;
+                let edges = subject.edges_mut();
+                *edges = edges.with(Hydrator::Follows);
                 standalone("follower", viewer(VIEWER_ID))
             }
             Role::LoggedOut => {
-                *subject.viewer_relationship_mut() = ViewerRelationship::default();
-                if let Subject::Post(post) = subject {
-                    post.post.edges = Hydrators::empty();
-                }
+                *subject.edges_mut() = EdgeSet::default();
                 standalone("logged_out", logged_out_viewer())
             }
             Role::As(role_name, viewer) => standalone(role_name, viewer.clone()),
@@ -200,7 +198,7 @@ fn golden_corpus_pins_policy_verdicts() {
     for case in cases {
         let verdict = case.evaluate(&rule_engine).into_verdict();
         if matches!(&case.expected, Verdict::Shown { media: Some(_), .. }) {
-            let (action, reason) = proto_action(verdict.clone());
+            let (action, reason) = proto_action(&verdict);
             assert_eq!(action.encode_to_vec(), [0x20, 0x01], "{}", case.name);
             assert_eq!(
                 reason.unwrap().encode_to_vec(),

@@ -1,10 +1,10 @@
 use crate::hydration::Hydrators;
 use crate::models::{
-    AuthorLabel, DropReason, EmergencyCopy, FosnrReason, LabelInterstitial,
+    AuthorLabel, DropReason, EmergencyCopy, FosnrReason, LabelInterstitial, LimitedActionType,
     LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
     PublicInterest, SafetyLabelMap, SafetyLabelType, TombstoneReason, ViewerProfile, Withholding,
 };
-use crate::params::{CountryList, LimitedActionType};
+use crate::params::CountryList;
 use crate::rules::RuleContext;
 use engine::{Engine, Fold, PostEngine};
 use features::{In, TweetSafetyLabels};

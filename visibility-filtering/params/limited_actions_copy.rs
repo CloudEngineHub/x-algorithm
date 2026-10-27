@@ -1,4 +1,4 @@
-use crate::params::LimitedActionType;
+use crate::models::LimitedActionType;
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -386,10 +386,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_image_layer_ships_the_paths_startup_loads() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/BUILD.bazel");
-        let ws = "crates/x-product/xai-visibility-filtering-service/BUILD.bazel";
-        let path = if Path::new(cargo).exists() { cargo } else { ws };
-        let build = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let build = std::fs::read_to_string(crate::pinned::crate_path("BUILD.bazel")).unwrap();
         for loaded in [BUNDLE_PATH, PINNED_METADATA_PATH] {
             assert!(build.contains(&format!("\"{loaded}\": ")), "{loaded}");
         }

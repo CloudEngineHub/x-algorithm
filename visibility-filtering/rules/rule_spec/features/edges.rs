@@ -1,5 +1,4 @@
 use crate::hydration::Hydrator;
-use crate::models::{PairEdges, ViewerRelationship};
 use crate::rules::rule_spec::engine::{Engine, UserEngine};
 use crate::rules::rule_spec::rule::RuleCond;
 use crate::rules::rule_spec::{Predicate, Truth};
@@ -23,17 +22,6 @@ impl RelationshipLeaf {
             Self::ViewerMutesAuthor => Hydrator::Mutes,
             Self::ViewerIsBlockedByAuthor => Hydrator::BlockedByAuthor,
             Self::AuthorFollowsViewer => Hydrator::AuthorFollowsViewer,
-        }
-    }
-
-    #[inline]
-    pub(in crate::rules) const fn holds(self, relationship: ViewerRelationship) -> bool {
-        match self {
-            Self::ViewerFollowsAuthor => relationship.follows,
-            Self::ViewerBlocksAuthor => relationship.blocks,
-            Self::ViewerMutesAuthor => relationship.mutes,
-            Self::ViewerIsBlockedByAuthor => relationship.blocked_by,
-            Self::AuthorFollowsViewer => relationship.followed_by,
         }
     }
 
@@ -95,14 +83,6 @@ impl PairEdgeLeaf {
         match self {
             Self::AuthorBlocksOuterAuthor => Hydrator::AuthorBlocksOuterAuthor,
             Self::OuterAuthorFollowsAuthor => Hydrator::OuterAuthorFollowsAuthor,
-        }
-    }
-
-    #[inline]
-    pub(in crate::rules) const fn holds(self, edges: PairEdges) -> bool {
-        match self {
-            Self::AuthorBlocksOuterAuthor => edges.author_blocks_outer_author,
-            Self::OuterAuthorFollowsAuthor => edges.outer_author_follows_author,
         }
     }
 

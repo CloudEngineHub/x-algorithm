@@ -1,14 +1,13 @@
 use super::key_origin::{KeyOrigin, Names};
 use super::{RequestRow, Store};
+use crate::hydration::decode::author::{DecodedActor, DecodedAuthor};
 use crate::hydration::fetcher::Fetcher;
 use crate::hydration::inventory::Stake;
 use crate::hydration::relation::Relation;
-use crate::hydration::{
-    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,
-};
+use crate::hydration::{Cause, HydratedTweet, HydratedUser, Hydrator, Lookup, Unresolved};
 use crate::models::{
-    AuthorId, ConversationControlFeatures, PostCandidate, PostEntity, SafetyLabelMap,
-    TweetFeatures, TweetId, UserEntity, ViewerRelationship,
+    AuthorId, ConversationControlFeatures, EdgeSet, PostCandidate, PostEntity, SafetyLabelMap,
+    TweetFeatures, TweetId, UserEntity,
 };
 use rustc_hash::FxHashMap;
 use xai_core_entities::entities::ConversationControlArm;
@@ -24,14 +23,10 @@ impl Store {
     ) -> HydratedTweet {
         let safety_labels = self.labels.request().get(id.0).cloned();
         match self.resolve(row, id, tweet_misses) {
-            Ok(author_id) => {
-                let candidate = self.candidate(row, position, id, author_id, unclaimed);
-                HydratedTweet::Resolved {
-                    candidate,
-                    source_tweet_id: self.source_tweet_id(id),
-                    safety_labels,
-                }
-            }
+            Ok(author_id) => HydratedTweet::Resolved {
+                candidate: self.candidate(row, position, id, author_id, unclaimed),
+                safety_labels,
+            },
             Err(reason) => HydratedTweet::Unresolved {
                 reason,
                 safety_labels,
@@ -50,7 +45,7 @@ impl Store {
             Some(cause) => HydratedUser::Unresolved(cause),
             None => HydratedUser::Resolved {
                 user: self.actor(row, user),
-                viewer_relationship: self.edges(row, position).0,
+                edges: self.edges(row, position),
                 failed: self.failed(row, position, unclaimed),
             },
         }
@@ -146,7 +141,7 @@ impl Store {
     }
 
     fn author(&self, author_id: AuthorId) -> UserEntity {
-        let (author_features, author_labels) = self
+        let DecodedAuthor { features, labels } = self
             .authors
             .request()
             .get(author_id.get())
@@ -154,15 +149,17 @@ impl Store {
             .unwrap_or_default();
         UserEntity {
             id: author_id.get(),
-            features: author_features,
-            labels: author_labels,
+            features,
+            labels,
             ..UserEntity::default()
         }
     }
 
     fn actor(&self, row: &RequestRow, user: AuthorId) -> UserEntity {
-        let ((features, labels), profile) =
-            self.actors.get(user.get()).copied().unwrap_or_default();
+        let DecodedActor {
+            author: DecodedAuthor { features, labels },
+            profile,
+        } = self.actors.get(user.get()).copied().unwrap_or_default();
         let lacks = |fetcher: &Fetcher<bool>, origin| {
             self.key(origin, row)
                 .and_then(|key| fetcher.get(key))
@@ -184,9 +181,8 @@ impl Store {
         }
     }
 
-    fn edges(&self, row: &RequestRow, position: usize) -> (ViewerRelationship, Hydrators) {
-        let (viewer_relationship, post_edges) = self
-            .callable
+    fn edges(&self, row: &RequestRow, position: usize) -> EdgeSet {
+        self.callable
             .iter()
             .filter(|&node| {
                 node.edge()
@@ -196,21 +192,7 @@ impl Store {
                     })
                     .unwrap_or(false)
             })
-            .fold(
-                (ViewerRelationship::default(), Hydrators::empty()),
-                |(mut relationship, mut post), node| {
-                    if let Some(slot) = relationship.slot(node) {
-                        *slot = true;
-                    } else {
-                        post = post.with(node);
-                    }
-                    (relationship, post)
-                },
-            );
-        debug_assert!(post_edges
-            .iter()
-            .all(|node| viewer_relationship.get(node).is_none()));
-        (viewer_relationship, post_edges)
+            .fold(EdgeSet::default(), EdgeSet::with)
     }
 
     pub(super) fn candidate(
@@ -222,10 +204,9 @@ impl Store {
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> PostCandidate {
         let id = tweet_id.0;
-        let (viewer_relationship, post_edges) = self.edges(row, position);
         PostCandidate {
             author: self.author(author_id),
-            viewer_relationship,
+            edges: self.edges(row, position),
             post: PostEntity {
                 tweet_id: id,
                 source_tweet_id: self.source_tweet_id(tweet_id).map(|source| source.0),
@@ -241,7 +222,6 @@ impl Store {
                     .get(id)
                     .map(|labels| SafetyLabelMap::from_proto_label_types(labels))
                     .unwrap_or_default(),
-                edges: post_edges,
                 conversation_control: self.control(row).cloned().map(|control| {
                     ConversationControlFeatures {
                         viewer_country: self
@@ -296,7 +276,7 @@ impl Store {
                             .of(self.owner(Hydrator::ReactedToAuthorSafety))
                             .get(user_id)
                     })
-                    .is_some_and(|(author, _)| author.is_protected),
+                    .is_some_and(|author| author.features.is_protected),
             },
             failed: self.failed(row, position, unclaimed),
         }

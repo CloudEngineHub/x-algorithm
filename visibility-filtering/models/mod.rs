@@ -15,8 +15,9 @@ pub use tweet::{
 };
 pub use verdict::{
     Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
-    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice,
-    NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict, Withholding,
+    LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
+    Withholding,
 };
 pub use viewer::{
     ClientCapability, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures,
@@ -82,16 +83,10 @@ pub struct QuoteLink {
     pub quoting_author: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PairEdges {
-    pub author_blocks_outer_author: bool,
-    pub outer_author_follows_author: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct QuoteFacts {
-    pub link: Option<QuoteLink>,
-    pub pair_edges: PairEdges,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    pub link: QuoteLink,
+    pub pair_edges: EdgeSet,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +133,7 @@ impl EvaluationKey {
 #[derive(Clone, Debug, Default)]
 pub struct PostCandidate {
     pub author: UserEntity,
-    pub viewer_relationship: ViewerRelationship,
+    pub edges: EdgeSet,
     pub post: PostEntity,
     pub failed: Hydrators,
 }
@@ -146,8 +141,8 @@ pub struct PostCandidate {
 #[derive(Clone, Debug)]
 pub struct UserCandidate {
     pub user: UserEntity,
-    pub viewer_relationship: ViewerRelationship,
-    pub quote: QuoteFacts,
+    pub edges: EdgeSet,
+    pub quote: Option<Quote>,
     pub failed: Hydrators,
 }
 
@@ -156,8 +151,8 @@ impl UserCandidate {
     pub(crate) fn author_of(post: &PostCandidate) -> Self {
         Self {
             user: post.author.clone(),
-            viewer_relationship: post.viewer_relationship,
-            quote: QuoteFacts::default(),
+            edges: post.edges,
+            quote: None,
             failed: post.failed,
         }
     }
@@ -174,65 +169,17 @@ pub struct UserEntity {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ViewerRelationship {
-    pub follows: bool,
-    pub blocks: bool,
-    pub mutes: bool,
-    pub blocked_by: bool,
-    pub followed_by: bool,
-}
+pub struct EdgeSet(Hydrators);
 
-impl ViewerRelationship {
+impl EdgeSet {
     #[inline]
-    pub(crate) fn slot(&mut self, node: Hydrator) -> Option<&mut bool> {
-        match node {
-            Hydrator::Follows => Some(&mut self.follows),
-            Hydrator::Blocks => Some(&mut self.blocks),
-            Hydrator::Mutes => Some(&mut self.mutes),
-            Hydrator::BlockedByAuthor => Some(&mut self.blocked_by),
-            Hydrator::AuthorFollowsViewer => Some(&mut self.followed_by),
-            Hydrator::PureCore
-            | Hydrator::Tweet
-            | Hydrator::ConversationControl
-            | Hydrator::TweetSafetyLabels
-            | Hydrator::ViewerProfile
-            | Hydrator::ViewerLabels
-            | Hydrator::AuthorSafety
-            | Hydrator::AuthorLabels
-            | Hydrator::MuteRetweets
-            | Hydrator::BlockedByReplyRoot
-            | Hydrator::SuperFollowsExclusive
-            | Hydrator::RootFollowsViewer
-            | Hydrator::RootFollowsViewerSecondDegree
-            | Hydrator::SuperFollowsRoot
-            | Hydrator::ViewerFollowsRoot
-            | Hydrator::BlockedByConversationRoot
-            | Hydrator::ConversationRootPost
-            | Hydrator::BlockedByConversationRootPost
-            | Hydrator::ViewerCountry
-            | Hydrator::CommunityModeration
-            | Hydrator::CommunityModerator
-            | Hydrator::CommunityViewerRemoved
-            | Hydrator::ArticleLifecycle
-            | Hydrator::ArticleMediaEntities
-            | Hydrator::ArticleCoverMedia
-            | Hydrator::TrustedFriends
-            | Hydrator::OutsideNarrowcastPlace
-            | Hydrator::AuthorBlocksOuterAuthor
-            | Hydrator::OuterAuthorFollowsAuthor
-            | Hydrator::QuotedTweet
-            | Hydrator::ReactedToPostSafetyLabels
-            | Hydrator::ReactedToAuthorSafety
-            | Hydrator::ViewerNotificationFilters
-            | Hydrator::AuthorProfile
-            | Hydrator::AuthorConfirmedEmail
-            | Hydrator::AuthorVerifiedPhone => None,
-        }
+    pub fn contains(self, node: Hydrator) -> bool {
+        self.0.contains(node)
     }
 
     #[inline]
-    pub(crate) fn get(mut self, node: Hydrator) -> Option<bool> {
-        self.slot(node).copied()
+    pub fn with(self, node: Hydrator) -> Self {
+        Self(self.0.with(node))
     }
 }
 
@@ -243,7 +190,6 @@ pub struct PostEntity {
     pub is_reply: bool,
     pub tweet_features: TweetFeatures,
     pub safety_labels: SafetyLabelMap,
-    pub edges: Hydrators,
     pub conversation_control: Option<ConversationControlFeatures>,
     pub community_moderation: CommunityModeration,
             pub viewer_is_community_moderator: Option<bool>,

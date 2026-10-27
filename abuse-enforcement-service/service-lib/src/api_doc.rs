@@ -107,6 +107,7 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::action_control::RowsRequest,
         xai_abuse_enforcement_types::action_control::RowSetting,
         xai_abuse_enforcement_types::action_control::ActionControlSeenRow,
+        xai_abuse_enforcement_types::action_control::FollowerSkipView,
         xai_abuse_enforcement_types::allowlist::AllowlistEntry,
         xai_abuse_enforcement_types::allowlist::AllowlistRecord,
         xai_abuse_enforcement_types::allowlist::AllowlistAddRequest,

@@ -6,7 +6,6 @@ use crate::rules::RuleId;
 use strum::VariantArray;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
-use xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
@@ -35,42 +34,37 @@ pub(crate) struct LevelSpec {
 pub(crate) enum QuoteEntries {
     NotJudged,
     Judged {
-        rerenders: &'static [(RuleId, ThriftFilteredReason)],
+        rerenders: &'static [(RuleId, RerenderReason)],
     },
 }
 
-static TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS: [(RuleId, ThriftFilteredReason); 8] = [
-    (
-        RuleId::DeactivatedAuthor,
-        ThriftFilteredReason::AuthorIsDeactivated(true),
-    ),
-    (
-        RuleId::ErasedAuthor,
-        ThriftFilteredReason::AuthorIsDeactivated(true),
-    ),
-    (
-        RuleId::OffboardedAuthor,
-        ThriftFilteredReason::AuthorAccountIsInactive(true),
-    ),
-    (
-        RuleId::SuspendedAuthor,
-        ThriftFilteredReason::AuthorIsSuspended(true),
-    ),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RerenderReason {
+    AuthorDeactivated,
+    AuthorInactive,
+    AuthorSuspended,
+    AuthorBlocksViewer,
+    AuthorProtected,
+    Unspecified,
+}
+
+static TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS: [(RuleId, RerenderReason); 8] = [
+    (RuleId::DeactivatedAuthor, RerenderReason::AuthorDeactivated),
+    (RuleId::ErasedAuthor, RerenderReason::AuthorDeactivated),
+    (RuleId::OffboardedAuthor, RerenderReason::AuthorInactive),
+    (RuleId::SuspendedAuthor, RerenderReason::AuthorSuspended),
     (
         RuleId::QuotedAuthorBlocksQuotingAuthor,
-        ThriftFilteredReason::AuthorBlockViewer(true),
+        RerenderReason::AuthorBlocksViewer,
     ),
-    (
-        RuleId::ViewerBlocksAuthor,
-        ThriftFilteredReason::UnspecifiedReason(true),
-    ),
+    (RuleId::ViewerBlocksAuthor, RerenderReason::Unspecified),
     (
         RuleId::QuotedViewerMutesAuthorNotFollowing,
-        ThriftFilteredReason::UnspecifiedReason(true),
+        RerenderReason::Unspecified,
     ),
     (
         RuleId::ProtectedQuotedAuthor,
-        ThriftFilteredReason::AuthorIsProtected(true),
+        RerenderReason::AuthorProtected,
     ),
 ];
 

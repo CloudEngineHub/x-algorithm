@@ -4,17 +4,19 @@ use crate::models::{
     PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
 };
 use crate::params::CountryLists;
+use crate::rules::defaults::{Bucket, Defaults, Effect};
 use crate::rules::levels::LevelRules;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
-use crate::rules::rule_spec::observed::{self, NoTrace, NodeObserver, NodeTrace, NodeTracer, Skip};
-use crate::rules::rule_spec::rule::{self, Rule, RuleCond};
+use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
+use crate::rules::rule_spec::rule::{self, Rule};
 use crate::rules::rule_spec::{rule_name, ActionSpec, Contribution, RuleAction, RuleId, Truth};
-use crate::rules::{RuleContext, SafetyLevel};
+use crate::rules::{Predicate, RequestLeaf, RuleContext, SafetyLevel};
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::sync::Arc;
 use strum::VariantArray;
+use tracing::warn;
 
 pub(super) struct Policy<E: Engine = PostEngine> {
     rules: Vec<(&'static str, Rule<E>)>,
@@ -50,6 +52,14 @@ impl<E: Fold> Policy<E> {
         Self { rules, hydrators }
     }
 
+    fn reads(&self, leaf: Predicate) -> bool {
+        let mut read = Vec::new();
+        for (_, rule) in &self.rules {
+            rule.leaves(&mut read);
+        }
+        read.contains(&leaf)
+    }
+
     #[cfg(test)]
     fn rule_names(&self) -> Vec<&'static str> {
         let mut names: Vec<&'static str> = self.rules.iter().map(|&(name, _)| name).collect();
@@ -62,127 +72,13 @@ impl<E: Fold> Policy<E> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Effect {
-    DidNotApply,
-    Decided,
-    AfterTerminal,
-    FilledMedia,
-    KeptEarlierMedia,
-    KeptEarlierMediaInsteadOfNotice,
-    FilledNotice,
-    KeptEarlierNotice,
-    FilledEngagement,
-    AddedEngagementReason,
-    DuplicateEngagementReason,
-}
-
-type Completed = (Option<Contribution>, Hydrators);
-
-#[derive(Clone, Copy)]
-pub(super) enum Bucket {
-    Withholding,
-    Media,
-    Engagement,
-}
-
-impl Bucket {
-    fn relied_on_by(self, verdict: &Verdict) -> bool {
-        let notice = match verdict {
-            Verdict::Withheld(_) => return matches!(self, Self::Withholding),
-            Verdict::Shown { notice, .. } => notice.as_ref().map(|notice| &notice.value),
-        };
-        match self {
-            Self::Withholding => true,
-            Self::Media => !matches!(notice, Some(Notice::Appealable { .. })),
-            Self::Engagement => !notice.is_some_and(Notice::is_whole_verdict),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-pub(super) struct Defaults {
-    withholding: Hydrators,
-    media: Hydrators,
-    engagement: Hydrators,
-}
-
-impl Defaults {
-    fn get(self, bucket: Bucket) -> Hydrators {
-        match bucket {
-            Bucket::Withholding => self.withholding,
-            Bucket::Media => self.media,
-            Bucket::Engagement => self.engagement,
-        }
-    }
-
-    fn admit(&mut self, bucket: Bucket, reads: Hydrators) {
-        let admitted = match bucket {
-            Bucket::Withholding => &mut self.withholding,
-            Bucket::Media => &mut self.media,
-            Bucket::Engagement => &mut self.engagement,
-        };
-        *admitted = admitted.union(reads);
-    }
-
-    fn relied_on_by(self, verdict: &Verdict) -> Self {
-        let relied = |bucket: Bucket| {
-            if bucket.relied_on_by(verdict) {
-                self.get(bucket)
-            } else {
-                Hydrators::empty()
-            }
-        };
-        Self {
-            withholding: relied(Bucket::Withholding),
-            media: relied(Bucket::Media),
-            engagement: relied(Bucket::Engagement),
-        }
-    }
-
-    fn all(self) -> Hydrators {
-        self.withholding.union(self.media).union(self.engagement)
-    }
-}
-
-pub(super) trait PolicyObserver<E: Engine>: NodeObserver<E> {
-    fn row(
-        &mut self,
-        by: &'static str,
-        root: Self::Handle,
-        truth: Truth,
-        effect: Effect,
-        defaults_admitted: (Bucket, Hydrators),
-        completed: Option<Completed>,
-    );
-
-    fn retained(&mut self, defaults: Defaults);
-}
-
-impl<E: Engine> PolicyObserver<E> for NoTrace {
-    #[inline]
-    fn row(
-        &mut self,
-        _: &'static str,
-        (): (),
-        _: Truth,
-        _: Effect,
-        _: (Bucket, Hydrators),
-        _: Option<Completed>,
-    ) {
-    }
-
-    #[inline]
-    fn retained(&mut self, _: Defaults) {}
-}
-
 #[derive(Default)]
 pub(super) struct Folded {
     decision: Decision,
     terminal: Option<(usize, Verdict)>,
 }
 
-fn fold<E: Fold, O: PolicyObserver<E>>(
+fn fold<E: Fold, O: Observer<E>>(
     rules: &[(&'static str, Rule<E>)],
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
@@ -192,7 +88,7 @@ fn fold<E: Fold, O: PolicyObserver<E>>(
 }
 
 #[inline]
-fn fold_from<E: Fold, O: PolicyObserver<E>>(
+fn fold_from<E: Fold, O: Observer<E>>(
     rules: &[(&'static str, Rule<E>)],
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
@@ -242,7 +138,7 @@ fn fold_from<E: Fold, O: PolicyObserver<E>>(
 }
 
 #[inline]
-fn finish<E: Engine, O: PolicyObserver<E>>(
+fn finish<E: Engine, O: Observer<E>>(
     Folded { decision, terminal }: Folded,
     failed: Hydrators,
     observer: &mut O,
@@ -443,7 +339,7 @@ impl PostPolicy {
     }
 
     #[inline]
-    fn fold_user<O: PolicyObserver<UserEngine>>(
+    fn fold_user<O: Observer<UserEngine>>(
         &self,
         context: &RuleContext<'_, UserCandidate>,
         observer: &mut O,
@@ -452,7 +348,7 @@ impl PostPolicy {
     }
 
     #[inline]
-    fn gate<O: PolicyObserver<PostEngine>>(
+    fn gate<O: Observer<PostEngine>>(
         &self,
         user: Folded,
         context: &RuleContext<'_>,
@@ -483,6 +379,21 @@ impl PostPolicy {
 struct Level {
     policy: PostPolicy,
     plan: HydrationPlan,
+    reads_soft_nsfw_new_user_drop: bool,
+}
+
+impl Level {
+    fn new(level: SafetyLevel, policy: PostPolicy) -> Self {
+        let plan = HydrationPlan::new(level, policy.hydrators);
+        let soft_nsfw_new_user_drop =
+            Predicate::Request(RequestLeaf::RequestHasSoftNsfwNewUserDrop);
+        Self {
+            reads_soft_nsfw_new_user_drop: policy.user.reads(soft_nsfw_new_user_drop)
+                || policy.post.reads(soft_nsfw_new_user_drop),
+            policy,
+            plan,
+        }
+    }
 }
 
 pub struct RuleEngine {
@@ -537,70 +448,56 @@ fn named<E: Engine>(
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AdmissionError {
-    MissingInputs(Hydrators),
+pub(crate) struct Admitted<'a> {
+    level: AdmittedLevel<'a>,
+    hydration: &'a Hydration,
 }
 
-pub(super) struct Admitted<'a> {
+#[derive(Clone, Copy)]
+struct AdmittedLevel<'a> {
     policy: &'a PostPolicy,
     viewer: &'a ViewerFeatures,
     country_lists: &'a CountryLists,
 }
 
-impl Admitted<'_> {
-    fn context<'c>(
-        &'c self,
-        candidate: &'c PostCandidate,
-        placement: Placement,
-    ) -> RuleContext<'c> {
-        let context = RuleContext::new(self.viewer, candidate, placement, self.country_lists);
-        #[cfg(test)]
-        let context = context.hydrated_by(self.policy.post.hydrators);
-        context
-    }
-
-    fn user_context<'c>(
-        &'c self,
-        user: &'c UserCandidate,
-        placement: Placement,
-    ) -> RuleContext<'c, UserCandidate> {
-        let context = RuleContext::new(self.viewer, user, placement, self.country_lists);
-        #[cfg(test)]
-        let context = context.hydrated_by(self.policy.user.hydrators);
-        context
-    }
-
-    fn evaluate_user(&self, user: &UserCandidate, placement: Placement) -> Evaluation {
-        self.policy
-            .user
-            .evaluate(&self.user_context(user, placement))
-    }
-
-    #[inline]
-    fn admit(&self, user: UserCandidate, placement: Placement) -> AdmittedUser<'_> {
-        AdmittedUser {
-            admitted: self,
-            user,
-            placement,
-        }
-    }
-}
-
-pub(crate) struct AdmittedPosts<'a> {
-    users: AdmittedUsers<'a>,
-}
-
-impl AdmittedPosts<'_> {
+impl<'a> Admitted<'a> {
     pub(crate) fn post(
         &self,
         tweet_id: TweetId,
         copied: bool,
         placement: Placement,
-    ) -> Option<AdmittedPost<'_>> {
-        let candidate = self.users.hydration.candidate(tweet_id, copied)?;
-        let author = self.users.post(tweet_id, placement)?;
+    ) -> Option<AdmittedPost<'a>> {
+        let candidate = self.hydration.candidate(tweet_id, copied)?;
+        let author = self.author(tweet_id, placement)?;
         Some(AdmittedPost { author, candidate })
+    }
+
+    pub(crate) fn author(
+        &self,
+        tweet_id: TweetId,
+        placement: Placement,
+    ) -> Option<AdmittedUser<'a>> {
+        let author =
+            self.hydration
+                .author(tweet_id, placement, self.level.policy.user.hydrators)?;
+        Some(self.level.admit_user(author, placement))
+    }
+
+    pub(crate) fn user(&self, id: AuthorId) -> Option<AdmittedUser<'a>> {
+        let user = self
+            .hydration
+            .user_candidate(id, self.level.policy.user.hydrators)?;
+        Some(self.level.admit_user(user, Placement::Standalone))
+    }
+}
+
+impl<'a> AdmittedLevel<'a> {
+    fn admit_user(self, user: UserCandidate, placement: Placement) -> AdmittedUser<'a> {
+        AdmittedUser {
+            level: self,
+            user,
+            placement,
+        }
     }
 }
 
@@ -621,27 +518,8 @@ impl AdmittedPost<'_> {
     }
 }
 
-pub(crate) struct AdmittedUsers<'a> {
-    admitted: Admitted<'a>,
-    hydration: &'a Hydration,
-}
-
-impl AdmittedUsers<'_> {
-    pub(crate) fn post(&self, tweet_id: TweetId, placement: Placement) -> Option<AdmittedUser<'_>> {
-        let reads = self.admitted.policy.user.hydrators;
-        let author = self.hydration.author(tweet_id, placement, reads)?;
-        Some(self.admitted.admit(author, placement))
-    }
-
-    pub(crate) fn user(&self, id: AuthorId) -> Option<AdmittedUser<'_>> {
-        let reads = self.admitted.policy.user.hydrators;
-        let user = self.hydration.user_candidate(id, reads)?;
-        Some(self.admitted.admit(user, Placement::Standalone))
-    }
-}
-
 pub(crate) struct AdmittedUser<'a> {
-    admitted: &'a Admitted<'a>,
+    level: AdmittedLevel<'a>,
     user: UserCandidate,
     placement: Placement,
 }
@@ -652,22 +530,43 @@ impl AdmittedUser<'_> {
     }
 
     pub(crate) fn evaluate(&self) -> Evaluation {
-        self.admitted.evaluate_user(&self.user, self.placement)
+        self.level.policy.user.evaluate(&self.user_context())
+    }
+
+    fn context<'c>(&'c self, candidate: &'c PostCandidate) -> RuleContext<'c> {
+        let AdmittedLevel {
+            viewer,
+            country_lists,
+            ..
+        } = self.level;
+        let context = RuleContext::new(viewer, candidate, self.placement, country_lists);
+        #[cfg(test)]
+        let context = context.hydrated_by(self.level.policy.post.hydrators);
+        context
+    }
+
+    fn user_context(&self) -> RuleContext<'_, UserCandidate> {
+        let AdmittedLevel {
+            viewer,
+            country_lists,
+            ..
+        } = self.level;
+        let context = RuleContext::new(viewer, &self.user, self.placement, country_lists);
+        #[cfg(test)]
+        let context = context.hydrated_by(self.level.policy.user.hydrators);
+        context
     }
 
     #[inline]
-    fn fold<O: PolicyObserver<UserEngine> + PolicyObserver<PostEngine>>(
+    fn fold<O: Observer<UserEngine> + Observer<PostEngine>>(
         &self,
         candidate: &PostCandidate,
         observer: &mut O,
     ) -> Evaluation {
-        let (admitted, placement) = (self.admitted, self.placement);
-        let folded = admitted
+        let folded = self.level.policy.fold_user(&self.user_context(), observer);
+        self.level
             .policy
-            .fold_user(&admitted.user_context(&self.user, placement), observer);
-        admitted
-            .policy
-            .gate(folded, &admitted.context(candidate, placement), observer)
+            .gate(folded, &self.context(candidate), observer)
     }
 }
 
@@ -686,12 +585,12 @@ impl RuleEngine {
                 let rules = level_rules.lists();
                 let policy =
                     PostPolicy::new(named(&mut names, rules.user), named(&mut names, rules.post));
-                let plan = HydrationPlan::new(level, policy.hydrators);
+                let entry = Level::new(level, policy);
                 assert!(
-                    plans_from_its_rows(level_rules, &plan),
+                    plans_from_its_rows(level_rules, &entry.plan),
                     "{level:?} plans keys its request rows cannot give"
                 );
-                Level { policy, plan }
+                entry
             })
             .collect();
         Self {
@@ -704,50 +603,54 @@ impl RuleEngine {
         &'a self,
         level: SafetyLevel,
         hydration: &'a Hydration,
-    ) -> Result<AdmittedPosts<'a>, AdmissionError> {
-        let policy = self.policy(level);
-        let viewer = hydration.viewer();
-        let logged_in = viewer.viewer.user_id().is_some();
-        let required = policy
-            .hydrators
-            .iter()
-            .filter(|&node| logged_in || !node.needs_viewer())
-            .fold(Hydrators::empty(), Hydrators::with);
-        let missing = required.difference(hydration.planned());
+    ) -> Option<Admitted<'a>> {
+        let missing = self.unplanned_inputs(level, hydration);
         if !missing.is_empty() {
-            return Err(AdmissionError::MissingInputs(missing));
+            warn!(
+                ?missing,
+                ?level,
+                "hydration not admitted by its level's policy; failing its candidates"
+            );
+            return None;
         }
-        Ok(AdmittedPosts {
-            users: AdmittedUsers {
-                admitted: Admitted {
-                    policy,
-                    viewer,
-                    country_lists: &self.country_lists,
-                },
-                hydration,
+        Some(Admitted {
+            level: AdmittedLevel {
+                policy: self.policy(level),
+                viewer: hydration.viewer(),
+                country_lists: &self.country_lists,
             },
+            hydration,
         })
     }
 
-    pub(crate) fn admit_users<'a>(
-        &'a self,
-        level: SafetyLevel,
-        hydration: &'a Hydration,
-    ) -> Result<AdmittedUsers<'a>, AdmissionError> {
-        debug_assert!(
-            matches!(level.spec().rules, LevelRules::UserOnly(_)),
-            "{level:?} judges a post"
-        );
-        self.admit(level, hydration).map(|posts| posts.users)
+    pub(crate) fn judges_only_users(&self, level: SafetyLevel) -> bool {
+        self.policy(level).post.rules.is_empty()
+    }
+
+    fn unplanned_inputs(&self, level: SafetyLevel, hydration: &Hydration) -> Hydrators {
+        let logged_in = hydration.viewer().viewer.user_id().is_some();
+        self.policy(level)
+            .hydrators
+            .iter()
+            .filter(|&node| logged_in || !node.needs_viewer())
+            .fold(Hydrators::empty(), Hydrators::with)
+            .difference(hydration.planned())
     }
 
     #[cfg(test)]
-    fn admitted<'a>(&'a self, level: SafetyLevel, viewer: &'a ViewerFeatures) -> Admitted<'a> {
-        Admitted {
+    fn admit_user<'a>(
+        &'a self,
+        level: SafetyLevel,
+        viewer: &'a ViewerFeatures,
+        user: UserCandidate,
+        placement: Placement,
+    ) -> AdmittedUser<'a> {
+        AdmittedLevel {
             policy: self.policy(level),
             viewer,
             country_lists: &self.country_lists,
         }
+        .admit_user(user, placement)
     }
 
     #[cfg(test)]
@@ -762,7 +665,7 @@ impl RuleEngine {
     }
 
     #[cfg(test)]
-    fn fold<O: PolicyObserver<UserEngine> + PolicyObserver<PostEngine>>(
+    fn fold<O: Observer<UserEngine> + Observer<PostEngine>>(
         &self,
         level: SafetyLevel,
         viewer: &ViewerFeatures,
@@ -770,14 +673,14 @@ impl RuleEngine {
         placement: Placement,
         observer: &mut O,
     ) -> Evaluation {
-        let admitted = self.admitted(level, viewer);
         let author = UserCandidate {
             failed: candidate
                 .failed
-                .intersection(admitted.policy.user.hydrators),
+                .intersection(self.policy(level).user.hydrators),
             ..UserCandidate::author_of(candidate)
         };
-        admitted.admit(author, placement).fold(candidate, observer)
+        self.admit_user(level, viewer, author, placement)
+            .fold(candidate, observer)
     }
 
     #[cfg(test)]
@@ -788,11 +691,8 @@ impl RuleEngine {
         user: &UserCandidate,
         placement: Placement,
     ) -> Evaluation {
-        debug_assert!(
-            matches!(level.spec().rules, LevelRules::UserOnly(_)),
-            "{level:?} judges a post"
-        );
-        self.admitted(level, viewer).evaluate_user(user, placement)
+        self.admit_user(level, viewer, user.clone(), placement)
+            .evaluate()
     }
 
     fn level(&self, level: SafetyLevel) -> &Level {
@@ -813,92 +713,13 @@ impl RuleEngine {
         &self.level(level).plan
     }
 
+    pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {
+        self.level(level).reads_soft_nsfw_new_user_drop
+    }
+
     #[cfg(test)]
     pub(crate) fn wired_rule_names(&self, level: SafetyLevel) -> Vec<&'static str> {
         self.policy(level).rule_names()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PolicyTrace {
-    pub evaluation: Evaluation,
-    pub nodes: Vec<NodeTrace>,
-    pub rows: Vec<RowTrace>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RowTrace {
-    pub by: &'static str,
-    pub root: usize,
-    pub truth: Truth,
-    pub effect: Effect,
-    pub defaults_admitted: Hydrators,
-    pub defaults_retained: Hydrators,
-    pub completed: Option<Completed>,
-}
-
-#[derive(Default)]
-struct Total {
-    tracer: NodeTracer,
-    rows: Vec<(Bucket, RowTrace)>,
-}
-
-impl Total {
-    fn into_trace(self, evaluation: Evaluation) -> PolicyTrace {
-        PolicyTrace {
-            evaluation,
-            nodes: self.tracer.nodes,
-            rows: self.rows.into_iter().map(|(_, row)| row).collect(),
-        }
-    }
-}
-
-impl<E: Engine> NodeObserver<E> for Total {
-    const TOTAL: bool = true;
-    type Handle = usize;
-
-    fn enter(
-        &mut self,
-        node: Option<RuleCond<E>>,
-        parent: Option<usize>,
-        skip: Option<Skip<usize>>,
-    ) -> usize {
-        NodeObserver::<E>::enter(&mut self.tracer, node, parent, skip)
-    }
-
-    fn finish(&mut self, handle: usize, truth: Truth) {
-        NodeObserver::<E>::finish(&mut self.tracer, handle, truth);
-    }
-}
-
-impl<E: Engine> PolicyObserver<E> for Total {
-    fn row(
-        &mut self,
-        by: &'static str,
-        root: usize,
-        truth: Truth,
-        effect: Effect,
-        (bucket, defaults_admitted): (Bucket, Hydrators),
-        completed: Option<Completed>,
-    ) {
-        self.rows.push((
-            bucket,
-            RowTrace {
-                by,
-                root,
-                truth,
-                effect,
-                defaults_admitted,
-                defaults_retained: Hydrators::empty(),
-                completed,
-            },
-        ));
-    }
-
-    fn retained(&mut self, defaults: Defaults) {
-        for (bucket, row) in &mut self.rows {
-            row.defaults_retained = row.defaults_admitted.intersection(defaults.get(*bucket));
-        }
     }
 }
 
@@ -915,7 +736,7 @@ impl Policy {
 pub(super) struct WiredRule<'a, E: Engine = PostEngine> {
     pub(super) name: &'static str,
     pub(super) action: &'a ActionSpec<E>,
-    pub(super) when: RuleCond<E>,
+    pub(super) when: rule::RuleCond<E>,
 }
 
 #[cfg(test)]
@@ -955,9 +776,7 @@ impl RuleEngine {
         post: Vec<(&'static str, Rule)>,
     ) -> Self {
         let mut engine = Self::for_tests();
-        let policy = PostPolicy::new(user, post);
-        let plan = HydrationPlan::new(level, policy.hydrators);
-        engine.levels[level as usize] = Level { policy, plan };
+        engine.levels[level as usize] = Level::new(level, PostPolicy::new(user, post));
         engine
     }
 }
@@ -968,15 +787,13 @@ mod tests {
     use crate::hydration::Hydrator;
     use crate::models::Withholding;
     use crate::models::{
-        AuthorFeatures, ClientCapability, DropReason, NsfwViewerDropReason, SafetyLabelMap,
-        SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
+        AuthorFeatures, ClientCapability, DropReason, NsfwViewerDropReason, SafetyLabelType,
+        VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
         candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
     };
-    use crate::rules::rule_spec::rule::RuleCond;
-    use crate::rules::rule_spec::{spelled_label, FosnrNotice};
-    use crate::rules::{test_context, tweet_rules};
+    use crate::rules::test_context;
 
     #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
@@ -1185,158 +1002,6 @@ country_specific_nsfw_content_gating:
         context.acquire_edge(Hydrator::Follows);
     }
 
-    #[test]
-    fn each_rule_name_wires_the_same_rules_at_every_level() {
-        const WIRED_DIFFERENTLY: [&str; 6] = [
-            "nsfw_high_precision/blur/nudity",
-            "nsfw_high_precision/blur/sensitive",
-            "gore_and_violence_high_precision/blur",
-            "nsfw_card_image/blur/sensitive",
-            "nsfw_admin/blur/sensitive",
-            "nsfw_user/blur/sensitive_user",
-        ];
-        let rule_engine = RuleEngine::for_tests();
-        let mut first: Vec<(&str, SafetyLevel, Vec<String>)> = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            let policy = rule_engine.policy(level);
-            for name in policy.rule_names() {
-                let user = policy
-                    .user
-                    .rules
-                    .iter()
-                    .filter(|&&(other, _)| other == name);
-                let post = policy
-                    .post
-                    .rules
-                    .iter()
-                    .filter(|&&(other, _)| other == name);
-                let rules: Vec<String> = user
-                    .map(|(_, rule)| rule.authored())
-                    .chain(post.map(|(_, rule)| rule.authored()))
-                    .collect();
-                match first.iter().find(|(other, ..)| *other == name) {
-                    None => first.push((name, level, rules)),
-                    Some((_, first_level, wired)) => assert!(
-                        *wired == rules || WIRED_DIFFERENTLY.contains(&name),
-                        "{name} wires other rules at {level:?} than at {first_level:?}: \
-                         wire the same rules at every level, or give the {level:?} \
-                         rules their own RuleId"
-                    ),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn each_rule_of_a_rule_id_names_the_same_labels() {
-        fn labels<E: Engine>(rules: &[&Rule<E>]) -> Vec<(RuleId, String, Vec<String>)> {
-            rules
-                .iter()
-                .map(|rule| {
-                    let mut labels: Vec<String> = rule
-                        .when
-                        .conjuncts()
-                        .iter()
-                        .filter_map(|condition| condition.own_tweet_label())
-                        .collect();
-                    labels.sort_unstable();
-                    (rule.id, rule.name(), labels)
-                })
-                .collect()
-        }
-        let mut first: Vec<(RuleId, String, Vec<String>)> = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            let rules = level.spec().rules.lists();
-            for (id, name, labels) in labels(rules.user).into_iter().chain(labels(rules.post)) {
-                match first.iter().find(|(other, ..)| *other == id) {
-                    None => first.push((id, name, labels)),
-                    Some((_, other, read)) => assert!(
-                        *read == labels,
-                        "{name} names the labels {labels:?} but {other}, a rule of the same \
-                         RuleId, names {read:?}: copy the label conditions of {other}, or give it \
-                         its own RuleId"
-                    ),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn each_fosnr_violation_has_a_label_drop_and_each_fosnr_label_drop_a_violation() {
-        let rule_engine = RuleEngine::for_tests();
-        let mut dropped = Vec::new();
-        for &level in SafetyLevel::VARIANTS {
-            for (name, rule) in &rule_engine.policy(level).post.rules {
-                let id: &str = rule.id.into();
-                let RuleCond::All([only]) = rule.when else {
-                    continue;
-                };
-                let [label] = only.positive_tweet_labels()[..] else {
-                    continue;
-                };
-                if !id.starts_with("fosnr") {
-                    continue;
-                }
-                assert!(
-                    tweet_rules::FOSNR_AUTHOR_VIOLATIONS
-                        .iter()
-                        .any(|violation| violation.label == label),
-                    "{name} drops a FOSNR label FOSNR_AUTHOR_VIOLATIONS does not name: add its \
-                     row to FOSNR_AUTHOR_VIOLATIONS in src/rules/tweet_rules.rs"
-                );
-                dropped.push(label);
-            }
-        }
-        for violation in &tweet_rules::FOSNR_AUTHOR_VIOLATIONS {
-            assert!(
-                dropped.contains(&violation.label),
-                "FOSNR_AUTHOR_VIOLATIONS names {:?} but no level drops it: add a `const \
-                 FOSNR_<LABEL>_DROP_UNDESIRABLE: Rule` reading it and list it in the levels",
-                xai_safety_label_store::types::label_meta(violation.label).map(|meta| meta.ident),
-            );
-        }
-    }
-
-    #[test]
-    fn a_notice_reads_the_labels_it_names() {
-        let rule_engine = RuleEngine::for_tests();
-        for &level in SafetyLevel::VARIANTS {
-            for (name, rule) in &rule_engine.policy(level).post.rules {
-                let mut read = rule.when.positive_tweet_labels();
-                let mut named: Vec<SafetyLabelType> = match rule.action.spec() {
-                    ActionSpec::SoftIntervention(FosnrNotice { label, .. }) => vec![*label],
-                    ActionSpec::Appealable(violations) => {
-                        violations.iter().map(|violation| violation.label).collect()
-                    }
-                    ActionSpec::LabelInterstitial(spec) => {
-                        for label in spec.labels() {
-                            assert!(
-                                SafetyLabelMap::SOURCE_READ_LABELS.contains(label),
-                                "{name} reads the source of {} but SafetyLabelMap drops it: add \
-                                 the label to SafetyLabelMap::SOURCE_READ_LABELS",
-                                spelled_label(*label),
-                            );
-                        }
-                        spec.labels().to_vec()
-                    }
-                    ActionSpec::Drop(_)
-                    | ActionSpec::Tombstone(_)
-                    | ActionSpec::MediaRestriction(_)
-                    | ActionSpec::LimitedEngagement(_) => continue,
-                };
-                read.sort_by_key(|label| label.0);
-                named.sort_by_key(|label| label.0);
-                assert!(
-                    read == named,
-                    "{name} names {:?} but its conditions read {:?}: make `when` read exactly the \
-                     labels its action names",
-                    named.into_iter().map(spelled_label).collect::<Vec<_>>(),
-                    read.into_iter().map(spelled_label).collect::<Vec<_>>(),
-                );
-            }
-        }
-    }
-
     mod engine {
         use super::super::*;
         use crate::hydration::Hydrator;
@@ -1348,6 +1013,7 @@ country_specific_nsfw_content_gating:
         };
         use crate::rules::fixtures::{allow, author_viewer, blurred, candidate, viewer, VIEWER_ID};
         use crate::rules::rule_spec::leaves::*;
+        use crate::rules::rule_spec::observed::Skip;
         use crate::rules::rule_spec::rule::Audience::{Everyone, NonFollowers};
         use crate::rules::rule_spec::rule::{all, any, NamedCond, RuleCond, UserRule};
         use crate::rules::rule_spec::{drop_post, limit, soft_intervention, ActionSpec, DropAs};
@@ -1821,7 +1487,7 @@ country_specific_nsfw_content_gating:
         use crate::rules::golden_corpus::post_cases;
         use crate::rules::rule_spec::conditions::VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES;
         use crate::rules::rule_spec::leaves::*;
-        use crate::rules::rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
+        use crate::rules::rule_spec::observed::{NodeKind, NodeTrace, RowTrace, Skip, Witness};
         use crate::rules::rule_spec::rule::{
             all, any, Audience, DescriptionError, NamedCond, RuleCond,
         };
@@ -2310,11 +1976,10 @@ country_specific_nsfw_content_gating:
                 .tweet(TweetId(1))
                 .and_then(|tweet| tweet.candidate())
                 .is_some());
-            let Err(AdmissionError::MissingInputs(missing)) =
-                rule_engine.admit(SafetyLevel::TimelineHome, &unplanned)
-            else {
-                panic!("an unplanned hydration is admitted");
-            };
+            assert!(rule_engine
+                .admit(SafetyLevel::TimelineHome, &unplanned)
+                .is_none());
+            let missing = rule_engine.unplanned_inputs(SafetyLevel::TimelineHome, &unplanned);
             assert!(
                 missing.contains(Hydrator::Follows) && missing.contains(Hydrator::AuthorSafety),
                 "{missing:?}"
@@ -2323,7 +1988,7 @@ country_specific_nsfw_content_gating:
             let planned = hydrate(rule_engine.plan(SafetyLevel::TimelineHome)).await;
             assert!(rule_engine
                 .admit(SafetyLevel::TimelineHome, &planned)
-                .is_ok());
+                .is_some());
         }
 
         #[tokio::test]
@@ -2349,14 +2014,17 @@ country_specific_nsfw_content_gating:
                 Hydrators::empty(),
             ))
             .await;
+            assert!(rule_engine
+                .admit(SafetyLevel::FilterAll, &unplanned)
+                .is_none());
             assert_eq!(
-                rule_engine.admit(SafetyLevel::FilterAll, &unplanned).err(),
-                Some(AdmissionError::MissingInputs(Hydrators::of(
-                    Hydrator::Follows
-                )))
+                rule_engine.unplanned_inputs(SafetyLevel::FilterAll, &unplanned),
+                Hydrators::of(Hydrator::Follows)
             );
             let planned = hydrate(rule_engine.plan(SafetyLevel::FilterAll)).await;
-            assert!(rule_engine.admit(SafetyLevel::FilterAll, &planned).is_ok());
+            assert!(rule_engine
+                .admit(SafetyLevel::FilterAll, &planned)
+                .is_some());
         }
 
         #[tokio::test]
@@ -2389,7 +2057,7 @@ country_specific_nsfw_content_gating:
                 HydrationRequest::for_users(50, vec![AuthorId(10), AuthorId(20)], &caches),
             )
             .await;
-            let users = rule_engine.admit_users(level, &hydration).unwrap();
+            let users = rule_engine.admit(level, &hydration).unwrap();
             let verdict = |id| {
                 users
                     .user(AuthorId(id))

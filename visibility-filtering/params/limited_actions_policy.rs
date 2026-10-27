@@ -1,4 +1,4 @@
-use crate::models::LimitedEngagementReason;
+use crate::models::{LimitedActionType, LimitedEngagementReason};
 use crate::params::limited_actions_copy::{Prompt, PromptCopy};
 use xai_feature_switches::FeatureSwitchResults;
 use xai_stats_receiver::StatsReceiverExt;
@@ -10,37 +10,6 @@ const COPY_NAMESPACE_KEY: &str = "limited_actions_policy_copy_namespace";
 const PROMPT_TYPE_KEY: &str = "limited_actions_policy_prompt_type";
 const LEARN_MORE_URL_KEY: &str = "limited_actions_policy_prompt_learn_more_url";
 const MISSING_POLICY_COUNTER: &str = "limited_actions_policy_missing";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
-#[strum(serialize_all = "snake_case")]
-pub enum LimitedActionType {
-    Reply,
-    Retweet,
-    QuoteTweet,
-    Like,
-    React,
-    SendViaDm,
-    AddToBookmarks,
-    AddToMoment,
-    PinToProfile,
-    ViewTweetActivity,
-    ShareTweetVia,
-    Follow,
-    ListsAddRemove,
-    MuteConversation,
-    Embed,
-    ViewHiddenReplies,
-    HideCommunityTweet,
-    CopyLink,
-    VoteOnPoll,
-    RemoveFromCommunity,
-    ShowRetweetActionMenu,
-    ReplyDownVote,
-    Autoplay,
-    EditTweet,
-    Highlight,
-    ViewPostEngagements,
-}
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -345,12 +314,11 @@ mod tests {
                 .filter_map(|(_, namespace, actions)| Some(((*namespace)?, actions.as_slice()))),
         );
         let stats = Counted::default();
-        let policies = ClientSwitches::for_tests().limited_actions_policies(
+        let policies = ClientSwitches::for_tests_with(copy).limited_actions_policies(
             None,
             None,
             None,
             expected.iter().map(|(reason, _, _)| *reason),
-            &copy,
             Some(&stats),
         );
         for (reason, namespace, actions) in expected {
@@ -388,16 +356,18 @@ limited_actions_policy:
     values:
       limited_actions_policy_limited_actions: ["no_such_action"]
 "#;
-        let switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(
-            FeatureSwitches::load_string(POLICY).unwrap(),
-        )));
+        let switches = ClientSwitches::new(
+            Arc::new(ArcSwap::from_pointee(
+                FeatureSwitches::load_string(POLICY).unwrap(),
+            )),
+            LimitedActionsCopy::from_json("[]"),
+        );
         let stats = Counted::default();
         let policies = switches.limited_actions_policies(
             None,
             None,
             None,
             [StaleTweet, ConversationControl, BlockedViewer, StaleTweet],
-            &LimitedActionsCopy::from_json("[]"),
             Some(&stats),
         );
         assert_eq!(

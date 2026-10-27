@@ -1450,11 +1450,19 @@ message TweetInfo {
   uint64 notificationClickCount = 43;
   uint64 notificationDismissCount = 44;
   uint64 notificationSeeLessOftenCount = 45;
+  SearchAuthorMatch searchAuthorMatch = 46;
+  bool hasVideo = 47;
+  bool hasImage = 48;
 }
 
 message SearchLexicalMatch {
   float matchedWordFraction = 1;
   bool exactPhrase = 2;
+}
+
+message SearchAuthorMatch {
+  bool authorHandleExact = 1;
+  float authorNameOverlap = 2;
 }
 
 message PostEngagerFeatures {

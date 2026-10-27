@@ -8,8 +8,7 @@ pub use xai_abuse_enforcement_types::backfill::*;
 use xai_abuse_proto::enforcement as abuse_proto;
 
 use crate::action_control::{
-    ActionControl, CONFIRM_WORD, ControlConfig, ControlStore, DRY_RUN_LABEL_PREFIX, entity_of,
-    lkey_for,
+    ActionControl, CONFIRM_WORD, ControlStore, DRY_RUN_LABEL_PREFIX, entity_of, lkey_for,
 };
 use crate::backfill_claims::{ClaimStore, KeyLocks};
 use crate::facts::{EntityType, Facts, GizmoduckFacts};
@@ -720,7 +719,6 @@ impl Backfill {
         key_id: &str,
         cfg: &BackfillConfig,
         control: &ActionControl,
-        control_cfg: &ControlConfig,
         off_switch: &OffSwitch,
         now_ms: i64,
     ) -> Result<(BackfillRunRecord, bool), RunError> {
@@ -776,10 +774,6 @@ impl Backfill {
                 Some(Box::new(existing)),
             ));
         }
-        let entity = match req.entity {
-            ControlEntity::User => EntityType::User,
-            ControlEntity::Post => EntityType::Post,
-        };
         let scope = lkey_for(req.entity, &req.head, req.classifier.as_deref(), None);
         let current = control
             .stored_version(&scope)
@@ -812,31 +806,6 @@ impl Backfill {
         let factory = seen
             .iter()
             .any(|s| s.factory && s.head == req.head && s.entity_type == req.entity);
-        let weak = if factory {
-            Vec::new()
-        } else {
-            control.weak_rows(
-                entity,
-                &req.head,
-                req.classifier.as_deref(),
-                &req.levels,
-                control_cfg,
-                now_ms,
-            )
-        };
-        if !weak.is_empty() {
-            return Err(RunError::Conflict(
-                "weak_evidence",
-                format!(
-                    "the evidence of {} doesn't clear its floor now",
-                    weak.iter()
-                        .map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                None,
-            ));
-        }
         let runs = self
             .list()
             .await
@@ -1014,8 +983,6 @@ impl Backfill {
         who: Option<&str>,
         key_id: &str,
         cfg: &BackfillConfig,
-        control: &ActionControl,
-        control_cfg: &ControlConfig,
         off_switch: &OffSwitch,
         now_ms: i64,
     ) -> Result<BackfillRunRecord, RunError> {
@@ -1144,34 +1111,6 @@ impl Backfill {
                 .is_some()
             {
                 return conflict("switched_off", "the model is still switched off".into());
-            }
-            let entity = match stored.entity {
-                ControlEntity::User => EntityType::User,
-                ControlEntity::Post => EntityType::Post,
-            };
-            let weak = if stored.factory {
-                Vec::new()
-            } else {
-                control.weak_rows(
-                    entity,
-                    &stored.head,
-                    stored.classifier.as_deref(),
-                    &stored.levels,
-                    control_cfg,
-                    now_ms,
-                )
-            };
-            if !weak.is_empty() {
-                return conflict(
-                    "weak_evidence",
-                    format!(
-                        "the evidence of {} doesn't clear its floor now",
-                        weak.iter()
-                            .map(|r| r.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
             }
         }
         let mut next = stored.clone();
@@ -1479,22 +1418,12 @@ mod tests {
         key: &str,
         who: Option<&str>,
     ) -> Result<(BackfillRunRecord, bool), RunError> {
-        bf.start(
-            req,
-            who,
-            key,
-            &config("page", "sender", 10),
-            ac,
-            &ControlConfig::default(),
-            sw,
-            NOW,
-        )
-        .await
+        bf.start(req, who, key, &config("page", "sender", 10), ac, sw, NOW)
+            .await
     }
 
     async fn change(
         bf: &Backfill,
-        ac: &ActionControl,
         sw: &OffSwitch,
         id: &str,
         c: Change,
@@ -1513,8 +1442,6 @@ mod tests {
             Some("operator@example.com"),
             key,
             &config("page", "sender", 10),
-            ac,
-            &ControlConfig::default(),
             sw,
             at,
         )
@@ -1586,7 +1513,6 @@ mod tests {
                 "page",
                 &cfg,
                 &ac,
-                &ControlConfig::default(),
                 &sw,
                 NOW,
             )
@@ -2102,7 +2028,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 "run-00000001",
                 Change::Resume,
@@ -2533,38 +2458,77 @@ mod tests {
         });
     }
 
-                    #[tokio::test]
-    async fn a_factory_head_starts_without_the_row_evidence_check() {
+                #[tokio::test]
+    async fn a_run_starts_without_evidence_and_is_marked_factory_from_the_seen_list() {
         let (store, bf, _, sw) = parts();
         let control = Arc::new(MemControlStore::default());
         high_row(&control, "H", true, None);
         high_row(&control, "F", false, None);
         let ac = ActionControl::new(control.clone(), "test".into(), String::new());
         ac.refresh().await.unwrap();
-        let req = || BackfillRunStartRequest {
+        let req = |run_id: &str| BackfillRunStartRequest {
             levels: vec![LevelRow::High],
             expected_control_version: Some(1),
-            ..start_request("run-00000001", "H", NOW)
+            ..start_request(run_id, "H", NOW)
         };
-        assert!(matches!(
-            start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await,
-            Err(RunError::Conflict("weak_evidence", ..))
-        ));
+        let (rec, created) = start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000000"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            created && !rec.factory,
+            "a high row with no evidence starts"
+        );
+        assert_eq!(rec.state, RunState::Running);
+        change(
+            &bf,
+            &sw,
+            &rec.run_id,
+            Change::Stop,
+            1,
+            "page",
+            None,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
         seen_factory(&control, "H");
         control
             .fail_scan
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        match start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await {
+        match start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000001"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        {
             Err(RunError::Store(msg)) => assert!(msg.contains("seen list"), "{msg}"),
             other => panic!("expected a store error, got {other:?}"),
         }
-        assert!(store.pkey_rows(RUN_PKEY).is_empty(), "nothing written");
+        assert_eq!(store.pkey_rows(RUN_PKEY).len(), 1, "nothing more written");
         control
             .fail_scan
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let (rec, created) = start(&bf, &ac, &sw, req(), "page", Some("a@example.com"))
-            .await
-            .unwrap();
+        let (rec, created) = start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000001"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        .unwrap();
         assert!(created && rec.factory);
         assert_eq!(rec.state, RunState::Running);
         seen_factory(&control, "F");
@@ -2580,7 +2544,7 @@ mod tests {
     }
 
             #[tokio::test]
-    async fn resume_skips_the_row_evidence_check_only_for_a_factory_run() {
+    async fn resume_does_not_look_at_evidence() {
         const DAY: i64 = 86_400_000;
         let now = crate::now_millis();
         let (_, bf, _, sw) = parts();
@@ -2597,7 +2561,7 @@ mod tests {
         seen_factory(&control, "F");
         let ac = ActionControl::new(control.clone(), "test".into(), String::new());
         ac.refresh().await.unwrap();
-        for (head, run_id, refused) in [("N", "run-0000000n", true), ("F", "run-0000000f", false)] {
+        for (head, run_id, factory) in [("N", "run-0000000n", false), ("F", "run-0000000f", true)] {
             let req = BackfillRunStartRequest {
                 levels: vec![LevelRow::High],
                 expected_control_version: Some(1),
@@ -2610,28 +2574,17 @@ mod tests {
                     "page",
                     &config("page", "sender", 10),
                     &ac,
-                    &ControlConfig::default(),
                     &sw,
                     now,
                 )
                 .await
                 .unwrap();
-            change(
-                &bf,
-                &ac,
-                &sw,
-                run_id,
-                Change::Pause,
-                1,
-                "page",
-                None,
-                now + 1,
-            )
-            .await
-            .unwrap();
+            assert_eq!(rec.factory, factory);
+            change(&bf, &sw, run_id, Change::Pause, 1, "page", None, now + 1)
+                .await
+                .unwrap();
             let resumed = change(
                 &bf,
-                &ac,
                 &sw,
                 run_id,
                 Change::Resume,
@@ -2641,16 +2594,7 @@ mod tests {
                 now + 2 * DAY,
             )
             .await;
-            if refused {
-                assert!(!rec.factory);
-                assert!(
-                    matches!(resumed, Err(RunError::Conflict("weak_evidence", ..))),
-                    "{resumed:?}"
-                );
-            } else {
-                assert!(rec.factory);
-                assert_eq!(resumed.unwrap().state, RunState::Running);
-            }
+            assert_eq!(resumed.unwrap().state, RunState::Running, "{head}");
         }
     }
 
@@ -2663,14 +2607,14 @@ mod tests {
             .unwrap();
         let id = rec.run_id.as_str();
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Pause, 1, "sender", None, NOW + 1).await,
+            change(&bf, &sw, id, Change::Pause, 1, "sender", None, NOW + 1).await,
             Err(RunError::Forbidden(..))
         ));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Pause, 7, "page", None, NOW + 1).await,
+            change(&bf, &sw, id, Change::Pause, 7, "page", None, NOW + 1).await,
             Err(RunError::Conflict("version_conflict", ..))
         ));
-        let p = change(&bf, &ac, &sw, id, Change::Pause, 1, "page", None, NOW + 1)
+        let p = change(&bf, &sw, id, Change::Pause, 1, "page", None, NOW + 1)
             .await
             .unwrap();
         assert_eq!(
@@ -2679,16 +2623,15 @@ mod tests {
         );
         assert_eq!(gate(&p, NOW + 2), Err(STATUS_RUN_PAUSED));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Done, 2, "sender", None, NOW + 2).await,
+            change(&bf, &sw, id, Change::Done, 2, "sender", None, NOW + 2).await,
             Err(RunError::Conflict("not_running", ..))
         ));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Resume, 2, "page", None, NOW + 2).await,
+            change(&bf, &sw, id, Change::Resume, 2, "page", None, NOW + 2).await,
             Err(RunError::Invalid("confirm_required", _))
         ));
         let r = change(
             &bf,
-            &ac,
             &sw,
             id,
             Change::Resume,
@@ -2700,7 +2643,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.state, RunState::Running);
-        let d = change(&bf, &ac, &sw, id, Change::Done, 3, "sender", None, NOW + 3)
+        let d = change(&bf, &sw, id, Change::Done, 3, "sender", None, NOW + 3)
             .await
             .unwrap();
         assert_eq!(d.state, RunState::Done);
@@ -2713,7 +2656,7 @@ mod tests {
         );
         assert_eq!(gate(&d, done_at + DONE_DRAIN_MS + 1), Err(STATUS_RUN_DONE));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Stop, 4, "page", None, NOW + 4).await,
+            change(&bf, &sw, id, Change::Stop, 4, "page", None, NOW + 4).await,
             Err(RunError::Conflict("already_final", ..))
         ));
         assert_eq!(d.history.len(), 4);
@@ -2728,7 +2671,6 @@ mod tests {
             .unwrap();
         let s = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2743,7 +2685,6 @@ mod tests {
         for c in [Change::Pause, Change::Resume, Change::Stop, Change::Done] {
             let r = change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 c,
@@ -2800,7 +2741,6 @@ mod tests {
         bf.hold_for_off_switch(&rec, NOW + 1).await.unwrap();
         change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2827,7 +2767,6 @@ mod tests {
             .unwrap();
         change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Pause,
@@ -2848,7 +2787,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Resume,
@@ -2873,7 +2811,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 "run-unstart1",
                 Change::Resume,
@@ -2896,7 +2833,6 @@ mod tests {
             .unwrap();
         let stopped = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2922,7 +2858,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Pause,
@@ -2956,7 +2891,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Done,
@@ -2970,7 +2904,6 @@ mod tests {
         ));
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3011,7 +2944,6 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3041,7 +2973,6 @@ mod tests {
             .unwrap();
         let p = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Pause,
@@ -3055,7 +2986,6 @@ mod tests {
         let late = p.paused_at_ms.unwrap() + MAX_PAUSE_MS + 1;
         match change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3075,7 +3005,6 @@ mod tests {
         let ok = p.paused_at_ms.unwrap() + MAX_PAUSE_MS;
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3091,7 +3020,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Resume,
@@ -3106,7 +3034,6 @@ mod tests {
         assert!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Stop,

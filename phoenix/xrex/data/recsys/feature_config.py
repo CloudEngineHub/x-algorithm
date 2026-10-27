@@ -156,6 +156,7 @@ OPTIONAL_COLUMNS: list[str] = [
     "sample_source",
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
+    "lineItemIdSeq",
     "auxValueContentViewRatioSeq",
     "auxValueContentViewValidSeq",
     "auxValueContentViewBaselineMeanUsdSeq",

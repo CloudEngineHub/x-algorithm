@@ -54,6 +54,8 @@ from xrex.data.recsys.feature_config import (
 from xrex.data.recsys.recsys_batch import (
     AUX_VALUE_EVENTS,
     EMBEDDING_CONFIG,
+    VALUE_LINE_ITEM_KEY,
+    VALUE_LINE_ITEM_OPERAND,
     EmbeddingType,
     RecsysFeaturesBatch,
     aux_value_label_keys,
@@ -123,6 +125,8 @@ from xrex.models.value_heads import (
     PURCHASE_VALUE_METRIC_PREFIX,
     PURCHASE_VALUE_VT_METRIC_PREFIX,
     VALUE_EMA_STATE_SIZE,
+    WITHIN_LI_SLICES,
+    WITHIN_LI_STATE_COLS,
     ValueBinTable,
     value_binned_sums_key,
     value_head_loss_compute,
@@ -131,6 +135,8 @@ from xrex.models.value_heads import (
     value_sums_key,
     value_valid_mask,
     value_valid_weights,
+    value_within_li_smoothed_stats,
+    within_li_ema_key,
 )
 from xrex.utils.sharding import with_sharding_constraint_unless_manual
 from xrex.utils.utils import Summary, dump_to_file
@@ -967,6 +973,10 @@ class RecsysAggregatedModelConfig(Config):
     purchase_value_history_tower: bool = False
     purchase_value_history_tower_hidden: int = 64
     purchase_value_history_tower_proj: int = 32
+    purchase_value_history_ratio_features: bool = False
+    purchase_value_within_li_metric: bool = False
+    purchase_value_within_li_buckets: int = 1 << 16
+    purchase_value_within_li_windows: tuple[int, ...] = ()
     aux_value_heads: tuple[AuxValueHeadConfig, ...] = ()
     aux_value_head_weights: str = ""
     aux_value_head_type: str = "binned"
@@ -1009,14 +1019,33 @@ class RecsysAggregatedModelConfig(Config):
 
     @property
     def aux_value_events(self) -> tuple[str, ...]:
-        return tuple(head.event for head in self.active_aux_value_heads)
+        events = tuple(head.event for head in self.active_aux_value_heads)
+        if self.purchase_value_enabled and self.purchase_value_within_li_metric:
+            events = (*events, VALUE_LINE_ITEM_OPERAND)
+        return events
+
+    @property
+    def within_li_windows(self) -> tuple[int, ...]:
+        return self.purchase_value_within_li_windows or self.purchase_value_smoothing_windows
 
     def value_head_ema_keys(self) -> dict[str, jax.Array]:
-        return {
+        keys = {
             f"{head.ema_key}/{ws}": jnp.zeros((VALUE_EMA_STATE_SIZE,), dtype=jnp.float32)
             for head in self.value_heads()
             for ws in head.smoothing_windows
         }
+        if self.purchase_value_enabled and self.purchase_value_within_li_metric:
+            shape = (self.purchase_value_within_li_buckets, WITHIN_LI_STATE_COLS)
+            keys.update(
+                {
+                    within_li_ema_key(PURCHASE_VALUE_EMA_KEY, name, ws): jnp.zeros(
+                        shape, dtype=jnp.float32
+                    )
+                    for name in WITHIN_LI_SLICES
+                    for ws in self.within_li_windows
+                }
+            )
+        return keys
 
     def value_heads(self) -> tuple[ValueHead, ...]:
         heads: list[ValueHead] = []
@@ -1093,6 +1122,25 @@ class RecsysAggregatedModelConfig(Config):
                 raise ValueError("purchase_value_history_tower is not supported with use_seqpack")
             if self.num_continuous_actions <= WEB_CONV_VALUE_USD_IDX:
                 raise ValueError("purchase_value_history_tower needs history value slot 6")
+        if self.purchase_value_history_ratio_features:
+            if not self.purchase_value_history_tower:
+                raise ValueError(
+                    "purchase_value_history_ratio_features needs purchase_value_history_tower"
+                )
+            if self.num_continuous_actions <= WEB_CONV_VALUE_RATIO_IDX:
+                raise ValueError("purchase_value_history_ratio_features needs history slot 7")
+        if self.purchase_value_within_li_metric:
+            if not self.purchase_value_enabled:
+                raise ValueError("purchase_value_within_li_metric needs the purchase-value head")
+            if self.use_seqpack:
+                raise ValueError(
+                    "purchase_value_within_li_metric is not supported with use_seqpack"
+                )
+            buckets = self.purchase_value_within_li_buckets
+            if buckets < 2 or buckets & (buckets - 1):
+                raise ValueError("purchase_value_within_li_buckets must be a power of two >= 2")
+            if any(w <= 0 for w in self.purchase_value_within_li_windows):
+                raise ValueError("purchase_value_within_li_windows must be positive sample counts")
         if not self.purchase_value_enabled:
             return
         if self.num_continuous_actions <= PURCHASE_VALUE_ACTION_INDEX:
@@ -1740,6 +1788,7 @@ def normalize_web_conv_value(values: jax.Array, usd_cap: float, ratio_cap: float
 
 
 PURCHASE_VALUE_HISTORY_FEATURES = 9
+PURCHASE_VALUE_HISTORY_RATIO_FEATURES = 7
 
 
 def purchase_value_history_features(
@@ -1748,6 +1797,7 @@ def purchase_value_history_features(
     history_impr_ts: jax.Array,
     candidate_auth_hashes: jax.Array,
     usd_cap: float,
+    ratio_cap: float | None = None,
 ) -> jax.Array:
     usd = history_continuous_actions[..., WEB_CONV_VALUE_USD_IDX].astype(jnp.float32)
     valid = jnp.isfinite(usd) & (usd > 0)
@@ -1788,7 +1838,47 @@ def purchase_value_history_features(
         axis=-1,
     )
     user = jnp.broadcast_to(user[:, None, :], per_candidate.shape[:2] + (user.shape[-1],))
-    return jnp.concatenate([per_candidate, user], axis=-1)
+    if ratio_cap is None:
+        return jnp.concatenate([per_candidate, user], axis=-1)
+
+    ratio = history_continuous_actions[..., WEB_CONV_VALUE_RATIO_IDX].astype(jnp.float32)
+    valid_r = jnp.isfinite(ratio) & (ratio > 0)
+    lr = jnp.where(
+        valid_r,
+        jnp.log(jnp.clip(ratio, 1.0 / ratio_cap, ratio_cap)) / math.log(ratio_cap),
+        0.0,
+    )
+    same_r = same & valid_r[:, None, :]
+    n_same_r = same_r.sum(-1)
+    mean_same_r = jnp.einsum("bch,bh->bc", same_r.astype(jnp.float32), lr) / jnp.maximum(
+        n_same_r, 1
+    )
+    last_same_idx = jnp.argmax(jnp.where(same_r, ts_rel[:, None, :], -jnp.inf), axis=-1)
+    last_same_r = jnp.take_along_axis(lr, last_same_idx, axis=-1)
+    n_user_r = valid_r.sum(-1)
+    last_user_idx = jnp.argmax(jnp.where(valid_r, ts_rel, -jnp.inf), axis=-1)
+    has_user_r = n_user_r > 0
+    ratio_user = jnp.stack(
+        [
+            has_user_r.astype(jnp.float32),
+            lr.sum(-1) / jnp.maximum(n_user_r, 1),
+            jnp.where(has_user_r, jnp.take_along_axis(lr, last_user_idx[:, None], -1)[:, 0], 0.0),
+            jnp.where(has_user_r, jnp.where(valid_r, lr, -1.0).max(-1), 0.0),
+        ],
+        axis=-1,
+    )
+    ratio_candidate = jnp.stack(
+        [
+            (n_same_r > 0).astype(jnp.float32),
+            mean_same_r,
+            jnp.where(n_same_r > 0, last_same_r, 0.0),
+        ],
+        axis=-1,
+    )
+    ratio_user = jnp.broadcast_to(
+        ratio_user[:, None, :], per_candidate.shape[:2] + (ratio_user.shape[-1],)
+    )
+    return jnp.concatenate([per_candidate, user, ratio_candidate, ratio_user], axis=-1)
 
 
 def block_history_reduce(
@@ -3209,6 +3299,11 @@ class RecsysAggregatedModel(hk.Module):
             cast_jax(history_impr_ts),
             cast_jax(batch["candidate_seq"]["auth_hashes"]),
             self.config.web_conv_value_usd_cap,
+            ratio_cap=(
+                self.config.web_conv_value_ratio_cap
+                if self.config.purchase_value_history_ratio_features
+                else None
+            ),
         )
 
     @hk.transparent
@@ -4858,12 +4953,14 @@ class RecsysAggregatedModel(hk.Module):
                 return jnp.stack([(pvf[..., 0] * w).sum(), (pvf[..., 5] * w).sum(), w.sum()])
 
             stats["_purchase-value-history-sums"] = history_value_sums(loss_padding_mask)
+        value_preds: dict[str, jax.Array] = {}
         for head in value_heads:
             value_ratio, baseline, value_mask = c.value_heads[head.ema_key]
             if purchase_value_features is not None and head.slot == PURCHASE_VALUE_ACTION_INDEX:
                 stats[f"_{head.metric_prefix}-history-sums"] = history_value_sums(value_mask)
             if head.slot is not None:
                 pred_ratio = candidate_continuous_preds[:, :, head.slot]
+                value_preds[head.ema_key] = pred_ratio
                 bin_logits = head_logits_by_index.get(head.slot) if head.bins else None
             else:
                 assert head.event is not None and head.bins is not None
@@ -4954,6 +5051,14 @@ class RecsysAggregatedModel(hk.Module):
                     sq_candidate_padding,
                 )
 
+        line_item_id = batch["candidate_seq"].get(VALUE_LINE_ITEM_KEY)
+        if line_item_id is not None and self.config.purchase_value_within_li_metric:
+            line_item_id = cast_jax(line_item_id).astype(jnp.int32)
+            line_item_id = jnp.pad(
+                line_item_id, ((0, 0), (0, c.loss_padding_mask.shape[1] - line_item_id.shape[1]))
+            )
+        else:
+            line_item_id = None
         metric_inputs = {
             "candidates": c,
             "logits": candidate_logits,
@@ -4962,6 +5067,8 @@ class RecsysAggregatedModel(hk.Module):
             "history_len": history_len,
             "continuous": continuous_metric_inputs,
             "embedding_norms": embedding_norms,
+            "value_preds": value_preds,
+            "value_line_item_id": line_item_id,
         }
         return regularization_loss, (stats, metric_inputs)
 
@@ -5238,6 +5345,32 @@ class RecsysAggregatedModel(hk.Module):
                     )
                     stats.update(smoothed_stats)
                     stats["_rce_ema"] = {**stats.get("_rce_ema", {}), **value_ema}
+            line_item_id = metric_inputs.get("value_line_item_id")
+            purchase_pred = metric_inputs.get("value_preds", {}).get(PURCHASE_VALUE_EMA_KEY)
+            if (
+                self.config.purchase_value_within_li_metric
+                and smoothing_batch_size is not None
+                and line_item_id is not None
+                and purchase_pred is not None
+            ):
+                assert rce_ema is not None
+                ratio, baseline, value_mask = c.value_heads[PURCHASE_VALUE_EMA_KEY]
+                li_stats, li_ema = value_within_li_smoothed_stats(
+                    raw_ratio=ratio,
+                    baseline_mean_usd=baseline,
+                    valid_mask=value_mask,
+                    pred_ratio=purchase_pred,
+                    line_item_id=line_item_id,
+                    clicked=c.targets[..., CLICK_ACTION_INDEX] > 0,
+                    rce_ema=rce_ema,
+                    batch_size=smoothing_batch_size,
+                    windows=self.config.within_li_windows,
+                    num_buckets=self.config.purchase_value_within_li_buckets,
+                    ema_key=PURCHASE_VALUE_EMA_KEY,
+                    metric_prefix=value_heads[0].metric_prefix,
+                )
+                stats.update(li_stats)
+                stats["_rce_ema"] = {**stats.get("_rce_ema", {}), **li_ema}
 
         embedding_norms: dict[str, tuple[jax.Array, jax.Array]] = metric_inputs["embedding_norms"]
         for name, (l2_norms, padding) in embedding_norms.items():
