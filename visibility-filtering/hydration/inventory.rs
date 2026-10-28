@@ -69,22 +69,10 @@ pub(super) const fn claimed_answer_fails(stake: Stake, answer: Answer) -> bool {
     !matches!(answer, Answer::Unclaimed) && classify(stake, answer).fails_node()
 }
 
-pub(super) struct Row {
-    pub(super) decides_existence: bool,
-    pub(super) batch: Batch,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Batch {
-    Unrecorded,
-    Keys,
-    Requested,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
 pub(crate) enum Source {
     TesPureCoreData,
-    TesTweet,
+    TesTweetForVisibility,
     TesConversationControl,
     TesQuotedTweet,
     SafetyLabels,
@@ -108,92 +96,30 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    pub(super) const fn row(self) -> Row {
+    pub(super) const fn decides_existence(self) -> bool {
         match self {
-            Source::TesPureCoreData => Row {
-                decides_existence: true,
-                batch: Batch::Keys,
-            },
-            Source::TesTweet => Row {
-                decides_existence: true,
-                batch: Batch::Unrecorded,
-            },
-            Source::TesConversationControl => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::TesQuotedTweet => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::SafetyLabels => Row {
-                decides_existence: false,
-                batch: Batch::Requested,
-            },
-            Source::GizmoduckViewer => Row {
-                decides_existence: false,
-                batch: Batch::Unrecorded,
-            },
-            Source::GizmoduckAuthor => Row {
-                decides_existence: true,
-                batch: Batch::Keys,
-            },
-            Source::Flock => Row {
-                decides_existence: false,
-                batch: Batch::Requested,
-            },
-            Source::FlockUserPair => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::ViewerCountry => Row {
-                decides_existence: false,
-                batch: Batch::Unrecorded,
-            },
-            Source::Wingman => Row {
-                decides_existence: false,
-                batch: Batch::Requested,
-            },
-            Source::CommunityModeration => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::CommunityModerator => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::CommunityViewerRemoved => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::ArticleLifecycle => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::ArticleMediaEntities => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::ArticleCoverMedia => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::TrustedFriends => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
-            Source::UserLocation => Row {
-                decides_existence: false,
-                batch: Batch::Unrecorded,
-            },
-            Source::GizmoduckActor => Row {
-                decides_existence: true,
-                batch: Batch::Keys,
-            },
-            Source::ActorEmails | Source::ActorPhones => Row {
-                decides_existence: false,
-                batch: Batch::Keys,
-            },
+            Source::TesPureCoreData
+            | Source::TesTweetForVisibility
+            | Source::GizmoduckAuthor
+            | Source::GizmoduckActor => true,
+            Source::TesConversationControl
+            | Source::TesQuotedTweet
+            | Source::SafetyLabels
+            | Source::GizmoduckViewer
+            | Source::Flock
+            | Source::FlockUserPair
+            | Source::ViewerCountry
+            | Source::Wingman
+            | Source::CommunityModeration
+            | Source::CommunityModerator
+            | Source::CommunityViewerRemoved
+            | Source::ArticleLifecycle
+            | Source::ArticleMediaEntities
+            | Source::ArticleCoverMedia
+            | Source::TrustedFriends
+            | Source::UserLocation
+            | Source::ActorEmails
+            | Source::ActorPhones => false,
         }
     }
 }

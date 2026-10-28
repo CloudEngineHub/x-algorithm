@@ -1,8 +1,5 @@
 use super::{Role, Row, Subject};
-use crate::hydration::Hydrator::{
-    BlockedByAuthor, BlockedByConversationRoot, BlockedByConversationRootPost, BlockedByReplyRoot,
-    Blocks, MuteRetweets, Mutes,
-};
+use crate::hydration::Hydrator::{BlockedByAuthor, Blocks, MuteRetweets, Mutes};
 use crate::models::LimitedEngagementReason;
 use crate::rules::fixtures::{allow, candidate, controlled_root, dropped, limited, limited_for};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
@@ -69,7 +66,7 @@ pub(super) fn rows() -> Vec<Row> {
             subject: Subject::Post(
                 candidate()
                     .with_edge(BlockedByAuthor)
-                    .with_edge(BlockedByReplyRoot)
+                    .root_author_blocks_viewer()
                     .build(),
             ),
             expect: vec![(
@@ -91,7 +88,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "root_author_block",
-            subject: Subject::Post(candidate().with_edge(BlockedByReplyRoot).build()),
+            subject: Subject::Post(candidate().root_author_blocks_viewer().build()),
             expect: vec![(
                 TimelineHomeHydration,
                 Role::Author,
@@ -105,7 +102,7 @@ pub(super) fn rows() -> Vec<Row> {
             name: "root_author_block_community_conversation",
             subject: Subject::Post(
                 candidate()
-                    .with_edge(BlockedByReplyRoot)
+                    .root_author_blocks_viewer()
                     .with_conversation_control(controlled_root(ConversationControlArm::Community))
                     .build(),
             ),
@@ -118,61 +115,6 @@ pub(super) fn rows() -> Vec<Row> {
                         LimitedEngagementReason::ConversationControl,
                     ],
                     "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-                ),
-            )],
-        },
-        Row {
-            name: "nested_root_author_block_community_conversation",
-            subject: Subject::Post(
-                candidate()
-                    .with_edge(BlockedByConversationRoot)
-                    .reply()
-                    .with_conversation_control(controlled_root(ConversationControlArm::Community))
-                    .build(),
-            ),
-            expect: vec![(
-                TimelineHomeHydration,
-                Role::NonFollower,
-                limited_for(
-                    &[
-                        LimitedEngagementReason::RootAuthorBlockedViewer,
-                        LimitedEngagementReason::ConversationControl,
-                    ],
-                    "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-                ),
-            )],
-        },
-        Row {
-            name: "conversation_root_post_author_block",
-            subject: Subject::Post(
-                candidate()
-                    .with_edge(BlockedByConversationRootPost)
-                    .reply()
-                    .build(),
-            ),
-            expect: vec![(
-                TimelineHomeHydration,
-                Role::NonFollower,
-                limited(
-                    LimitedEngagementReason::RootAuthorBlockedViewer,
-                    "blocked_viewer/limited_engagement/root_author_blocked_viewer",
-                ),
-            )],
-        },
-        Row {
-            name: "root_author_block_on_the_community_root",
-            subject: Subject::Post(
-                candidate()
-                    .with_edge(BlockedByConversationRoot)
-                    .with_conversation_control(controlled_root(ConversationControlArm::Community))
-                    .build(),
-            ),
-            expect: vec![(
-                TimelineHomeHydration,
-                Role::NonFollower,
-                limited(
-                    LimitedEngagementReason::ConversationControl,
-                    "limit_replies_community/limited_engagement/conversation_control",
                 ),
             )],
         },

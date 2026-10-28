@@ -14,6 +14,7 @@ use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
 use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
+use crate::side_effects::phoenix_request_cache_side_effect::ServedSlateCacheSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -30,6 +31,7 @@ use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
     KafkaPublisherClient, MockKafkaPublisherClient,
 };
+use xai_candidate_pipeline::component_library::clients::redis_client::MockRedisClient;
 use xai_candidate_pipeline::filter::Filter;
 use xai_candidate_pipeline::hydrator::Hydrator;
 use xai_candidate_pipeline::query_hydrator::QueryHydrator;
@@ -60,6 +62,7 @@ impl RankedFollowingCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -89,6 +92,11 @@ impl RankedFollowingCandidatePipeline {
             ServedCandidatesKafkaSideEffect::prod(),
             ClientEventsKafkaSideEffect::prod(),
             ServedEventKafkaSideEffect::prod(),
+            super::shared_phoenix_request_cache_redis_clients(),
+        );
+        let served_slate_cache = ServedSlateCacheSideEffect::new(
+            phoenix_request_cache_redis_atla_client,
+            phoenix_request_cache_redis_pdxa_client,
         );
 
         Self::build(
@@ -103,6 +111,7 @@ impl RankedFollowingCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            served_slate_cache,
         )
     }
 
@@ -119,6 +128,7 @@ impl RankedFollowingCandidatePipeline {
         served_candidates: ServedCandidatesKafkaSideEffect,
         client_events: ClientEventsKafkaSideEffect,
         served_event: ServedEventKafkaSideEffect,
+        served_slate_cache: ServedSlateCacheSideEffect,
     ) -> Self {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ServedHistoryQueryHydrator::from_client(Arc::clone(
@@ -155,6 +165,7 @@ impl RankedFollowingCandidatePipeline {
                     &served_history_client,
                 ))),
                 Box::new(TruncateServedHistorySideEffect::new(served_history_client)),
+                Box::new(served_slate_cache),
             ]);
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>> = vec![];
@@ -183,6 +194,10 @@ impl RankedFollowingCandidatePipeline {
         let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_event = ServedEventKafkaSideEffect::new(Arc::clone(&mock_kafka));
+        let served_slate_cache = ServedSlateCacheSideEffect::new(
+            Arc::new(MockRedisClient::default()),
+            Arc::new(MockRedisClient::default()),
+        );
         Self::build(
             scored_posts_server,
             ad_index_client,
@@ -195,6 +210,7 @@ impl RankedFollowingCandidatePipeline {
             served_candidates,
             client_events,
             served_event,
+            served_slate_cache,
         )
     }
 }

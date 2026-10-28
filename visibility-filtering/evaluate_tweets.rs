@@ -1,23 +1,21 @@
-use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, Rpc};
-use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId};
+use crate::ingress::{self, Entry};
+use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, RequestMetrics};
+use crate::models::{Evaluation, RequestViewer};
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{normalize_viewer_id, PostBatch, PostEvaluation, PostEvaluator};
+use crate::post_evaluator::{PostEvaluation, PostEvaluator};
 use crate::quote::{Passes, QuotePassRunner};
-use crate::rules::{QuoteEntries, SafetyLevel};
+use crate::rules::{SafetyLevel, WireLevel};
 use crate::treatment;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use vf_pb::tweet_evaluation::Outcome;
 use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering_proto as vf_pb;
-use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
 
 pub(crate) trait EntryComparator: Send + Sync {
     fn compare(
         &self,
-        viewer_id: Option<u64>,
-        context: Option<&TwitterContextViewer>,
-        country_code: Option<&str>,
+        viewer: &RequestViewer,
         safety_level: SafetyLevel,
         outcomes: &[PostEvaluation],
         quote_passes: &Passes,
@@ -50,22 +48,23 @@ impl EvaluateTweetsEndpoint {
         &self,
         request: Request<vf_pb::EvaluateTweetsRequest>,
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-        let level = ThriftLevel(request.get_ref().safety_level);
-        let safety_level = if ThriftLevel::ENUM_VALUES.contains(&level) {
-            SafetyLevel::from_thrift(level)
-                .ok_or_else(|| Status::unimplemented("safety level has no Rust policy"))
-        } else {
-            Err(Status::invalid_argument("unknown safety level"))
-        };
+        let safety_level =
+            ingress::level(WireLevel::EvaluateTweets(request.get_ref().safety_level));
         ft_metrics::observe_request(
+            self.post_evaluator.metrics(),
             Endpoint::EvaluateTweets,
             RequestLevel::of(safety_level.as_ref().ok().copied()),
             request,
-            |request, context| async move {
+            |request, context, metrics| async move {
                 let twitter_context =
                     xai_twittercontext::extract_twitter_context(request.metadata());
                 context
-                    .scope(self.handle_inner(request.into_inner(), twitter_context, safety_level))
+                    .scope(self.handle_inner(
+                        request.into_inner(),
+                        twitter_context,
+                        &metrics,
+                        safety_level,
+                    ))
                     .await
                     .map(Response::new)
             },
@@ -77,34 +76,15 @@ impl EvaluateTweetsEndpoint {
         &self,
         req: vf_pb::EvaluateTweetsRequest,
         twitter_context: Option<TwitterContextViewer>,
+        metrics: &RequestMetrics,
         safety_level: Result<SafetyLevel, Status>,
     ) -> Result<vf_pb::EvaluateTweetsResponse, Status> {
-        ft_metrics::record_batch_size(Endpoint::EvaluateTweets, req.tweets.len());
+        ft_metrics::record_batch_size(metrics, req.tweets.len());
         let safety_level = safety_level?;
-        let judges_quote_entries = matches!(
-            safety_level.spec().quote_entries,
-            QuoteEntries::Judged { .. }
-        );
-        let entries: Vec<Entry> = req
-            .tweets
-            .iter()
-            .map(|tweet| {
-                let placement = match &tweet.quote_context {
-                    None => Placement::Standalone,
-                    Some(quote) if judges_quote_entries => Placement::InnerQuoted {
-                        outer: TweetId(quote.outer_tweet_id),
-                    },
-                    Some(_) => return Entry::NotJudged,
-                };
-                Entry::Judged(PlacedCandidate {
-                    candidate: RawCandidate {
-                        tweet_id: TweetId(tweet.tweet_id),
-                        request_author_id: None,
-                    },
-                    placement,
-                })
-            })
-            .collect();
+        let ingress::Request {
+            viewer,
+            rows: entries,
+        } = ingress::evaluate_tweets(&req, twitter_context, safety_level);
         let candidates = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -112,16 +92,16 @@ impl EvaluateTweetsEndpoint {
                 Entry::NotJudged => None,
             })
             .collect();
-        let viewer_id = normalize_viewer_id(req.viewer_id);
-        let request = evaluate_tweets_request(
+        let request = ingress::evaluate_tweets_batch(
             &self.client_switches,
-            twitter_context.as_ref(),
-            viewer_id,
+            viewer.clone(),
             safety_level,
             candidates,
         );
-        let country_code = request.country_code.clone();
-        let (outcomes, pending) = self.quote_pass.serve(&self.post_evaluator, request).await;
+        let (outcomes, pending) = self
+            .quote_pass
+            .serve(&self.post_evaluator, request, metrics)
+            .await;
         let mut evaluated = outcomes.iter().peekable();
         let answers: Vec<Answer> = entries
             .iter()
@@ -142,8 +122,7 @@ impl EvaluateTweetsEndpoint {
             })
         };
         ft_metrics::record_sent(
-            Endpoint::EvaluateTweets,
-            safety_level,
+            metrics,
             evaluations(),
             answers
                 .iter()
@@ -151,11 +130,11 @@ impl EvaluateTweetsEndpoint {
                 .count(),
         );
         let policies = self.client_switches.limited_actions_policies(
-            twitter_context.as_ref(),
-            viewer_id,
-            country_code.as_deref(),
+            viewer.context(),
+            viewer.id(),
+            viewer.country_code(),
             evaluations().flat_map(|evaluation| evaluation.verdict().limited_engagement_reasons()),
-            xai_stats_receiver::global_stats_receiver().as_deref(),
+            metrics.plain(),
         );
         let results = answers
             .iter()
@@ -183,24 +162,12 @@ impl EvaluateTweetsEndpoint {
             outcomes,
             move |outcomes, quote_passes| {
                 if let Some(comparator) = comparator {
-                    comparator.compare(
-                        viewer_id,
-                        twitter_context.as_ref(),
-                        country_code.as_deref(),
-                        safety_level,
-                        outcomes,
-                        quote_passes,
-                    );
+                    comparator.compare(&viewer, safety_level, outcomes, quote_passes);
                 }
             },
         );
         Ok(vf_pb::EvaluateTweetsResponse { results })
     }
-}
-
-enum Entry {
-    Judged(PlacedCandidate),
-    NotJudged,
 }
 
 enum Answer<'a> {
@@ -209,32 +176,14 @@ enum Answer<'a> {
     Evaluated(&'a Evaluation),
 }
 
-pub(crate) fn evaluate_tweets_request(
-    client_switches: &ClientSwitches,
-    context: Option<&TwitterContextViewer>,
-    viewer_id: Option<u64>,
-    safety_level: SafetyLevel,
-    candidates: Vec<PlacedCandidate>,
-) -> PostBatch {
-    let country_code = context
-        .map(|context| context.request_country_code.as_str())
-        .filter(|code| !code.is_empty());
-    PostBatch {
-        viewer_id,
-        country_code: country_code.map(str::to_owned),
-        client_capability: client_switches.resolve(context, viewer_id, country_code),
-        safety_level,
-        candidates,
-        rpc: Rpc::EvaluateTweets,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
-    use crate::models::TweetFeatures;
+    use crate::metrics::Metrics;
+    use crate::models::{PlacedCandidate, RawCandidate, RetweetMerge, TweetFeatures, TweetId};
+    use crate::post_evaluator::PostBatch;
     use crate::rules::{NoTrace, RuleEngine, RuleId};
     use crate::scenario::{tweet_data, Wire};
     use std::collections::HashMap;
@@ -242,6 +191,7 @@ mod tests {
         GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
     };
     use xai_x_thrift::action::{self, Action, DropReason};
+    use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
     use xai_x_thrift::safety_result::{FilteredReason as ThriftFilteredReason, SafetyResult};
     use xai_x_thrift::tweet_service::{
         TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
@@ -294,6 +244,10 @@ mod tests {
             (4, tonic::Code::Unimplemented),
             (
                 ThriftLevel::QUOTED_TWEET_RULES.0,
+                tonic::Code::Unimplemented,
+            ),
+            (
+                ThriftLevel::IMMERSIVE_EXPANDED_RECOMMENDATIONS.0,
                 tonic::Code::Unimplemented,
             ),
             (9999, tonic::Code::InvalidArgument),
@@ -497,7 +451,7 @@ mod tests {
                 .tweet(2, 30)
                 .tweet(3, 10)
                 .tweet(4, 10)
-                .fail_key(Source::TesTweet, 4)
+                .fail_key(Source::TesTweetForVisibility, 4)
                 .tweet(5, 20)
                 .labels(5, bounced)
                 .retweet(6, 10, 7, Some(30))
@@ -639,11 +593,14 @@ mod tests {
                 HYDRATION_TIMEOUT - INBOUND_ALLOWANCE,
             ),
         ] {
-            let post_evaluator =
-                PostEvaluator::new(Arc::new(world()), RuleEngine::for_tests(), Arc::default());
-            let request = |rpc| PostBatch {
-                viewer_id: Some(VIEWER),
-                country_code: None,
+            let post_evaluator = PostEvaluator::new(
+                Arc::new(world()),
+                RuleEngine::for_tests(),
+                Arc::default(),
+                Metrics::none(),
+            );
+            let request = |retweet_merge| PostBatch {
+                viewer: RequestViewer::new(Some(VIEWER), None),
                 client_capability: ClientCapability::default(),
                 safety_level: level,
                 candidates: [1, 2, 3]
@@ -654,10 +611,16 @@ mod tests {
                         })
                     })
                     .to_vec(),
-                rpc,
+                retweet_merge,
             };
-            for rpc in [Rpc::FilterTweets, Rpc::EvaluateTweets] {
-                let (_, outcomes) = post_evaluator.run(request(rpc), &mut NoTrace).await;
+            for (retweet_merge, endpoint) in [
+                (RetweetMerge::Unmerged, Endpoint::FilterTweets),
+                (RetweetMerge::Merged, Endpoint::EvaluateTweets),
+            ] {
+                let metrics = Metrics::none().request(endpoint, RequestLevel::Named(level));
+                let (_, outcomes) = post_evaluator
+                    .run(request(retweet_merge), &metrics, &mut NoTrace)
+                    .await;
                 assert!(
                     outcomes[1]
                         .evaluation
@@ -748,7 +711,7 @@ mod tests {
                 None,
                 None,
                 [ConversationControl],
-                None,
+                &Metrics::none(),
             );
             let thrift_limit = LimitedEngagements::new(
                 action::LimitedEngagementReason::ConversationControl(

@@ -1,7 +1,7 @@
 pub mod batch;
 pub(crate) mod community_source;
 mod decode;
-mod execute;
+pub(crate) mod execute;
 pub(crate) mod fallback_cache;
 mod fetcher;
 mod hydrator;
@@ -13,10 +13,10 @@ pub(crate) mod sources;
 mod store;
 pub mod tweet_source;
 
-use crate::metrics::Rpc;
+use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, ClientCapability, EdgeSet, Placement, PostCandidate, Quote, RawCandidate, TweetId,
-    UserCandidate, UserEntity, ViewerFeatures,
+    AuthorId, ClientCapability, EdgeSet, Placement, PostCandidate, Quote, RawCandidate,
+    RetweetMerge, TweetId, UserCandidate, UserEntity, ViewerFeatures,
 };
 pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
@@ -59,8 +59,9 @@ pub(crate) struct HydrationRequest<'a> {
     raw_candidates: Vec<RawCandidate>,
     users: Vec<AuthorId>,
     quotes: Vec<QuoteEntry>,
-    posts_judged_for: Option<Rpc>,
+    retweet_merge: RetweetMerge,
     fallback_caches: &'a FallbackCaches,
+    metrics: &'a RequestMetrics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -75,8 +76,9 @@ impl<'a> HydrationRequest<'a> {
         country_code: Option<String>,
         client_capability: ClientCapability,
         raw_candidates: Vec<RawCandidate>,
-        posts_judged_for: Option<Rpc>,
+        retweet_merge: RetweetMerge,
         fallback_caches: &'a FallbackCaches,
+        metrics: &'a RequestMetrics,
     ) -> Self {
         Self {
             viewer_id,
@@ -85,8 +87,9 @@ impl<'a> HydrationRequest<'a> {
             raw_candidates,
             users: Vec::new(),
             quotes: Vec::new(),
-            posts_judged_for,
+            retweet_merge,
             fallback_caches,
+            metrics,
         }
     }
 
@@ -94,6 +97,7 @@ impl<'a> HydrationRequest<'a> {
         viewer_id: u64,
         users: Vec<AuthorId>,
         fallback_caches: &'a FallbackCaches,
+        metrics: &'a RequestMetrics,
     ) -> Self {
         Self {
             users,
@@ -102,8 +106,9 @@ impl<'a> HydrationRequest<'a> {
                 None,
                 ClientCapability::default(),
                 Vec::new(),
-                None,
+                RetweetMerge::Unmerged,
                 fallback_caches,
+                metrics,
             )
         }
     }
@@ -132,7 +137,7 @@ pub(crate) struct Hydration {
     users: FxHashMap<AuthorId, HydratedUser>,
     quotes: FxHashMap<QuoteEntry, Quoted>,
     has_fetched_retweet_sources: bool,
-    posts_judged_for: Option<Rpc>,
+    retweet_merge: RetweetMerge,
 }
 
 pub(crate) enum HydratedUser {
@@ -216,7 +221,7 @@ impl Hydration {
     }
 
     pub(crate) fn is_on(&self, relation: Relation) -> bool {
-        relation.is_on(self.posts_judged_for, self.planned)
+        relation.is_on(self.retweet_merge, self.planned)
     }
 
             pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {

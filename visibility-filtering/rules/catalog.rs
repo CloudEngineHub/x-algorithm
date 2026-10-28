@@ -45,7 +45,7 @@ fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = 
 pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let listed = level.spec().rules.lists();
+        let listed = level.spec().rules().lists();
         for entry in catalog_rules(listed.user).chain(catalog_rules(listed.post)) {
             match rules.iter_mut().find(|(other, _)| *other == entry) {
                 Some((_, levels)) => levels.push(level.into()),
@@ -136,9 +136,39 @@ fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DropReason;
+    use crate::rules::rule_spec::ActionSpec;
+    use std::collections::BTreeSet;
 
     #[test]
     fn the_policy_catalog_is_printed_from_the_rules() {
         crate::pinned::assert_pinned("docs/policy-catalog.md", &catalog());
+    }
+
+    fn viewer_gated_drop_rules<E: Engine>(
+        rules: &[&'static Rule<E>],
+    ) -> impl Iterator<Item = String> {
+        rules
+            .iter()
+            .filter(|rule| {
+                matches!(
+                    rule.action.spec(),
+                    ActionSpec::Drop(DropReason::NsfwViewer(_))
+                )
+            })
+            .map(|rule| rule_name(rule.id, &rule.action))
+    }
+
+    #[test]
+    fn dashboard_lists_every_viewer_gated_drop_rule() {
+        let gated: BTreeSet<String> = SafetyLevel::VARIANTS
+            .iter()
+            .flat_map(|level| {
+                let listed = level.spec().rules().lists();
+                viewer_gated_drop_rules(listed.user).chain(viewer_gated_drop_rules(listed.post))
+            })
+            .collect();
+        let dashboard = crate::pinned::dashboard_tuple("VIEWER_GATED_DROP_RULES");
+        assert_eq!(dashboard, gated);
     }
 }

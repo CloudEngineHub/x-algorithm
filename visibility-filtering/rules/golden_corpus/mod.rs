@@ -107,6 +107,9 @@ impl Role {
             }
             Role::LoggedOut => {
                 *subject.edges_mut() = EdgeSet::default();
+                if let Subject::Post(post) = subject {
+                    post.post.conversation_root_author_blocks_viewer = false;
+                }
                 standalone("logged_out", logged_out_viewer())
             }
             Role::As(role_name, viewer) => standalone(role_name, viewer.clone()),
@@ -141,7 +144,7 @@ impl Row {
         } = self;
         expect.into_iter().map(move |(level, role, expected)| {
             assert_eq!(
-                matches!(level.spec().rules, LevelRules::UserOnly(_)),
+                matches!(level.spec().rules(), LevelRules::UserOnly(_)),
                 matches!(subject, Subject::User(_)),
                 "{name}: {level:?} judges the other subject kind",
             );
@@ -354,7 +357,7 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
     let cases = corpus();
     let mut diverged = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let rules = level.spec().rules.lists();
+        let rules = level.spec().rules().lists();
         let reference = one_fold(rules);
         let used = rules
             .user

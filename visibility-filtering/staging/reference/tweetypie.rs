@@ -2,10 +2,14 @@ use super::{
     ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
 };
 use crate::config::ENV_REFERENCE;
-use crate::evaluate_tweets::evaluate_tweets_request;
 use crate::hydration::{HYDRATION_TIMEOUT, request_context};
+use crate::ingress;
+use crate::metrics::families::{TWEETYPIE_REFERENCE_BATCHES, TWEETYPIE_REFERENCE_COMPARE};
+use crate::metrics::{Endpoint, RequestLevel};
 use crate::models::viewer::Client;
-use crate::models::{Evaluation, PlacedCandidate, Placement, RawCandidate, TweetId, Verdict};
+use crate::models::{
+    Evaluation, PlacedCandidate, Placement, RawCandidate, RequestViewer, TweetId, Verdict,
+};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
 use crate::post_evaluator::{PostEvaluation, PostEvaluator};
 use crate::quote::QuotePass;
@@ -28,7 +32,6 @@ use tokio::time::{Instant, timeout};
 use tonic::metadata::MetadataMap;
 use tracing::warn;
 use xai_build_version::current_build_information;
-use xai_stats_receiver::global_stats_receiver;
 use xai_strato::strato_thrift::{StratoResult, strato_decode};
 use xai_strato::{StratoGrpc, encode};
 use xai_twittercontext_proto::TwitterContextViewer;
@@ -49,8 +52,6 @@ const COLUMN: &str = "tweetypie/getTweetFields.Tweet";
 const TWEETYPIE_MAX_BATCH_SIZE: usize = 250;
 const MAX_IN_FLIGHT: usize = 32;
 const TWEETYPIE_TIMEOUT: Duration = Duration::from_millis(1500);
-const COMPARE: &str = "vf_tweetypie_reference_compare";
-const BATCHES: &str = "vf_tweetypie_reference_batches";
 const RECORD_LINE_MARKER: &str = "vf_tweetypie_reference_record";
 pub(crate) const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
 const RECORD_CAP_PER_MINUTE: u32 = 20;
@@ -101,22 +102,19 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn counter_labels<'a>(&'a self, build_sha: &'a str) -> [(&'static str, &'a str); 11] {
+    fn counter_values<'a>(&'a self, build_sha: &'a str) -> [&'a str; 11] {
         [
-            ("safety_level", SAFETY_LEVEL.into()),
-            ("placement", self.lens.into()),
-            ("tp", &self.tp.0),
-            ("tp_reason", &self.tp.1),
-            ("vf", &self.vf.0),
-            ("vf_reason", &self.vf.1),
-            ("vf_rule", self.vf_rule),
-            ("quoted_tweet_rule", self.quoted_tweet_rule),
-            ("quote_pass", self.quote_pass),
-            (
-                "renders_alike",
-                if self.renders_alike { "true" } else { "false" },
-            ),
-            ("build_sha", build_sha),
+            SAFETY_LEVEL.into(),
+            self.lens.into(),
+            &self.tp.0,
+            &self.tp.1,
+            &self.vf.0,
+            &self.vf.1,
+            self.vf_rule,
+            self.quoted_tweet_rule,
+            self.quote_pass,
+            if self.renders_alike { "true" } else { "false" },
+            build_sha,
         ]
     }
 }
@@ -298,15 +296,21 @@ impl TweetypieReference {
             })
             .collect();
         let client = Client::Web.context(Some(viewer_id), country_code.as_deref());
-        let request = evaluate_tweets_request(
+        let request = ingress::evaluate_tweets_batch(
             &self.client_switches,
-            Some(&client),
-            Some(viewer_id),
+            RequestViewer::with_context(Some(viewer_id), Some(client.clone())),
             SAFETY_LEVEL,
             candidates,
         );
+        let metrics = self
+            .post_evaluator
+            .metrics()
+            .request(Endpoint::EvaluateTweets, RequestLevel::Named(SAFETY_LEVEL));
         let rust = request_context(Instant::now(), None).scope(async {
-            let (_, outcomes) = self.post_evaluator.run(request, &mut NoTrace).await;
+            let (_, outcomes) = self
+                .post_evaluator
+                .run(request, &metrics, &mut NoTrace)
+                .await;
             outcomes
         });
         let tp = timeout(
@@ -358,25 +362,22 @@ impl TweetypieReference {
             *counts.entry(bucket).or_default() += 1;
         }
         drop(sampler);
-        if let Some(stats) = global_stats_receiver() {
-            for (bucket, count) in &counts {
-                stats.incr(COMPARE, &bucket.counter_labels(&self.build_sha), *count);
-            }
+        let metrics = self.post_evaluator.metrics();
+        for (bucket, count) in counts {
+            metrics.count(
+                &TWEETYPIE_REFERENCE_COMPARE,
+                bucket.counter_values(&self.build_sha),
+                count,
+            );
         }
     }
 
     fn count(&self, outcome: BatchOutcome) {
-        if let Some(stats) = global_stats_receiver() {
-            stats.incr(
-                BATCHES,
-                &[
-                    ("safety_level", SAFETY_LEVEL.into()),
-                    ("outcome", outcome.into()),
-                    ("build_sha", &self.build_sha),
-                ],
-                1,
-            );
-        }
+        self.post_evaluator.metrics().count(
+            &TWEETYPIE_REFERENCE_BATCHES,
+            [SAFETY_LEVEL.into(), outcome.into(), &self.build_sha],
+            1,
+        );
     }
 }
 
@@ -477,7 +478,7 @@ impl Compared<'_> {
             .vf
             .into_iter()
             .flat_map(|outcome| treatment::decided_rows(outcome.evaluation.verdict()))
-            .map(|(rule, kind)| format!("{rule}:{kind}"))
+            .map(|(rule, action)| format!("{rule}:{}", <&str>::from(action)))
             .collect();
         let labels: BTreeMap<i32, Option<i64>> = self
             .vf
@@ -565,6 +566,7 @@ fn vf_label(outcome: &PostEvaluation, level: SafetyLevel) -> Label {
 mod tests {
     use super::*;
     use crate::hydration::{Hydrators, Lookup};
+    use crate::metrics::{Metrics, Recorded};
     use crate::models::{Decided, DropReason, Withholding};
     use crate::rules::RuleId;
     use crate::rules::fixtures::CLIENT_CLASSES;
@@ -836,13 +838,27 @@ mod tests {
                 ..compared(&tp, Some(&vf))
             };
             let bucket = compared.bucket();
-            assert!(bucket.counter_labels("sha").contains(&("placement", name)));
+            assert_eq!(counted(&bucket).label("placement"), Some(name));
             let record = compared.to_json(&bucket, "sha", None);
             assert_eq!(
                 (record["placement"].as_str(), record["outer"].as_u64()),
                 (Some(name), outer)
             );
         }
+    }
+
+    pub(super) fn counted(bucket: &Bucket) -> Recorded {
+        let (metrics, recording) = Metrics::recording();
+        metrics.count(
+            &TWEETYPIE_REFERENCE_COMPARE,
+            bucket.counter_values("sha"),
+            1,
+        );
+        let [sample] = recording
+            .take(&TWEETYPIE_REFERENCE_COMPARE.family)
+            .try_into()
+            .unwrap();
+        sample
     }
 
     #[test]
@@ -857,8 +873,8 @@ mod tests {
         let compared = compared(&tp, Some(&vf));
         let bucket = compared.bucket();
         let mut emitted = json!({
-            "compare_metric": COMPARE,
-            "compare_labels": bucket.counter_labels("abc123def456").map(|(key, _)| key),
+            "compare_metric": TWEETYPIE_REFERENCE_COMPARE.family.name,
+            "compare_labels": TWEETYPIE_REFERENCE_COMPARE.family.labels,
             "record": compared.to_json(&bucket, "abc123def456", Some("xai-vf-service-cand--abcde-0")),
         });
         emitted.sort_all_objects();

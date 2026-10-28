@@ -5,7 +5,6 @@ use crate::models::{
 };
 use crate::params::CountryLists;
 use crate::rules::defaults::{Bucket, Defaults, Effect};
-use crate::rules::levels::LevelRules;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
 use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
@@ -424,12 +423,10 @@ fn interned_name(
     name
 }
 
-fn plans_from_its_rows(rules: LevelRules, plan: &HydrationPlan) -> bool {
+fn plans_from_its_rows(plan: &HydrationPlan) -> bool {
     match plan.rows() {
         RequestRows::Posts => !plan.keys_a_node_only_user_rows_give(),
-        RequestRows::Users => {
-            matches!(rules, LevelRules::UserOnly(_)) && plan.keys_only_user_rows_or_viewer()
-        }
+        RequestRows::Users => plan.keys_only_user_rows_or_viewer(),
     }
 }
 
@@ -581,13 +578,12 @@ impl RuleEngine {
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
-                let level_rules = level.spec().rules;
-                let rules = level_rules.lists();
+                let rules = level.spec().rules().lists();
                 let policy =
                     PostPolicy::new(named(&mut names, rules.user), named(&mut names, rules.post));
                 let entry = Level::new(level, policy);
                 assert!(
-                    plans_from_its_rows(level_rules, &entry.plan),
+                    plans_from_its_rows(&entry.plan),
                     "{level:?} plans keys its request rows cannot give"
                 );
                 entry
@@ -621,10 +617,6 @@ impl RuleEngine {
             },
             hydration,
         })
-    }
-
-    pub(crate) fn judges_only_users(&self, level: SafetyLevel) -> bool {
-        self.policy(level).post.rules.is_empty()
     }
 
     fn unplanned_inputs(&self, level: SafetyLevel, hydration: &Hydration) -> Hydrators {
@@ -945,10 +937,6 @@ country_specific_nsfw_content_gating:
             withheld_by(candidate().with_author_features(nsfw_admin)),
             None
         );
-        assert_eq!(
-            withheld_by(labeled(SafetyLabelType::NSFW_REPORTED_HEURISTICS)),
-            None
-        );
         assert_eq!(withheld_by(labeled(SafetyLabelType::NSFW_CARD_IMAGE)), None);
     }
 
@@ -958,38 +946,25 @@ country_specific_nsfw_content_gating:
         let user_rows = |nodes| {
             HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes)
         };
-        let user_only = SafetyLevel::QuotedTweetRules.spec().rules;
-        let user_then_post = SafetyLevel::FilterAll.spec().rules;
         let user_and_viewer_keyed = Hydrators::of(Hydrator::ViewerProfile)
             .with(Hydrator::AuthorSafety)
             .with(Hydrator::Blocks);
-        assert!(plans_from_its_rows(
-            user_only,
-            &user_rows(user_and_viewer_keyed)
-        ));
-        assert!(!plans_from_its_rows(
-            user_then_post,
-            &user_rows(user_and_viewer_keyed)
-        ));
+        assert!(plans_from_its_rows(&user_rows(user_and_viewer_keyed)));
         for post_keyed in [
             Hydrator::Tweet,
             Hydrator::MuteRetweets,
             Hydrator::AuthorBlocksOuterAuthor,
         ] {
             let plan = user_rows(user_and_viewer_keyed.with(post_keyed));
-            assert!(!plans_from_its_rows(user_only, &plan), "{post_keyed:?}");
+            assert!(!plans_from_its_rows(&plan), "{post_keyed:?}");
         }
         let post_rows = |nodes| {
             HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Posts, nodes)
         };
-        assert!(plans_from_its_rows(
-            user_only,
-            &post_rows(user_and_viewer_keyed)
-        ));
-        assert!(!plans_from_its_rows(
-            user_only,
-            &post_rows(user_and_viewer_keyed.with(Hydrator::AuthorProfile))
-        ));
+        assert!(plans_from_its_rows(&post_rows(user_and_viewer_keyed)));
+        assert!(!plans_from_its_rows(&post_rows(
+            user_and_viewer_keyed.with(Hydrator::AuthorProfile)
+        )));
     }
 
     #[test]
@@ -1481,7 +1456,10 @@ country_specific_nsfw_content_gating:
         use crate::hydration::inventory::Source;
         use crate::hydration::sources::{suspended, InMemorySources};
         use crate::hydration::{HydrationRequest, Hydrator};
-        use crate::models::{ClientCapability, RawCandidate, SafetyLabelType, TweetId};
+        use crate::metrics::{Endpoint, Metrics, RequestLevel};
+        use crate::models::{
+            ClientCapability, RawCandidate, RetweetMerge, SafetyLabelType, TweetId,
+        };
         use crate::models::{LimitedEngagementReason, Notice};
         use crate::rules::fixtures::{allow, candidate, dropped, viewer, VIEWER_ID};
         use crate::rules::golden_corpus::post_cases;
@@ -1953,13 +1931,16 @@ country_specific_nsfw_content_gating:
                 request_author_id: None,
             }];
             let caches = FallbackCaches::default();
+            let metrics =
+                Metrics::none().request(Endpoint::FilterTweets, RequestLevel::Named(plan.level()));
             let request = HydrationRequest::new(
                 Some(50),
                 Some("us".into()),
                 ClientCapability::default(),
                 raw,
-                None,
+                RetweetMerge::Unmerged,
                 &caches,
+                &metrics,
             );
             plan.hydrate(&sources, request).await
         }
@@ -2054,7 +2035,13 @@ country_specific_nsfw_content_gating:
             )
             .hydrate(
                 &sources,
-                HydrationRequest::for_users(50, vec![AuthorId(10), AuthorId(20)], &caches),
+                HydrationRequest::for_users(
+                    50,
+                    vec![AuthorId(10), AuthorId(20)],
+                    &caches,
+                    &Metrics::none()
+                        .request(Endpoint::FilterNotifications, RequestLevel::Named(level)),
+                ),
             )
             .await;
             let users = rule_engine.admit(level, &hydration).unwrap();

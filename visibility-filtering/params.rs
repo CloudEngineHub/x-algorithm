@@ -1,7 +1,9 @@
 mod client_switches;
 pub(crate) mod limited_actions_copy;
-mod limited_actions_policy;
+pub(crate) mod limited_actions_policy;
 
+use crate::metrics::families::FEATURE_SWITCH_LOAD_FAILURES;
+use crate::metrics::Metrics;
 use arc_swap::ArcSwap;
 use limited_actions_copy::DriftCheck;
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,6 @@ use xai_feature_switches::{
     NullExperimentBucketsChooser, QueryNode, RecipientBuilder, ReloadableAbDeciderStore, Value,
     DEFAULT_ABDECIDER_PATH,
 };
-use xai_stats_receiver::StatsReceiverExt;
 
 pub(crate) use client_switches::ClientSwitches;
 pub(crate) use limited_actions_policy::LimitedActionsPolicies;
@@ -33,8 +34,6 @@ const SCALA_FILES: [&str; 7] = [
 
 const LIMITED_ACTIONS_POLICY_FILE: &str =
     "../../visibility-limited-actions/main/limited_actions_policy.yml";
-
-const LOAD_FAILURE_COUNTER: &str = "feature_switch_load_failures";
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, strum::VariantArray,
@@ -255,13 +254,13 @@ impl SwitchFiles {
         Self { files, experiments }
     }
 
-    pub fn load(&mut self, stats: Option<&dyn StatsReceiverExt>) -> Option<FeatureSwitches> {
+    pub(crate) fn load(&mut self, metrics: &Metrics) -> Option<FeatureSwitches> {
         for (path, last_good) in &mut self.files {
             match parse_file(path) {
                 Ok(features) => *last_good = features,
                 Err(error) => {
                     let file = path.file_name().and_then(|name| name.to_str());
-                    load_failed(file.unwrap_or_default(), &error, stats);
+                    load_failed(file.unwrap_or_default(), &error, metrics);
                 }
             }
         }
@@ -272,7 +271,7 @@ impl SwitchFiles {
             .collect();
         self.experiments
             .engine(features)
-            .map_err(|error| load_failed("all", &error, stats))
+            .map_err(|error| load_failed("all", &error, metrics))
             .ok()
     }
 }
@@ -283,19 +282,13 @@ fn parse_file(path: &Path) -> xai_feature_switches::Result<Vec<Feature>> {
     Ok(features)
 }
 
-fn load_failed(
-    file: &str,
-    error: &xai_feature_switches::Error,
-    stats: Option<&dyn StatsReceiverExt>,
-) {
+fn load_failed(file: &str, error: &xai_feature_switches::Error, metrics: &Metrics) {
     tracing::warn!(
         file,
         %error,
         "feature switches: file failed to load; keeping its last good values"
     );
-    if let Some(stats) = stats {
-        stats.incr(LOAD_FAILURE_COUNTER, &[("file", file)], 1);
-    }
+    metrics.count(&FEATURE_SWITCH_LOAD_FAILURES, [file], 1);
 }
 
 pub(crate) fn spawn_refresh(
@@ -303,17 +296,17 @@ pub(crate) fn spawn_refresh(
     feature_switches: Arc<ArcSwap<FeatureSwitches>>,
     country_lists: Arc<CountryLists>,
     copy_drift: DriftCheck,
-    stats: Option<Arc<dyn StatsReceiverExt>>,
+    metrics: Metrics,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if let Some(engine) = files.load(stats.as_deref()) {
+            if let Some(engine) = files.load(&metrics) {
                 feature_switches.store(Arc::new(engine));
             }
             country_lists.refresh(&feature_switches.load());
-            copy_drift.run(stats.as_deref());
+            copy_drift.run(&metrics);
         }
     });
 }
@@ -351,35 +344,6 @@ fn load(list: CountryList, configured: Option<&Vec<Value>>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use xai_stats_receiver::HistogramBuckets;
-
-    #[derive(Default)]
-    pub(super) struct Counted(Mutex<Vec<(String, String, u64)>>);
-
-    impl StatsReceiverExt for Counted {
-        fn incr(&self, name: &str, scopes: &[(&str, &str)], value: u64) {
-            let labels = scopes
-                .iter()
-                .map(|(label, tag)| format!("{label}={tag}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            self.0
-                .lock()
-                .unwrap()
-                .push((name.to_string(), labels, value));
-        }
-        fn observe(&self, _: &str, _: &[(&str, &str)], _: f64, _: HistogramBuckets) {}
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-    }
-
-    impl Counted {
-        pub(super) fn take(&self) -> Vec<(String, String, u64)> {
-            std::mem::take(&mut self.0.lock().unwrap())
-        }
-    }
 
     fn engine(yaml: &str) -> FeatureSwitches {
         FeatureSwitches::load_string(yaml).unwrap()
@@ -477,21 +441,28 @@ country_specific_nsfw_content_gating:
         );
         let fs_path = dir.join("rust_vf.yml");
         let mut files = SwitchFiles::beside(fs_path.to_str().unwrap(), Experiments::none());
-        let stats = Counted::default();
+        let (metrics, recording) = Metrics::recording();
         let ios_tombstone = |engine: &FeatureSwitches| {
             engine
                 .match_recipient(&RecipientBuilder::new().build())
                 .get_bool_no_impression("age_verification_ios_tombstone_rule_enabled")
         };
-        let failed = |file: &str| (LOAD_FAILURE_COUNTER.to_string(), format!("file={file}"), 1);
+        let failed = |file: &str| format!("feature_switch_load_failures{{file={file}}} 1");
+        let failures = || -> Vec<String> {
+            recording
+                .take(&FEATURE_SWITCH_LOAD_FAILURES.family)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
 
-        let engine = files.load(Some(&stats)).unwrap();
+        let engine = files.load(&metrics).unwrap();
         assert_eq!(ios_tombstone(&engine), Some(true));
         assert!(!engine
             .match_recipient(&RecipientBuilder::new().build())
             .is_set("other_flag"));
         assert_eq!(
-            stats.take(),
+            failures(),
             [
                 failed("rust_vf.yml"),
                 failed("community_tweet.yml"),
@@ -535,7 +506,7 @@ country_specific_nsfw_content_gating:
                 "country_specific_nsfw_content_gating.yml",
                 &COUNTRIES.replace("us", code),
             );
-            let engine = files.load(Some(&stats)).unwrap();
+            let engine = files.load(&metrics).unwrap();
             assert_eq!(ios_tombstone(&engine), Some(true), "{broken}");
             let lists = CountryLists::starting_at_default();
             lists.refresh(&engine);
@@ -543,7 +514,7 @@ country_specific_nsfw_content_gating:
                 lists.contains(CountryList::LocalRegulations, code),
                 "{broken}"
             );
-            assert_eq!(stats.take(), [failed("age_verification.yml")], "{broken}");
+            assert_eq!(failures(), [failed("age_verification.yml")], "{broken}");
         }
     }
 }

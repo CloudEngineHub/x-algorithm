@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
@@ -25,6 +26,20 @@ pub(crate) fn crate_path(path: &str) -> PathBuf {
     } else {
         Path::new("crates/x-product/xai-visibility-filtering-service").join(path)
     }
+}
+
+pub(crate) fn dashboard_tuple(name: &str) -> BTreeSet<String> {
+    let dashboard = fs::read_to_string(crate_path("scripts/dashboard.py")).unwrap();
+    let (tuple, _) = dashboard
+        .split_once(&format!("\n{name} = ("))
+        .and_then(|(_, rest)| rest.split_once("\n)"))
+        .unwrap_or_else(|| panic!("scripts/dashboard.py assigns no tuple to {name}"));
+    tuple
+        .split(',')
+        .map(|item| item.trim().trim_matches('"'))
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn write_output(path: &str, rendered: &str) {

@@ -1,11 +1,11 @@
 use super::{PostBatch, PostEvaluator};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::{
-    Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, RequestRows,
-    Unresolved,
+    Cause, HydratedTweet, HydratedUser, HydrationRequest, Hydrator, Hydrators, Lookup, Unresolved,
 };
+use crate::metrics::RequestMetrics;
 use crate::models::{AuthorId, Evaluation, EvaluationKey};
-use crate::rules::SafetyLevel;
+use crate::rules::{LevelSpec, SafetyLevel};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -54,30 +54,34 @@ impl AuthorJudgement {
 impl PostEvaluator {
     pub(crate) async fn evaluate_authors(
         &self,
-        mut request: PostBatch,
+        request: PostBatch,
+        metrics: &RequestMetrics,
     ) -> HashMap<EvaluationKey, AuthorJudgement> {
         let level = request.safety_level;
-        if !self.rule_engine.judges_only_users(level) {
-            warn!(
-                ?level,
-                "authors evaluated at a level of post rules; failing them"
-            );
-            let failed = AuthorJudgement::Unresolved(Unresolved {
-                lookup: Lookup::Tweet,
-                cause: Cause::Failed,
-            });
-            return request
-                .candidates
-                .iter()
-                .map(|placed| (placed.key(), failed.clone()))
-                .collect();
+        match level.spec() {
+            LevelSpec::QuotePass { .. } => {}
+            LevelSpec::Posts(_) | LevelSpec::Notifications { .. } => {
+                warn!(
+                    ?level,
+                    "authors evaluated outside the quote pass level; failing them"
+                );
+                let failed = AuthorJudgement::Unresolved(Unresolved {
+                    lookup: Lookup::Tweet,
+                    cause: Cause::Failed,
+                });
+                return request
+                    .candidates
+                    .iter()
+                    .map(|placed| (placed.key(), failed.clone()))
+                    .collect();
+            }
         }
         let hydration = self
             .rule_engine
             .plan(level)
             .hydrate(
                 &*self.sources,
-                request.hydration_request(None, &FallbackCaches::default()),
+                request.hydration_request(&FallbackCaches::default(), metrics),
             )
             .await;
         let admitted = self.rule_engine.admit(level, &hydration);
@@ -117,20 +121,29 @@ impl PostEvaluator {
         level: SafetyLevel,
         viewer_id: u64,
         users: Vec<AuthorId>,
+        metrics: &RequestMetrics,
     ) -> HashMap<AuthorId, Option<Evaluation>> {
-        if level.spec().rows != RequestRows::Users {
-            warn!(
-                ?level,
-                "users evaluated at a level of post rows; failing them"
-            );
-            return users.into_iter().map(|id| (id, None)).collect();
+        match level.spec() {
+            LevelSpec::Notifications { .. } => {}
+            LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => {
+                warn!(
+                    ?level,
+                    "users evaluated outside a notification level; failing them"
+                );
+                return users.into_iter().map(|id| (id, None)).collect();
+            }
         }
         let hydration = self
             .rule_engine
             .plan(level)
             .hydrate(
                 &*self.sources,
-                HydrationRequest::for_users(viewer_id, users.clone(), &self.fallback_caches),
+                HydrationRequest::for_users(
+                    viewer_id,
+                    users.clone(),
+                    &self.fallback_caches,
+                    metrics,
+                ),
             )
             .await;
         let viewer_failed = !hydration
@@ -162,8 +175,10 @@ mod tests {
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::InMemorySources;
     use crate::hydration::Hydrator;
-    use crate::metrics::Rpc;
-    use crate::models::{ClientCapability, PlacedCandidate, Placement, TweetId};
+    use crate::metrics::{Endpoint, Metrics, RequestLevel};
+    use crate::models::{
+        ClientCapability, PlacedCandidate, Placement, RequestViewer, RetweetMerge, TweetId,
+    };
     use crate::rules::fixtures::{allow, dropped};
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::raw;
@@ -204,20 +219,26 @@ mod tests {
             Arc::clone(&sources) as _,
             RuleEngine::for_tests(),
             Arc::default(),
+            Metrics::none(),
         );
         let quoted = |tweet_id| PlacedCandidate {
             candidate: raw(tweet_id, None),
             placement: Placement::InnerQuoted { outer: TweetId(9) },
         };
         let authors = post_evaluator
-            .evaluate_authors(PostBatch {
-                viewer_id: None,
-                country_code: None,
-                client_capability: ClientCapability::default(),
-                safety_level: SafetyLevel::QuotedTweetRules,
-                candidates: [1, 2, 3, 4].map(quoted).into(),
-                rpc: Rpc::EvaluateTweets,
-            })
+            .evaluate_authors(
+                PostBatch {
+                    viewer: RequestViewer::default(),
+                    client_capability: ClientCapability::default(),
+                    safety_level: SafetyLevel::QuotedTweetRules,
+                    candidates: [1, 2, 3, 4].map(quoted).into(),
+                    retweet_merge: RetweetMerge::Unmerged,
+                },
+                &Metrics::none().request(
+                    Endpoint::EvaluateTweets,
+                    RequestLevel::Named(SafetyLevel::QuotedTweetRules),
+                ),
+            )
             .await;
         let judged = |verdict| AuthorJudgement::Judged(Evaluation::complete(verdict));
         assert_eq!(
@@ -272,8 +293,12 @@ mod tests {
             .tweet(8, 30)
             .authors(&[20, 30])
             .fail_key(Source::TesPureCoreData, 9);
-        let post_evaluator =
-            PostEvaluator::new(Arc::new(sources), RuleEngine::for_tests(), Arc::default());
+        let post_evaluator = PostEvaluator::new(
+            Arc::new(sources),
+            RuleEngine::for_tests(),
+            Arc::default(),
+            Metrics::none(),
+        );
         let quoted = |tweet_id, outer| PlacedCandidate {
             candidate: raw(tweet_id, None),
             placement: Placement::InnerQuoted {
@@ -281,14 +306,21 @@ mod tests {
             },
         };
         let batch = || PostBatch {
-            viewer_id: Some(50),
-            country_code: None,
+            viewer: RequestViewer::new(Some(50), None),
             client_capability: ClientCapability::default(),
             safety_level: SafetyLevel::QuotedTweetRules,
             candidates: vec![quoted(1, 8), quoted(2, 9)],
-            rpc: Rpc::EvaluateTweets,
+            retweet_merge: RetweetMerge::Unmerged,
         };
-        let authors = post_evaluator.evaluate_authors(batch()).await;
+        let authors = post_evaluator
+            .evaluate_authors(
+                batch(),
+                &Metrics::none().request(
+                    Endpoint::EvaluateTweets,
+                    RequestLevel::Named(SafetyLevel::QuotedTweetRules),
+                ),
+            )
+            .await;
         assert_eq!(
             authors[&quoted(1, 8).key()],
             AuthorJudgement::Judged(Evaluation::complete(allow()))
@@ -305,7 +337,13 @@ mod tests {
             .plan(SafetyLevel::QuotedTweetRules)
             .hydrate(
                 &*post_evaluator.sources,
-                batch().hydration_request(None, &FallbackCaches::default()),
+                batch().hydration_request(
+                    &FallbackCaches::default(),
+                    &Metrics::none().request(
+                        Endpoint::EvaluateTweets,
+                        RequestLevel::Named(SafetyLevel::QuotedTweetRules),
+                    ),
+                ),
             )
             .await;
         let admitted = post_evaluator

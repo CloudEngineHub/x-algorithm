@@ -75,26 +75,6 @@ pub(super) fn rows() -> Vec<Row> {
             )],
         },
         Row {
-            name: "nsfw_reported_heuristics_label_without_the_modern_blur",
-            subject: Subject::Post(labeled(SafetyLabelType::NSFW_REPORTED_HEURISTICS)),
-            expect: vec![(
-                TimelineHomeHydration,
-                no_client_context(),
-                legacy_interstitial("nsfw_reported_heuristics/legacy_interstitial"),
-            )],
-        },
-        Row {
-            name: "gore_and_violence_reported_heuristics_label_without_the_modern_blur",
-            subject: Subject::Post(labeled(
-                SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS,
-            )),
-            expect: vec![(
-                TimelineHomeHydration,
-                no_client_context(),
-                legacy_interstitial("gore_and_violence_reported_heuristics/legacy_interstitial"),
-            )],
-        },
-        Row {
             name: "nsfw_card_image_label_without_the_modern_blur",
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_CARD_IMAGE)),
             expect: vec![(

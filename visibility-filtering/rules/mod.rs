@@ -32,8 +32,8 @@ pub use rule_spec::{
     RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
     TweetSafetyLabelsLeaf, ViewerAccountLeaf,
 };
-pub use safety_level::SafetyLevel;
-pub(crate) use safety_level::{QuoteEntries, RerenderReason};
+pub(crate) use safety_level::{LevelError, LevelSpec, QuoteEntries, RerenderReason, WireLevel};
+pub use safety_level::{Rpc, SafetyLevel};
 
 #[cfg(test)]
 pub(crate) fn test_context<'a>(

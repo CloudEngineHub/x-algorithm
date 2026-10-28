@@ -561,12 +561,21 @@ impl CandidateBuilder {
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
         debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
+        debug_assert!(
+            !Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR.contains(edge),
+            "{edge:?} is read through root_author_blocks_viewer()"
+        );
         self.candidate.edges = self.candidate.edges.with(edge);
         self
     }
 
     pub(crate) fn with_media(mut self) -> Self {
         self.candidate.post.tweet_features.media.has_media = true;
+        self
+    }
+
+    pub(crate) fn root_author_blocks_viewer(mut self) -> Self {
+        self.candidate.post.conversation_root_author_blocks_viewer = true;
         self
     }
 
@@ -580,11 +589,6 @@ impl CandidateBuilder {
 
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
         self.candidate.post.source_tweet_id = Some(source_tweet_id);
-        self
-    }
-
-    pub(crate) fn reply(mut self) -> Self {
-        self.candidate.post.is_reply = true;
         self
     }
 

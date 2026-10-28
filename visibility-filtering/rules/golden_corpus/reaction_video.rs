@@ -5,17 +5,6 @@ use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::InterstitialReason;
 
-const GORE_LABELS: [(&str, SafetyLabelType); 2] = [
-    (
-        "reaction_to_gore_and_violence_high_precision_post",
-        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
-    ),
-    (
-        "reaction_to_gore_and_violence_reported_heuristics_post",
-        SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS,
-    ),
-];
-
 pub(super) fn rows() -> Vec<Row> {
     let adult = || {
         blurred(
@@ -36,7 +25,7 @@ pub(super) fn rows() -> Vec<Row> {
         )
     };
     let nsfw_view = || Role::As("nsfw_view", sensitive_opt_in_viewer());
-    let mut rows = vec![
+    vec![
         Row {
             name: "reaction_to_adult_post",
             subject: Subject::Post(
@@ -91,15 +80,20 @@ pub(super) fn rows() -> Vec<Row> {
                 (TimelineHome, Role::NonFollower, allow()),
             ],
         },
-    ];
-    rows.extend(GORE_LABELS.into_iter().map(|(name, label)| Row {
-        name,
-        subject: Subject::Post(candidate().with_reacted_to_post_labels(&[label]).build()),
-        expect: vec![
-            (TimelineHomeHydration, Role::NonFollower, gore()),
-            (TimelineHomeHydration, Role::Author, gore()),
-            (TimelineHomeHydration, nsfw_view(), gore()),
-        ],
-    }));
-    rows
+        Row {
+            name: "reaction_to_gore_post",
+            subject: Subject::Post(
+                candidate()
+                    .with_reacted_to_post_labels(&[
+                        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,
+                    ])
+                    .build(),
+            ),
+            expect: vec![
+                (TimelineHomeHydration, Role::NonFollower, gore()),
+                (TimelineHomeHydration, Role::Author, gore()),
+                (TimelineHomeHydration, nsfw_view(), gore()),
+            ],
+        },
+    ]
 }

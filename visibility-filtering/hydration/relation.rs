@@ -1,8 +1,7 @@
 use crate::hydration::inventory::Source;
 use crate::hydration::store::KeyOrigin;
 use crate::hydration::{Hydrator, Hydrators};
-use crate::metrics::Rpc;
-use crate::models::{AuthorId, PureCore, TweetFeatures, TweetId};
+use crate::models::{AuthorId, PureCore, RetweetMerge, TweetFeatures, TweetId};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
@@ -36,7 +35,7 @@ pub(super) enum Trigger {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Role {
-    Judged { rpc: Rpc },
+    Judged,
     Read,
 }
 
@@ -51,9 +50,7 @@ impl Relation {
         match self {
             Relation::RetweetSource => RelationSpec {
                 trigger: Trigger::PureCore(retweet_source),
-                role: Role::Judged {
-                    rpc: Rpc::EvaluateTweets,
-                },
+                role: Role::Judged,
                 fetch: Fetch::Shared,
             },
             Relation::ConversationRoot => RelationSpec {
@@ -89,9 +86,9 @@ impl Relation {
         false
     }
 
-    pub(super) fn is_on(self, posts_judged_for: Option<Rpc>, planned: Hydrators) -> bool {
+    pub(super) fn is_on(self, retweet_merge: RetweetMerge, planned: Hydrators) -> bool {
         match self.spec().role {
-            Role::Judged { rpc } => posts_judged_for == Some(rpc),
+            Role::Judged => retweet_merge == RetweetMerge::Merged,
             Role::Read => planned
                 .iter()
                 .any(|node| node.spec().relation == Some(self)),
@@ -154,7 +151,7 @@ impl fmt::Display for Relation {
             reads.join(",")
         )?;
         match spec.role {
-            Role::Judged { rpc } => write!(f, " role: judged ({})", <&str>::from(rpc))?,
+            Role::Judged => f.write_str(" role: judged (retweet merge)")?,
             Role::Read => f.write_str(" role: read")?,
         }
         if spec.trigger.needs_viewer() {

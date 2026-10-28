@@ -1,14 +1,13 @@
 use super::{HydratedRequest, PostBatch, PostEvaluation, PostEvaluator, PostObserver};
 use crate::hydration::Hydrators;
-use crate::metrics as ft_metrics;
-use crate::metrics::Rpc;
+use crate::metrics::families::RETWEET_SOURCES;
+use crate::metrics::RequestMetrics;
 use crate::models::{
-    Decided, Evaluation, EvaluationKey, PlacedCandidate, TweetId, Verdict, Withholding,
+    Decided, Evaluation, EvaluationKey, PlacedCandidate, RetweetMerge, TweetId, Verdict,
+    Withholding,
 };
 use crate::rules::PolicyTrace;
 use std::collections::{HashMap, HashSet};
-
-const RETWEET_SOURCES: &str = "evaluate_tweets_retweet_sources";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeSelection {
@@ -42,11 +41,12 @@ impl PostObserver for Traced {
 pub(crate) async fn hydrate_and_trace(
     post_evaluator: &PostEvaluator,
     request: PostBatch,
+    metrics: &RequestMetrics,
 ) -> (HydratedRequest, Vec<PostEvaluation>, Traced) {
-    let rpc = request.rpc;
+    let retweet_merge = request.retweet_merge;
     let mut traced = Traced::default();
-    let (hydrated, outcomes) = post_evaluator.run(request, &mut traced).await;
-    if rpc == Rpc::EvaluateTweets {
+    let (hydrated, outcomes) = post_evaluator.run(request, metrics, &mut traced).await;
+    if retweet_merge == RetweetMerge::Merged {
         trace_unmerged_sources(post_evaluator, &hydrated, &mut traced);
     }
     (hydrated, outcomes, traced)
@@ -87,16 +87,9 @@ pub(super) fn merge_sources<O: PostObserver>(
         }
         return outcomes;
     }
-    ft_metrics::incr_nonzero(
-        RETWEET_SOURCES,
-        &[("outcome", "in_batch")],
-        in_batch.len() as u64,
-    );
-    ft_metrics::incr_nonzero(
-        RETWEET_SOURCES,
-        &[("outcome", "fetched")],
-        fetched.len() as u64,
-    );
+    let metrics = hydrated.metrics();
+    metrics.count(&RETWEET_SOURCES, ["in_batch"], in_batch.len() as u64);
+    metrics.count(&RETWEET_SOURCES, ["fetched"], fetched.len() as u64);
     let source_ids = || in_batch.iter().chain(&fetched).copied();
     let keys = hydrated
         .candidates()
@@ -249,7 +242,6 @@ mod tests {
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup, Relation};
-    use crate::metrics::Rpc;
     use crate::models::{
         ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
         MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate, SafetyLabelType,
@@ -449,7 +441,7 @@ mod tests {
     fn evaluate_tweets(sources: InMemorySources) -> Scenario<InMemorySources> {
         Scenario::new(sources, SafetyLevel::TimelineHomeHydration)
             .viewer(Some(1))
-            .rpc(Rpc::EvaluateTweets)
+            .retweet_merge(RetweetMerge::Merged)
     }
 
     fn requested(tweet_ids: &[u64]) -> Vec<RawCandidate> {
@@ -485,7 +477,7 @@ mod tests {
 
     const TWEET_KEYED: [Source; 4] = [
         Source::TesPureCoreData,
-        Source::TesTweet,
+        Source::TesTweetForVisibility,
         Source::TesConversationControl,
         Source::SafetyLabels,
     ];
@@ -607,7 +599,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
             );
         }
         for tweet_ids in [&[2][..], &[1, 2, 3, 5]] {
-            let plain = evaluate_tweets(retweet_world(true)).rpc(Rpc::FilterTweets);
+            let plain = evaluate_tweets(retweet_world(true)).retweet_merge(RetweetMerge::Unmerged);
             plain.hydrate(&requested(tweet_ids)).await;
             let merged = evaluate_tweets(retweet_world(true));
             merged.evaluate(&requested(tweet_ids)).await;
@@ -680,7 +672,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         let ms = Duration::from_millis;
         retweet_world(share_names_author)
             .latency(Source::TesPureCoreData, ms(10))
-            .latency(Source::TesTweet, ms(30))
+            .latency(Source::TesTweetForVisibility, ms(30))
             .latency(Source::TesConversationControl, ms(20))
             .latency(Source::SafetyLabels, ms(15))
             .latency(Source::GizmoduckViewer, ms(5))
@@ -693,7 +685,8 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         let ms = Duration::from_millis;
         for share_names_author in [true, false] {
             let raw = requested(&[1, 2, 3, 4]);
-            let alone = evaluate_tweets(slow_world(share_names_author)).rpc(Rpc::FilterTweets);
+            let alone = evaluate_tweets(slow_world(share_names_author))
+                .retweet_merge(RetweetMerge::Unmerged);
             let t0 = tokio::time::Instant::now();
             alone.hydrate(&raw).await;
             let alone = starts(alone.sources(), t0);
@@ -732,7 +725,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         let rows = [
             (
                 "source tweet row",
-                retweet_world(true).fail_key(Source::TesTweet, 6),
+                retweet_world(true).fail_key(Source::TesTweetForVisibility, 6),
                 [
                     Complete,
                     Complete,
@@ -993,7 +986,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
         }
 
         let evaluated = evaluate_tweets(shared_lookups(Found, NotFound, NotFound, true))
-            .rpc(Rpc::FilterTweets)
+            .retweet_merge(RetweetMerge::Unmerged)
             .evaluate(&requested(&[1]))
             .await;
         assert_eq!(evaluated.evaluations(), [judged]);
@@ -1045,7 +1038,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
 
     #[tokio::test]
     async fn the_source_of_a_failed_retweet_changes_no_verdict() {
-        let world = || retweet_world(true).fail_key(Source::TesTweet, 4);
+        let world = || retweet_world(true).fail_key(Source::TesTweetForVisibility, 4);
         let judged = |world: InMemorySources| async move {
             let scenario = evaluate_tweets(world);
             let evaluated = scenario.evaluate(&requested(&[1, 2, 3, 4])).await;
@@ -1215,7 +1208,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
             batches(sources),
             "\
 TesPureCoreData [[5], [2]]
-TesTweet [[5], [2]]
+TesTweetForVisibility [[5], [2]]
 TesConversationControl [[5], [2]]
 SafetyLabels [[5], [2]]
 GizmoduckViewer [[1]]
@@ -1279,7 +1272,7 @@ Flock blocks-rev[30]"
             SafetyLevel::TimelineHome,
         )
         .viewer(Some(1))
-        .rpc(Rpc::EvaluateTweets);
+        .retweet_merge(RetweetMerge::Merged);
         let stale = Evaluation::complete(dropped(
             FilteredReason::UnspecifiedReason,
             "stale_tweet/drop/unspecified",
@@ -1307,7 +1300,7 @@ Flock blocks-rev[30]"
             let evaluated = scenario.evaluate(&requested(tweet_ids)).await;
             assert_eq!(evaluated.retweet_sources, expected, "{tweet_ids:?}");
         }
-        let plain = scenario.rpc(Rpc::FilterTweets);
+        let plain = scenario.retweet_merge(RetweetMerge::Unmerged);
         let evaluated = plain.evaluate(&requested(&[1, 2, 3, 4])).await;
         assert_eq!(evaluated.retweet_sources, NoSource);
         assert_eq!(<&str>::from(NoSource), "none");

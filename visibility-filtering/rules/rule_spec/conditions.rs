@@ -12,15 +12,6 @@ pub(in crate::rules) const HAS_NSFW_MEDIA_LABEL: RuleCond = RuleCond::Named(&Nam
     ],
 });
 
-pub(in crate::rules) const REACTED_TO_POST_HAS_GORE_MEDIA_LABEL: RuleCond =
-    RuleCond::Named(&NamedCond {
-        name: "reacted_to_post_has_gore_media_label",
-        condition: any![
-            ReactedToPostHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-            ReactedToPostHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS)
-        ],
-    });
-
 pub(in crate::rules) const IS_NSFW_FLAGGED: RuleCond = RuleCond::Named(&NamedCond {
     name: "is_nsfw_flagged",
     condition: any![
@@ -148,7 +139,7 @@ mod tests {
     fn no_two_named_conditions_read_the_same_leaves() {
         let mut named = Vec::new();
         for &level in SafetyLevel::VARIANTS {
-            let rules = level.spec().rules.lists();
+            let rules = level.spec().rules().lists();
             named.extend(leaf_sets(rules.user));
             named.extend(leaf_sets(rules.post));
         }

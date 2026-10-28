@@ -260,6 +260,10 @@ def _batch_timestamps(
         return manifest.batch_timestamps(min_batch, max_batch)
 
 
+def batch_start_time_ms(topic_dir: str, batch_id: int) -> int:
+    return int(_batch_timestamps(topic_dir, batch_id, batch_id)[0])
+
+
 def resolve_time_range(
     topic_dir: str,
     min_batch: int,

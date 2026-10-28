@@ -762,6 +762,7 @@ class InterleavingRecordBatchProvider:
         id_list_sidecar_root: str | None = None,
         id_list_prefer_sidecar: bool = True,
         id_list_sidecar_strict: bool = False,
+        end_batch_id: int | None = None,
     ):
         self._conversion_delay_columns = conversion_delay_columns
         self._include_action_delay_columns = include_action_delay_columns
@@ -874,7 +875,7 @@ class InterleavingRecordBatchProvider:
             meta = _load_valid_batches_metadata(metadata_path)
             if meta is None:
                 raise ValueError(f"Cannot load metadata from {metadata_path}")
-            start_batch_id, end_batch_id = _resolve_time_range(
+            start_batch_id, range_end_batch_id = _resolve_time_range(
                 self._topic_dir,
                 meta["min_valid_batch"],
                 meta["max_valid_batch"],
@@ -882,7 +883,13 @@ class InterleavingRecordBatchProvider:
                 max_timestamp_ms,
             )
             if max_timestamp_ms is not None:
-                self._end_batch_id = end_batch_id
+                self._end_batch_id = range_end_batch_id
+        if end_batch_id is not None:
+            self._end_batch_id = (
+                end_batch_id
+                if self._end_batch_id is None
+                else min(self._end_batch_id, end_batch_id)
+            )
 
         self._shuffle_skip_rows: int = 0
         self._shuffle_skip_spans_windows: bool = False
@@ -1476,6 +1483,17 @@ class InterleavingRecordBatchProvider:
         self._reads_in_current_batch = 0
         yield from self._drain_files(files, pool=pool)
 
+    def set_end_batch_id(self, end_batch_id: int) -> None:
+        if self._end_batch_id is not None and end_batch_id < self._end_batch_id:
+            raise ValueError(
+                f"end_batch_id can only move forward: {self._end_batch_id} -> {end_batch_id}"
+            )
+        self._end_batch_id = end_batch_id
+
+    def block_shuffle_window_start(self) -> int | None:
+        state = self._block_state
+        return None if state is None else state[0]
+
     def get_position(self) -> DataPosition:
         if self._shuffle_window_time_slices > 0 and self._shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
             return DataPosition(
@@ -1863,11 +1881,16 @@ class PhoenixDataset(Dataset):
         batch_size: int,
         current_step: int,
         resume_position: DataPosition | None = None,
+        end_batch_id: int | None = None,
+        start_batch_id: int | None = None,
     ) -> int | None:
-        if self.date_range is None or self.path is None:
+        if self.path is None:
             return None
-        max_ts = self._parse_date_bound(self.date_range[1])
-        if max_ts is None:
+        min_ts = max_ts = None
+        if self.date_range is not None:
+            min_ts = self._parse_date_bound(self.date_range[0])
+            max_ts = self._parse_date_bound(self.date_range[1])
+        if end_batch_id is None and max_ts is None:
             return None
 
         topic_dir = self.path
@@ -1876,14 +1899,17 @@ class PhoenixDataset(Dataset):
         if meta is None:
             return None
 
-        min_ts = self._parse_date_bound(self.date_range[0])
-        start_bid, end_bid = _resolve_time_range(
-            topic_dir,
-            meta["min_valid_batch"],
-            meta["max_valid_batch"],
-            min_ts,
-            max_ts,
-        )
+        if end_batch_id is None:
+            start_bid, end_bid = _resolve_time_range(
+                topic_dir,
+                meta["min_valid_batch"],
+                meta["max_valid_batch"],
+                min_ts,
+                max_ts,
+            )
+        else:
+            start_bid = self.start_batch_id() if start_batch_id is None else start_batch_id
+            end_bid = min(end_batch_id, meta["max_valid_batch"] + 1)
         resume_bid: int | None = None
         saved_reads = 0
         saved_bs: int | None = None
@@ -2025,6 +2051,49 @@ class PhoenixDataset(Dataset):
         )
         return data_end_step
 
+    def supports_follow_data_end(self) -> bool:
+        return True
+
+    @property
+    def _topic_dir(self) -> str:
+        assert self.path is not None, "follow_data_end requires dataset.path"
+        return self.path
+
+    def start_batch_id(self) -> int:
+        meta = _load_valid_batches_metadata(os.path.join(self._topic_dir, ".valid_batches.json"))
+        if meta is None:
+            raise RuntimeError(f"could not read the dataset index under {self._topic_dir}")
+        min_ts = None if self.date_range is None else self._parse_date_bound(self.date_range[0])
+        if min_ts is None:
+            return meta["min_valid_batch"]
+        start_bid, _ = _resolve_time_range(
+            self._topic_dir, meta["min_valid_batch"], meta["max_valid_batch"], min_ts, None
+        )
+        return start_bid
+
+    def available_end_batch_id(self, after_end_batch_id: int = -1) -> int | None:
+        meta = _load_valid_batches_metadata(os.path.join(self._topic_dir, ".valid_batches.json"))
+        if meta is None:
+            return None
+        end = meta["max_valid_batch"] + 1
+        if end <= after_end_batch_id:
+            return None
+        manifest = (
+            load_batch_manifest(self._topic_dir) if self._counts_steps_from_manifest() else None
+        )
+        if manifest is not None:
+            end = min(end, manifest.first_batch + manifest.rows.shape[0])
+        return end if end > after_end_batch_id else None
+
+    def set_end_batch_id(self, end_batch_id: int) -> None:
+        self._end_batch_id = end_batch_id
+        if self._rb_provider is not None:
+            self._rb_provider.set_end_batch_id(end_batch_id)
+
+    def reader_window_start(self) -> int | None:
+        provider = self._rb_provider
+        return None if provider is None else provider.block_shuffle_window_start()
+
     def shutdown(self):
         stop_event = self._producer_stop
         queue = self._producer_queue
@@ -2048,6 +2117,7 @@ class PhoenixDataset(Dataset):
     _producer_queue: Queue | None = dataclasses.field(init=False, default=None, repr=False)
     _producer_stop: Event | None = dataclasses.field(init=False, default=None, repr=False)
     _producer_thread: Thread | None = dataclasses.field(init=False, default=None, repr=False)
+    _end_batch_id: int | None = dataclasses.field(init=False, default=None, repr=False)
 
     def get_data_position(self) -> DataPosition | None:
         if self._rb_provider is not None:
@@ -2171,6 +2241,7 @@ class PhoenixDataset(Dataset):
                         block_shuffle_order_per_shard=(
                             self.block_shuffle_order_per_shard and not self.is_eval
                         ),
+                        end_batch_id=self._end_batch_id,
                     )
                 else:
                     if shuffle_window > 0 or shuffle_mode != ShuffleMode.NONE:

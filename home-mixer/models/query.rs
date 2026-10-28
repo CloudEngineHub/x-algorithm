@@ -5,6 +5,7 @@ use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::in_network_reply::{serialize_in_network_replies, InNetworkReplies};
 use crate::models::user_features::UserFeatures;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_candidate_pipeline::candidate_pipeline::PipelineQuery;
@@ -139,6 +140,8 @@ pub struct ScoredPostsQuery {
     pub ad_drops: Arc<AdDrops>,
     #[serde(serialize_with = "serialize_debug")]
     pub video_carousel: Arc<OnceLock<Vec<PostCandidate>>>,
+    #[serde(skip)]
+    pub served_post_score_infos: Arc<OnceLock<HashMap<u64, xai_recsys_proto::ScoreInfo>>>,
 }
 
 pub use xai_candidate_pipeline::component_library::clients::strato_client::UserDemographics;
@@ -255,6 +258,7 @@ impl ScoredPostsQuery {
             following_pagination_meta: Arc::new(OnceLock::new()),
             ad_drops: Arc::default(),
             video_carousel: Arc::new(OnceLock::new()),
+            served_post_score_infos: Arc::new(OnceLock::new()),
         }
     }
 

@@ -847,92 +847,6 @@ pub(super) const NSFW_ACCOUNT_LEGACY_INTERSTITIAL: Rule = Rule {
     action: legacy_nsfw_interstitial(),
 };
 
-pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_AGE_VERIFICATION: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: NonAuthors,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        ClientVerifyBlurSupportIs(VerifyBlurSupport::Unsupported),
-        VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES
-    ],
-    action: tombstone(TombstoneReason::SensitiveViewerAgeVerification),
-};
-
-pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_UPDATE_APP_IOS: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: NonAuthors,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        ClientVerifyBlurSupportIs(VerifyBlurSupport::IosNeedsUpdate),
-        VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES
-    ],
-    action: tombstone(TombstoneReason::UpdateAppIos),
-};
-
-pub(super) const NSFW_REPORTED_HEURISTICS_TOMBSTONE_UPDATE_APP_ANDROID: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: NonAuthors,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        ClientVerifyBlurSupportIs(VerifyBlurSupport::AndroidNeedsUpdate),
-        VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES
-    ],
-    action: tombstone(TombstoneReason::UpdateAppAndroid),
-};
-
-pub(super) const NSFW_REPORTED_HEURISTICS_BLUR_SENSITIVE_AGE_PROMPT: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: NonAuthors,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        ClientVerifyBlurSupportIs(VerifyBlurSupport::Supported),
-        VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES
-    ],
-    action: blur_with_age_prompt(InterstitialReason::Sensitive(true)),
-};
-
-pub(super) const NSFW_REPORTED_HEURISTICS_BLUR_SENSITIVE: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: Everyone,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
-    ],
-    action: blur(InterstitialReason::Sensitive(true)),
-};
-
-pub(super) const NSFW_REPORTED_HEURISTICS_LEGACY_INTERSTITIAL: Rule = Rule {
-    id: RuleId::NsfwReportedHeuristics,
-    audience: Everyone,
-    when: all![
-        TweetHasLabel(SafetyLabelType::NSFW_REPORTED_HEURISTICS),
-        !ClientHasModernBlur
-    ],
-    action: legacy_nsfw_interstitial(),
-};
-
-pub(super) const GORE_AND_VIOLENCE_REPORTED_HEURISTICS_BLUR_SENSITIVE: Rule = Rule {
-    id: RuleId::GoreAndViolenceReportedHeuristics,
-    audience: Everyone,
-    when: all![
-        TweetHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS),
-        !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
-    ],
-    action: blur(InterstitialReason::Sensitive(true)),
-};
-
-pub(super) const GORE_AND_VIOLENCE_REPORTED_HEURISTICS_LEGACY_INTERSTITIAL: Rule = Rule {
-    id: RuleId::GoreAndViolenceReportedHeuristics,
-    audience: Everyone,
-    when: all![
-        TweetHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS),
-        !ClientHasModernBlur
-    ],
-    action: legacy_nsfw_interstitial(),
-};
-
 pub(super) const ORIGINAL_TWEET_ADULT_MEDIA_PROPAGATION_BLUR_SENSITIVE: Rule = Rule {
     id: RuleId::OriginalTweetAdultMediaPropagation,
     audience: Everyone,
@@ -943,7 +857,9 @@ pub(super) const ORIGINAL_TWEET_ADULT_MEDIA_PROPAGATION_BLUR_SENSITIVE: Rule = R
 pub(super) const ORIGINAL_TWEET_GORE_MEDIA_PROPAGATION_BLUR_VIOLENCE: Rule = Rule {
     id: RuleId::OriginalTweetGoreMediaPropagation,
     audience: Everyone,
-    when: all![REACTED_TO_POST_HAS_GORE_MEDIA_LABEL],
+    when: all![ReactedToPostHasLabel(
+        SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION
+    )],
     action: blur(InterstitialReason::Violence(true)),
 };
 

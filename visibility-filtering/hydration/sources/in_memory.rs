@@ -524,7 +524,8 @@ impl Sources for InMemorySources {
     }
 
     async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures> {
-        self.keyed(Source::TesTweet, tweet_ids, &self.tweets).await
+        self.keyed(Source::TesTweetForVisibility, tweet_ids, &self.tweets)
+            .await
     }
 
     async fn conversation_controls(

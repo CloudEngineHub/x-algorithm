@@ -163,7 +163,9 @@ impl vf_pb::VisibilityFilteringService for VFServer {
 mod tests {
     use super::*;
     use crate::hydration::sources::InMemorySources;
+    use crate::metrics::Metrics;
     use crate::params::ClientSwitches;
+    use crate::safety_label_source::metrics::LabelMetrics;
     use crate::safety_label_source::remote::{FailureKind, LookupResults, RemoteLabels};
     use crate::safety_label_source::LookupError;
     use crate::safety_label_source::SafetyLabelSource;
@@ -228,10 +230,14 @@ mod tests {
                 ClientSwitches::for_tests(),
                 None,
             ),
-            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
-                Arc::new(NoLabels),
-                Some(1024),
-            ))),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(
+                Arc::new(SafetyLabelSource::new(
+                    Arc::new(NoLabels),
+                    Some(1024),
+                    LabelMetrics::default(),
+                )),
+                Metrics::none(),
+            ),
         }
     }
 
@@ -305,10 +311,14 @@ mod tests {
     #[tokio::test]
     async fn get_safety_labels_loopback() {
         let (channel, handle) = serve(VFServer {
-            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
-                Arc::new(LabelsForPostOne),
-                Some(1024),
-            ))),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(
+                Arc::new(SafetyLabelSource::new(
+                    Arc::new(LabelsForPostOne),
+                    Some(1024),
+                    LabelMetrics::default(),
+                )),
+                Metrics::none(),
+            ),
             ..server(InMemorySources::default())
         })
         .await;

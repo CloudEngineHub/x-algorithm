@@ -7,7 +7,7 @@ use crate::rules::Expansion;
 use strum::VariantArray;
 use xai_core_entities::gizmoduck_client::QueryFields;
 
-const ACTORS: (&str, &str) = ("gizmoduck_actor", "get_users");
+const ACTORS: (&str, &str) = ("gizmoduck", "actor_profile");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
@@ -184,7 +184,7 @@ pub(super) struct NodeSpec {
 impl NodeSpec {
     pub(super) const fn stake(self) -> Stake {
         let names_the_row = matches!(self.key.names(), Names::Post | Names::Author);
-        if self.source.row().decides_existence && names_the_row {
+        if self.source.decides_existence() && names_the_row {
             Stake::Exists
         } else {
             self.declared
@@ -231,37 +231,38 @@ impl Hydrator {
                 ..node
             }
         }
-        const RELATIONSHIPS: (&str, &str) = ("socialgraph", "batch_check_relationships");
-        const BLOCKED_BY: (&str, &str) = ("blocked_by", "batch_check_blocked_by");
-        const USER_PAIRS: (&str, &str) = ("socialgraph", "batch_check_user_pairs");
+        const VIEWER_AUTHOR_EDGES: (&str, &str) = ("socialgraph", "viewer_author_edges");
+        const QUOTE_AUTHOR_EDGES: (&str, &str) = ("socialgraph", "quote_author_edges");
+        const CONVERSATION_ROOT_AUTHOR_EDGES: (&str, &str) =
+            ("socialgraph", "conversation_root_author_edges");
         const REACTED_TO: Stake = Expansion::ReactedTo.spec().on_failure;
         match self {
             H::PureCore => node(
                 S::TesPureCoreData,
                 Part::Column,
                 K::RequestTweets,
-                ("tes", "get_tweet_core_datas"),
+                ("tes", "tweet_pure_core_data"),
                 MustHave,
             ),
             H::Tweet => node(
-                S::TesTweet,
+                S::TesTweetForVisibility,
                 Part::Column,
                 K::RequestTweets,
-                ("tes", "get_tweets"),
+                ("tes", "tweet_for_visibility"),
                 MustHave,
             ),
             H::ConversationControl => node(
                 S::TesConversationControl,
                 Part::Column,
                 K::RequestTweets,
-                ("conversation_control", "get_conversation_controls"),
+                ("tes", "tweet_conversation_control"),
                 BestEffort,
             ),
             H::TweetSafetyLabels => node(
                 S::SafetyLabels,
                 Part::Column,
                 K::RequestTweets,
-                ("safety_labels", "get"),
+                ("safety_labels", "tweet_safety_labels"),
                 MustHave,
             ),
             H::ViewerProfile => node(
@@ -272,112 +273,112 @@ impl Hydrator {
                     QueryFields::SAFETY,
                 ]),
                 K::Viewer,
-                ("gizmoduck", "get_viewer_data"),
+                ("gizmoduck", "viewer_profile"),
                 MustHave,
             ),
             H::ViewerLabels => node(
                 S::GizmoduckViewer,
                 Part::Fields(&[QueryFields::LABELS]),
                 K::Viewer,
-                ("gizmoduck", "get_viewer_data"),
+                ("gizmoduck", "viewer_profile"),
                 MustHave,
             ),
             H::AuthorSafety => node(
                 S::GizmoduckAuthor,
                 Part::Fields(&[QueryFields::SAFETY]),
                 K::PureCoreAuthor,
-                ("gizmoduck", "get_users"),
+                ("gizmoduck", "author_profile"),
                 MustHave,
             ),
             H::AuthorLabels => node(
                 S::GizmoduckAuthor,
                 Part::Fields(&[QueryFields::LABELS]),
                 K::PureCoreAuthor,
-                ("gizmoduck", "get_users"),
+                ("gizmoduck", "author_profile"),
                 MustHave,
             ),
             H::Follows => node(
                 S::Flock,
                 Part::Edge(Edge::Follows),
                 K::PureCoreAuthor,
-                RELATIONSHIPS,
+                VIEWER_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::Blocks => node(
                 S::Flock,
                 Part::Edge(Edge::Blocks),
                 K::PureCoreAuthor,
-                RELATIONSHIPS,
+                VIEWER_AUTHOR_EDGES,
                 MustHave,
             ),
             H::Mutes => node(
                 S::Flock,
                 Part::Edge(Edge::Mutes),
                 K::PureCoreAuthor,
-                RELATIONSHIPS,
+                VIEWER_AUTHOR_EDGES,
                 MustHave,
             ),
             H::MuteRetweets => node(
                 S::Flock,
                 Part::Edge(Edge::MuteRetweets),
                 K::PureCoreRetweeter,
-                RELATIONSHIPS,
+                VIEWER_AUTHOR_EDGES,
                 MustHave,
             ),
             H::BlockedByAuthor => node(
                 S::Flock,
                 Part::Edge(Edge::BlockedBy),
                 K::PureCoreAuthor,
-                BLOCKED_BY,
+                VIEWER_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::BlockedByReplyRoot => node(
                 S::Flock,
                 Part::Edge(Edge::BlockedBy),
                 K::PureCoreReplyRoot,
-                BLOCKED_BY,
+                VIEWER_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::SuperFollowsExclusive => node(
                 S::Flock,
                 Part::Edge(Edge::SuperFollows),
                 K::ExclusiveConversationAuthor,
-                ("exclusive_content", "batch_check_super_follows"),
+                ("socialgraph", "exclusive_super_follow"),
                 MustHave,
             ),
             H::RootFollowsViewer => node(
                 S::Flock,
                 Part::Edge(Edge::FollowedBy),
                 K::CommunityOrMyNetworkRoot,
-                ("conversation_control", "batch_check_followed_by"),
+                CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::RootFollowsViewerSecondDegree => node(
                 S::Wingman,
                 Part::Edge(Edge::SecondDegree),
                 K::MyNetworkRootNotFollowingViewer,
-                ("conversation_control", "exists_intersect"),
+                ("wingman", "conversation_root_author_second_degree"),
                 Absent(Tier::BestEffort),
             ),
             H::SuperFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::SuperFollows),
                 K::SubscribersRoot,
-                ("conversation_control", "batch_check_super_follows"),
+                CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::ViewerFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::Follows),
                 K::FollowersRoot,
-                ("conversation_control", "batch_check_follows"),
+                CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::BlockedByConversationRoot => node(
                 S::Flock,
                 Part::Edge(Edge::BlockedBy),
                 K::ConversationControlBlockAuthor,
-                ("conversation_control", "batch_check_blocked_by"),
+                CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::ConversationRootPost => reads(
@@ -386,7 +387,7 @@ impl Hydrator {
                     S::TesPureCoreData,
                     Part::Column,
                     K::RelatedTweet,
-                    ("conversation_root", "get_tweet_core_datas"),
+                    ("tes", "conversation_root_pure_core_data"),
                     BestEffort,
                 ),
             ),
@@ -396,7 +397,7 @@ impl Hydrator {
                     S::Flock,
                     Part::Edge(Edge::BlockedBy),
                     K::ConversationRootPostAuthor,
-                    ("conversation_root", "batch_check_blocked_by"),
+                    ("socialgraph", "conversation_root_author_blocked_by"),
                     BestEffort,
                 ),
             ),
@@ -404,63 +405,63 @@ impl Hydrator {
                 S::ViewerCountry,
                 Part::Column,
                 K::ViewerForCoAllowedList,
-                ("conversation_control", "tfe_top_country"),
+                ("about_this_account", "viewer_country"),
                 BestEffort,
             ),
             H::CommunityModeration => node(
                 S::CommunityModeration,
                 Part::Column,
                 K::CommunityPost,
-                ("communities", "moderation_state"),
+                ("communities", "community_moderation"),
                 MustHave,
             ),
             H::CommunityModerator => node(
                 S::CommunityModerator,
                 Part::Column,
                 K::ModeratedCommunity,
-                ("communities", "visibility_features"),
+                ("communities", "community_moderator"),
                 MustHave,
             ),
             H::CommunityViewerRemoved => node(
                 S::CommunityViewerRemoved,
                 Part::Column,
                 K::TweetCommunity,
-                ("communities", "is_removed"),
+                ("communities", "community_viewer_removed"),
                 BestEffort,
             ),
             H::ArticleLifecycle => node(
                 S::ArticleLifecycle,
                 Part::Column,
                 K::TweetArticle,
-                ("article", "get_lifecycles"),
+                ("articles", "article_lifecycle"),
                 MustHave,
             ),
             H::ArticleMediaEntities => node(
                 S::ArticleMediaEntities,
                 Part::Column,
                 K::TweetArticle,
-                ("article", "get_media_entities"),
+                ("articles", "article_media_entities"),
                 Absent(Tier::MustHave),
             ),
             H::ArticleCoverMedia => node(
                 S::ArticleCoverMedia,
                 Part::Column,
                 K::TweetArticle,
-                ("article", "get_cover_media"),
+                ("articles", "article_cover_media"),
                 Absent(Tier::MustHave),
             ),
             H::TrustedFriends => node(
                 S::TrustedFriends,
                 Part::Edge(Edge::TrustedFriends),
                 K::TrustedFriendsList,
-                ("trusted_friends", "is_member_or_owner"),
+                ("trusted_friends", "trusted_friends_membership"),
                 Absent(Tier::MustHave),
             ),
             H::OutsideNarrowcastPlace => node(
                 S::UserLocation,
                 Part::Edge(Edge::OutsidePlace),
                 K::NarrowcastPlace,
-                ("geoduck", "user_location"),
+                ("geoduck", "viewer_location"),
                 BestEffort,
             ),
             H::AuthorBlocksOuterAuthor => reads(
@@ -469,7 +470,7 @@ impl Hydrator {
                     S::FlockUserPair,
                     Part::PairEdge(PairEdge::AuthorBlocksOuterAuthor),
                     K::Pair(PairEdge::AuthorBlocksOuterAuthor),
-                    USER_PAIRS,
+                    QUOTE_AUTHOR_EDGES,
                     MustHave,
                 ),
             ),
@@ -479,7 +480,7 @@ impl Hydrator {
                     S::FlockUserPair,
                     Part::PairEdge(PairEdge::OuterAuthorFollowsAuthor),
                     K::Pair(PairEdge::OuterAuthorFollowsAuthor),
-                    USER_PAIRS,
+                    QUOTE_AUTHOR_EDGES,
                     BestEffort,
                 ),
             ),
@@ -487,7 +488,7 @@ impl Hydrator {
                 S::TesQuotedTweet,
                 Part::Column,
                 K::OuterOfMissingQuote,
-                ("tes", "get_quoted_tweets"),
+                ("tes", "quoted_tweet"),
                 BestEffort,
             ),
             H::ReactedToPostSafetyLabels => reads(
@@ -496,7 +497,7 @@ impl Hydrator {
                     S::SafetyLabels,
                     Part::Column,
                     K::RelatedTweet,
-                    ("safety_labels", "get"),
+                    ("safety_labels", "reacted_to_safety_labels"),
                     REACTED_TO,
                 ),
             ),
@@ -506,7 +507,7 @@ impl Hydrator {
                     S::GizmoduckAuthor,
                     Part::Fields(&[QueryFields::SAFETY]),
                     K::RelatedAuthor,
-                    ("gizmoduck", "get_users"),
+                    ("gizmoduck", "reacted_to_author_profile"),
                     REACTED_TO,
                 ),
             ),
@@ -514,7 +515,7 @@ impl Hydrator {
                 S::GizmoduckViewer,
                 Part::Fields(&[QueryFields::MUTE_SETTINGS]),
                 K::Viewer,
-                ("gizmoduck", "get_viewer_data"),
+                ("gizmoduck", "viewer_profile"),
                 MustHave,
             ),
             H::AuthorProfile => node(
@@ -528,21 +529,21 @@ impl Hydrator {
                 S::Flock,
                 Part::Edge(Edge::FollowedBy),
                 K::PureCoreAuthor,
-                RELATIONSHIPS,
+                VIEWER_AUTHOR_EDGES,
                 MustHave,
             ),
             H::AuthorConfirmedEmail => node(
                 S::ActorEmails,
                 Part::Column,
                 K::UserIfViewerFiltersNoConfirmedEmail,
-                ("notifinfra", "get_obfuscated_user_emails"),
+                ("notifinfra", "actor_emails"),
                 MustHave,
             ),
             H::AuthorVerifiedPhone => node(
                 S::ActorPhones,
                 Part::Column,
                 K::UserIfViewerFiltersNoConfirmedPhone,
-                ("notifinfra", "get_obfuscated_user_phones"),
+                ("notifinfra", "actor_phones"),
                 MustHave,
             ),
         }
@@ -663,6 +664,11 @@ const MUST_HAVE: Hydrators = {
 };
 
 impl Hydrators {
+    pub(crate) const BLOCKED_BY_CONVERSATION_ROOT_AUTHOR: Self =
+        Self::of(Hydrator::BlockedByReplyRoot)
+            .with(Hydrator::BlockedByConversationRoot)
+            .with(Hydrator::BlockedByConversationRootPost);
+
     pub(crate) const fn must_have(self) -> Self {
         self.intersection(MUST_HAVE)
     }

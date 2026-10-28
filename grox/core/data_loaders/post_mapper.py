@@ -374,6 +374,7 @@ class PostMapper:
             if user_metadata.profileBannerImageUrl
             else None,
             blocked_count=user_metadata.blockedCount,
+            is_suspended=user_metadata.isSuspended,
         )
 
     @classmethod

@@ -1,6 +1,9 @@
 use crate::hydration::{request_context, Cause, Unresolved};
-use crate::metrics::{self as ft_metrics, Endpoint};
-use crate::models::{Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, Verdict};
+use crate::metrics::families::QUOTE_PASS;
+use crate::metrics::{self as ft_metrics, RequestMetrics};
+use crate::models::{
+    Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, RetweetMerge, Verdict,
+};
 use crate::post_evaluator::{AuthorJudgement, PostBatch, PostEvaluation, PostEvaluator};
 use crate::rules::{NoTrace, QuoteEntries, RerenderReason, RuleId, SafetyLevel};
 use std::collections::HashMap;
@@ -8,7 +11,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-pub(crate) const QUOTE_PASS: &str = "vf_quote_pass";
 const SHED: &str = "shed";
 const MAX_SHADOW_PASSES_IN_FLIGHT: usize = 32;
 
@@ -72,12 +74,11 @@ fn quoted_authors(request: &PostBatch) -> Option<PostBatch> {
         .copied()
         .collect();
     (!quotes.is_empty()).then(|| PostBatch {
-        viewer_id: request.viewer_id,
-        country_code: request.country_code.clone(),
+        viewer: request.viewer.clone(),
         client_capability: request.client_capability,
         safety_level: SafetyLevel::QuotedTweetRules,
         candidates: quotes,
-        rpc: request.rpc,
+        retweet_merge: RetweetMerge::Unmerged,
     })
 }
 
@@ -105,6 +106,7 @@ pub(crate) struct QuotePassRunner {
 pub(crate) struct PendingPass {
     level: SafetyLevel,
     authors: Option<PostBatch>,
+    metrics: RequestMetrics,
 }
 
 impl QuotePassRunner {
@@ -119,6 +121,7 @@ impl QuotePassRunner {
         &self,
         post_evaluator: &PostEvaluator,
         request: PostBatch,
+        metrics: &RequestMetrics,
     ) -> (Vec<PostEvaluation>, PendingPass) {
         let pending = PendingPass {
             level: request.safety_level,
@@ -126,8 +129,9 @@ impl QuotePassRunner {
                 QuotePassMode::Off => None,
                 QuotePassMode::Shadow => quoted_authors(&request),
             },
+            metrics: metrics.at_level(SafetyLevel::QuotedTweetRules),
         };
-        let (_, outcomes) = post_evaluator.run(request, &mut NoTrace).await;
+        let (_, outcomes) = post_evaluator.run(request, metrics, &mut NoTrace).await;
         (outcomes, pending)
     }
 
@@ -142,9 +146,9 @@ impl QuotePassRunner {
             return then(&outcomes, &Passes::Skipped);
         };
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-            ft_metrics::incr_nonzero(
-                QUOTE_PASS,
-                &[("outcome", SHED), ("safety_level", pending.level.into())],
+            pending.metrics.count(
+                &QUOTE_PASS,
+                [SHED],
                 u64::try_from(authors.candidates.len()).unwrap_or(u64::MAX),
             );
             return then(&outcomes, &Passes::Shed);
@@ -168,9 +172,9 @@ impl PendingPass {
     ) -> Passes {
         match self.authors {
             None => Passes::Skipped,
-            Some(authors) => {
-                Passes::Ran(quote_pass(post_evaluator, self.level, authors, outcomes).await)
-            }
+            Some(authors) => Passes::Ran(
+                quote_pass(post_evaluator, self.level, authors, outcomes, &self.metrics).await,
+            ),
         }
     }
 }
@@ -180,10 +184,11 @@ async fn quote_pass(
     level: SafetyLevel,
     authors: PostBatch,
     outcomes: &[PostEvaluation],
+    metrics: &RequestMetrics,
 ) -> Vec<QuotePass> {
-    let authors = post_evaluator.evaluate_authors(authors).await;
+    let authors = post_evaluator.evaluate_authors(authors, metrics).await;
     let passes = passes(level, outcomes, &authors);
-    record(level, &passes);
+    record(metrics, &passes);
     passes
 }
 
@@ -277,28 +282,23 @@ fn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {
 }
 
 fn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {
-    let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {
+    let QuoteEntries::Judged { rerenders } = level.spec().quote_entries() else {
         return None;
     };
     let &(_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;
     Some(Rerendered { by, reason })
 }
 
-fn record(level: SafetyLevel, passes: &[QuotePass]) {
+fn record(metrics: &RequestMetrics, passes: &[QuotePass]) {
     let mut counts: HashMap<&'static str, u64> = HashMap::new();
     for pass in passes {
         *counts.entry((&pass.outcome).into()).or_default() += 1;
     }
     for (outcome, count) in counts {
-        ft_metrics::incr_nonzero(
-            QUOTE_PASS,
-            &[("outcome", outcome), ("safety_level", level.into())],
-            count,
-        );
+        metrics.count(&QUOTE_PASS, [outcome], count);
     }
     ft_metrics::record_verdicts(
-        Endpoint::EvaluateTweets,
-        SafetyLevel::QuotedTweetRules,
+        metrics,
         passes.iter().filter_map(|pass| match pass.outcome {
             PassOutcome::Dropped(_) | PassOutcome::Passed => {
                 pass.author.as_ref().map(Evaluation::verdict)
@@ -321,8 +321,9 @@ mod tests {
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{suspended, Fault, InMemorySources};
     use crate::hydration::tweet_fallback_cache;
-    use crate::metrics::thread_recorded;
-    use crate::models::TweetId;
+    use crate::metrics::families::PHASE_MS;
+    use crate::metrics::{Metrics, Recording};
+    use crate::models::{RequestViewer, TweetId};
     use crate::rules::RuleEngine;
     use crate::scenario::{tweet_data, Wire};
     use std::time::Duration;
@@ -332,7 +333,6 @@ mod tests {
     use xai_core_entities::entities::{
         GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState,
     };
-    use xai_twittercontext_proto::TwitterContextViewer;
     use xai_visibility_filtering_proto as vf_pb;
     use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
 
@@ -347,9 +347,7 @@ mod tests {
     impl EntryComparator for Captured {
         fn compare(
             &self,
-            _: Option<u64>,
-            _: Option<&TwitterContextViewer>,
-            _: Option<&str>,
+            _: &RequestViewer,
             _: SafetyLevel,
             _: &[PostEvaluation],
             quote_passes: &Passes,
@@ -361,6 +359,7 @@ mod tests {
     struct Served {
         wire: Wire,
         compared: UnboundedReceiver<Passes>,
+        recording: Arc<Recording>,
     }
 
     impl Served {
@@ -370,13 +369,19 @@ mod tests {
             quote_pass: QuotePassRunner,
         ) -> Self {
             let (captured, compared) = unbounded_channel();
+            let (metrics, recording) = Metrics::recording();
             let wire = Wire::serving(
                 world,
                 caches,
                 Some(Box::new(Captured(captured))),
                 quote_pass,
+                metrics,
             );
-            Self { wire, compared }
+            Self {
+                wire,
+                compared,
+                recording,
+            }
         }
 
         async fn outcomes(
@@ -861,7 +866,6 @@ mod tests {
     async fn a_running_pass_holds_its_permit_until_it_ends() {
         let world = Arc::new(world().fault(Source::FlockUserPair, Fault::Hangs));
         let mut served = Served::new(Arc::clone(&world), FallbackCaches::default(), one_permit());
-        thread_recorded::start();
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
         assert_eq!(
@@ -884,7 +888,15 @@ mod tests {
             1,
             "the shed pass fetches nothing"
         );
-        let shed = thread_recorded::take(QUOTE_PASS)
+        let quote_pass = served.recording.take(&QUOTE_PASS.family);
+        assert!(
+            quote_pass.iter().all(|sample| {
+                sample.label("rpc") == Some("evaluate_tweets")
+                    && sample.label("safety_level") == Some("quoted_tweet_rules")
+            }),
+            "{quote_pass:?}"
+        );
+        let shed = quote_pass
             .iter()
             .filter(|sample| sample.label("outcome") == Some(SHED))
             .map(|sample| sample.value)
@@ -929,13 +941,15 @@ mod tests {
             FallbackCaches::default(),
             QuotePassRunner::new(QuotePassMode::Shadow),
         );
-        thread_recorded::start();
         let (_, passes) = served.serve(Some(VIEWER), quote_with_outer()).await;
-        let hydrations = thread_recorded::take("vf_phase_ms")
+        let hydrations: Vec<Option<String>> = served
+            .recording
+            .take(&PHASE_MS.family)
             .iter()
             .filter(|sample| sample.label("stage") == Some("hydration"))
-            .count();
+            .map(|sample| sample.label("rpc").map(str::to_owned))
+            .collect();
         assert_eq!(passes.len(), 1, "the pass ran");
-        assert_eq!(hydrations, 1);
+        assert_eq!(hydrations, [Some("evaluate_tweets".to_owned())]);
     }
 }

@@ -1,5 +1,4 @@
 pub use crate::hydration::{Hydrator, Hydrators, Lookup};
-pub use crate::metrics::Rpc;
 pub use crate::models::viewer::Client;
 pub use crate::models::{
     AuthorLabel, ClientCapability, Decided, DropReason, Evaluation, FosnrReason, LimitedActionType,
@@ -14,17 +13,19 @@ pub use crate::rules::{
     ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
     CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, Effect, NodeKind, NodeTrace,
     PolicyTrace, PostFactsLeaf, PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf,
-    ReactedToPostSafetyLabelsLeaf, RelationshipLeaf, ReplyControlLeaf, RequestLeaf, RowTrace,
+    ReactedToPostSafetyLabelsLeaf, RelationshipLeaf, ReplyControlLeaf, RequestLeaf, RowTrace, Rpc,
     SafetyLevel, Skip, SourceTweetIdLeaf, Truth, TweetLeaf, TweetSafetyLabelsLeaf,
     ViewerAccountLeaf, Witness,
 };
 
-use crate::evaluate_tweets::evaluate_tweets_request;
-use crate::filter_tweets::filter_tweets_request;
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{test_users_metadata, Sources};
 use crate::hydration::{request_context, HydratedTweet, Hydration};
-use crate::models::{EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, Viewer};
+use crate::ingress;
+use crate::metrics::{Endpoint, Metrics, RequestLevel};
+use crate::models::{
+    EvaluationKey, PlacedCandidate, PostCandidate, RawCandidate, RequestViewer, Viewer,
+};
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_card::PostCards;
 use crate::post_evaluator::{self, HydratedRequest, PostEvaluator};
@@ -36,7 +37,6 @@ use futures::future::{join, join_all};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use tokio::time::Instant;
-use xai_twittercontext_proto::TwitterContextViewer;
 use xai_x_thrift::tweet_service::TweetFieldsResultState;
 
 pub struct Explainer {
@@ -301,6 +301,7 @@ impl Explainer {
             serving.fallback_caches,
             serving.country_lists,
             serving.client_switches,
+            serving.metrics,
         )
     }
 
@@ -313,8 +314,7 @@ impl Explainer {
 
 struct RouteRun {
     route: Route,
-    context: Option<TwitterContextViewer>,
-    country_code: Option<String>,
+    viewer: RequestViewer,
     capability: ClientCapability,
     hydrated: HydratedRequest,
     provenance: Provenance,
@@ -326,11 +326,17 @@ impl Explainer {
         fallback_caches: FallbackCaches,
         country_lists: Arc<CountryLists>,
         client_switches: ClientSwitches,
+        metrics: Metrics,
     ) -> Self {
         let rule_engine = RuleEngine::with_country_lists(country_lists);
         Self {
             cards: Arc::clone(&sources) as Arc<dyn PostCards>,
-            post_evaluator: PostEvaluator::new(sources, rule_engine, Arc::new(fallback_caches)),
+            post_evaluator: PostEvaluator::new(
+                sources,
+                rule_engine,
+                Arc::new(fallback_caches),
+                metrics,
+            ),
             client_switches,
         }
     }
@@ -360,36 +366,41 @@ impl Explainer {
             request_author_id: None,
         });
         let candidates = vec![requested];
-        let (context, request) = match route.rpc {
+        let (request, endpoint) = match route.rpc {
             Rpc::FilterTweets => (
-                None,
-                filter_tweets_request(
+                ingress::filter_tweets_batch(
                     self.post_evaluator.rule_engine(),
                     &self.client_switches,
-                    viewer_id,
-                    ask.country.clone(),
+                    RequestViewer::new(viewer_id, ask.country.clone()),
                     route.level,
                     candidates,
                 ),
+                Endpoint::FilterTweets,
             ),
-            Rpc::EvaluateTweets => {
-                let context = ask.client.context(viewer_id, ask.country.as_deref());
-                let request = evaluate_tweets_request(
+            Rpc::EvaluateTweets => (
+                ingress::evaluate_tweets_batch(
                     &self.client_switches,
-                    Some(&context),
-                    viewer_id,
+                    RequestViewer::with_context(
+                        viewer_id,
+                        Some(ask.client.context(viewer_id, ask.country.as_deref())),
+                    ),
                     route.level,
                     candidates,
-                );
-                (Some(context), request)
-            }
+                ),
+                Endpoint::EvaluateTweets,
+            ),
         };
         let capability = request.client_capability;
-        let country_code = request.country_code.clone();
+        let viewer = request.viewer.clone();
+        let metrics = self
+            .post_evaluator
+            .metrics()
+            .request(endpoint, RequestLevel::Named(route.level));
         request_context(Instant::now(), None)
             .scope(async {
                 let (hydrated, outcomes, mut traced) =
-                    post_evaluator::hydrate_and_trace(&self.post_evaluator, request).await;
+                    post_evaluator::hydrate_and_trace(&self.post_evaluator, request, &metrics)
+                        .await;
                 let source_tweet_id = hydrated
                     .hydration()
                     .tweet(requested.tweet_id())
@@ -416,8 +427,7 @@ impl Explainer {
                 };
                 RouteRun {
                     route,
-                    context,
-                    country_code,
+                    viewer,
                     capability,
                     hydrated,
                     provenance,
@@ -431,11 +441,11 @@ impl Explainer {
         let judgement = match evaluation {
             Evaluation::Complete { verdict, .. } | Evaluation::Partial { verdict, .. } => {
                 let policies = self.client_switches.limited_actions_policies(
-                    level.context.as_ref(),
-                    ask.viewer.map(NonZeroU64::get),
-                    level.country_code.as_deref(),
+                    level.viewer.context(),
+                    level.viewer.id(),
+                    level.viewer.country_code(),
                     verdict.limited_engagement_reasons(),
-                    None,
+                    &Metrics::none(),
                 );
                 Judgement::Judged {
                     state: treatment::thrift_result_state(verdict, level.route.level, &policies),
@@ -571,6 +581,7 @@ mod tests {
     use crate::clients::socialgraph_client::Graph;
     use crate::filter_tweets::FilterTweetsEndpoint;
     use crate::hydration::sources::{suspended, InMemorySources};
+    use crate::rules::WireLevel;
     use crate::scenario::{tweet_data, Wire};
     use strum::VariantArray;
     use vf_pb::tweet_evaluation::Outcome;
@@ -614,6 +625,7 @@ mod tests {
             FallbackCaches::default(),
             Arc::new(CountryLists::starting_at_default()),
             ClientSwitches::for_tests(),
+            Metrics::none(),
         )
         .explain(&ask)
         .await;
@@ -711,7 +723,9 @@ mod tests {
                 FilterTweets => {
                     let proto = (0..=255)
                         .filter_map(|number| vf_pb::SafetyLevel::try_from(number).ok())
-                        .find(|&proto| SafetyLevel::from_proto(proto) == Some(route.level()))
+                        .find(|&proto| {
+                            SafetyLevel::parse(WireLevel::FilterTweets(proto)) == Ok(route.level())
+                        })
                         .unwrap();
                     let response = filter_tweets
                         .handle(tonic::Request::new(vf_pb::VisibilityFilterRequest {
@@ -739,7 +753,10 @@ mod tests {
                     let thrift = ThriftLevel::ENUM_VALUES
                         .iter()
                         .copied()
-                        .find(|&thrift| SafetyLevel::from_thrift(thrift) == Some(route.level()))
+                        .find(|&thrift| {
+                            SafetyLevel::parse(WireLevel::EvaluateTweets(thrift.0))
+                                == Ok(route.level())
+                        })
                         .unwrap();
                     let sent = wire
                         .send_with_context(

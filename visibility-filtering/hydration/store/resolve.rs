@@ -4,7 +4,9 @@ use crate::hydration::decode::author::{DecodedActor, DecodedAuthor};
 use crate::hydration::fetcher::Fetcher;
 use crate::hydration::inventory::Stake;
 use crate::hydration::relation::Relation;
-use crate::hydration::{Cause, HydratedTweet, HydratedUser, Hydrator, Lookup, Unresolved};
+use crate::hydration::{
+    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,
+};
 use crate::models::{
     AuthorId, ConversationControlFeatures, EdgeSet, PostCandidate, PostEntity, SafetyLabelMap,
     TweetFeatures, TweetId, UserEntity,
@@ -182,7 +184,9 @@ impl Store {
     }
 
     fn edges(&self, row: &RequestRow, position: usize) -> EdgeSet {
+        let unread = self.root_author_block(row).unread();
         self.callable
+            .difference(unread)
             .iter()
             .filter(|&node| {
                 node.edge()
@@ -204,17 +208,13 @@ impl Store {
         unclaimed: &mut Vec<(Hydrator, u64)>,
     ) -> PostCandidate {
         let id = tweet_id.0;
+        let edges = self.edges(row, position);
         PostCandidate {
             author: self.author(author_id),
-            edges: self.edges(row, position),
+            edges,
             post: PostEntity {
                 tweet_id: id,
                 source_tweet_id: self.source_tweet_id(tweet_id).map(|source| source.0),
-                is_reply: self
-                    .pure_cores
-                    .request()
-                    .get(id)
-                    .is_some_and(|core| core.reply_to.is_some()),
                 tweet_features: TweetFeatures::default(),
                 safety_labels: self
                     .labels
@@ -277,6 +277,10 @@ impl Store {
                             .get(user_id)
                     })
                     .is_some_and(|author| author.features.is_protected),
+                conversation_root_author_blocks_viewer:
+                    Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR
+                        .iter()
+                        .any(|node| edges.contains(node)),
             },
             failed: self.failed(row, position, unclaimed),
         }

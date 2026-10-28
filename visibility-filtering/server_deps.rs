@@ -15,13 +15,17 @@ use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::{Backends, ProdSources};
 use crate::hydration::tweet_source::TweetSource;
 use crate::hydration::{author_fallback_cache, tweet_fallback_cache, Lookup};
-use crate::metrics::Rpc;
-use crate::models::{ClientCapability, Evaluation, PlacedCandidate, RawCandidate, TweetId};
+use crate::metrics::{Endpoint, Metrics, RequestLevel};
+use crate::models::{
+    ClientCapability, Evaluation, PlacedCandidate, RawCandidate, RequestViewer, RetweetMerge,
+    TweetId,
+};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::{ClientSwitches, CountryLists};
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
 use crate::quote::QuotePassRunner;
 use crate::rules::{NoTrace, SafetyLevel};
+use crate::safety_label_source::metrics::LabelMetrics;
 use crate::safety_label_source::remote::RemoteSource;
 use crate::safety_label_source::warmer::{CacheWarmer, StratoWarmFetcher};
 use crate::safety_label_source::{ManhattanLabelFetcher, MhLabelClient, SafetyLabelSource};
@@ -114,6 +118,7 @@ pub(crate) struct ServerDeps {
     pub(crate) post_evaluator: Arc<PostEvaluator>,
     pub(crate) client_switches: ClientSwitches,
     safety_label_source: Arc<SafetyLabelSource>,
+    metrics: Metrics,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +143,7 @@ pub(crate) struct Serving {
     pub(crate) safety_label_source: Arc<SafetyLabelSource>,
     pub(crate) client_switches: ClientSwitches,
     pub(crate) country_lists: Arc<CountryLists>,
+    pub(crate) metrics: Metrics,
 }
 
 #[expect(
@@ -151,8 +157,9 @@ pub(crate) async fn serving(
     experiments: crate::params::Experiments,
 ) -> Serving {
     let stats = xai_stats_receiver::global_stats_receiver();
-    let (limited_actions_copy, copy_drift) =
-        LimitedActionsCopy::load_baked(datacenter, stats.as_deref());
+    let metrics = Metrics::new(stats.clone());
+    let label_metrics = LabelMetrics::new(stats);
+    let (limited_actions_copy, copy_drift) = LimitedActionsCopy::load_baked(datacenter, &metrics);
     let init_deadline = tokio::time::Instant::now() + CLIENT_INIT_RETRY_BUDGET;
     let author_cache_capacity = crate::config::author_cache_capacity();
     let tweet_cache_capacity = crate::config::tweet_cache_capacity();
@@ -162,6 +169,7 @@ pub(crate) async fn serving(
         deterministic_aperture(),
         metadata,
         cache_warming,
+        &label_metrics,
     )
     .await;
     let fallback_caches = FallbackCaches {
@@ -172,7 +180,7 @@ pub(crate) async fn serving(
         crate::params::SwitchFiles::beside(&crate::config::fs_path(), experiments);
     let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
         switch_files
-            .load(stats.as_deref())
+            .load(&metrics)
             .expect("files that each built an engine build one together"),
     ));
     let country_lists = Arc::new(CountryLists::starting_at_default());
@@ -183,7 +191,7 @@ pub(crate) async fn serving(
         feature_switches,
         Arc::clone(&country_lists),
         copy_drift,
-        stats,
+        metrics.clone(),
     );
     Serving {
         init_deadline,
@@ -192,6 +200,7 @@ pub(crate) async fn serving(
         safety_label_source,
         client_switches,
         country_lists,
+        metrics,
     }
 }
 
@@ -204,6 +213,7 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         safety_label_source,
         client_switches,
         country_lists,
+        metrics,
     } = serving(
         datacenter,
         metadata,
@@ -216,6 +226,7 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         Arc::new(sources),
         rule_engine,
         Arc::new(fallback_caches),
+        metrics.clone(),
     ));
 
     warm_post_evaluator(&post_evaluator).await;
@@ -225,6 +236,7 @@ pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> S
         post_evaluator,
         client_switches,
         safety_label_source,
+        metrics,
     }
 }
 
@@ -255,7 +267,7 @@ impl ServerDeps {
                 self.client_switches,
                 comparators.filter_tweets,
             ),
-            get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(self.safety_label_source, self.metrics),
         }
     }
 }
@@ -270,6 +282,7 @@ pub(crate) async fn prod_sources(
     deterministic_aperture: bool,
     metadata: Option<&MetadataMap>,
     cache_warming: CacheWarming,
+    label_metrics: &LabelMetrics,
 ) -> (ProdSources, Arc<SafetyLabelSource>) {
     let tes_client = Arc::new(
         init_client_with_retry("tes", init_deadline, || async move {
@@ -433,15 +446,16 @@ pub(crate) async fn prod_sources(
     warm_cache(&twemcache).await;
     warm_manhattan(mh_label_client.as_ref()).await;
 
-    let cache_warmer = cache_warming.warmer(|| build_cache_warmer(stratoserver));
+    let cache_warmer = cache_warming.warmer(|| build_cache_warmer(stratoserver, label_metrics));
 
-    let mut remote = RemoteSource::new(twemcache, mh_label_client);
+    let mut remote = RemoteSource::new(twemcache, mh_label_client, label_metrics.clone());
     if let Some(warmer) = cache_warmer {
         remote = remote.with_warmer(warmer);
     }
     let safety_label_source = Arc::new(SafetyLabelSource::new(
         Arc::new(remote),
         crate::config::safety_label_cache_capacity(),
+        label_metrics.clone(),
     ));
 
     let tweet_source = TweetSource {
@@ -464,14 +478,18 @@ pub(crate) async fn prod_sources(
     (sources, safety_label_source)
 }
 
-fn build_cache_warmer(stratoserver: StratoGrpc) -> Option<Arc<CacheWarmer>> {
+fn build_cache_warmer(
+    stratoserver: StratoGrpc,
+    label_metrics: &LabelMetrics,
+) -> Option<Arc<CacheWarmer>> {
     if !crate::config::cache_warm_enabled() {
         return None;
     }
     info!("L2 cache warmer enabled");
-    Some(CacheWarmer::spawn(Arc::new(StratoWarmFetcher::new(
-        stratoserver,
-    ))))
+    Some(CacheWarmer::spawn(
+        Arc::new(StratoWarmFetcher::new(stratoserver)),
+        label_metrics.clone(),
+    ))
 }
 
 const STRATO_REQUEST_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
@@ -575,15 +593,14 @@ const WARM_FILTER_TWEETS_SLEEP: Duration = Duration::from_millis(500);
 
 fn warm_filter_tweets_request() -> PostBatch {
     PostBatch {
-        viewer_id: None,
-        country_code: None,
+        viewer: RequestViewer::default(),
         client_capability: ClientCapability::default(),
         safety_level: SafetyLevel::TimelineHomeRecommendations,
         candidates: vec![PlacedCandidate::standalone(RawCandidate {
             tweet_id: TweetId(WARM_FILTER_TWEETS_TWEET_ID),
             request_author_id: None,
         })],
-        rpc: Rpc::FilterTweets,
+        retweet_merge: RetweetMerge::Unmerged,
     }
 }
 
@@ -603,9 +620,12 @@ async fn warm_post_evaluator(post_evaluator: &PostEvaluator) {
     let mut consecutive_warm = 0u32;
     while start.elapsed() < WARM_FILTER_TWEETS_DEADLINE {
         attempts += 1;
-        let (_, outcomes) = post_evaluator
-            .run(warm_filter_tweets_request(), &mut NoTrace)
-            .await;
+        let request = warm_filter_tweets_request();
+        let metrics = post_evaluator.metrics().request(
+            Endpoint::FilterTweets,
+            RequestLevel::Named(request.safety_level),
+        );
+        let (_, outcomes) = post_evaluator.run(request, &metrics, &mut NoTrace).await;
         if filter_tweets_response_is_warm(&outcomes) {
             consecutive_warm += 1;
             if consecutive_warm >= WARM_FILTER_TWEETS_CONSECUTIVE {

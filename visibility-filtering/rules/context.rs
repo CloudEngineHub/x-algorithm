@@ -176,11 +176,6 @@ impl PostCoreFacts<'_> {
     }
 
     #[inline]
-    pub(super) fn is_reply(self) -> bool {
-        self.0.post.is_reply
-    }
-
-    #[inline]
     pub(super) fn created_after(self, unix_ms: u64) -> bool {
         tweet_timestamp_ms(self.0.post.tweet_id) > unix_ms
     }

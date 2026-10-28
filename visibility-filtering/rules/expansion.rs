@@ -109,7 +109,7 @@ mod tests {
                 );
             }
             for &level in SafetyLevel::VARIANTS {
-                let post = level.spec().rules.lists().post;
+                let post = level.spec().rules().lists().post;
                 let listed = spec.rules.iter().filter(|rule| post.contains(rule)).count();
                 assert!(
                     listed == 0 || listed == spec.rules.len(),

@@ -244,28 +244,6 @@ pub(super) fn rows() -> Vec<Row> {
             }),
         },
         Row {
-            name: "nsfw_reported_heuristics_label_per_client_class",
-            subject: Subject::Post(labeled(SafetyLabelType::NSFW_REPORTED_HEURISTICS)),
-            expect: per_client_class(|support| match support {
-                Unsupported => tombstoned(
-                    TombstoneReason::SensitiveViewerAgeVerification,
-                    "nsfw_reported_heuristics/tombstone/age_verification",
-                ),
-                IosNeedsUpdate => tombstoned(
-                    TombstoneReason::UpdateAppIos,
-                    "nsfw_reported_heuristics/tombstone/update_app_ios",
-                ),
-                AndroidNeedsUpdate => tombstoned(
-                    TombstoneReason::UpdateAppAndroid,
-                    "nsfw_reported_heuristics/tombstone/update_app_android",
-                ),
-                Supported => verify_blurred(
-                    InterstitialReason::Sensitive(true),
-                    "nsfw_reported_heuristics/blur/sensitive/age_prompt",
-                ),
-            }),
-        },
-        Row {
             name: "nsfw_card_image_label_per_client_class",
             subject: Subject::Post(labeled(SafetyLabelType::NSFW_CARD_IMAGE)),
             expect: per_client_class(|support| match support {
@@ -459,62 +437,6 @@ pub(super) fn rows() -> Vec<Row> {
                     blurred(
                         InterstitialReason::Nudity(true),
                         "nsfw_high_precision/blur/nudity",
-                    ),
-                ),
-            ],
-        },
-        Row {
-            name: "nsfw_reported_heuristics_label",
-            subject: Subject::Post(labeled(SafetyLabelType::NSFW_REPORTED_HEURISTICS)),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    web_in_fr(),
-                    verify_blurred(
-                        InterstitialReason::Sensitive(true),
-                        "nsfw_reported_heuristics/blur/sensitive/age_prompt",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    web_in_us(),
-                    blurred(
-                        InterstitialReason::Sensitive(true),
-                        "nsfw_reported_heuristics/blur/sensitive",
-                    ),
-                ),
-                (TimelineHomeHydration, sensitive_opt_in_web_in_us(), allow()),
-                (
-                    TimelineHomeHydration,
-                    author_web_in_fr(),
-                    blurred(
-                        InterstitialReason::Sensitive(true),
-                        "nsfw_reported_heuristics/blur/sensitive",
-                    ),
-                ),
-            ],
-        },
-        Row {
-            name: "gore_and_violence_reported_heuristics_label_for_a_web_viewer",
-            subject: Subject::Post(labeled(
-                SafetyLabelType::GORE_AND_VIOLENCE_REPORTED_HEURISTICS,
-            )),
-            expect: vec![
-                (
-                    TimelineHomeHydration,
-                    web_in_us(),
-                    blurred(
-                        InterstitialReason::Sensitive(true),
-                        "gore_and_violence_reported_heuristics/blur/sensitive",
-                    ),
-                ),
-                (TimelineHomeHydration, sensitive_opt_in_web_in_us(), allow()),
-                (
-                    TimelineHomeHydration,
-                    author_web_in_us(),
-                    blurred(
-                        InterstitialReason::Sensitive(true),
-                        "gore_and_violence_reported_heuristics/blur/sensitive",
                     ),
                 ),
             ],

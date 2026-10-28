@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use xai_twittercontext_proto::TwitterContextViewer;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -18,6 +19,45 @@ impl Viewer {
             Viewer::LoggedIn { id, .. } => Some(*id),
             Viewer::LoggedOut => None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RequestViewer {
+    id: Option<u64>,
+    country_code: Option<String>,
+    context: Option<Arc<TwitterContextViewer>>,
+}
+
+impl RequestViewer {
+    pub(crate) fn new(raw_id: Option<u64>, country_code: Option<String>) -> Self {
+        Self {
+            id: raw_id.filter(|&id| id.cast_signed() > 0),
+            country_code: country_code.filter(|code| !code.is_empty()),
+            context: None,
+        }
+    }
+
+    pub(crate) fn with_context(raw_id: Option<u64>, context: Option<TwitterContextViewer>) -> Self {
+        let country_code = context
+            .as_ref()
+            .map(|context| context.request_country_code.clone());
+        Self {
+            context: context.map(Arc::new),
+            ..Self::new(raw_id, country_code)
+        }
+    }
+
+    pub(crate) fn id(&self) -> Option<u64> {
+        self.id
+    }
+
+    pub(crate) fn country_code(&self) -> Option<&str> {
+        self.country_code.as_deref()
+    }
+
+    pub(crate) fn context(&self) -> Option<&TwitterContextViewer> {
+        self.context.as_deref()
     }
 }
 

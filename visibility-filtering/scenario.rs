@@ -2,10 +2,10 @@ use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
-use crate::metrics::{RetweetSources, Rpc};
+use crate::metrics::{Endpoint, Metrics, RequestLevel, RequestMetrics, RetweetSources};
 use crate::models::{
     ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
-    SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
+    RequestViewer, RetweetMerge, SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
 };
 use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
@@ -69,8 +69,9 @@ pub(crate) struct Scenario<S> {
     viewer_id: Option<u64>,
     country_code: Option<String>,
     client_capability: ClientCapability,
-    rpc: Rpc,
+    retweet_merge: RetweetMerge,
     fallback_caches: Arc<FallbackCaches>,
+    metrics: Metrics,
 }
 
 pub(crate) struct InRequestOrder {
@@ -104,8 +105,9 @@ impl<S: Sources + 'static> Scenario<S> {
             viewer_id: None,
             country_code: None,
             client_capability: ClientCapability::default(),
-            rpc: Rpc::FilterTweets,
+            retweet_merge: RetweetMerge::Unmerged,
             fallback_caches: Arc::default(),
+            metrics: Metrics::none(),
         }
     }
 
@@ -124,13 +126,18 @@ impl<S: Sources + 'static> Scenario<S> {
         self
     }
 
-    pub(crate) fn rpc(mut self, rpc: Rpc) -> Self {
-        self.rpc = rpc;
+    pub(crate) fn retweet_merge(mut self, retweet_merge: RetweetMerge) -> Self {
+        self.retweet_merge = retweet_merge;
         self
     }
 
     pub(crate) fn fallback_caches(mut self, fallback_caches: FallbackCaches) -> Self {
         self.fallback_caches = Arc::new(fallback_caches);
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -148,8 +155,10 @@ impl<S: Sources + 'static> Scenario<S> {
         plan: &HydrationPlan,
         raw: &[RawCandidate],
     ) -> InRequestOrder {
-        let mut request = self.request(raw);
-        let request = request.hydration_request(Some(self.rpc), &self.fallback_caches);
+        let metrics = self.request_metrics();
+        let request = self
+            .request(raw)
+            .hydration_request(&self.fallback_caches, &metrics);
         let hydration = plan.hydrate(&*self.sources, request).await;
         InRequestOrder::of(&hydration, raw)
     }
@@ -165,18 +174,28 @@ impl<S: Sources + 'static> Scenario<S> {
     ) -> Evaluated {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
-        let post_evaluator = PostEvaluator::new(sources, rule_engine, caches);
-        let (hydrated, outcomes) = post_evaluator.run(self.request(raw), &mut NoTrace).await;
+        let post_evaluator = PostEvaluator::new(sources, rule_engine, caches, self.metrics.clone());
+        let (hydrated, outcomes) = post_evaluator
+            .run(self.request(raw), &self.request_metrics(), &mut NoTrace)
+            .await;
         Evaluated {
             outcomes,
             retweet_sources: hydrated.retweet_sources(),
         }
     }
 
+    fn request_metrics(&self) -> RequestMetrics {
+        let endpoint = match self.retweet_merge {
+            RetweetMerge::Merged => Endpoint::EvaluateTweets,
+            RetweetMerge::Unmerged => Endpoint::FilterTweets,
+        };
+        self.metrics
+            .request(endpoint, RequestLevel::Named(self.level))
+    }
+
     fn request(&self, raw: &[RawCandidate]) -> PostBatch {
         PostBatch {
-            viewer_id: self.viewer_id,
-            country_code: self.country_code.clone(),
+            viewer: RequestViewer::new(self.viewer_id, self.country_code.clone()),
             client_capability: self.client_capability,
             safety_level: self.level,
             candidates: raw
@@ -184,7 +203,7 @@ impl<S: Sources + 'static> Scenario<S> {
                 .copied()
                 .map(PlacedCandidate::standalone)
                 .collect(),
-            rpc: self.rpc,
+            retweet_merge: self.retweet_merge,
         }
     }
 }
@@ -201,6 +220,7 @@ impl Wire {
             FallbackCaches::default(),
             None,
             QuotePassRunner::new(QuotePassMode::Off),
+            Metrics::none(),
         )
     }
 
@@ -209,11 +229,13 @@ impl Wire {
         fallback_caches: FallbackCaches,
         comparator: Option<Box<dyn EntryComparator>>,
         quote_pass: QuotePassRunner,
+        metrics: Metrics,
     ) -> Self {
         let post_evaluator = Arc::new(PostEvaluator::new(
             sources,
             RuleEngine::for_tests(),
             Arc::new(fallback_caches),
+            metrics,
         ));
         let endpoint = EvaluateTweetsEndpoint::new(
             Arc::clone(&post_evaluator),

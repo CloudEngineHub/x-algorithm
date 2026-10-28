@@ -1,6 +1,7 @@
 use crate::config::{ENV_APP_ENV, ENV_REFERENCE};
 use crate::evaluate_tweets::EntryComparator;
 use crate::filter_tweets::{Comparator, FinishComparison};
+use crate::models::RequestViewer;
 use crate::params::ClientSwitches;
 use crate::post_evaluator::{PostEvaluation, PostEvaluator};
 use crate::quote::Passes;
@@ -12,7 +13,6 @@ use strum::VariantNames;
 use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 use tweetypie::TweetypieReference;
-use xai_twittercontext_proto::TwitterContextViewer;
 
 pub(crate) mod tweetypie;
 
@@ -82,13 +82,10 @@ pub(crate) async fn build(
 }
 
 impl Comparator for Arc<TweetypieReference> {
-    fn begin(
-        &self,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        safety_level: SafetyLevel,
-    ) -> Option<FinishComparison> {
+    fn begin(&self, viewer: &RequestViewer, safety_level: SafetyLevel) -> Option<FinishComparison> {
         let reference = Arc::clone(self);
+        let viewer_id = viewer.id();
+        let country_code = viewer.country_code().map(str::to_owned);
         Some(Box::new(move |outcomes| {
             reference.spawn(viewer_id, country_code, safety_level, outcomes);
         }))
@@ -98,21 +95,12 @@ impl Comparator for Arc<TweetypieReference> {
 impl EntryComparator for Arc<TweetypieReference> {
     fn compare(
         &self,
-        viewer_id: Option<u64>,
-        context: Option<&TwitterContextViewer>,
-        country_code: Option<&str>,
+        viewer: &RequestViewer,
         safety_level: SafetyLevel,
         outcomes: &[PostEvaluation],
         quote_passes: &Passes,
     ) {
-        self.spawn_quote_comparison(
-            viewer_id,
-            context,
-            country_code,
-            safety_level,
-            outcomes,
-            quote_passes.ran(),
-        );
+        self.spawn_quote_comparison(viewer, safety_level, outcomes, quote_passes.ran());
     }
 }
 

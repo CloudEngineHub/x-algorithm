@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
-use super::metrics::{self, BatchStage, CacheResult, CacheTier};
+use super::metrics::{self, BatchStage, CacheResult, CacheTier, LabelMetrics};
 use super::remote::{LookupError, LookupResults, RemoteLabels};
 
 const TTL: Duration = Duration::from_secs(10);
@@ -55,19 +55,31 @@ pub struct SafetyLabelSource {
     clock: Clock,
     remote: Arc<dyn RemoteLabels>,
     now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    metrics: LabelMetrics,
 }
 
 impl SafetyLabelSource {
-    pub(crate) fn new(remote: Arc<dyn RemoteLabels>, cache_capacity: Option<usize>) -> Self {
-        Self::with_clock(remote, cache_capacity, Clock::new())
+    pub(crate) fn new(
+        remote: Arc<dyn RemoteLabels>,
+        cache_capacity: Option<usize>,
+        metrics: LabelMetrics,
+    ) -> Self {
+        Self::with_clock(remote, cache_capacity, Clock::new(), metrics)
     }
 
     fn with_clock(
         remote: Arc<dyn RemoteLabels>,
         cache_capacity: Option<usize>,
         clock: Clock,
+        metrics: LabelMetrics,
     ) -> Self {
-        Self::with_clocks(remote, cache_capacity, clock, Arc::new(system_unix_ms))
+        Self::with_clocks(
+            remote,
+            cache_capacity,
+            clock,
+            Arc::new(system_unix_ms),
+            metrics,
+        )
     }
 
     fn with_clocks(
@@ -75,6 +87,7 @@ impl SafetyLabelSource {
         cache_capacity: Option<usize>,
         clock: Clock,
         now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+        metrics: LabelMetrics,
     ) -> Self {
         info!(
             cache_capacity = cache_capacity.unwrap_or(0),
@@ -90,6 +103,7 @@ impl SafetyLabelSource {
             clock,
             remote,
             now_ms,
+            metrics,
         }
     }
 
@@ -107,7 +121,7 @@ impl SafetyLabelSource {
         let remote_results = self.remote.get(&local_misses).await;
         self.backfill_local(remote_results, &mut results);
 
-        Self::emit_stats(total - batch_size, batch_size, expired);
+        self.emit_stats(total - batch_size, batch_size, expired);
 
         let now_ms = (self.now_ms)();
         let mut dropped = 0;
@@ -123,7 +137,7 @@ impl SafetyLabelSource {
                 *map = Arc::new(live);
             }
         }
-        metrics::record_expired_labels(dropped);
+        metrics::record_expired_labels(&self.metrics, dropped);
 
         results
     }
@@ -178,11 +192,17 @@ impl SafetyLabelSource {
         }
     }
 
-    fn emit_stats(hits: usize, batch_size: usize, expired: usize) {
-        metrics::record_cache_keys(CacheTier::Local, CacheResult::Hit, hits);
-        metrics::record_cache_keys(CacheTier::Local, CacheResult::Miss, batch_size - expired);
-        metrics::record_cache_keys(CacheTier::Local, CacheResult::Expired, expired);
-        metrics::record_batch_size(BatchStage::LocalMiss, batch_size);
+    fn emit_stats(&self, hits: usize, batch_size: usize, expired: usize) {
+        let metrics = &self.metrics;
+        metrics::record_cache_keys(metrics, CacheTier::Local, CacheResult::Hit, hits);
+        metrics::record_cache_keys(
+            metrics,
+            CacheTier::Local,
+            CacheResult::Miss,
+            batch_size - expired,
+        );
+        metrics::record_cache_keys(metrics, CacheTier::Local, CacheResult::Expired, expired);
+        metrics::record_batch_size(metrics, BatchStage::LocalMiss, batch_size);
     }
 }
 
@@ -260,7 +280,11 @@ mod tests {
     #[tokio::test]
     async fn get_backfills_remote_successes_into_l1() {
         let remote = found(42);
-        let source = SafetyLabelSource::new(Arc::<FakeRemote>::clone(&remote), Some(1024));
+        let source = SafetyLabelSource::new(
+            Arc::<FakeRemote>::clone(&remote),
+            Some(1024),
+            LabelMetrics::default(),
+        );
 
         let results1 = source.get(&[42]).await;
         let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());
@@ -281,7 +305,11 @@ mod tests {
             42,
             Err(LookupError::new(FailureKind::ManhattanFetch, "down")),
         )]));
-        let source = SafetyLabelSource::new(Arc::<FakeRemote>::clone(&remote), Some(1024));
+        let source = SafetyLabelSource::new(
+            Arc::<FakeRemote>::clone(&remote),
+            Some(1024),
+            LabelMetrics::default(),
+        );
 
         let results1 = source.get(&[42]).await;
         assert!(results1.get(&42).unwrap().is_err());
@@ -295,7 +323,11 @@ mod tests {
     #[tokio::test]
     async fn without_an_l1_every_read_goes_remote() {
         let remote = found(42);
-        let source = SafetyLabelSource::new(Arc::<FakeRemote>::clone(&remote), None);
+        let source = SafetyLabelSource::new(
+            Arc::<FakeRemote>::clone(&remote),
+            None,
+            LabelMetrics::default(),
+        );
 
         for _ in 0..2 {
             assert!(source.get(&[42]).await.get(&42).unwrap().is_ok());
@@ -306,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn get_does_not_backfill_future_tweet_id_into_l1() {
         let tweet_id = tweet_id_created_at(SystemTime::now() + Duration::from_secs(60));
-        let source = SafetyLabelSource::new(found(tweet_id), Some(1024));
+        let source = SafetyLabelSource::new(found(tweet_id), Some(1024), LabelMetrics::default());
 
         let results = source.get(&[tweet_id]).await;
 
@@ -319,8 +351,12 @@ mod tests {
         let (clock, mock) = Clock::mock();
         let tweet_id = tweet_id_created_at(SystemTime::now() - Duration::from_secs(60));
         let remote = found(tweet_id);
-        let source =
-            SafetyLabelSource::with_clock(Arc::<FakeRemote>::clone(&remote), Some(1024), clock);
+        let source = SafetyLabelSource::with_clock(
+            Arc::<FakeRemote>::clone(&remote),
+            Some(1024),
+            clock,
+            LabelMetrics::default(),
+        );
 
         source.get(&[tweet_id]).await;
         let first_expiry = l1_expiry(&source, tweet_id).expect("backfilled");
@@ -358,6 +394,7 @@ mod tests {
             Some(8),
             Clock::new(),
             Arc::new(move || now_ms.load(Ordering::Relaxed)),
+            LabelMetrics::default(),
         );
 
         let first = source.get(&[42]).await;

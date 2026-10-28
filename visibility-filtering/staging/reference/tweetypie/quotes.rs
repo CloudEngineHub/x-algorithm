@@ -2,7 +2,7 @@ use super::{
     BatchOutcome, Compared, Lens, TWEETYPIE_TIMEOUT, TpResult, TweetypieReference, get_tweet_fields,
 };
 use crate::models::viewer::Client;
-use crate::models::{EvaluationKey, Placement, TweetId};
+use crate::models::{EvaluationKey, Placement, RequestViewer, TweetId};
 use crate::post_evaluator::PostEvaluation;
 use crate::quote::QuotePass;
 use crate::result_label::{Class, NONE, label};
@@ -35,14 +35,12 @@ impl Lens {
 impl TweetypieReference {
     pub(in crate::staging::reference) fn spawn_quote_comparison(
         self: &Arc<Self>,
-        viewer_id: Option<u64>,
-        context: Option<&TwitterContextViewer>,
-        country_code: Option<&str>,
+        viewer: &RequestViewer,
         safety_level: SafetyLevel,
         outcomes: &[PostEvaluation],
         quote_passes: &[QuotePass],
     ) {
-        let Some(viewer_id) = viewer_id else {
+        let Some(viewer_id) = viewer.id() else {
             return;
         };
         let Some(quotes) = quote_comparisons(safety_level, outcomes, quote_passes) else {
@@ -50,11 +48,12 @@ impl TweetypieReference {
         };
         let client = TwitterContextViewer {
             user_id: viewer_id.cast_signed(),
-            ..context
+            ..viewer
+                .context()
                 .cloned()
-                .unwrap_or_else(|| Client::Web.context(None, country_code))
+                .unwrap_or_else(|| Client::Web.context(None, viewer.country_code()))
         };
-        let country_code = country_code.map(str::to_owned);
+        let country_code = viewer.country_code().map(str::to_owned);
         self.detach(move |reference| async move {
             reference
                 .compare_quotes(viewer_id, country_code, client, quotes)
@@ -115,7 +114,7 @@ fn quote_comparisons(
     quote_passes: &[QuotePass],
 ) -> Option<QuoteComparisons> {
     if !matches!(
-        safety_level.spec().quote_entries,
+        safety_level.spec().quote_entries(),
         QuoteEntries::Judged { .. }
     ) {
         return None;
@@ -167,7 +166,7 @@ fn quote_comparisons(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{compared, outcome, pair, shown};
+    use super::super::tests::{compared, counted, outcome, pair, shown};
     use super::super::{tp_failed, tp_result};
     use super::*;
     use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};
@@ -266,11 +265,7 @@ mod tests {
                 ..compared(&tp, Some(&vf))
             };
             let bucket = compared.bucket();
-            assert!(
-                bucket
-                    .counter_labels("sha")
-                    .contains(&("quoted_tweet_rule", rule))
-            );
+            assert_eq!(counted(&bucket).label("quoted_tweet_rule"), Some(rule));
             assert_eq!(
                 compared.to_json(&bucket, "sha", None)["quoted_tweet_rule"],
                 rule
@@ -317,7 +312,7 @@ mod tests {
             ))
         );
         for &level in SafetyLevel::VARIANTS {
-            if !matches!(level.spec().quote_entries, QuoteEntries::Judged { .. }) {
+            if !matches!(level.spec().quote_entries(), QuoteEntries::Judged { .. }) {
                 assert!(selected(level, &request).is_none(), "{level:?}");
             }
         }
@@ -410,11 +405,7 @@ mod tests {
                 "{lens:?} {:?}",
                 pass.outcome
             );
-            assert!(
-                bucket
-                    .counter_labels("sha")
-                    .contains(&("quote_pass", quote_pass))
-            );
+            assert_eq!(counted(&bucket).label("quote_pass"), Some(quote_pass));
             assert_eq!(
                 compared.to_json(&bucket, "sha", None)["quote_pass"],
                 quote_pass

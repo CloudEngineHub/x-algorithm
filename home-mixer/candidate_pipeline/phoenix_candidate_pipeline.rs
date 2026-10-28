@@ -68,7 +68,6 @@ use crate::filters::age_filter::AgeFilter;
 use crate::filters::ancestor_video_filter::AncestorVideoFilter;
 use crate::filters::ancillary_vf_filter::AncillaryVFFilter;
 use crate::filters::author_socialgraph_filter::AuthorSocialgraphFilter;
-use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
 use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
@@ -115,6 +114,8 @@ use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQu
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
 use crate::scorers::immersive_video_scorer::ImmersiveVideoScorer;
+use crate::scorers::page_decode_rerank_scorer::PageDecodeRerankScorer;
+use crate::scorers::page_rl_exploration_scorer::PageRlExplorationScorer;
 use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::vm_ranker::VMRanker;
 use crate::selectors::TopKScoreSelector;
@@ -434,16 +435,6 @@ impl PhoenixCandidatePipeline {
             Box::new(PreviouslyServedPostsFilter),
             Box::new(ViewerMutedKeywordFilter::new()),
             Box::new(AuthorSocialgraphFilter),
-            // Brazil 2026 election filter
-
-            // Application providers that use a recommendation system for users must exclude from the
-            // results the channels and profiles reported to the Electoral Court under the terms of
-            // § 1º of this article and, except in cases of paid boosting, the content posted on them.
-
-            // https://dadosabertos.tse.jus.br/dataset/candidatos-2026
-
-            // OmarAzizSenador deleted his account at the time this code was written.
-            Box::new(Brazil2026ElectionFilter),
             Box::new(VideoFilter),
             Box::new(TopicIdsFilter),
             Box::new(NewUserMinEngagementFilter),
@@ -472,8 +463,13 @@ impl PhoenixCandidatePipeline {
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
             },
         });
-        let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
-            vec![phoenix_scorer, immersive_video_scorer, vm_ranker];
+        let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
+            phoenix_scorer,
+            immersive_video_scorer,
+            vm_ranker,
+            Box::new(PageDecodeRerankScorer),
+            Box::new(PageRlExplorationScorer),
+        ];
 
         let selector = TopKScoreSelector;
 
@@ -560,8 +556,6 @@ impl PhoenixCandidatePipeline {
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
     ) -> PhoenixCandidatePipeline {
         let local_cache_eds = format!("");
-        let atla_phoenix_cache_eds = "";
-        let pdxa_phoenix_cache_eds = "";
 
         let (
             flock_socialgraph_client,
@@ -578,8 +572,7 @@ impl PhoenixCandidatePipeline {
             gizmoduck_client,
             strato_vf_client,
             redis_client,
-            phoenix_request_cache_redis_atla_client,
-            phoenix_request_cache_redis_pdxa_client,
+            (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
             phoenix_kafka_client,
             logged_scored_candidates_kafka_client,
             reranking_kafka_client,
@@ -707,24 +700,7 @@ impl PhoenixCandidatePipeline {
                     .expect("Failed to create xDS Redis client for local cache"),
                 ) as Arc<dyn RedisClient + Send + Sync>
             },
-            async {
-                Arc::new(
-                    XdsRedisClient::new(XdsRedisConfig {
-                        eds_resource_name: atla_phoenix_cache_eds.into(),
-                    })
-                    .await
-                    .expect("Failed to create xDS Redis client for atla phoenix cache"),
-                ) as Arc<dyn RedisClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    XdsRedisClient::new(XdsRedisConfig {
-                        eds_resource_name: pdxa_phoenix_cache_eds.into(),
-                    })
-                    .await
-                    .expect("Failed to create xDS Redis client for pdxa phoenix cache"),
-                ) as Arc<dyn RedisClient + Send + Sync>
-            },
+            super::shared_phoenix_request_cache_redis_clients(),
             async {
                 Arc::new(
                     ProdKafkaPublisherClient::new(PHOENIX_SCORES_TOPIC, KafkaCluster::Aiml).await,

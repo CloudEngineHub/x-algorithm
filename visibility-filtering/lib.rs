@@ -60,6 +60,7 @@ pub(crate) mod filter_notifications;
 pub(crate) mod filter_tweets;
 pub(crate) mod get_safety_labels;
 pub(crate) mod hydration;
+pub(crate) mod ingress;
 pub(crate) mod metrics;
 pub(crate) mod models;
 pub mod params;

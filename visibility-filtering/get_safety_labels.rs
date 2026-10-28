@@ -1,4 +1,5 @@
-use crate::safety_label_source::metrics;
+use crate::metrics::families::{LOOKUP_FAILURES, LOOKUP_TWEET_IDS};
+use crate::metrics::Metrics;
 use crate::safety_label_source::remote::FailureKind;
 use crate::safety_label_source::{LookupError, SafetyLabelSource};
 use enum_map::EnumMap;
@@ -14,12 +15,14 @@ use xai_visibility_filtering_proto as vf_pb;
 
 pub struct GetSafetyLabelsEndpoint {
     safety_label_source: Arc<SafetyLabelSource>,
+    metrics: Metrics,
 }
 
 impl GetSafetyLabelsEndpoint {
-    pub fn new(safety_label_source: Arc<SafetyLabelSource>) -> Self {
+    pub(crate) fn new(safety_label_source: Arc<SafetyLabelSource>, metrics: Metrics) -> Self {
         Self {
             safety_label_source,
+            metrics,
         }
     }
 
@@ -28,10 +31,11 @@ impl GetSafetyLabelsEndpoint {
         request: Request<vf_pb::GetSafetyLabelsRequest>,
     ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
         crate::metrics::observe_request(
+            &self.metrics,
             crate::metrics::Endpoint::GetSafetyLabels,
             crate::metrics::RequestLevel::Absent,
             request,
-            |request, _| self.handle_inner(request),
+            |request, _, request_metrics| self.handle_inner(request, request_metrics),
         )
         .await
     }
@@ -39,6 +43,7 @@ impl GetSafetyLabelsEndpoint {
     async fn handle_inner(
         &self,
         request: Request<vf_pb::GetSafetyLabelsRequest>,
+        request_metrics: crate::metrics::RequestMetrics,
     ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {
         let req = request.into_inner();
 
@@ -48,18 +53,25 @@ impl GetSafetyLabelsEndpoint {
             .collect::<FxHashSet<_>>()
             .into_iter()
             .collect();
-        crate::metrics::record_batch_size(
-            crate::metrics::Endpoint::GetSafetyLabels,
-            unique_ids.len(),
-        );
+        crate::metrics::record_batch_size(&request_metrics, unique_ids.len());
+        let metrics = request_metrics.plain();
 
         let resolved = self.safety_label_source.get(&unique_ids).await;
         let (response, failure_counts) =
             CachedGetSafetyLabelsResponse::try_from_resolved(resolved, unique_ids.len())?;
 
-        metrics::record_lookup_tweet_ids(response.results.len(), response.failed_ids.len());
+        metrics.count(
+            &LOOKUP_TWEET_IDS,
+            ["success"],
+            response.results.len() as u64,
+        );
+        metrics.count(
+            &LOOKUP_TWEET_IDS,
+            ["failed"],
+            response.failed_ids.len() as u64,
+        );
         for (kind, &count) in &failure_counts {
-            metrics::record_lookup_failures(kind, count);
+            metrics.count(&LOOKUP_FAILURES, [kind.into()], count as u64);
         }
 
         Ok(Response::new(response))

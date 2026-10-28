@@ -85,8 +85,6 @@ pub(crate) enum RuleId {
     NsfwAdmin,
     NsfwUser,
     NsfwAccount,
-    NsfwReportedHeuristics,
-    GoreAndViolenceReportedHeuristics,
 
     OriginalTweetAdultMediaPropagation,
     OriginalTweetGoreMediaPropagation,

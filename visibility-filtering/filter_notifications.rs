@@ -1,77 +1,12 @@
-use crate::metrics::{self, Endpoint, NotificationKind, RequestLevel};
+use crate::ingress;
+use crate::metrics::{self, Endpoint, RequestLevel};
 use crate::models::{AuthorId, Evaluation};
 use crate::post_evaluator::PostEvaluator;
-use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
-
-impl NotificationKind {
-    fn parse(kind: Option<&vf_pb::notification::Kind>) -> Result<Self, Status> {
-        match kind {
-            Some(vf_pb::notification::Kind::Follow(_)) => Ok(Self::Follow),
-            Some(vf_pb::notification::Kind::FollowRequestAccepted(_)) => {
-                Ok(Self::FollowRequestAccepted)
-            }
-            None => Err(Status::invalid_argument(
-                "a notification has no kind VF serves",
-            )),
-        }
-    }
-
-    const fn of_level(level: SafetyLevel) -> Option<Self> {
-        match level {
-            SafetyLevel::NotificationsFollow => Some(Self::Follow),
-            SafetyLevel::NotificationsWriterV2 => Some(Self::FollowRequestAccepted),
-            SafetyLevel::FilterAll
-            | SafetyLevel::TimelineHome
-            | SafetyLevel::TimelineHomeRecommendations
-            | SafetyLevel::TimelineHomeHydration
-            | SafetyLevel::ImmersiveExpandedRecommendations
-            | SafetyLevel::QuotedTweetRules => None,
-        }
-    }
-}
-
-struct Notifications {
-    level: SafetyLevel,
-    kind: NotificationKind,
-    recipient_id: u64,
-    actors: Vec<AuthorId>,
-}
-
-impl Notifications {
-    fn parse(request: &vf_pb::FilterNotificationsRequest) -> Result<Self, Status> {
-        if request.recipient_id == 0 {
-            return Err(Status::invalid_argument(
-                "FilterNotifications needs a recipient",
-            ));
-        }
-        let (level, kind) = SafetyLevel::from_notification_thrift(request.safety_level)
-            .and_then(|level| Some((level, NotificationKind::of_level(level)?)))
-            .ok_or_else(|| Status::invalid_argument("not a notification safety level"))?;
-        let actors = request
-            .notifications
-            .iter()
-            .map(|notification| {
-                if NotificationKind::parse(notification.kind.as_ref())? != kind {
-                    return Err(Status::invalid_argument(
-                        "the safety level does not serve this notification kind",
-                    ));
-                }
-                Ok(AuthorId(notification.actor_id))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            level,
-            kind,
-            recipient_id: request.recipient_id,
-            actors,
-        })
-    }
-}
 
 pub struct FilterNotificationsEndpoint {
     post_evaluator: Arc<PostEvaluator>,
@@ -86,52 +21,57 @@ impl FilterNotificationsEndpoint {
         &self,
         request: Request<vf_pb::FilterNotificationsRequest>,
     ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {
-        let level = RequestLevel::of(
-            SafetyLevel::from_notification_thrift(request.get_ref().safety_level)
-                .filter(|&level| NotificationKind::of_level(level).is_some()),
-        );
-        let endpoint = Endpoint::FilterNotifications;
-        metrics::observe_request(endpoint, level, request, |request, context| async move {
-            metrics::record_batch_size(endpoint, request.get_ref().notifications.len());
-            let notifications = Notifications::parse(request.get_ref())?;
-            let mut actors = notifications.actors.clone();
-            actors.sort_unstable_by_key(|actor| actor.0);
-            actors.dedup();
-            let by_actor: HashMap<AuthorId, Option<Evaluation>> = if actors.is_empty() {
-                HashMap::new()
-            } else {
-                context
-                    .scope(self.post_evaluator.evaluate_users(
-                        notifications.level,
-                        notifications.recipient_id,
-                        actors,
-                    ))
-                    .await
-            };
-            let evaluation = |actor: &AuthorId| by_actor.get(actor).and_then(Option::as_ref);
-            metrics::record_sent(
-                endpoint,
-                notifications.level,
-                notifications.actors.iter().filter_map(evaluation),
-                notifications
-                    .actors
+        let level = ingress::notification_level(request.get_ref().safety_level);
+        let request_level = RequestLevel::of(level.as_ref().ok().map(|&(level, _)| level));
+        metrics::observe_request(
+            self.post_evaluator.metrics(),
+            Endpoint::FilterNotifications,
+            request_level,
+            request,
+            |request, context, request_metrics| async move {
+                metrics::record_batch_size(&request_metrics, request.get_ref().notifications.len());
+                let (level, notifications) =
+                    ingress::filter_notifications(request.get_ref(), level)?;
+                let mut actors = notifications.ids.clone();
+                actors.sort_unstable_by_key(|actor| actor.0);
+                actors.dedup();
+                let by_actor: HashMap<AuthorId, Option<Evaluation>> = if actors.is_empty() {
+                    HashMap::new()
+                } else {
+                    context
+                        .scope(self.post_evaluator.evaluate_users(
+                            level,
+                            notifications.recipient,
+                            actors,
+                            &request_metrics,
+                        ))
+                        .await
+                };
+                let evaluation = |actor: &AuthorId| by_actor.get(actor).and_then(Option::as_ref);
+                metrics::record_sent(
+                    &request_metrics,
+                    notifications.ids.iter().filter_map(evaluation),
+                    notifications
+                        .ids
+                        .iter()
+                        .filter(|&actor| evaluation(actor).is_none())
+                        .count(),
+                );
+                let results: Vec<_> = notifications
+                    .ids
                     .iter()
-                    .filter(|&actor| evaluation(actor).is_none())
-                    .count(),
-            );
-            let results: Vec<_> = notifications
-                .actors
-                .iter()
-                .map(|actor| treatment::notification_result(evaluation(actor)))
-                .collect();
-            metrics::record_notification_results(
-                notifications.kind.into(),
-                results.iter().map(|&(_, labels)| labels),
-            );
-            Ok(Response::new(vf_pb::FilterNotificationsResponse {
-                results: results.into_iter().map(|(result, _)| result).collect(),
-            }))
-        })
+                    .map(|actor| treatment::notification_result(evaluation(actor)))
+                    .collect();
+                metrics::record_notification_results(
+                    &request_metrics,
+                    notifications.kind.into(),
+                    results.iter().map(|&(_, labels)| labels),
+                );
+                Ok(Response::new(vf_pb::FilterNotificationsResponse {
+                    results: results.into_iter().map(|(result, _)| result).collect(),
+                }))
+            },
+        )
         .await
     }
 }
@@ -142,7 +82,11 @@ mod tests {
     use crate::clients::socialgraph_client::Graph;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{found_user, suspended, Fault, InMemorySources};
-    use crate::metrics::thread_recorded;
+    use crate::metrics::families::{
+        EVALUATED_CANDIDATES, REQUESTS, REQUESTS_BY_CALLER, UNRESOLVED_TWEETS, VERDICTS,
+        VERDICTS_BY_RULE,
+    };
+    use crate::metrics::Metrics;
     use crate::rules::RuleEngine;
     use vf_pb::NotificationDropReason as DropReason;
     use xai_core_entities::entities::{
@@ -232,11 +176,29 @@ mod tests {
         recipient_id: u64,
         notifications: Vec<vf_pb::Notification>,
     ) -> (Result<Vec<Seen>, tonic::Code>, Arc<InMemorySources>) {
+        filter_with(
+            Metrics::none(),
+            sources,
+            safety_level,
+            recipient_id,
+            notifications,
+        )
+        .await
+    }
+
+    async fn filter_with(
+        metrics: Metrics,
+        sources: InMemorySources,
+        safety_level: i32,
+        recipient_id: u64,
+        notifications: Vec<vf_pb::Notification>,
+    ) -> (Result<Vec<Seen>, tonic::Code>, Arc<InMemorySources>) {
         let sources = Arc::new(sources);
         let endpoint = FilterNotificationsEndpoint::new(Arc::new(PostEvaluator::new(
             Arc::clone(&sources) as _,
             RuleEngine::for_tests(),
             Arc::default(),
+            metrics,
         )));
         let response = endpoint
             .handle(Request::new(vf_pb::FilterNotificationsRequest {
@@ -291,13 +253,15 @@ mod tests {
                 vec![follow(ACTOR), accepted(OTHER_ACTOR)],
             ),
             (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![follow(ACTOR)]),
-            (8, RECIPIENT, vec![follow(ACTOR)]),
             (9_999, RECIPIENT, vec![follow(ACTOR)]),
         ] {
             let (seen, sources) = filter(world(), level, recipient_id, notifications).await;
             assert_eq!(seen, Err(tonic::Code::InvalidArgument), "level {level}");
             assert!(sources.calls().is_empty());
         }
+        let (seen, sources) = filter(world(), 8, RECIPIENT, vec![follow(ACTOR)]).await;
+        assert_eq!(seen, Err(tonic::Code::Unimplemented));
+        assert!(sources.calls().is_empty());
         let (seen, sources) = filter(world(), FOLLOW, RECIPIENT, vec![]).await;
         assert_eq!(seen, Ok(vec![]));
         assert!(sources.calls().is_empty());
@@ -307,19 +271,19 @@ mod tests {
     async fn a_level_without_notifications_counts_as_an_unknown_level_failure() {
         let requests = |outcome| {
             [
+                ("outcome", outcome),
                 ("rpc", "filter_notifications"),
                 ("safety_level", "unknown"),
-                ("outcome", outcome),
             ]
             .to_vec()
         };
         for (family, expected) in [
             (
-                "vf_requests",
+                &REQUESTS.family,
                 vec![requests("started"), requests("failure")],
             ),
             (
-                "vf_requests_by_caller",
+                &REQUESTS_BY_CALLER.family,
                 vec![vec![
                     ("caller_identity", "unknown"),
                     ("rpc", "filter_notifications"),
@@ -327,10 +291,11 @@ mod tests {
                 ]],
             ),
         ] {
-            thread_recorded::start();
-            let (seen, _) = filter(world(), 8, RECIPIENT, vec![follow(ACTOR)]).await;
-            assert_eq!(seen, Err(tonic::Code::InvalidArgument));
-            let recorded: Vec<Vec<(String, String)>> = thread_recorded::take(family)
+            let (metrics, recording) = Metrics::recording();
+            let (seen, _) = filter_with(metrics, world(), 8, RECIPIENT, vec![follow(ACTOR)]).await;
+            assert_eq!(seen, Err(tonic::Code::Unimplemented));
+            let recorded: Vec<Vec<(String, String)>> = recording
+                .take(family)
                 .into_iter()
                 .map(|sample| sample.labels)
                 .collect();
@@ -343,7 +308,7 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            assert_eq!(recorded, expected, "{family}");
+            assert_eq!(recorded, expected, "{}", family.name);
         }
     }
 
@@ -359,24 +324,24 @@ mod tests {
         };
         for (family, label, judged, unevaluated) in [
             (
-                "vf_verdicts",
+                &VERDICTS.family,
                 "action",
                 vec![row("allow", 2.0), row("drop", 2.0)],
                 vec![row("drop", 2.0)],
             ),
             (
-                "vf_verdicts_by_rule",
+                &VERDICTS_BY_RULE.family,
                 "rule",
                 vec![row("not_found", 1.0), row("suspended_author/drop", 1.0)],
                 vec![row("lookup_failed", 2.0)],
             ),
             (
-                "vf_evaluated_candidates",
+                &EVALUATED_CANDIDATES.family,
                 "fail_open_defaults",
                 vec![row("none", 4.0)],
                 vec![],
             ),
-            ("vf_unresolved_tweets", "lookup", vec![], vec![]),
+            (&UNRESOLVED_TWEETS.family, "lookup", vec![], vec![]),
         ] {
             for (sources, actors, expected) in [
                 (
@@ -390,22 +355,25 @@ mod tests {
                     unevaluated,
                 ),
             ] {
-                thread_recorded::start();
-                follows(sources, actors).await;
-                let mut recorded: Vec<(String, String, String, f64)> =
-                    thread_recorded::take(family)
-                        .into_iter()
-                        .map(|sample| {
-                            (
-                                sample.label(label).unwrap().to_owned(),
-                                sample.label("safety_level").unwrap().to_owned(),
-                                sample.label("rpc").unwrap().to_owned(),
-                                sample.value,
-                            )
-                        })
-                        .collect();
+                let (metrics, recording) = Metrics::recording();
+                let notifications = actors.iter().copied().map(follow).collect();
+                let (seen, _) =
+                    filter_with(metrics, sources, FOLLOW, RECIPIENT, notifications).await;
+                assert!(seen.is_ok());
+                let mut recorded: Vec<(String, String, String, f64)> = recording
+                    .take(family)
+                    .into_iter()
+                    .map(|sample| {
+                        (
+                            sample.label(label).unwrap().to_owned(),
+                            sample.label("safety_level").unwrap().to_owned(),
+                            sample.label("rpc").unwrap().to_owned(),
+                            sample.value,
+                        )
+                    })
+                    .collect();
                 recorded.sort_by(|x, y| x.0.cmp(&y.0));
-                assert_eq!(recorded, expected, "{family} {actors:?}");
+                assert_eq!(recorded, expected, "{} {actors:?}", family.name);
             }
         }
     }

@@ -322,6 +322,9 @@ class RustParquetDataset(PhoenixDataset):
     def _counts_steps_from_manifest(self) -> bool:
         return False
 
+    def supports_follow_data_end(self) -> bool:
+        return False
+
     def make(
         self,
         *,

@@ -152,7 +152,7 @@ def home_like_transformer(fp8_gemms: str = "off"):
         use_layer_stack=True,
         unroll_layer_stack=True,
         use_remat=True,
-        remat_policy=RematType.SAVE_H100_QKV_ATTN_FFN,
+        remat_policy=RematType.SAVE_H100_RECSYS,
         fp8_gemms=fp8_gemms,
     )
 

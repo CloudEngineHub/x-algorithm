@@ -190,6 +190,49 @@ mod tests {
         assert_eq!(cached[3].tweet_id, 4);
     }
 
+    #[tokio::test]
+    async fn page_rl_fields_survive_the_cached_posts_round_trip() {
+        use crate::query_hydrators::cached_posts_query_hydrator::CachedPostsQueryHydrator;
+        use xai_candidate_pipeline::query_hydrator::QueryHydrator;
+
+        let redis_client = Arc::new(MockRedisClient::default());
+        let side_effect = RedisPostCandidateCacheSideEffect::new(redis_client.clone());
+        let query = test_query();
+        let decoded = PostCandidate {
+            page_decode_slot: Some(4),
+            page_decode_prob: Some(0.35),
+            page_rl_exploration_prob: Some(0.6),
+            ..candidate(11, 110, Some(0.9))
+        };
+        let input = Arc::new(SideEffectInput {
+            query: query.clone(),
+            selected_candidates: vec![decoded],
+            non_selected_candidates: vec![candidate(12, 120, Some(0.5))],
+        });
+
+        side_effect
+            .side_effect(input)
+            .await
+            .expect("side effect should succeed");
+        let hydrated = CachedPostsQueryHydrator {
+            redis_client: redis_client.clone(),
+        }
+        .hydrate(&query)
+        .await
+        .expect("cached posts should hydrate");
+
+        let cached = &hydrated.cached_posts;
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].tweet_id, 11);
+        assert_eq!(cached[0].page_decode_slot, Some(4));
+        assert_eq!(cached[0].page_decode_prob, Some(0.35));
+        assert_eq!(cached[0].page_rl_exploration_prob, Some(0.6));
+        assert_eq!(cached[1].tweet_id, 12);
+        assert_eq!(cached[1].page_decode_slot, None);
+        assert_eq!(cached[1].page_decode_prob, None);
+        assert_eq!(cached[1].page_rl_exploration_prob, None);
+    }
+
     #[test]
     fn get_candidates_to_cache_truncates_to_max() {
         let max_posts_to_cache = 750;

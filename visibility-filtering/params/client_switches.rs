@@ -1,12 +1,12 @@
 use super::limited_actions_policy::REASON_FIELD;
 use super::LimitedActionsPolicies;
+use crate::metrics::Metrics;
 use crate::models::{ClientCapability, LimitedEngagementReason, VerifyBlurSupport};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use strum::VariantArray;
 use xai_feature_switches::{FeatureSwitches, RecipientBuilder, Version};
-use xai_stats_receiver::StatsReceiverExt;
 use xai_twittercontext_proto::TwitterContextViewer;
 
 const SOFT_NSFW_NEW_USER_DROP: &str = "soft_nsfw_tweet_label_new_user_rule_enabled";
@@ -147,7 +147,7 @@ impl ClientSwitches {
         viewer_id: Option<u64>,
         country_code: Option<&str>,
         reasons: impl IntoIterator<Item = LimitedEngagementReason>,
-        stats: Option<&dyn StatsReceiverExt>,
+        metrics: &Metrics,
     ) -> LimitedActionsPolicies {
         let feature_switches = self.feature_switches.load();
         let language = context
@@ -167,7 +167,7 @@ impl ClientSwitches {
                 self.copy
                     .prompt(action_type, prompt_copy, language, country_code)
             },
-            stats,
+            metrics,
         )
         .in_language(language)
     }
@@ -239,7 +239,7 @@ mod tests {
             Arc::clone(&impressor) as _,
         );
         let engine = SwitchFiles::beside(fs_path.to_str().unwrap(), experiments)
-            .load(None)
+            .load(&Metrics::none())
             .unwrap();
         let switches = ClientSwitches::new(
             Arc::new(ArcSwap::from_pointee(engine)),

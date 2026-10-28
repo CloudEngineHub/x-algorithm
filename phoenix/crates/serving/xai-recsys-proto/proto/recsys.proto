@@ -622,6 +622,7 @@ enum ActionName {
   P_LONG_DWELL_AND_PIXEL_FIRE = 193;
   ADS_ATTRIBUTED_MACT_MMP_CLICK_INSTALL = 194;
   ADS_ATTRIBUTED_MACT_MMP_VIEW_INSTALL = 195;
+  ADS_LEADGEN_CONVERSION = 196;
   ADS_PURCHASE_CONVERSION = 200;
   ADS_MID_FUNNEL_CONVERSION = 201;
   ADS_ADD_TO_CART_CONVERSION = 202;
@@ -1492,6 +1493,7 @@ message ScoreInfo {
   optional double pageDecodeSlotProb = 7;
   repeated uint32 predictionHeads = 8;
   repeated float predictionValues = 9;
+  optional bool pageDecoded = 10;
 }
 
 message SlateContext {

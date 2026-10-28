@@ -42,7 +42,8 @@ from xai_checkpointing.common import _unsafe_jax2np
 from xai_checkpointing.tree_util import tree_to_dict
 from xai_configlib import configclass
 from xai_proto import copy_pb2, copy_pb2_grpc
-from xrex.data.parquet_recsys import DataPosition, PhoenixDataset
+from xrex.data.parquet_recsys import DataPosition, PhoenixDataset, ShuffleMode
+from xrex.data.parquet_recsys_metadata import parse_date_bound
 
 if typing.TYPE_CHECKING:
     from xrex.cuda.async_emb import (
@@ -93,6 +94,7 @@ from xrex.optimizers.optim import InjectHyperparamsState, apply_updates, partiti
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
 from xrex.optimizers.recsys.protocol import AsyncEmbOptimizer
 from xrex.train import retrieval_corpus_stager as corpus_stager
+from xrex.train.follow_data_end import DataEnd, DataEndFollower, KeyValueCoordination, agree
 from xrex.train.misc import (
     CheckpointConfig,
     PostEmbeddings,
@@ -188,6 +190,18 @@ def _pad_axis(x: jax.Array, axis: int, length: int | None) -> jax.Array:
     pad = [(0, 0)] * x.ndim
     pad[axis] = (0, length - x.shape[axis])
     return jnp.pad(x, pad)
+
+
+def restart_from_restored_offsets(dataset: PhoenixKafkaDataset) -> bool:
+    changed = False
+    if dataset.fresh_training_bootstrap:
+        dataset.fresh_training_bootstrap = False
+        dataset.native_checkpoint_restart = True
+        changed = True
+    if dataset.seek_to_timestamp_ms is not None:
+        dataset.seek_to_timestamp_ms = None
+        changed = True
+    return changed
 
 
 def max_over_processes(client, key_prefix: str, round_: int, value: int, timeout_ms: int) -> int:
@@ -443,6 +457,8 @@ class RecsysTrainer(Trainer):
     emb_optim_config: RecsysEmbeddingOptimConfig = field(default_factory=RecsysEmbeddingOptimConfig)
 
     stop_at_data_end: bool = False
+    follow_data_end: bool = False
+    follow_data_end_check_every_n: int = 200
 
     empty_history_augmentation_rate: float = 0.0
 
@@ -484,6 +500,7 @@ class RecsysTrainer(Trainer):
         default_factory=dict, init=False, repr=False
     )
     _candidate_size_round: int = field(default=0, init=False, repr=False)
+    _data_end_follower: DataEndFollower | None = field(default=None, init=False, repr=False)
     _async_emb_lookup_pin: jax.Array | None = field(default=None, init=False, repr=False)
     _allocator_anchors: list[jax.Array] = field(default_factory=list, init=False, repr=False)
     _batch_pipeline: BatchPipelineState = field(
@@ -542,6 +559,8 @@ class RecsysTrainer(Trainer):
                 "forward_only runs the synchronous step: set use_async_emb=False, "
                 "use_row_emb=False and num_microbatch=1"
             )
+        if self.follow_data_end:
+            self._validate_follow_data_end()
 
     state: RecsysTrainingState = field(init=False, repr=False, compare=False)
     _pending_shmem_ckpt_write_s: float | None = field(default=None, init=False, repr=False)
@@ -1284,6 +1303,115 @@ class RecsysTrainer(Trainer):
         )
         return res[0], int(progress["elapsed_samples"]), res[2]
 
+    def _validate_follow_data_end(self) -> None:
+        dataset = self.dataset
+        needs: list[str] = []
+        if not self.stop_at_data_end:
+            needs.append("stop_at_data_end=True")
+        if self.follow_data_end_check_every_n <= 0:
+            needs.append("follow_data_end_check_every_n > 0")
+        if not isinstance(dataset, PhoenixDataset) or not dataset.supports_follow_data_end():
+            needs.append("the Python offline reader (PhoenixDataset)")
+        else:
+            if dataset.path is None:
+                needs.append("dataset.path")
+            if dataset.is_eval or dataset.continuous:
+                needs.append("a training dataset with continuous=False")
+            if dataset.shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
+                needs.append("shuffle_mode=block_shuffle")
+            if (
+                dataset.date_range is not None
+                and parse_date_bound(dataset.date_range[1]) is not None
+            ):
+                needs.append("an open-ended date_range (date_range=<start>,none)")
+        if needs:
+            raise ValueError("follow_data_end needs " + ", ".join(needs))
+
+    def _data_end_step(self, step: int, data_end: int) -> int:
+        remaining_batches = data_end - step + 1
+        return step + remaining_batches // self.num_microbatch - 1
+
+    def _start_follow_data_end(
+        self,
+        num_shards: int,
+        loader_batch_size: int,
+        resume_position: DataPosition | None,
+    ) -> None:
+        from jax._src.distributed import global_state as jax_distributed
+
+        dataset = self.dataset
+        assert isinstance(dataset, PhoenixDataset)
+        assert isinstance(self.state, RecsysTrainingState)
+        step = self.state.step.item()
+        configured_max_steps = self.max_steps
+        start_batch_id: int | None = None
+
+        def probe(after_end_batch_id: int) -> DataEnd | None:
+            nonlocal start_batch_id
+            end = dataset.available_end_batch_id(after_end_batch_id)
+            if end is None:
+                return None
+            if start_batch_id is None:
+                start_batch_id = dataset.start_batch_id()
+            data_end = dataset.compute_max_steps(
+                num_shards=num_shards,
+                batch_size=loader_batch_size,
+                current_step=step,
+                resume_position=resume_position,
+                end_batch_id=end,
+                start_batch_id=start_batch_id,
+            )
+            if data_end is None:
+                raise RuntimeError(f"could not read the dataset index under {dataset.path}")
+            max_steps = self._data_end_step(step, data_end)
+            if configured_max_steps is not None:
+                max_steps = min(max_steps, configured_max_steps)
+            return DataEnd(end_batch_id=end, max_steps=max_steps)
+
+        is_process_0 = jax.process_index() == 0
+        coordination = KeyValueCoordination(
+            jax_distributed.client, jax.process_index(), jax.process_count()
+        )
+
+        def first_count() -> dict:
+            start = probe(-1)
+            if start is None:
+                raise ValueError(f"follow_data_end: no readable batch ids under {dataset.path}")
+            return {"end_batch_id": start.end_batch_id, "max_steps": start.max_steps}
+
+        start = DataEnd(
+            **agree(coordination, "follow_data_end/start", 0, first_count if is_process_0 else None)
+        )
+
+        dataset.set_end_batch_id(start.end_batch_id)
+        self.max_steps = start.max_steps
+        rank_logger.info(
+            "follow_data_end: starting with the data end at batch_id %d, max_steps=%d; "
+            "looking for new data every %d steps",
+            start.end_batch_id,
+            start.max_steps,
+            self.follow_data_end_check_every_n,
+        )
+        self._data_end_follower = DataEndFollower(
+            data_end=start,
+            window=dataset.shuffle_window_time_slices,
+            check_every_n=self.follow_data_end_check_every_n,
+            is_process_0=is_process_0,
+            probe=probe,
+            coordination=coordination,
+        )
+
+    def before_stop_check(self, soft_step: int) -> None:
+        follower = self._data_end_follower
+        if follower is None:
+            return
+        assert isinstance(self.dataset, PhoenixDataset)
+        data_end = follower.check(soft_step, self.dataset.reader_window_start())
+        if data_end is None:
+            return
+        self.dataset.set_end_batch_id(data_end.end_batch_id)
+        self.max_steps = data_end.max_steps
+
     def create_dataset(self, ctx: TrainerContext):
         assert isinstance(self.dataset, PhoenixDataset)
         if self.use_mock_gpu_client:
@@ -1333,6 +1461,8 @@ class RecsysTrainer(Trainer):
 
         skip_rows = 0 if should_reset_data else max(0, elapsed_samples - self.dataloader_offset)
         loader_batch_size = self.read_bsz_per_process // self.num_microbatch
+        if self.follow_data_end:
+            self._start_follow_data_end(data_world_size, loader_batch_size, resume_position)
         train_dataset = self.dataset.make(
             batch_size=loader_batch_size,
             shard_index=data_rank,
@@ -1349,7 +1479,7 @@ class RecsysTrainer(Trainer):
         )
         self._eval_dataset = train_dataset
 
-        if self.stop_at_data_end:
+        if self.stop_at_data_end and not self.follow_data_end:
             assert isinstance(self.state, RecsysTrainingState)
             step = self.state.step.item()
             data_end = self.dataset.compute_max_steps(
@@ -1359,8 +1489,7 @@ class RecsysTrainer(Trainer):
                 resume_position=resume_position,
             )
             if data_end is not None:
-                remaining_batches = data_end - step + 1
-                data_end = step + remaining_batches // self.num_microbatch - 1
+                data_end = self._data_end_step(step, data_end)
                 if self.max_steps is None or data_end < self.max_steps:
                     self.max_steps: int | None = data_end
 
@@ -3068,6 +3197,12 @@ class RecsysTrainer(Trainer):
                     rank_logger.info(
                         "Restored Kafka offsets for %d partitions", len(seek_to_offset)
                     )
+                    own_restart = ctx.checkpoint is not None and not ctx.checkpoint.is_manual_load()
+                    if own_restart and restart_from_restored_offsets(self.dataset):
+                        rank_logger.info(
+                            "Resuming this run's own Kafka offsets; dropped the first-start "
+                            "position (seek_to_timestamp_ms / fresh_training_bootstrap)"
+                        )
 
         if self.smoothing_windows and isinstance(self.model_config, RecsysAggregatedModelConfig):
             from xrex.data.recsys.constants import engagement_to_ids

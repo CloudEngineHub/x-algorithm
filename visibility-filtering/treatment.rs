@@ -525,7 +525,7 @@ fn drop_reason(reason: &DropReason, level: SafetyLevel) -> Option<action::DropRe
         FilteredReason::ViewerBlocksAuthor => action::DropReason::ViewerBlocksAuthor(true),
         FilteredReason::ViewerMutesAuthor => action::DropReason::ViewerMutesAuthor(true),
         FilteredReason::ExclusiveTweet => action::DropReason::ExclusiveTweet(true),
-        FilteredReason::UnspecifiedReason if level.spec().unspecified_drop_is_exact => {
+        FilteredReason::UnspecifiedReason if level.spec().unspecified_drop_is_exact() => {
             action::DropReason::Unspecified(true)
         }
         FilteredReason::UnspecifiedReason
@@ -645,59 +645,82 @@ pub(crate) fn proto_action(verdict: &Verdict) -> (vf_pb::Action, Option<vf_pb::F
     (vf_pb::Action { kind: Some(kind) }, filtered_reason)
 }
 
-pub(crate) fn metric_label(verdict: &Verdict) -> &'static str {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum VerdictAction {
+    Allow,
+    Drop,
+    Tombstone,
+    Interstitial,
+    LimitedEngagement,
+    TweetInterstitial,
+    SoftIntervention,
+    Appealable,
+}
+
+#[cfg(test)]
+const BY_RULE_ACTIONS: [VerdictAction; 6] = [
+    VerdictAction::Drop,
+    VerdictAction::Tombstone,
+    VerdictAction::Interstitial,
+    VerdictAction::LimitedEngagement,
+    VerdictAction::SoftIntervention,
+    VerdictAction::Appealable,
+];
+
+pub(crate) fn verdict_action(verdict: &Verdict) -> VerdictAction {
     match verdict {
         Verdict::Withheld(Decided {
             value: Withholding::Drop(_),
             ..
-        }) => "drop",
+        }) => VerdictAction::Drop,
         Verdict::Withheld(Decided {
             value: Withholding::Tombstone(_),
             ..
-        }) => "tombstone",
+        }) => VerdictAction::Tombstone,
         Verdict::Shown {
             notice: Some(notice),
             ..
-        } if notice.value.is_whole_verdict() => notice_label(&notice.value),
+        } if notice.value.is_whole_verdict() => notice_action(&notice.value),
         Verdict::Shown {
             notice: Some(_), ..
-        } => "tweet_interstitial",
+        } => VerdictAction::TweetInterstitial,
         Verdict::Shown {
             notice: None,
             media: None,
             engagement: None,
-        } => "allow",
+        } => VerdictAction::Allow,
         Verdict::Shown {
             notice: None,
             media: Some(_),
             engagement: None,
-        } => "interstitial",
+        } => VerdictAction::Interstitial,
         Verdict::Shown {
             notice: None,
             media: None,
             engagement: Some(_),
-        } => "limited_engagement",
+        } => VerdictAction::LimitedEngagement,
         Verdict::Shown {
             notice: None,
             media: Some(_),
             engagement: Some(_),
-        } => "tweet_interstitial",
+        } => VerdictAction::TweetInterstitial,
     }
 }
 
-const fn notice_label(notice: &Notice) -> &'static str {
+const fn notice_action(notice: &Notice) -> VerdictAction {
     match notice {
-        Notice::SoftIntervention(_) => "soft_intervention",
-        Notice::Appealable { .. } => "appealable",
-        Notice::LabelInterstitial(_) => "interstitial",
+        Notice::SoftIntervention(_) => VerdictAction::SoftIntervention,
+        Notice::Appealable { .. } => VerdictAction::Appealable,
+        Notice::LabelInterstitial(_) => VerdictAction::Interstitial,
     }
 }
 
 pub(crate) fn decided_rows(
     verdict: &Verdict,
-) -> impl Iterator<Item = (&'static str, &'static str)> {
+) -> impl Iterator<Item = (&'static str, VerdictAction)> {
     let (notice, first, second) = match verdict {
-        Verdict::Withheld(decided) => (None, Some((decided.by, metric_label(verdict))), None),
+        Verdict::Withheld(decided) => (None, Some((decided.by, verdict_action(verdict))), None),
         Verdict::Shown {
             notice,
             media,
@@ -705,11 +728,13 @@ pub(crate) fn decided_rows(
         } => (
             notice
                 .as_ref()
-                .map(|notice| (notice.by, notice_label(&notice.value))),
-            media.as_ref().map(|blur| (blur.by, "interstitial")),
+                .map(|notice| (notice.by, notice_action(&notice.value))),
+            media
+                .as_ref()
+                .map(|blur| (blur.by, VerdictAction::Interstitial)),
             engagement
                 .as_ref()
-                .map(|limit| (limit.by, "limited_engagement")),
+                .map(|limit| (limit.by, VerdictAction::LimitedEngagement)),
         ),
     };
     notice.into_iter().chain(first).chain(second)
@@ -848,7 +873,6 @@ fn notification_reason_label(reason: NotificationDropReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::Rpc;
     use crate::rules::fixtures::{
         appealed, dropped, label_interstitial, limited_for, noticed, tombstoned,
         with_label_interstitial,
@@ -1244,12 +1268,21 @@ mod tests {
                 expected.thrift,
                 "{name}"
             );
-            assert_eq!(metric_label(&verdict), expected.label, "{name}");
             assert_eq!(
-                decided_rows(&verdict).collect::<Vec<_>>(),
+                <&str>::from(verdict_action(&verdict)),
+                expected.label,
+                "{name}"
+            );
+            assert_eq!(
+                decided_rows(&verdict)
+                    .map(|(rule, action)| (rule, <&str>::from(action)))
+                    .collect::<Vec<_>>(),
                 expected.rows,
                 "{name}"
             );
+            for (rule, action) in decided_rows(&verdict) {
+                assert!(BY_RULE_ACTIONS.contains(&action), "{name}: {rule}");
+            }
             let (proto, reason) = proto_action(&verdict);
             assert_eq!(proto.kind, Some(expected.proto), "{name}");
             assert_eq!(reason, expected.reason.map(Into::into), "{name}");
@@ -1281,9 +1314,11 @@ mod tests {
                 "stale_tweet",
             )
         );
-        assert_eq!(metric_label(&verdict), "limited_engagement");
+        assert_eq!(<&str>::from(verdict_action(&verdict)), "limited_engagement");
         assert_eq!(
-            decided_rows(&verdict).collect::<Vec<_>>(),
+            decided_rows(&verdict)
+                .map(|(rule, action)| (rule, <&str>::from(action)))
+                .collect::<Vec<_>>(),
             [("limit_rule", "limited_engagement")]
         );
     }
@@ -1537,19 +1572,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_rpc_and_verdict_mix_labels() {
-        let dashboard =
-            std::fs::read_to_string(crate::pinned::crate_path("scripts/dashboard.py")).unwrap();
-        let filter_tweets = <&str>::from(Rpc::FilterTweets);
-        assert!(dashboard.contains(&format!("FT_RPC_FILTER = 'rpc=~\"{filter_tweets}|\"'")));
-        let actions = dashboard
-            .split_once("FT_VERDICT_ACTIONS = (")
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .map_or("", |(tuple, _)| tuple);
-        for (_, expected) in verdict_cases() {
-            let label = expected.label;
-            assert!(actions.contains(&format!("\"{label}\",")), "{label}");
-        }
+    fn dashboard_generator_pins_the_verdict_mix_labels() {
+        use strum::VariantArray;
+        let emitted: std::collections::BTreeSet<String> = VerdictAction::VARIANTS
+            .iter()
+            .map(|&action| <&str>::from(action).to_owned())
+            .collect();
+        let dashboard = crate::pinned::dashboard_tuple("FT_VERDICT_ACTIONS");
+        assert_eq!(dashboard, emitted);
     }
 
     #[test]
@@ -1741,7 +1771,7 @@ mod tests {
         let sent: Vec<(SafetyLevel, RuleId, TweetFieldsResultState)> = SafetyLevel::VARIANTS
             .iter()
             .flat_map(|&level| {
-                let rerenders = match level.spec().quote_entries {
+                let rerenders = match level.spec().quote_entries() {
                     QuoteEntries::Judged { rerenders } => rerenders,
                     QuoteEntries::NotJudged => &[],
                 };

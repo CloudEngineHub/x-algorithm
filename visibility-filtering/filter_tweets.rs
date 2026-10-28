@@ -1,46 +1,18 @@
-use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, Rpc};
-use crate::models::{ClientCapability, PlacedCandidate, RawCandidate, TweetId};
+use crate::ingress;
+use crate::metrics::{self as ft_metrics, Endpoint, RequestLevel, RequestMetrics};
+use crate::models::RequestViewer;
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{normalize_viewer_id, PostBatch, PostEvaluation, PostEvaluator};
-use crate::rules::{NoTrace, RuleEngine, SafetyLevel};
+use crate::post_evaluator::{PostEvaluation, PostEvaluator};
+use crate::rules::{NoTrace, SafetyLevel, WireLevel};
 use crate::treatment;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
-pub(crate) fn filter_tweets_request(
-    rule_engine: &RuleEngine,
-    client_switches: &ClientSwitches,
-    viewer_id: Option<u64>,
-    country_code: Option<String>,
-    safety_level: SafetyLevel,
-    candidates: Vec<PlacedCandidate>,
-) -> PostBatch {
-    let country_code = country_code.filter(|code| !code.is_empty());
-    let client_capability = ClientCapability {
-        soft_nsfw_new_user_drop: rule_engine.reads_soft_nsfw_new_user_drop(safety_level)
-            && client_switches.soft_nsfw_new_user_drop(viewer_id, country_code.as_deref()),
-        ..ClientCapability::default()
-    };
-    PostBatch {
-        viewer_id,
-        country_code,
-        client_capability,
-        safety_level,
-        candidates,
-        rpc: Rpc::FilterTweets,
-    }
-}
-
 pub(crate) type FinishComparison = Box<dyn FnOnce(&[PostEvaluation]) + Send>;
 
 pub(crate) trait Comparator: Send + Sync {
-    fn begin(
-        &self,
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        safety_level: SafetyLevel,
-    ) -> Option<FinishComparison>;
+    fn begin(&self, viewer: &RequestViewer, safety_level: SafetyLevel) -> Option<FinishComparison>;
 }
 
 pub struct FilterTweetsEndpoint {
@@ -66,12 +38,14 @@ impl FilterTweetsEndpoint {
         &self,
         request: Request<vf_pb::VisibilityFilterRequest>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
-        let safety_level = SafetyLevel::from_proto(request.get_ref().safety_level());
+        let safety_level =
+            ingress::level(WireLevel::FilterTweets(request.get_ref().safety_level()));
         ft_metrics::observe_request(
+            self.post_evaluator.metrics(),
             Endpoint::FilterTweets,
-            RequestLevel::of(safety_level),
+            RequestLevel::of(safety_level.as_ref().ok().copied()),
             request,
-            |request, context| self.handle_inner(request, context, safety_level),
+            |request, context, metrics| self.handle_inner(request, context, metrics, safety_level),
         )
         .await
     }
@@ -80,45 +54,33 @@ impl FilterTweetsEndpoint {
         &self,
         request: Request<vf_pb::VisibilityFilterRequest>,
         context: xai_x_rpc::CallContext,
-        safety_level: Option<SafetyLevel>,
+        metrics: RequestMetrics,
+        safety_level: Result<SafetyLevel, Status>,
     ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {
         let req = request.into_inner();
-        ft_metrics::record_batch_size(Endpoint::FilterTweets, req.tweets.len());
-        let viewer_id = normalize_viewer_id(req.viewer_id);
-        ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
+        ft_metrics::record_batch_size(&metrics, req.tweets.len());
+        let safety_level = safety_level?;
+        let raw_viewer_id = req.viewer_id;
+        let request = ingress::filter_tweets(req);
+        ft_metrics::record_viewer_state(metrics.plain(), raw_viewer_id, request.viewer.id());
 
-        let Some(safety_level) = safety_level else {
-            return Err(Status::unimplemented("safety level has no Rust policy"));
-        };
-        let candidates: Vec<PlacedCandidate> = req
-            .tweets
-            .iter()
-            .map(|t| {
-                PlacedCandidate::standalone(RawCandidate {
-                    tweet_id: TweetId(t.tweet_id),
-                    request_author_id: t.author_id,
-                })
-            })
-            .collect();
+        let finish_comparison = self
+            .comparator
+            .as_ref()
+            .and_then(|comparator| comparator.begin(&request.viewer, safety_level));
 
-        let finish_comparison = self.comparator.as_ref().and_then(|comparator| {
-            comparator.begin(viewer_id, req.country_code.clone(), safety_level)
-        });
-
-        let request = filter_tweets_request(
+        let request = ingress::filter_tweets_batch(
             self.post_evaluator.rule_engine(),
             &self.client_switches,
-            viewer_id,
-            req.country_code,
+            request.viewer,
             safety_level,
-            candidates,
+            request.rows,
         );
         let (_, outcomes) = context
-            .scope(self.post_evaluator.run(request, &mut NoTrace))
+            .scope(self.post_evaluator.run(request, &metrics, &mut NoTrace))
             .await;
         ft_metrics::record_sent(
-            Endpoint::FilterTweets,
-            safety_level,
+            &metrics,
             outcomes.iter().map(|outcome| &outcome.evaluation),
             0,
         );
@@ -141,6 +103,8 @@ mod tests {
     use super::*;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::InMemorySources;
+    use crate::metrics::Metrics;
+    use crate::rules::RuleEngine;
     use std::sync::Mutex;
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
@@ -150,6 +114,7 @@ mod tests {
                 Arc::<InMemorySources>::clone(&sources),
                 RuleEngine::for_tests(),
                 Arc::default(),
+                Metrics::none(),
             )),
             ClientSwitches::for_tests(),
             None,
@@ -188,11 +153,10 @@ mod tests {
     impl Comparator for ViewerIds {
         fn begin(
             &self,
-            viewer_id: Option<u64>,
-            _country_code: Option<String>,
+            viewer: &RequestViewer,
             _safety_level: SafetyLevel,
         ) -> Option<FinishComparison> {
-            self.0.lock().unwrap().push(viewer_id);
+            self.0.lock().unwrap().push(viewer.id());
             None
         }
     }
@@ -206,6 +170,7 @@ mod tests {
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
                 Arc::default(),
+                Metrics::none(),
             )),
             ClientSwitches::for_tests(),
             Some(Box::new(viewer_ids)),
@@ -233,8 +198,7 @@ mod tests {
     impl Comparator for FinishedResults {
         fn begin(
             &self,
-            _viewer_id: Option<u64>,
-            _country_code: Option<String>,
+            _viewer: &RequestViewer,
             _safety_level: SafetyLevel,
         ) -> Option<FinishComparison> {
             let finished = Arc::clone(&self.0);
@@ -259,6 +223,7 @@ mod tests {
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
                 Arc::default(),
+                Metrics::none(),
             )),
             ClientSwitches::for_tests(),
             Some(Box::new(comparator)),

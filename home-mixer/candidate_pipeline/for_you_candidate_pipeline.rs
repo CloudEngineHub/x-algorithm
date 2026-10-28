@@ -21,6 +21,7 @@ use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
 use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
+use crate::side_effects::phoenix_request_cache_side_effect::ServedSlateCacheSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -43,6 +44,7 @@ use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
     KafkaPublisherClient, MockKafkaPublisherClient,
 };
+use xai_candidate_pipeline::component_library::clients::redis_client::MockRedisClient;
 use xai_candidate_pipeline::component_library::clients::{
     MockReplyMixerClient, MockStratoClient, ProdReplyMixerClient, ProdStratoClient,
     ReplyMixerClient, StratoClient,
@@ -89,6 +91,7 @@ impl ForYouCandidatePipeline {
             tes_client,
             reply_mixer_client,
             strato_client,
+            (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -154,6 +157,11 @@ impl ForYouCandidatePipeline {
                         .expect("Failed to create Strato client"),
                 ) as Arc<dyn StratoClient + Send + Sync>
             },
+            super::shared_phoenix_request_cache_redis_clients(),
+        );
+        let served_slate_cache = ServedSlateCacheSideEffect::new(
+            phoenix_request_cache_redis_atla_client,
+            phoenix_request_cache_redis_pdxa_client,
         );
 
         Self::build(
@@ -174,6 +182,7 @@ impl ForYouCandidatePipeline {
             past_request_timestamps_client,
             tes_client,
             reply_mixer_client,
+            served_slate_cache,
         )
     }
 
@@ -196,6 +205,7 @@ impl ForYouCandidatePipeline {
         past_request_timestamps_client: Arc<dyn PastRequestTimestampsClient>,
         tes_client: Arc<dyn TESClient + Send + Sync>,
         reply_mixer_client: Arc<dyn ReplyMixerClient>,
+        served_slate_cache: ServedSlateCacheSideEffect,
     ) -> Self {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ServedHistoryQueryHydrator::from_client(Arc::clone(
@@ -246,6 +256,7 @@ impl ForYouCandidatePipeline {
                     &served_history_client,
                 ))),
                 Box::new(TruncateServedHistorySideEffect::new(served_history_client)),
+                Box::new(served_slate_cache),
             ]);
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, FeedItem>>> =
@@ -285,6 +296,10 @@ impl ForYouCandidatePipeline {
         let reply_mixer_client: Arc<dyn ReplyMixerClient> = Arc::new(MockReplyMixerClient);
         let strato_client: Arc<dyn StratoClient + Send + Sync> =
             Arc::new(MockStratoClient::default());
+        let served_slate_cache = ServedSlateCacheSideEffect::new(
+            Arc::new(MockRedisClient::default()),
+            Arc::new(MockRedisClient::default()),
+        );
         Self::build(
             scored_posts_server,
             strato_client,
@@ -303,6 +318,7 @@ impl ForYouCandidatePipeline {
             past_request_timestamps_client,
             tes_client,
             reply_mixer_client,
+            served_slate_cache,
         )
     }
 }

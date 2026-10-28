@@ -334,7 +334,7 @@ _H100_OVERRIDES = {
     "ep": 64,
     "use_async_emb": True,
     "overlap_step_host_work": True,
-    "remat_policy": RematType.SAVE_H100_QKV_ATTN_FFN,
+    "remat_policy": RematType.SAVE_H100_RECSYS,
     "unroll_layer_stack": True,
     "attn_impl": "cutedsl_ranker_varlen_attn",
     "learning_rate": 7.1e-4,

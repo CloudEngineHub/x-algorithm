@@ -19,6 +19,7 @@ pub use verdict::{
     MediaRestriction, Notice, NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict,
     Withholding,
 };
+pub(crate) use viewer::RequestViewer;
 pub use viewer::{
     ClientCapability, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures,
     ViewerProfile,
@@ -87,6 +88,20 @@ pub struct QuoteLink {
 pub struct Quote {
     pub link: QuoteLink,
     pub pair_edges: EdgeSet,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RetweetMerge {
+    Merged,
+    #[default]
+    Unmerged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum NotificationKind {
+    Follow,
+    FollowRequestAccepted,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,7 +202,6 @@ impl EdgeSet {
 pub struct PostEntity {
     pub tweet_id: u64,
     pub source_tweet_id: Option<u64>,
-    pub is_reply: bool,
     pub tweet_features: TweetFeatures,
     pub safety_labels: SafetyLabelMap,
     pub conversation_control: Option<ConversationControlFeatures>,
@@ -199,4 +213,5 @@ pub struct PostEntity {
     pub article_has_cover_media: bool,
     pub reacted_to_post_safety_labels: SafetyLabelMap,
     pub reacted_to_author_is_protected: bool,
+    pub conversation_root_author_blocks_viewer: bool,
 }

@@ -39,7 +39,7 @@ fn truths() -> Vec<Truth> {
 fn wired<E: Engine>(list: fn(PostRules) -> &'static [&'static Rule<E>]) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for &rule in list(level.spec().rules.lists()) {
+        for &rule in list(level.spec().rules().lists()) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -551,7 +551,7 @@ fn every_client_capability_is_live() {
 fn only_the_quote_pass_reads_the_quote() {
     let mut readers = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules.lists();
+        let PostRules { user, post } = level.spec().rules().lists();
         let mut read = Vec::new();
         for rule in user {
             rule.when.leaves(&mut read);
@@ -660,7 +660,7 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     };
     let mut shadowing = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules.lists();
+        let PostRules { user, post } = level.spec().rules().lists();
         for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
             let severity = user_rule.action.spec().severity();
             for &post_rule in post {
@@ -696,7 +696,7 @@ fn each_rule_name_wires_the_same_rules_at_every_level() {
     ];
     let mut first: Vec<(String, SafetyLevel, Vec<String>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let rules = level.spec().rules.lists();
+        let rules = level.spec().rules().lists();
         let authored = rules
             .user
             .iter()

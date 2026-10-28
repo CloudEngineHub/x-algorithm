@@ -8,7 +8,9 @@ use xai_cache::{CacheClient, KVCacheError, Key, Value};
 use xai_visibility_filtering_proto as vf_pb;
 
 use super::decode::{self, CachedLabels};
-use super::metrics::{self, BatchStage, CacheResult, CacheTier, ManhattanResult, SourceOutcome};
+use super::metrics::{
+    self, BatchStage, CacheResult, CacheTier, LabelMetrics, ManhattanResult, SourceOutcome,
+};
 use super::mh_client::ManhattanLabelFetcher;
 use super::warmer::CacheWarmer;
 
@@ -92,14 +94,26 @@ pub(crate) struct RemoteSource {
     twemcache: TwemcacheSource,
     manhattan: ManhattanSource,
     warmer: Option<Arc<CacheWarmer>>,
+    metrics: LabelMetrics,
 }
 
 impl RemoteSource {
-    pub(crate) fn new(cache: Arc<dyn CacheRead>, fetcher: Arc<dyn ManhattanLabelFetcher>) -> Self {
+    pub(crate) fn new(
+        cache: Arc<dyn CacheRead>,
+        fetcher: Arc<dyn ManhattanLabelFetcher>,
+        metrics: LabelMetrics,
+    ) -> Self {
         Self {
-            twemcache: TwemcacheSource { cache },
-            manhattan: ManhattanSource { fetcher },
+            twemcache: TwemcacheSource {
+                cache,
+                metrics: metrics.clone(),
+            },
+            manhattan: ManhattanSource {
+                fetcher,
+                metrics: metrics.clone(),
+            },
             warmer: None,
+            metrics,
         }
     }
 
@@ -154,7 +168,12 @@ impl RemoteLabels for RemoteSource {
         }
 
         for (reason, count) in fallback_counts {
-            metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);
+            metrics::record_cache_fallback_keys(
+                &self.metrics,
+                LabelSource::Twemcache,
+                reason,
+                count,
+            );
         }
 
         if let Some(warmer) = &self.warmer
@@ -163,7 +182,11 @@ impl RemoteLabels for RemoteSource {
             warmer.warm(warm_ids);
         }
 
-        metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());
+        metrics::record_batch_size(
+            &self.metrics,
+            BatchStage::ManhattanFallback,
+            fallback_ids.len(),
+        );
         results.extend(self.manhattan.get(&fallback_ids).await);
         results
     }
@@ -175,6 +198,7 @@ pub(crate) fn cache_key(id: u64) -> Result<Key, KVCacheError> {
 
 struct TwemcacheSource {
     cache: Arc<dyn CacheRead>,
+    metrics: LabelMetrics,
 }
 
 #[expect(
@@ -206,10 +230,15 @@ impl ItemCounts {
         }
     }
 
-    fn record_metrics(&self) {
-        metrics::record_cache_keys(CacheTier::Twemcache, CacheResult::Hit, self.hit);
-        metrics::record_cache_keys(CacheTier::Twemcache, CacheResult::NotFound, self.not_found);
-        metrics::record_cache_keys(CacheTier::Twemcache, CacheResult::Miss, self.miss);
+    fn record_metrics(&self, metrics: &LabelMetrics) {
+        metrics::record_cache_keys(metrics, CacheTier::Twemcache, CacheResult::Hit, self.hit);
+        metrics::record_cache_keys(
+            metrics,
+            CacheTier::Twemcache,
+            CacheResult::NotFound,
+            self.not_found,
+        );
+        metrics::record_cache_keys(metrics, CacheTier::Twemcache, CacheResult::Miss, self.miss);
     }
 }
 
@@ -236,6 +265,7 @@ impl TwemcacheSource {
                     );
                 }
                 metrics::record_source_request(
+                    &self.metrics,
                     LabelSource::Twemcache,
                     SourceOutcome::Failure,
                     start.elapsed().as_secs_f64() * 1000.0,
@@ -263,11 +293,12 @@ impl TwemcacheSource {
             results.insert(tweet_id, outcome);
         }
         metrics::record_source_request(
+            &self.metrics,
             LabelSource::Twemcache,
             SourceOutcome::Success,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-        counts.record_metrics();
+        counts.record_metrics(&self.metrics);
 
         results
     }
@@ -275,6 +306,7 @@ impl TwemcacheSource {
 
 struct ManhattanSource {
     fetcher: Arc<dyn ManhattanLabelFetcher>,
+    metrics: LabelMetrics,
 }
 
 impl ManhattanSource {
@@ -343,12 +375,13 @@ impl ManhattanSource {
         };
 
         metrics::record_source_request(
+            &self.metrics,
             LabelSource::Manhattan,
             request_outcome,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-        metrics::record_manhattan_keys(ManhattanResult::Success, successes);
-        metrics::record_manhattan_keys(ManhattanResult::Failed, failures);
+        metrics::record_manhattan_keys(&self.metrics, ManhattanResult::Success, successes);
+        metrics::record_manhattan_keys(&self.metrics, ManhattanResult::Failed, failures);
 
         results
     }
@@ -445,6 +478,7 @@ mod tests {
         let source = RemoteSource::new(
             FakeCache::new([(42, Ok(None))]),
             Arc::<FakeLabelFetcher>::clone(&fetcher),
+            LabelMetrics::default(),
         );
 
         let results = source.get(&[42, 42]).await;
@@ -463,8 +497,12 @@ mod tests {
         ]);
         let fetcher = Arc::new(FakeLabelFetcher::default());
         let (warmer, mut published) = CacheWarmer::without_drain_task(2);
-        let source = RemoteSource::new(cache, Arc::<FakeLabelFetcher>::clone(&fetcher))
-            .with_warmer(Arc::new(warmer));
+        let source = RemoteSource::new(
+            cache,
+            Arc::<FakeLabelFetcher>::clone(&fetcher),
+            LabelMetrics::default(),
+        )
+        .with_warmer(Arc::new(warmer));
 
         let results = source.get(&[1, 2, 3, 4, 5]).await;
 
@@ -492,6 +530,7 @@ mod tests {
         let source = RemoteSource::new(
             FakeCache::new([(42, Ok(None))]),
             Arc::<FakeLabelFetcher>::clone(&fetcher),
+            LabelMetrics::default(),
         );
 
         let results = source.get(&[42]).await;
@@ -513,6 +552,7 @@ mod tests {
         let source = RemoteSource::new(
             FakeCache::new([(42, Ok(None))]),
             Arc::<FakeLabelFetcher>::clone(&fetcher),
+            LabelMetrics::default(),
         )
         .with_warmer(warmer);
 
@@ -545,7 +585,12 @@ mod tests {
         ];
 
         for (cache, expected) in cases {
-            let results = TwemcacheSource { cache }.get(&[42]).await;
+            let results = TwemcacheSource {
+                cache,
+                metrics: LabelMetrics::default(),
+            }
+            .get(&[42])
+            .await;
             assert_eq!(results.get(&42), Some(&expected));
         }
     }
@@ -553,6 +598,7 @@ mod tests {
     async fn get_with_fetcher(fetcher: FakeLabelFetcher, ids: &[u64]) -> LookupResults {
         ManhattanSource {
             fetcher: Arc::new(fetcher),
+            metrics: LabelMetrics::default(),
         }
         .get(ids)
         .await

@@ -733,7 +733,7 @@ class Transformer(hk.Module):
             prevent_cse=config.prevent_cse,
         )
         fp8_remat_saves = config.fp8_gemms == Fp8Gemms.ALL and (
-            config.use_remat and config.remat_policy == RematType.SAVE_H100_QKV_ATTN_FFN
+            config.use_remat and config.remat_policy == RematType.SAVE_H100_RECSYS
         )
 
         def run_decoder_layer(

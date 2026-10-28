@@ -3,9 +3,10 @@ use crate::hydration::sources::Sources;
 use crate::hydration::{
     Cause, HydratedTweet, Hydration, HydrationRequest, Lookup, QuoteEntry, Relation, Unresolved,
 };
-use crate::metrics::{self as ft_metrics, RetweetSources, Rpc, Stage};
+use crate::metrics::{self as ft_metrics, Metrics, RequestMetrics, RetweetSources, Stage};
 use crate::models::{
-    ClientCapability, Evaluation, EvaluationKey, PlacedCandidate, Placement, TweetId,
+    ClientCapability, Evaluation, EvaluationKey, PlacedCandidate, Placement, RequestViewer,
+    RetweetMerge, TweetId,
 };
 use crate::rules::engine::Admitted;
 use crate::rules::{NoTrace, PolicyTrace, RuleEngine, SafetyLevel};
@@ -22,30 +23,30 @@ pub(crate) use retweet::hydrate_and_trace;
 pub use retweet::MergeSelection;
 
 pub struct PostBatch {
-    pub viewer_id: Option<u64>,
-    pub country_code: Option<String>,
+    pub(crate) viewer: RequestViewer,
     pub client_capability: ClientCapability,
     pub safety_level: SafetyLevel,
     pub candidates: Vec<PlacedCandidate>,
-    pub rpc: Rpc,
+    pub retweet_merge: RetweetMerge,
 }
 
 impl PostBatch {
     pub(crate) fn hydration_request<'a>(
-        &mut self,
-        posts_judged_for: Option<Rpc>,
+        &self,
         fallback_caches: &'a FallbackCaches,
+        metrics: &'a RequestMetrics,
     ) -> HydrationRequest<'a> {
         HydrationRequest::new(
-            self.viewer_id,
-            self.country_code.take(),
+            self.viewer.id(),
+            self.viewer.country_code().map(str::to_owned),
             self.client_capability,
             self.candidates
                 .iter()
                 .map(|placed| placed.candidate)
                 .collect(),
-            posts_judged_for,
+            self.retweet_merge,
             fallback_caches,
+            metrics,
         )
         .with_quotes(
             self.candidates
@@ -60,10 +61,6 @@ impl PostBatch {
                 .collect(),
         )
     }
-}
-
-pub(crate) fn normalize_viewer_id(raw: Option<u64>) -> Option<u64> {
-    raw.filter(|&id| id.cast_signed() > 0)
 }
 
 #[derive(Clone)]
@@ -88,6 +85,7 @@ pub struct PostEvaluator {
     sources: Arc<dyn Sources>,
     rule_engine: RuleEngine,
     fallback_caches: Arc<FallbackCaches>,
+    metrics: Metrics,
 }
 
 impl PostEvaluator {
@@ -95,11 +93,13 @@ impl PostEvaluator {
         sources: Arc<dyn Sources>,
         rule_engine: RuleEngine,
         fallback_caches: Arc<FallbackCaches>,
+        metrics: Metrics,
     ) -> Self {
         Self {
             sources,
             rule_engine,
             fallback_caches,
+            metrics,
         }
     }
 
@@ -107,36 +107,32 @@ impl PostEvaluator {
         &self.rule_engine
     }
 
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
     pub(crate) async fn run<O: PostObserver>(
         &self,
         request: PostBatch,
+        metrics: &RequestMetrics,
         observer: &mut O,
     ) -> (HydratedRequest, Vec<PostEvaluation>) {
-        match request.rpc {
-            Rpc::FilterTweets => {
-                let hydrated = self.hydrate(request, None).await;
-                let outcomes = self.evaluate_in_request_order(&hydrated, observer);
-                (hydrated, outcomes)
-            }
-            Rpc::EvaluateTweets => {
-                let hydrated = self.hydrate(request, Some(Rpc::EvaluateTweets)).await;
-                let outcomes = retweet::merge_sources(self, &hydrated, observer);
-                (hydrated, outcomes)
-            }
-        }
+        let retweet_merge = request.retweet_merge;
+        let hydrated = self.hydrate(request, metrics).await;
+        let outcomes = match retweet_merge {
+            RetweetMerge::Unmerged => self.evaluate_in_request_order(&hydrated, observer),
+            RetweetMerge::Merged => retweet::merge_sources(self, &hydrated, observer),
+        };
+        (hydrated, outcomes)
     }
 
-    async fn hydrate(
-        &self,
-        mut request: PostBatch,
-        posts_judged_for: Option<Rpc>,
-    ) -> HydratedRequest {
+    async fn hydrate(&self, request: PostBatch, metrics: &RequestMetrics) -> HydratedRequest {
         let started = Instant::now();
         let plan = self.rule_engine.plan(request.safety_level);
         let hydration = plan
             .hydrate(
                 &*self.sources,
-                request.hydration_request(posts_judged_for, &self.fallback_caches),
+                request.hydration_request(&self.fallback_caches, metrics),
             )
             .await;
         let hydrated_at = Instant::now();
@@ -154,14 +150,14 @@ impl PostEvaluator {
             RetweetSources::NoSource
         };
         ft_metrics::record_phase(
-            request.rpc,
+            metrics,
             Stage::Hydration,
             retweet_sources,
             hydrated_at - started,
         );
         HydratedRequest {
             safety_level: request.safety_level,
-            rpc: request.rpc,
+            metrics: metrics.clone(),
             retweet_sources,
             candidates: request.candidates,
             hydration,
@@ -182,7 +178,7 @@ impl PostEvaluator {
             .map(|candidate| Self::outcome(hydrated, admitted.as_ref(), candidate.key(), observer))
             .collect();
         ft_metrics::record_phase(
-            hydrated.rpc,
+            &hydrated.metrics,
             Stage::PostHydration,
             hydrated.retweet_sources,
             evaluating.elapsed(),
@@ -207,7 +203,7 @@ impl PostEvaluator {
                 .or_insert_with(|| Self::outcome(hydrated, admitted.as_ref(), key, observer));
         }
         ft_metrics::record_phase(
-            hydrated.rpc,
+            &hydrated.metrics,
             Stage::PostHydration,
             hydrated.retweet_sources,
             evaluating.elapsed(),
@@ -306,7 +302,7 @@ impl PostObserver for HashMap<EvaluationKey, PolicyTrace> {
 
 pub(crate) struct HydratedRequest {
     safety_level: SafetyLevel,
-    rpc: Rpc,
+    metrics: RequestMetrics,
     retweet_sources: RetweetSources,
     candidates: Vec<PlacedCandidate>,
     hydration: Hydration,
@@ -315,6 +311,10 @@ pub(crate) struct HydratedRequest {
 impl HydratedRequest {
     pub(crate) fn hydration(&self) -> &Hydration {
         &self.hydration
+    }
+
+    pub(crate) fn metrics(&self) -> &RequestMetrics {
+        &self.metrics
     }
 
     #[cfg(test)]
@@ -643,7 +643,7 @@ mod tests {
                 .collect();
             assert_eq!(starts, root_starts, "{name}");
             for source in [
-                Source::TesTweet,
+                Source::TesTweetForVisibility,
                 Source::TesConversationControl,
                 Source::SafetyLabels,
             ] {
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(judged().await, expected);
         scenario
             .sources()
-            .break_source(Source::TesTweet, Fault::Fails);
+            .break_source(Source::TesTweetForVisibility, Fault::Fails);
         assert_eq!(judged().await, expected);
         assert_eq!(
             scenario.sources().keys(Source::TrustedFriends),
@@ -921,9 +921,9 @@ mod tests {
         let sources = match tweet_row {
             TweetRow::Found => sources.tweet_features(1, nullcast),
             TweetRow::NotFound => sources.without_tweet_row(1),
-            TweetRow::Failed => sources.fail_key(Source::TesTweet, 1),
+            TweetRow::Failed => sources.fail_key(Source::TesTweetForVisibility, 1),
             TweetRow::FailedCacheHit => {
-                broken.push((Source::TesTweet, Fault::Fails));
+                broken.push((Source::TesTweetForVisibility, Fault::Fails));
                 sources.tweet_features(1, nullcast)
             }
         };

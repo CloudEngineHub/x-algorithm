@@ -1,11 +1,19 @@
 use crate::hydration::{AuthorNotFound, RequestRows};
-use crate::metrics::Rpc;
+use crate::models::NotificationKind;
 use crate::rules::levels;
-use crate::rules::levels::LevelRules;
+use crate::rules::levels::{LevelRules, PostRules};
+use crate::rules::rule_spec::rule::UserRule;
 use crate::rules::RuleId;
 use strum::VariantArray;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Rpc {
+    FilterTweets,
+    EvaluateTweets,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
@@ -20,17 +28,42 @@ pub enum SafetyLevel {
     NotificationsWriterV2,
 }
 
-pub(crate) struct LevelSpec {
-    proto: Option<vf_pb::SafetyLevel>,
-    thrift: Option<ThriftLevel>,
-    on_evaluate_tweets: bool,
-    pub(super) rules: LevelRules,
-    pub(crate) unspecified_drop_is_exact: bool,
-    pub(crate) quote_entries: QuoteEntries,
-    pub(crate) author_not_found: AuthorNotFound,
-    pub(crate) rows: RequestRows,
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WireLevel {
+    FilterTweets(vf_pb::SafetyLevel),
+    EvaluateTweets(i32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LevelError {
+    Unknown,
+    NotServed,
+}
+
+pub(crate) enum LevelSpec {
+    Posts(PostLevel),
+    QuotePass {
+        rules: UserRules,
+    },
+    Notifications {
+        thrift: ThriftLevel,
+        kind: NotificationKind,
+        rules: UserRules,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UserRules(&'static [&'static UserRule]);
+
+pub(crate) struct PostLevel {
+    proto: Option<vf_pb::SafetyLevel>,
+    evaluate_tweets: Option<ThriftLevel>,
+    rules: PostRules,
+    unspecified_drop_is_exact: bool,
+    quote_entries: QuoteEntries,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum QuoteEntries {
     NotJudged,
     Judged {
@@ -71,120 +104,163 @@ static TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS: [(RuleId, RerenderReason); 8] = 
 impl SafetyLevel {
     pub(crate) const fn spec(self) -> LevelSpec {
         match self {
-            SafetyLevel::FilterAll => LevelSpec {
+            SafetyLevel::FilterAll => LevelSpec::Posts(PostLevel {
                 proto: Some(vf_pb::SafetyLevel::FilterAll),
-                thrift: Some(ThriftLevel::FILTER_ALL),
-                on_evaluate_tweets: true,
-                rules: LevelRules::UserThenPost(levels::FILTER_ALL),
+                evaluate_tweets: Some(ThriftLevel::FILTER_ALL),
+                rules: levels::FILTER_ALL,
                 unspecified_drop_is_exact: true,
                 quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Posts,
-            },
-            SafetyLevel::TimelineHome => LevelSpec {
+            }),
+            SafetyLevel::TimelineHome => LevelSpec::Posts(PostLevel {
                 proto: Some(vf_pb::SafetyLevel::TimelineHome),
-                thrift: Some(ThriftLevel::TIMELINE_HOME),
-                on_evaluate_tweets: true,
-                rules: LevelRules::UserThenPost(levels::TIMELINE_HOME),
+                evaluate_tweets: Some(ThriftLevel::TIMELINE_HOME),
+                rules: levels::TIMELINE_HOME,
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Posts,
-            },
-            SafetyLevel::TimelineHomeRecommendations => LevelSpec {
+            }),
+            SafetyLevel::TimelineHomeRecommendations => LevelSpec::Posts(PostLevel {
                 proto: Some(vf_pb::SafetyLevel::TimelineHomeRecommendations),
-                thrift: Some(ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS),
-                on_evaluate_tweets: true,
-                rules: LevelRules::UserThenPost(levels::TIMELINE_HOME_RECOMMENDATIONS),
+                evaluate_tweets: Some(ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS),
+                rules: levels::TIMELINE_HOME_RECOMMENDATIONS,
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Posts,
-            },
-            SafetyLevel::TimelineHomeHydration => LevelSpec {
+            }),
+            SafetyLevel::TimelineHomeHydration => LevelSpec::Posts(PostLevel {
                 proto: None,
-                thrift: Some(ThriftLevel::TIMELINE_HOME_HYDRATION),
-                on_evaluate_tweets: true,
-                rules: LevelRules::UserThenPost(levels::TIMELINE_HOME_HYDRATION),
+                evaluate_tweets: Some(ThriftLevel::TIMELINE_HOME_HYDRATION),
+                rules: levels::TIMELINE_HOME_HYDRATION,
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::Judged {
                     rerenders: &TIMELINE_HOME_HYDRATION_QUOTE_RERENDERS,
                 },
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Posts,
-            },
-            SafetyLevel::ImmersiveExpandedRecommendations => LevelSpec {
+            }),
+            SafetyLevel::ImmersiveExpandedRecommendations => LevelSpec::Posts(PostLevel {
                 proto: Some(vf_pb::SafetyLevel::ImmersiveExpandedRecommendations),
-                thrift: Some(ThriftLevel::IMMERSIVE_EXPANDED_RECOMMENDATIONS),
-                on_evaluate_tweets: false,
-                rules: LevelRules::UserThenPost(levels::IMMERSIVE_EXPANDED_RECOMMENDATIONS),
+                evaluate_tweets: None,
+                rules: levels::IMMERSIVE_EXPANDED_RECOMMENDATIONS,
                 unspecified_drop_is_exact: false,
                 quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Posts,
+            }),
+            SafetyLevel::QuotedTweetRules => LevelSpec::QuotePass {
+                rules: UserRules(levels::QUOTED_TWEET_RULES),
             },
-            SafetyLevel::QuotedTweetRules => LevelSpec {
-                proto: None,
-                thrift: None,
-                on_evaluate_tweets: false,
-                rules: LevelRules::UserOnly(levels::QUOTED_TWEET_RULES),
-                unspecified_drop_is_exact: false,
-                quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::ReadsErased,
-                rows: RequestRows::Posts,
+            SafetyLevel::NotificationsFollow => LevelSpec::Notifications {
+                thrift: ThriftLevel::NOTIFICATIONS_FOLLOW,
+                kind: NotificationKind::Follow,
+                rules: UserRules(levels::NOTIFICATIONS_FOLLOW),
             },
-            SafetyLevel::NotificationsFollow => LevelSpec {
-                proto: None,
-                thrift: Some(ThriftLevel::NOTIFICATIONS_FOLLOW),
-                on_evaluate_tweets: false,
-                rules: LevelRules::UserOnly(levels::NOTIFICATIONS_FOLLOW),
-                unspecified_drop_is_exact: false,
-                quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Users,
-            },
-            SafetyLevel::NotificationsWriterV2 => LevelSpec {
-                proto: None,
-                thrift: Some(ThriftLevel::NOTIFICATIONS_WRITER_V2),
-                on_evaluate_tweets: false,
-                rules: LevelRules::UserOnly(levels::NOTIFICATIONS_WRITER_V2),
-                unspecified_drop_is_exact: false,
-                quote_entries: QuoteEntries::NotJudged,
-                author_not_found: AuthorNotFound::Unresolves,
-                rows: RequestRows::Users,
+            SafetyLevel::NotificationsWriterV2 => LevelSpec::Notifications {
+                thrift: ThriftLevel::NOTIFICATIONS_WRITER_V2,
+                kind: NotificationKind::FollowRequestAccepted,
+                rules: UserRules(levels::NOTIFICATIONS_WRITER_V2),
             },
         }
     }
 
-    pub(crate) fn from_proto(level: vf_pb::SafetyLevel) -> Option<Self> {
+    pub(crate) fn parse(wire: WireLevel) -> Result<Self, LevelError> {
+        match wire {
+            WireLevel::FilterTweets(proto) => Self::served_where(|spec| match spec {
+                LevelSpec::Posts(post) => post.proto == Some(proto),
+                LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. } => false,
+            }),
+            WireLevel::EvaluateTweets(number) => {
+                let number = known_thrift(number)?;
+                Self::served_where(|spec| match spec {
+                    LevelSpec::Posts(post) => post.evaluate_tweets == Some(number),
+                    LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. } => false,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn notification_level(number: i32) -> Result<(Self, NotificationKind), LevelError> {
+        let number = known_thrift(number)?;
+        Self::VARIANTS
+            .iter()
+            .find_map(|&level| match level.spec() {
+                LevelSpec::Notifications { thrift, kind, .. } => {
+                    (thrift == number).then_some((level, kind))
+                }
+                LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => None,
+            })
+            .ok_or(LevelError::NotServed)
+    }
+
+    fn served_where(serves: impl Fn(&LevelSpec) -> bool) -> Result<Self, LevelError> {
         Self::VARIANTS
             .iter()
             .copied()
-            .find(|variant| variant.spec().proto == Some(level))
+            .find(|variant| serves(&variant.spec()))
+            .ok_or(LevelError::NotServed)
     }
 
-    pub(crate) fn from_thrift(level: ThriftLevel) -> Option<Self> {
-        Self::VARIANTS.iter().copied().find(|variant| {
-            let spec = variant.spec();
-            spec.on_evaluate_tweets && spec.thrift == Some(level)
-        })
-    }
-
-    pub(crate) fn from_notification_thrift(number: i32) -> Option<Self> {
-        Self::VARIANTS.iter().copied().find(|variant| {
-            variant.spec().rows == RequestRows::Users && variant.thrift_number() == Some(number)
-        })
-    }
-
-    pub(crate) fn thrift_number(self) -> Option<i32> {
-        self.spec().thrift.map(|thrift| thrift.0)
+    pub(crate) fn may_merge_retweets(self) -> bool {
+        match self.spec() {
+            LevelSpec::Posts(post) => post.evaluate_tweets.is_some(),
+            LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. } => false,
+        }
     }
 
     pub(crate) fn is_carried_by(self, rpc: Rpc) -> bool {
-        match rpc {
-            Rpc::FilterTweets => self.spec().proto.is_some(),
-            Rpc::EvaluateTweets => self.spec().on_evaluate_tweets,
+        match (rpc, self.spec()) {
+            (Rpc::FilterTweets, LevelSpec::Posts(post)) => post.proto.is_some(),
+            (Rpc::FilterTweets, LevelSpec::QuotePass { .. } | LevelSpec::Notifications { .. }) => {
+                false
+            }
+            (Rpc::EvaluateTweets, _) => self.may_merge_retweets(),
         }
+    }
+}
+
+impl LevelSpec {
+    pub(super) const fn rules(&self) -> LevelRules {
+        match self {
+            Self::Posts(post) => LevelRules::UserThenPost(post.rules),
+            Self::QuotePass {
+                rules: UserRules(rules),
+            }
+            | Self::Notifications {
+                rules: UserRules(rules),
+                ..
+            } => LevelRules::UserOnly(rules),
+        }
+    }
+
+    pub(crate) const fn rows(&self) -> RequestRows {
+        match self {
+            Self::Posts(_) | Self::QuotePass { .. } => RequestRows::Posts,
+            Self::Notifications { .. } => RequestRows::Users,
+        }
+    }
+
+    pub(crate) const fn author_not_found(&self) -> AuthorNotFound {
+        match self {
+            Self::Posts(_) | Self::Notifications { .. } => AuthorNotFound::Unresolves,
+            Self::QuotePass { .. } => AuthorNotFound::ReadsErased,
+        }
+    }
+
+    pub(crate) const fn unspecified_drop_is_exact(&self) -> bool {
+        match self {
+            Self::Posts(post) => post.unspecified_drop_is_exact,
+            Self::QuotePass { .. } | Self::Notifications { .. } => false,
+        }
+    }
+
+    pub(crate) const fn quote_entries(&self) -> QuoteEntries {
+        match self {
+            Self::Posts(post) => post.quote_entries,
+            Self::QuotePass { .. } | Self::Notifications { .. } => QuoteEntries::NotJudged,
+        }
+    }
+}
+
+fn known_thrift(number: i32) -> Result<ThriftLevel, LevelError> {
+    let thrift = ThriftLevel(number);
+    if ThriftLevel::ENUM_VALUES.contains(&thrift) {
+        Ok(thrift)
+    } else {
+        Err(LevelError::Unknown)
     }
 }
 
@@ -196,7 +272,12 @@ mod tests {
     fn every_filter_tweets_level_reaches_its_level() {
         let reached: Vec<_> = (0..=255)
             .filter_map(|number| vf_pb::SafetyLevel::try_from(number).ok())
-            .map(|proto| (proto, SafetyLevel::from_proto(proto)))
+            .map(|proto| {
+                (
+                    proto,
+                    SafetyLevel::parse(WireLevel::FilterTweets(proto)).ok(),
+                )
+            })
             .collect();
         assert_eq!(
             reached,
@@ -222,7 +303,11 @@ mod tests {
     fn evaluate_tweets_serves_these_thrift_levels() {
         let served: Vec<_> = ThriftLevel::ENUM_VALUES
             .iter()
-            .filter_map(|&thrift| SafetyLevel::from_thrift(thrift).map(|level| (thrift, level)))
+            .filter_map(|&thrift| {
+                SafetyLevel::parse(WireLevel::EvaluateTweets(thrift.0))
+                    .ok()
+                    .map(|level| (thrift, level))
+            })
             .collect();
         assert_eq!(
             served,
@@ -241,11 +326,19 @@ mod tests {
         );
     }
 
+    fn wire_ids(spec: &LevelSpec) -> (Option<vf_pb::SafetyLevel>, Option<i32>) {
+        match spec {
+            LevelSpec::Posts(post) => (post.proto, post.evaluate_tweets.map(|thrift| thrift.0)),
+            LevelSpec::QuotePass { .. } => (None, None),
+            LevelSpec::Notifications { thrift, .. } => (None, Some(thrift.0)),
+        }
+    }
+
     #[test]
-    fn every_level_reports_the_number_the_thrift_enum_gives_it() {
+    fn every_served_level_takes_the_number_the_thrift_enum_gives_it() {
         let numbers: Vec<_> = SafetyLevel::VARIANTS
             .iter()
-            .map(|level| level.thrift_number())
+            .map(|level| wire_ids(&level.spec()).1)
             .collect();
         assert_eq!(
             numbers,
@@ -254,7 +347,7 @@ mod tests {
                 Some(8),
                 Some(61),
                 Some(82),
-                Some(247),
+                None,
                 None,
                 Some(246),
                 Some(72)
@@ -266,42 +359,29 @@ mod tests {
     fn each_level_has_rules_an_ingress_and_wire_ids_of_its_own() {
         for &level in SafetyLevel::VARIANTS {
             let spec = level.spec();
-            let lists = spec.rules.lists();
+            let lists = spec.rules().lists();
             assert!(
                 !lists.user.is_empty() || !lists.post.is_empty(),
                 "{level:?} wires no rule"
             );
-            match spec.rules {
-                LevelRules::UserOnly(_) => assert!(
-                    [Rpc::FilterTweets, Rpc::EvaluateTweets]
-                        .into_iter()
-                        .all(|rpc| !level.is_carried_by(rpc)),
-                    "{level:?} is user-only, so no post request carries it"
-                ),
-                LevelRules::UserThenPost(_) => assert!(
-                    spec.proto.is_some() || spec.on_evaluate_tweets,
+            let (proto, thrift) = wire_ids(&spec);
+            if let LevelSpec::Posts(_) = spec {
+                assert!(
+                    proto.is_some() || thrift.is_some(),
                     "{level:?} has no ingress"
-                ),
+                );
             }
-            assert!(
-                spec.rows == RequestRows::Posts || spec.thrift.is_some(),
-                "{level:?} takes user rows without a Thrift level FilterNotifications names"
-            );
-            assert!(
-                !spec.on_evaluate_tweets || spec.thrift.is_some(),
-                "{level:?} is served on EvaluateTweets without a Thrift level"
-            );
             for &other in SafetyLevel::VARIANTS
                 .iter()
                 .filter(|&&other| other != level)
             {
-                let other_spec = other.spec();
+                let (other_proto, other_thrift) = wire_ids(&other.spec());
                 assert!(
-                    spec.proto.is_none() || spec.proto != other_spec.proto,
+                    proto.is_none() || proto != other_proto,
                     "{level:?} and {other:?} share a proto level"
                 );
                 assert!(
-                    spec.thrift.is_none() || spec.thrift != other_spec.thrift,
+                    thrift.is_none() || thrift != other_thrift,
                     "{level:?} and {other:?} share a Thrift level"
                 );
             }
@@ -317,7 +397,7 @@ mod tests {
             .collect();
         rules.sort_unstable();
         for &level in SafetyLevel::VARIANTS {
-            let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {
+            let QuoteEntries::Judged { rerenders } = level.spec().quote_entries() else {
                 continue;
             };
             let mut rows: Vec<&str> = rerenders.iter().map(|&(rule, _)| rule.into()).collect();

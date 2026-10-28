@@ -1,17 +1,15 @@
+use crate::metrics::families::{LIMITED_ACTIONS_COPY_DRIFT_CHECKS, LIMITED_ACTIONS_COPY_KEYS};
+use crate::metrics::Metrics;
 use crate::models::LimitedActionType;
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use xai_stats_receiver::StatsReceiverExt;
 use xai_stringcenter::{StringCenter, DEFAULT_LANGUAGE};
 use xai_visibility_filtering::graphql_results::translate;
 
 const BUNDLE_PATH: &str = "/config/stringcenter/visibility-ltd-actions.json";
 const PINNED_METADATA_PATH: &str = "/config/stringcenter/_BUNDLE_METADATA.json";
 const LIVE_METADATA_DIR: &str = "/usr/local/config/stringcenter/bundles/visibility-ltd-actions";
-
-const KEYS_GAUGE: &str = "limited_actions_copy_keys";
-const DRIFT_COUNTER: &str = "limited_actions_copy_drift_checks";
 
 const GENERIC_SUBTEXT_NAMESPACES: [&str; 2] = ["BlockedViewer", "ReadonlyViewer"];
 pub(crate) const LEARN_MORE_PLACEHOLDER: &str = "learnmore";
@@ -78,10 +76,7 @@ impl LimitedActionsCopy {
         clippy::expect_used,
         reason = "startup fail-fast: the image carries the bundle, so a load failure is a build bug"
     )]
-    pub(crate) fn load_baked(
-        datacenter: &str,
-        stats: Option<&dyn StatsReceiverExt>,
-    ) -> (Self, DriftCheck) {
+    pub(crate) fn load_baked(datacenter: &str, metrics: &Metrics) -> (Self, DriftCheck) {
         let (copy, drift) = Self::load(
             Path::new(BUNDLE_PATH),
             Path::new(PINNED_METADATA_PATH),
@@ -90,9 +85,7 @@ impl LimitedActionsCopy {
                 .join("_BUNDLE_METADATA.json"),
         )
         .expect("the image's limited-actions copy loads");
-        if let Some(stats) = stats {
-            stats.gauge(KEYS_GAUGE, &[], copy.bundle.len() as f64);
-        }
+        metrics.set(&LIMITED_ACTIONS_COPY_KEYS, [], copy.bundle.len() as f64);
         (copy, drift)
     }
 
@@ -183,15 +176,13 @@ impl PromptCopy {
 }
 
 impl DriftCheck {
-    pub(crate) fn run(&self, stats: Option<&dyn StatsReceiverExt>) -> Drift {
+    pub(crate) fn run(&self, metrics: &Metrics) -> Drift {
         let drift = match bundle_hash(&self.live_metadata) {
             Ok(live) if live == self.pinned_hash => Drift::Match,
             Ok(_) => Drift::Mismatch,
             Err(_) => Drift::Unreadable,
         };
-        if let Some(stats) = stats {
-            stats.incr(DRIFT_COUNTER, &[("result", drift.into())], 1);
-        }
+        metrics.count(&LIMITED_ACTIONS_COPY_DRIFT_CHECKS, [drift.into()], 1);
         drift
     }
 }
@@ -369,13 +360,13 @@ pub(crate) mod tests {
         let live = dir.path().join("live.json");
         let (copy, drift) = LimitedActionsCopy::load(&bundle, &pinned, live.clone()).unwrap();
         assert_eq!(copy.bundle.len(), 6);
-        assert_eq!(drift.run(None), Drift::Unreadable);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Unreadable);
         write("live.json", r#"{"bundle_hash": "aaaa"}"#);
-        assert_eq!(drift.run(None), Drift::Match);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Match);
         write("live.json", r#"{"bundle_hash": "bbbb"}"#);
-        assert_eq!(drift.run(None), Drift::Mismatch);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Mismatch);
         write("live.json", "{");
-        assert_eq!(drift.run(None), Drift::Unreadable);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Unreadable);
 
         let missing = dir.path().join("missing.json");
         assert!(LimitedActionsCopy::load(&missing, &pinned, live.clone()).is_err());

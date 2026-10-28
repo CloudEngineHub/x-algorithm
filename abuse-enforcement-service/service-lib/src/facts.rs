@@ -208,6 +208,7 @@ pub struct GizmoduckFacts {
     pub is_blue_verified: bool,
     pub verified_type: Option<String>,
     pub is_affiliate: bool,
+    pub user_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -416,6 +417,7 @@ fn reconstruct_user_signals(map: &BTreeMap<String, String>) -> UserFacts {
             is_blue_verified: parse_bool(map.get("gizmoduck_is_blue_verified")),
             verified_type: parse_dbg_opt_string(map.get("gizmoduck_verified_type")),
             is_affiliate: parse_bool(map.get("gizmoduck_is_affiliate")),
+            user_type: None,
         }
     } else {
         GizmoduckFacts::default()
@@ -701,6 +703,7 @@ mod tests {
                     is_blue_verified: false,
                     verified_type: Some("Business".into()),
                     is_affiliate: false,
+                    user_type: None,
                 },
                 cred: CredFacts {
                     is_high: Some(false),

@@ -1,5 +1,5 @@
 use crate::hydration::batch::{Hydrated, HydrationBatch};
-use crate::hydration::inventory::{Answer, Batch, Source};
+use crate::hydration::inventory::{Answer, Source};
 use crate::hydration::relation::Relation;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
@@ -64,12 +64,6 @@ pub(crate) enum Owner {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct FetcherSpec {
-    pub(super) batch: Batch,
-    pub(super) fields: AskedFields,
-}
-
-#[derive(Clone, Copy)]
 pub(super) enum AskedFields {
     Planned,
     EveryLevel,
@@ -95,27 +89,12 @@ impl FetcherId {
         })
     }
 
-    pub(super) const fn spec(self) -> FetcherSpec {
-        let batch = self.source.row().batch;
-        match self.owner {
-            Owner::Request => FetcherSpec {
-                batch,
-                fields: if matches!(
-                    self.source,
-                    Source::GizmoduckAuthor | Source::GizmoduckActor
-                ) {
-                    AskedFields::EveryLevel
-                } else {
-                    AskedFields::Planned
-                },
-            },
-            Owner::Related(_) => FetcherSpec {
-                batch: match batch {
-                    Batch::Requested => Batch::Keys,
-                    Batch::Unrecorded | Batch::Keys => batch,
-                },
-                fields: AskedFields::Planned,
-            },
+    pub(super) const fn asked_fields(self) -> AskedFields {
+        match (self.owner, self.source) {
+            (Owner::Request, Source::GizmoduckAuthor | Source::GizmoduckActor) => {
+                AskedFields::EveryLevel
+            }
+            _ => AskedFields::Planned,
         }
     }
 }

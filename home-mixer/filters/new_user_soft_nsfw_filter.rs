@@ -1,6 +1,9 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::{RequestType, ScoredPostsQuery};
-use crate::params::{EnableNewUserSoftNsfwFilter, NewUserSoftNsfwFilterMaxAccountAgeSecs};
+use crate::params::{
+    EnableNewUserSoftNsfwFilter, NewUserSoftNsfwFilterMaxAccountAgeSecs,
+    NewUserSoftNsfwFilterMaxScoringSeqLength,
+};
 use std::time::Duration;
 use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
@@ -15,6 +18,21 @@ pub(crate) fn new_user_soft_nsfw_filter_enabled(query: &ScoredPostsQuery) -> boo
     }
     let max_age = Duration::from_secs(query.params.get(NewUserSoftNsfwFilterMaxAccountAgeSecs));
     duration_since_creation_opt(query.user_id).is_some_and(|age| age < max_age)
+        && below_max_scoring_seq_length(query)
+}
+
+fn below_max_scoring_seq_length(query: &ScoredPostsQuery) -> bool {
+    let max_length = query.params.get(NewUserSoftNsfwFilterMaxScoringSeqLength);
+    max_length == 0 || scoring_sequence_length(query).is_none_or(|length| length < max_length)
+}
+
+fn scoring_sequence_length(query: &ScoredPostsQuery) -> Option<u64> {
+    query
+        .scoring_sequence
+        .as_ref()?
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.length)
 }
 
 fn is_labeled_soft_nsfw_out_of_network(candidate: &PostCandidate) -> bool {

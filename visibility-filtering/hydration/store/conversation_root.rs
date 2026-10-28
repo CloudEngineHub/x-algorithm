@@ -2,7 +2,7 @@ use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
 use crate::hydration::hydrator::Edge;
 use crate::hydration::inventory::Answer;
-use crate::hydration::{Cause, Hydrator};
+use crate::hydration::{Cause, Hydrator, Hydrators};
 use crate::models::{AuthorId, ReplyTo, TweetId};
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 
@@ -15,7 +15,57 @@ pub(super) enum ConversationRootAuthor {
     Unresolved,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootAuthorBlock {
+    Unread,
+    ReadBy(Hydrator),
+    FailedBy(Hydrator),
+}
+
+impl RootAuthorBlock {
+    pub(super) fn unread(self) -> Hydrators {
+        match self {
+            Self::Unread => Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR,
+            Self::ReadBy(node) | Self::FailedBy(node) => {
+                Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR.difference(Hydrators::of(node))
+            }
+        }
+    }
+
+    pub(super) fn failed(self) -> Hydrators {
+        match self {
+            Self::FailedBy(node) => Hydrators::of(node),
+            Self::Unread | Self::ReadBy(_) => Hydrators::empty(),
+        }
+    }
+}
+
 impl Store {
+    pub(super) fn root_author_block(&self, row: &RequestRow) -> RootAuthorBlock {
+        if self
+            .callable
+            .intersection(Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR)
+            .is_empty()
+        {
+            return RootAuthorBlock::Unread;
+        }
+        match self.conversation_root_author(row) {
+            None => RootAuthorBlock::Unread,
+            Some(ConversationRootAuthor::PureCore(_)) => {
+                RootAuthorBlock::ReadBy(Hydrator::BlockedByReplyRoot)
+            }
+            Some(ConversationRootAuthor::RootPureCoreFailed) => {
+                RootAuthorBlock::FailedBy(Hydrator::BlockedByReplyRoot)
+            }
+            Some(
+                ConversationRootAuthor::ConversationControl(_) | ConversationRootAuthor::Unresolved,
+            ) => RootAuthorBlock::ReadBy(Hydrator::BlockedByConversationRoot),
+            Some(ConversationRootAuthor::RootPost(_)) => {
+                RootAuthorBlock::ReadBy(Hydrator::BlockedByConversationRootPost)
+            }
+        }
+    }
+
     pub(super) fn conversation_root_author(
         &self,
         row: &RequestRow,

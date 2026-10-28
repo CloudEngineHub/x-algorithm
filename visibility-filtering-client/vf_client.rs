@@ -67,8 +67,6 @@ impl SafetyLevel {
 pub struct VisibilityFilteringLookupContext {
     pub safety_level: SafetyLevel,
     pub for_user_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opt_in_blocking: Option<bool>,
 }
 
 impl MValCodec for VisibilityFilteringLookupContext {
@@ -93,13 +91,6 @@ impl MValCodec for VisibilityFilteringLookupContext {
             .unwrap();
         proto.write_i64(self.for_user_id as i64).unwrap();
         proto.write_field_end().unwrap();
-        if let Some(opt_in_blocking) = self.opt_in_blocking {
-            proto
-                .write_field_begin(&TFieldIdentifier::new("opt_in_blocking", TType::Bool, 3))
-                .unwrap();
-            proto.write_bool(opt_in_blocking).unwrap();
-            proto.write_field_end().unwrap();
-        }
         proto.write_field_stop().unwrap();
         proto.write_struct_end().unwrap();
     }
@@ -213,7 +204,6 @@ impl VfClient for StratoVfClient {
         let view = VisibilityFilteringLookupContext {
             safety_level,
             for_user_id,
-            opt_in_blocking: None,
         };
         let calls: Vec<_> = tweet_ids
             .iter()
@@ -673,86 +663,6 @@ impl VfClient for MockVfClient {
         _context: Option<TwitterContextViewer>,
     ) -> HashMap<u64, Result<TweetVisibility>> {
         HashMap::new()
-    }
-}
-
-#[cfg(test)]
-mod lookup_context_tests {
-    use std::io::Cursor;
-
-    use thrift::protocol::{TBinaryInputProtocol, TInputProtocol, TType};
-    use xai_strato::encode;
-
-    use super::{SafetyLevel, VisibilityFilteringLookupContext};
-
-    fn view_fields(view: &VisibilityFilteringLookupContext) -> Vec<(i16, TType, Vec<u8>)> {
-        let bytes = encode(&(20_u64, view.clone()));
-        let mut proto = TBinaryInputProtocol::new(Cursor::new(bytes), false);
-        proto.read_struct_begin().unwrap();
-        let mval = proto.read_field_begin().unwrap();
-        assert_eq!((mval.id, mval.field_type), (Some(4), TType::Struct));
-        proto.read_struct_begin().unwrap();
-        let key = proto.read_field_begin().unwrap();
-        assert_eq!(key.id, Some(0));
-        proto.skip(key.field_type).unwrap();
-        proto.read_field_end().unwrap();
-        let view_field = proto.read_field_begin().unwrap();
-        assert_eq!(
-            (view_field.id, view_field.field_type),
-            (Some(1), TType::Struct)
-        );
-        proto.read_struct_begin().unwrap();
-        let mut fields = Vec::new();
-        loop {
-            let field = proto.read_field_begin().unwrap();
-            if field.field_type == TType::Stop {
-                break;
-            }
-            let value = match field.field_type {
-                TType::I32 => proto.read_i32().unwrap().to_be_bytes().to_vec(),
-                TType::I64 => proto.read_i64().unwrap().to_be_bytes().to_vec(),
-                TType::Bool => vec![u8::from(proto.read_bool().unwrap())],
-                other => panic!("unexpected field type {other:?}"),
-            };
-            fields.push((field.id.unwrap(), field.field_type, value));
-            proto.read_field_end().unwrap();
-        }
-        fields
-    }
-
-    #[test]
-    fn omits_opt_in_blocking_when_unset() {
-        let fields = view_fields(&VisibilityFilteringLookupContext {
-            safety_level: SafetyLevel::SearchTop,
-            for_user_id: 123,
-            opt_in_blocking: None,
-        });
-        assert_eq!(
-            fields,
-            vec![
-                (1, TType::I32, 6_i32.to_be_bytes().to_vec()),
-                (2, TType::I64, 123_i64.to_be_bytes().to_vec()),
-            ]
-        );
-    }
-
-    #[test]
-    fn writes_opt_in_blocking_as_thrift_field_3() {
-        for value in [false, true] {
-            let fields = view_fields(&VisibilityFilteringLookupContext {
-                safety_level: SafetyLevel::SearchLatest,
-                for_user_id: 123,
-                opt_in_blocking: Some(value),
-            });
-            assert_eq!(
-                fields,
-                vec![
-                    (1, TType::I32, 7_i32.to_be_bytes().to_vec()),
-                    (2, TType::I64, 123_i64.to_be_bytes().to_vec()),
-                    (3, TType::Bool, vec![u8::from(value)]),
-                ]
-            );
-        }
     }
 }
 

@@ -71,28 +71,27 @@ impl Quotes {
         self.pair_edges.get_mut(usize::from(edge as u8))
     }
 
-    pub(super) fn land_pairs<'q>(
+    pub(super) fn land_pair(
         &mut self,
-        queries: impl Iterator<Item = (PairEdge, &'q EdgeQuery)>,
-        answers: Vec<RawHydrationBatch<bool>>,
+        edge: PairEdge,
+        query: &EdgeQuery,
+        answer: RawHydrationBatch<bool>,
     ) {
-        for ((edge, query), answer) in queries.zip(answers) {
-            let EdgeFrom::User(source) = query.from else {
-                continue;
-            };
-            let pair = |destination| UserPair {
-                source,
-                destination,
-            };
-            let claimed: Vec<UserPair> = query.destination_ids.iter().copied().map(pair).collect();
-            let answers = answer
-                .into_hydrated()
-                .into_iter()
-                .map(|(destination, holds)| (pair(destination), holds))
-                .collect();
-            if let Some(fetcher) = self.pair_fetcher_mut(edge) {
-                fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));
-            }
+        let EdgeFrom::User(source) = query.from else {
+            return;
+        };
+        let pair = |destination| UserPair {
+            source,
+            destination,
+        };
+        let claimed: Vec<UserPair> = query.destination_ids.iter().copied().map(pair).collect();
+        let answers = answer
+            .into_hydrated()
+            .into_iter()
+            .map(|(destination, holds)| (pair(destination), holds))
+            .collect();
+        if let Some(fetcher) = self.pair_fetcher_mut(edge) {
+            fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::hydration::fetcher::FetcherId;
 use crate::hydration::inventory::Source;
 use crate::models::NsfwFeature;
 use crate::safety_label_source::decode::tests::{cached_value_not_found, mval, raw_label};
+use crate::safety_label_source::metrics::LabelMetrics;
 use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
 use crate::safety_label_source::remote::{cache_key, CacheRead, RemoteSource};
 use std::fmt;
@@ -17,9 +18,9 @@ use tower::ServiceExt;
 use xai_cache::{KVCacheError, Key, Value};
 use xai_core_entities::entities::{
     ApiCounts, CashtagAttachments, ConversationControlArm, EditControl, EscherbirdEntityAnnotation,
-    ExclusiveTweetControl, GizmoduckAccount, GizmoduckUserResult, MediaEntities, PCFLabel,
-    PureCoreData, ReactionContext, Safety, TakedownReason, TrustedFriendsControl, UrlEntities,
-    UserResponseState,
+    ExclusiveTweetControl, GizmoduckAccount, GizmoduckUserResult, MediaEntities, NoteTweet,
+    PCFLabel, PureCoreData, ReactionContext, Safety, TakedownReason, TrustedFriendsControl,
+    UrlEntities, UserResponseState,
 };
 use xai_core_entities::gizmoduck_client::{
     GizmoduckClient, LookupContext, MockGizmoduckClient, UserFields, ViewerData,
@@ -235,6 +236,10 @@ impl TESClient for Tes {
     }
 
     async fn get_urls(&self, _: Vec<u64>) -> Answers<UrlEntities> {
+        unreachable!()
+    }
+
+    async fn get_note_tweets(&self, _: Vec<u64>) -> Answers<NoteTweet> {
         unreachable!()
     }
 
@@ -599,8 +604,13 @@ fn prod_sources() -> ProdSources {
         trusted_friends: TrustedFriendsClient::new(strato()),
         user_location: UserLocationClient::new(strato()),
         safety_labels: Arc::new(SafetyLabelSource::new(
-            Arc::new(RemoteSource::new(Arc::clone(&fake) as _, fake)),
+            Arc::new(RemoteSource::new(
+                Arc::clone(&fake) as _,
+                fake,
+                LabelMetrics::default(),
+            )),
             None,
+            LabelMetrics::default(),
         )),
         communities: CommunitySource {
             grpc_client: strato(),
@@ -706,7 +716,7 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
             let keys = [TWEET, MISSING, FAILED, ABSENT];
             shown(unanswered, &sources.pure_cores(owner, &keys).await, &keys)
         }
-        Source::TesTweet => {
+        Source::TesTweetForVisibility => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
             shown(unanswered, &sources.tweets(&keys).await, &keys)
         }

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-26T16:00:39Z
+// mirrored from config feature-switch defaults; last sync 2026-10-27T16:00:37Z
 use xai_feature_switches::param;
 
 param!(
@@ -31,12 +31,6 @@ param!(
     String,
     "rust_home_mixer_thunder_algorithm",
     "default"
-);
-param!(
-    ThunderClusterId,
-    String,
-    "rust_home_mixer_thunder_cluster_id",
-    "amp"
 );
 param!(
     TweetMixerMaxResults,
@@ -314,6 +308,60 @@ param!(
     bool,
     "rust_home_mixer_enable_home_excursion_scores",
     false
+);
+param!(
+    EnablePageLogging,
+    bool,
+    "rust_home_mixer_enable_page_logging",
+    false
+);
+param!(
+    PageLogTtlSeconds,
+    u64,
+    "rust_home_mixer_page_log_ttl_seconds",
+    3600
+);
+param!(
+    EnablePageDecodeRerank,
+    bool,
+    "rust_home_mixer_enable_page_decode_rerank",
+    false
+);
+param!(
+    PageDecodePoolN,
+    u32,
+    "rust_home_mixer_page_decode_pool_n",
+    200
+);
+param!(
+    PageDecodeSteps,
+    u32,
+    "rust_home_mixer_page_decode_steps",
+    64
+);
+param!(
+    PageDecodeTemperature,
+    f64,
+    "rust_home_mixer_page_decode_temperature",
+    0.0
+);
+param!(
+    EnablePageRlExploration,
+    bool,
+    "rust_home_mixer_enable_page_rl_exploration",
+    false
+);
+param!(
+    PageRlExplorationTemperature,
+    f64,
+    "rust_home_mixer_page_rl_exploration_temperature",
+    0.2
+);
+param!(
+    PageRlExplorationTopK,
+    usize,
+    "rust_home_mixer_page_rl_exploration_top_k",
+    64
 );
 
 // These weights reflect a combination of how much an action is
@@ -821,7 +869,13 @@ param!(
     NewUserSoftNsfwFilterMaxAccountAgeSecs,
     u64,
     "rust_home_mixer_new_user_soft_nsfw_filter_max_account_age_secs",
-    86400
+    604800
+);
+param!(
+    NewUserSoftNsfwFilterMaxScoringSeqLength,
+    u64,
+    "rust_home_mixer_new_user_soft_nsfw_filter_max_scoring_seq_length",
+    100
 );
 param!(
     NewUserMinEngagementFilterMaxResurrectionAgeSecs,
@@ -1175,6 +1229,12 @@ param!(
     f64,
     "rust_home_mixer_video_carousel_embedding_dedupe_threshold",
     0.72
+);
+param!(
+    EnableVideoCarouselHighRiskFilter,
+    bool,
+    "rust_home_mixer_enable_video_carousel_high_risk_filter",
+    false
 );
 param!(
     EnableVideoCarouselCandidatesLogging,
