@@ -796,41 +796,39 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
             )
         }
         Source::Flock => {
-            let query = |graph, direction, destination| EdgeQuery {
+            let viewer = |graph, direction, destination| EdgeQuery {
                 graph,
                 direction,
                 from: EdgeFrom::Viewer,
                 destination_ids: vec![destination],
             };
-            let held: Vec<EdgeQuery> = EDGES
-                .map(|(graph, direction, _)| query(graph, direction, FOLLOWER))
-                .into_iter()
-                .chain([query(Graph::Mutes, EdgeDirection::Forward, FOLLOWER)])
-                .collect();
-            let failed = vec![query(Graph::Follows, EdgeDirection::Forward, FAILED)];
-            let mut answers = vec![];
-            for queries in [held, failed] {
-                let batches = sources.select_edges(VIEWER, &queries).await.unwrap();
-                for (query, batch) in queries.iter().zip(&batches) {
-                    answers.push(shown(unanswered, batch, &query.destination_ids));
-                }
-            }
-            answers.join(", ")
-        }
-        Source::FlockUserPair => {
-            let query = |graph, destination| EdgeQuery {
+            let sourced = |graph, destination| EdgeQuery {
                 from: EdgeFrom::User(AUTHOR),
                 ..EdgeQuery::forward(graph, vec![destination])
             };
-            let held = vec![
-                query(Graph::Blocks, FOLLOWER),
-                query(Graph::Follows, FOLLOWER),
-                query(Graph::Mutes, FOLLOWER),
+            let mut held = vec![
+                sourced(Graph::Blocks, FOLLOWER),
+                sourced(Graph::Follows, FOLLOWER),
+                sourced(Graph::Mutes, FOLLOWER),
             ];
-            let failed = vec![query(Graph::Blocks, FAILED)];
+            let mut failed = vec![sourced(Graph::Blocks, FAILED)];
+            let viewer_id = match owner {
+                Owner::Request => {
+                    held.extend(
+                        EDGES.map(|(graph, direction, _)| viewer(graph, direction, FOLLOWER)),
+                    );
+                    held.push(viewer(Graph::Mutes, EdgeDirection::Forward, FOLLOWER));
+                    failed.push(viewer(Graph::Follows, EdgeDirection::Forward, FAILED));
+                    Some(VIEWER)
+                }
+                Owner::Related(_) => None,
+            };
             let mut answers = vec![];
             for queries in [held, failed] {
-                let batches = sources.select_pair_edges(&queries).await.unwrap();
+                let batches = sources
+                    .select_edges(owner, viewer_id, &queries)
+                    .await
+                    .unwrap();
                 for (query, batch) in queries.iter().zip(&batches) {
                     answers.push(shown(unanswered, batch, &query.destination_ids));
                 }

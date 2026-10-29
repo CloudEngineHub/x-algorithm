@@ -1,7 +1,9 @@
 use super::{Role, Row, Subject};
 use crate::models::{AuthorLabel, PostCandidate};
 use crate::rules::fixtures::{allow, candidate, dropped};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeRecommendations};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeRecommendations,
+};
 use xai_visibility_filtering::models::FilteredReason;
 
 pub(super) fn rows() -> Vec<Row> {
@@ -12,15 +14,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "nsfw_high_recall_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "nsfw_high_recall_user_label/drop/unspecified",
@@ -36,15 +30,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "nsfw_high_precision_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "nsfw_high_precision_user_label/drop/unspecified",
@@ -59,21 +45,21 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "spam_high_recall_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "spam_high_recall_user_label/drop/unspecified",
                     ),
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "spam_high_recall_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -82,21 +68,21 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "compromised_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "compromised_user_label/drop/unspecified",
                     ),
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "compromised_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -105,21 +91,21 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "read_only_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "read_only_user_label/drop/unspecified",
                     ),
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "read_only_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -128,21 +114,21 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "impersonation_high_precision_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "impersonation_high_precision_user_label/drop/unspecified",
                     ),
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "impersonation_high_precision_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -151,15 +137,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "nsfw_avatar_image_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "nsfw_avatar_image_user_label/drop/unspecified",
@@ -174,15 +152,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "nsfw_banner_image_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "nsfw_banner_image_user_label/drop/unspecified",
@@ -203,8 +173,19 @@ pub(super) fn rows() -> Vec<Row> {
                         "abusive_high_recall_user_label/drop/unspecified",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Follower, allow()),
-                (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
+                    Role::each([Role::Follower, Role::Author]),
+                    allow(),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "abusive_high_recall_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -213,15 +194,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "nsfw_near_perfect_user_label/drop/unspecified",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "nsfw_near_perfect_user_label/drop/unspecified",
@@ -243,8 +216,19 @@ pub(super) fn rows() -> Vec<Row> {
                         "do_not_amplify_user_label/drop/unspecified",
                     ),
                 ),
-                (TimelineHomeRecommendations, Role::Follower, allow()),
-                (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
+                    Role::each([Role::Follower, Role::Author]),
+                    allow(),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "do_not_amplify_user_label/drop/unspecified",
+                    ),
+                ),
             ],
         },
     ]

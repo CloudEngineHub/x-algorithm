@@ -579,8 +579,10 @@ impl RuleEngine {
             .iter()
             .map(|&level| {
                 let rules = level.spec().rules().lists();
-                let policy =
-                    PostPolicy::new(named(&mut names, rules.user), named(&mut names, rules.post));
+                let policy = PostPolicy::new(
+                    named(&mut names, &rules.user),
+                    named(&mut names, &rules.post),
+                );
                 let entry = Level::new(level, policy);
                 assert!(
                     plans_from_its_rows(&entry.plan),
@@ -779,8 +781,8 @@ mod tests {
     use crate::hydration::Hydrator;
     use crate::models::Withholding;
     use crate::models::{
-        AuthorFeatures, ClientCapability, DropReason, NsfwViewerDropReason, SafetyLabelType,
-        VerifyBlurSupport, ViewerAge, ViewerProfile,
+        AuthorFeatures, ClientCapability, ClientSwitch, DropReason, NsfwViewerDropReason,
+        SafetyLabelType, VerifyBlurSupport, ViewerAge, ViewerProfile,
     };
     use crate::rules::fixtures::{
         candidate, viewer, viewer_with_profile, CandidateBuilder, VIEWER_ID,
@@ -898,13 +900,10 @@ country_specific_nsfw_content_gating:
             country_code: Some("us".into()),
             client_capability: ClientCapability {
                 verify_blur_support: Some(VerifyBlurSupport::IosNeedsUpdate),
-                modern_blur: true,
-                stale_tweet_limits: true,
-                community_viewer_removed_limits: true,
-                gore_blur_ignores_settings: true,
-                fosnr_rules: true,
-                fosnr_fallback_drops: false,
-                soft_nsfw_new_user_drop: false,
+                ..ClientCapability::DEFAULT
+                    .with(ClientSwitch::ModernBlur)
+                    .with(ClientSwitch::CommunityViewerRemovedLimits)
+                    .with(ClientSwitch::GoreBlurIgnoresSettings)
             },
             ..viewer(VIEWER_ID)
         };

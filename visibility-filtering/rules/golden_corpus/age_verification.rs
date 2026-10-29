@@ -5,9 +5,9 @@ use crate::models::VerifyBlurSupport::{
     AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported,
 };
 use crate::models::{
-    AuthorFeatures, ClientCapability, LimitedEngagementReason, NsfwFeature, NsfwViewerDropReason,
-    PostCandidate, SafetyLabelType, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport,
-    Viewer, ViewerFeatures, ViewerProfile,
+    AuthorFeatures, ClientCapability, ClientSwitch, LimitedEngagementReason, NsfwFeature,
+    NsfwViewerDropReason, PostCandidate, SafetyLabelType, TombstoneReason, TweetFeatures, Verdict,
+    VerifyBlurSupport, Viewer, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
     allow, author_viewer, blurred, blurred_and_limited, candidate, labeled, legacy_interstitial,
@@ -661,13 +661,9 @@ pub(super) fn rows() -> Vec<Row> {
                             country_code: Some("fr".into()),
                             client_capability: ClientCapability {
                                 verify_blur_support: Some(Supported),
-                                modern_blur: true,
-                                stale_tweet_limits: true,
-                                community_viewer_removed_limits: true,
-                                gore_blur_ignores_settings: false,
-                                fosnr_rules: true,
-                                fosnr_fallback_drops: false,
-                                soft_nsfw_new_user_drop: false,
+                                ..ClientCapability::DEFAULT
+                                    .with(ClientSwitch::ModernBlur)
+                                    .with(ClientSwitch::CommunityViewerRemovedLimits)
                             },
                             ..sensitive_opt_in_viewer()
                         },

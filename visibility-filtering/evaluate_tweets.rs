@@ -182,7 +182,9 @@ mod tests {
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{Fault, InMemorySources};
     use crate::metrics::Metrics;
-    use crate::models::{PlacedCandidate, RawCandidate, RetweetMerge, TweetFeatures, TweetId};
+    use crate::models::{
+        ClientSwitch, PlacedCandidate, RawCandidate, RetweetMerge, TweetFeatures, TweetId,
+    };
     use crate::post_evaluator::PostBatch;
     use crate::rules::{NoTrace, RuleEngine, RuleId};
     use crate::scenario::{tweet_data, Wire};
@@ -194,7 +196,8 @@ mod tests {
     use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
     use xai_x_thrift::safety_result::{FilteredReason as ThriftFilteredReason, SafetyResult};
     use xai_x_thrift::tweet_service::{
-        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
+        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,
+        TweetFieldsResultState,
     };
 
     fn encoded(state: &TweetFieldsResultState) -> Outcome {
@@ -305,11 +308,7 @@ mod tests {
         let suspended = filtered(ThriftFilteredReason::AuthorIsSuspended(true));
         for (tweet_ids, core_data_calls, outcomes) in [
             (vec![4, 6], 1, vec![suspended.clone(), suspended.clone()]),
-            (
-                vec![5, 7],
-                2,
-                vec![suspended, Outcome::Failed(vf_pb::Failed {})],
-            ),
+            (vec![5, 7], 2, vec![suspended, not_found()]),
         ] {
             let calls_before = sources.keys(Source::TesPureCoreData).len();
             let sent = wire
@@ -478,6 +477,7 @@ mod tests {
             (tweet_data(1, None), bounced.clone()),
             (tweet_data(5, Some(9)), bounced.clone()),
             (tweet_data(4, None), failed()),
+            (tweet_data(8, None), not_found()),
             (tweet_data(5, None), bounced),
             (tweet_data(2, None), suspended.clone()),
             (tweet_data(6, None), suspended.clone()),
@@ -524,6 +524,12 @@ mod tests {
 
     fn failed() -> Outcome {
         Outcome::Failed(vf_pb::Failed {})
+    }
+
+    fn not_found() -> Outcome {
+        encoded(&TweetFieldsResultState::NotFound(
+            TweetFieldsResultNotFound::new(false, false, None),
+        ))
     }
 
     #[tokio::test(start_paused = true)]
@@ -779,7 +785,11 @@ mod tests {
         let wire = Wire::new(Arc::<InMemorySources>::clone(&world));
         let class = CLIENT_CLASSES
             .iter()
-            .find(|class| class.capability.community_viewer_removed_limits)
+            .find(|class| {
+                class
+                    .capability
+                    .has(ClientSwitch::CommunityViewerRemovedLimits)
+            })
             .unwrap();
         let context = TwitterContextViewer {
             client_application_id: class.app_id,

@@ -1,6 +1,5 @@
 use super::{RequestRow, Store};
 use crate::hydration::fetcher::AnyFetcher;
-use crate::hydration::hydrator::Edge;
 use crate::hydration::inventory::Answer;
 use crate::hydration::{Cause, Hydrator, Hydrators};
 use crate::models::{AuthorId, ReplyTo, TweetId};
@@ -128,7 +127,7 @@ impl Store {
             return None;
         }
         let root = control.conversation_tweet_author_id;
-        let holds = *self.edge_fetcher(Edge::FollowedBy)?.get(root)?;
+        let holds = self.edge_holds(Hydrator::RootFollowsViewer, root)?;
         (!holds).then_some(root)
     }
 }

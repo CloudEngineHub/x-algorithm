@@ -2,7 +2,10 @@ use super::{Role, Row, Subject};
 use crate::hydration::Hydrator::{BlockedByAuthor, Blocks, MuteRetweets, Mutes};
 use crate::models::LimitedEngagementReason;
 use crate::rules::fixtures::{allow, candidate, controlled_root, dropped, limited, limited_for};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -11,26 +14,62 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "viewer_blocks_author",
             subject: Subject::Post(candidate().with_edge(Blocks).build()),
-            expect: vec![(
-                TimelineHome,
-                Role::NonFollower,
-                dropped(
-                    FilteredReason::ViewerBlocksAuthor,
-                    "viewer_blocks_author/drop",
+            expect: vec![
+                (
+                    TimelineHome,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerBlocksAuthor,
+                        "viewer_blocks_author/drop",
+                    ),
                 ),
-            )],
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerBlocksAuthor,
+                        "viewer_blocks_author/drop",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerBlocksAuthor,
+                        "viewer_blocks_author/drop",
+                    ),
+                ),
+            ],
         },
         Row {
             name: "viewer_mutes_author",
             subject: Subject::Post(candidate().with_edge(Mutes).build()),
-            expect: vec![(
-                TimelineHome,
-                Role::NonFollower,
-                dropped(
-                    FilteredReason::ViewerMutesAuthor,
-                    "viewer_mutes_author/drop",
+            expect: vec![
+                (
+                    TimelineHome,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerMutesAuthor,
+                        "viewer_mutes_author/drop",
+                    ),
                 ),
-            )],
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerMutesAuthor,
+                        "viewer_mutes_author/drop",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::ViewerMutesAuthor,
+                        "viewer_mutes_author/drop",
+                    ),
+                ),
+            ],
         },
         Row {
             name: "viewer_blocks_and_mutes_author",
@@ -47,14 +86,32 @@ pub(super) fn rows() -> Vec<Row> {
         Row {
             name: "muted_retweets_retweet",
             subject: Subject::Post(candidate().with_edge(MuteRetweets).retweet_of(2).build()),
-            expect: vec![(
-                TimelineHome,
-                Role::NonFollower,
-                dropped(
-                    FilteredReason::UnspecifiedReason,
-                    "viewer_mutes_retweets/drop/unspecified",
+            expect: vec![
+                (
+                    TimelineHome,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "viewer_mutes_retweets/drop/unspecified",
+                    ),
                 ),
-            )],
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "viewer_mutes_retweets/drop/unspecified",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "viewer_mutes_retweets/drop/unspecified",
+                    ),
+                ),
+            ],
         },
         Row {
             name: "muted_retweets_original",

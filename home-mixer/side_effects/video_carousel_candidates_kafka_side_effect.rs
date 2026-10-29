@@ -2,7 +2,7 @@ use crate::models::candidate::CandidateHelpers;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     EnableVideoCarouselCandidatesLogging, VideoCarouselImmersiveVqvWeight,
-    VideoCarouselVideoOpenWeight,
+    VideoCarouselOpenTimesImmersiveDwellWeight, VideoCarouselVideoOpenWeight,
 };
 use crate::side_effects::phoenix_experiments_side_effect::{
     build_logged_scored_candidate, insert_cluster_scores,
@@ -81,6 +81,8 @@ fn served_carousel_candidates(
     };
     let video_open_weight = query.params.get(VideoCarouselVideoOpenWeight);
     let immersive_vqv_weight = query.params.get(VideoCarouselImmersiveVqvWeight);
+    let open_times_immersive_dwell_weight =
+        query.params.get(VideoCarouselOpenTimesImmersiveDwellWeight);
     videos
         .iter()
         .enumerate()
@@ -92,7 +94,12 @@ fn served_carousel_candidates(
             }
             prediction_scores.insert(
                 "video_carousel.score".to_string(),
-                video_carousel::carousel_score(video, video_open_weight, immersive_vqv_weight),
+                video_carousel::carousel_score(
+                    video,
+                    video_open_weight,
+                    immersive_vqv_weight,
+                    open_times_immersive_dwell_weight,
+                ),
             );
             LoggedScoredCandidate {
                 post_id: video.get_original_tweet_id() as i64,

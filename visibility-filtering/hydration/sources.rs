@@ -81,9 +81,12 @@ pub(crate) trait Sources: Send + Sync {
 
     async fn verified_phones(&self, user_ids: &[u64]) -> RawHydrationBatch<bool>;
 
-    async fn select_edges(&self, viewer_id: u64, queries: &[EdgeQuery]) -> Edges;
-
-    async fn select_pair_edges(&self, queries: &[EdgeQuery]) -> Edges;
+    async fn select_edges(
+        &self,
+        owner: Owner,
+        viewer_id: Option<u64>,
+        queries: &[EdgeQuery],
+    ) -> Edges;
 
     async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>>;
 
@@ -370,18 +373,17 @@ impl Sources for ProdSources {
         )
     }
 
-    async fn select_edges(&self, viewer_id: u64, queries: &[EdgeQuery]) -> Edges {
+    async fn select_edges(
+        &self,
+        _owner: Owner,
+        viewer_id: Option<u64>,
+        queries: &[EdgeQuery],
+    ) -> Edges {
         let sets = self
             .backends
             .socialgraph
-            .select_edges(Some(viewer_id), queries)
+            .select_edges(viewer_id, queries)
             .await;
-        let edges = edge_batches(queries, sets.as_deref());
-        select_result(sets.as_deref(), edges)
-    }
-
-    async fn select_pair_edges(&self, queries: &[EdgeQuery]) -> Edges {
-        let sets = self.backends.socialgraph.select_edges(None, queries).await;
         let edges = edge_batches(queries, sets.as_deref());
         select_result(sets.as_deref(), edges)
     }

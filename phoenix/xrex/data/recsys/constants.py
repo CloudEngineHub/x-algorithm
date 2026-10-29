@@ -296,6 +296,9 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsSignupConversion": [
         "AdsSignUpConversion",
     ],
+    "IsLeadgenConversion": [
+        "AdsLeadgenConversion",
+    ],
     "IsSiteVisitConversion": [
         "AdsSiteVisitConversion",
     ],
@@ -492,6 +495,10 @@ CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_SIGN_UP_CONVERSION,
     recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CLICK_INSTALL,
+]
+
+FRESH_CLICK_CONDITIONED_ACTION_INDICES = [
+    recsys_pb2.ActionName.ADS_LEADGEN_CONVERSION,
 ]
 
 MMP_CLICK_CONDITIONED_ACTION_INDICES = [

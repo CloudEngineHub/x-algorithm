@@ -1,7 +1,7 @@
 use super::limited_actions_policy::REASON_FIELD;
 use super::LimitedActionsPolicies;
 use crate::metrics::Metrics;
-use crate::models::{ClientCapability, LimitedEngagementReason, VerifyBlurSupport};
+use crate::models::{ClientCapability, ClientSwitch, LimitedEngagementReason, VerifyBlurSupport};
 use crate::params::limited_actions_copy::LimitedActionsCopy;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -11,49 +11,40 @@ use xai_twittercontext_proto::TwitterContextViewer;
 
 const SOFT_NSFW_NEW_USER_DROP: &str = "soft_nsfw_tweet_label_new_user_rule_enabled";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClientSwitch {
-    AgeVerification(VerifyBlurSupport),
-    ModernBlur,
-    StaleTweetLimits,
-    CommunityViewerRemovedLimits,
-    GoreBlurIgnoresSettings,
-    FosnrRules,
-    FosnrFallbackDrops,
-}
-
-impl ClientSwitch {
-    const fn key(self) -> &'static str {
-        use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported};
-        match self {
-            Self::AgeVerification(Unsupported) => "age_verification_uk_tombstone_rule_enabled",
-            Self::AgeVerification(IosNeedsUpdate) => "age_verification_ios_tombstone_rule_enabled",
-            Self::AgeVerification(AndroidNeedsUpdate) => {
-                "age_verification_android_tombstone_rule_enabled"
-            }
-            Self::AgeVerification(Supported) => {
-                "age_verification_blurred_media_interstitial_rule_enabled"
-            }
-            Self::ModernBlur => "media_visibility_treatments_blurred_media_interstitial_enabled",
-            Self::StaleTweetLimits => "stale_tweet_limited_actions_rules_enabled",
-            Self::CommunityViewerRemovedLimits => {
-                "community_tweet_viewer_removed_limited_actions_rules_enabled"
-            }
-            Self::GoreBlurIgnoresSettings => {
-                "media_visibility_treatments_blurred_media_interstitial_ignore_settings_enabled"
-            }
-            Self::FosnrRules => "freedom_of_speech_not_reach_rules_enabled",
-            Self::FosnrFallbackDrops => "freedom_of_speech_not_reach_fallback_drop_rules_enabled",
+const fn key(switch: ClientSwitch) -> &'static str {
+    match switch {
+        ClientSwitch::ModernBlur => {
+            "media_visibility_treatments_blurred_media_interstitial_enabled"
+        }
+        ClientSwitch::StaleTweetLimits => "stale_tweet_limited_actions_rules_enabled",
+        ClientSwitch::CommunityViewerRemovedLimits => {
+            "community_tweet_viewer_removed_limited_actions_rules_enabled"
+        }
+        ClientSwitch::GoreBlurIgnoresSettings => {
+            "media_visibility_treatments_blurred_media_interstitial_ignore_settings_enabled"
+        }
+        ClientSwitch::FosnrRules => "freedom_of_speech_not_reach_rules_enabled",
+        ClientSwitch::FosnrFallbackDrops => {
+            "freedom_of_speech_not_reach_fallback_drop_rules_enabled"
         }
     }
+}
 
-    const fn default_on(self) -> bool {
-        matches!(
-            self,
-            Self::AgeVerification(VerifyBlurSupport::Unsupported)
-                | Self::StaleTweetLimits
-                | Self::FosnrRules
-        )
+const fn age_verification_key(support: VerifyBlurSupport) -> &'static str {
+    match support {
+        VerifyBlurSupport::Unsupported => "age_verification_uk_tombstone_rule_enabled",
+        VerifyBlurSupport::IosNeedsUpdate => "age_verification_ios_tombstone_rule_enabled",
+        VerifyBlurSupport::AndroidNeedsUpdate => "age_verification_android_tombstone_rule_enabled",
+        VerifyBlurSupport::Supported => "age_verification_blurred_media_interstitial_rule_enabled",
+    }
+}
+
+const fn age_verification_default_on(support: VerifyBlurSupport) -> bool {
+    match support {
+        VerifyBlurSupport::Unsupported => true,
+        VerifyBlurSupport::IosNeedsUpdate
+        | VerifyBlurSupport::AndroidNeedsUpdate
+        | VerifyBlurSupport::Supported => false,
     }
 }
 
@@ -109,19 +100,20 @@ impl ClientSwitches {
             .feature_switches
             .load()
             .match_recipient(&recipient(context, viewer_id, country_code).build());
-        let on = |switch: ClientSwitch| {
-            results
-                .get_bool_no_impression(switch.key())
-                .unwrap_or(switch.default_on())
-        };
+        let on =
+            |key: &str, default_on: bool| results.get_bool_no_impression(key).unwrap_or(default_on);
         ClientCapability {
-            verify_blur_support: verify_blur_support(on),
-            modern_blur: on(ClientSwitch::ModernBlur),
-            stale_tweet_limits: on(ClientSwitch::StaleTweetLimits),
-            community_viewer_removed_limits: on(ClientSwitch::CommunityViewerRemovedLimits),
-            gore_blur_ignores_settings: on(ClientSwitch::GoreBlurIgnoresSettings),
-            fosnr_rules: on(ClientSwitch::FosnrRules),
-            fosnr_fallback_drops: on(ClientSwitch::FosnrFallbackDrops),
+            verify_blur_support: verify_blur_support(|support| {
+                on(
+                    age_verification_key(support),
+                    age_verification_default_on(support),
+                )
+            }),
+            switches_on: ClientSwitch::VARIANTS
+                .iter()
+                .copied()
+                .filter(|&switch| on(key(switch), switch.default_on()))
+                .collect(),
             soft_nsfw_new_user_drop: false,
         }
     }
@@ -192,11 +184,11 @@ fn recipient(
     recipient
 }
 
-fn verify_blur_support(on: impl Fn(ClientSwitch) -> bool) -> Option<VerifyBlurSupport> {
+fn verify_blur_support(on: impl Fn(VerifyBlurSupport) -> bool) -> Option<VerifyBlurSupport> {
     VerifyBlurSupport::VARIANTS
         .iter()
         .copied()
-        .find(|&support| on(ClientSwitch::AgeVerification(support)))
+        .find(|&support| on(support))
 }
 
 fn client_version(user_agent: &str) -> Option<Version> {
@@ -300,13 +292,7 @@ mod tests {
             switches.resolve(Some(&third_party), Some(TEST_USER_ID), None),
             ClientCapability {
                 verify_blur_support: Some(VerifyBlurSupport::Supported),
-                modern_blur: true,
-                stale_tweet_limits: true,
-                community_viewer_removed_limits: false,
-                gore_blur_ignores_settings: false,
-                fosnr_rules: true,
-                fosnr_fallback_drops: false,
-                soft_nsfw_new_user_drop: false,
+                ..ClientCapability::DEFAULT.with(ClientSwitch::ModernBlur)
             }
         );
         let app_id = |name: &str| {
@@ -322,7 +308,7 @@ mod tests {
             assert_eq!(
                 switches
                     .resolve(Some(&client), Some(1), None)
-                    .stale_tweet_limits,
+                    .has(ClientSwitch::StaleTweetLimits),
                 stale_tweet_limits,
                 "{version}"
             );
@@ -342,17 +328,15 @@ mod tests {
             assert_eq!(
                 switches
                     .resolve(Some(&context(app_id, user_agent)), Some(1), None)
-                    .community_viewer_removed_limits,
+                    .has(ClientSwitch::CommunityViewerRemovedLimits),
                 community_viewer_removed_limits,
                 "{user_agent}"
             );
         }
         let web = &CLIENT_CLASSES[0];
-        assert!(
-            !switches
-                .resolve(Some(&context(web.app_id, web.user_agent)), None, None)
-                .community_viewer_removed_limits
-        );
+        assert!(!switches
+            .resolve(Some(&context(web.app_id, web.user_agent)), None, None)
+            .has(ClientSwitch::CommunityViewerRemovedLimits));
         assert_eq!(
             switches.resolve(None, Some(TEST_USER_ID), None),
             ClientCapability::default()
@@ -378,8 +362,11 @@ mod tests {
             (&[AndroidNeedsUpdate, Unsupported], Some(Unsupported)),
             (&[], None),
         ] {
-            let on_switch = |switch| matches!(switch, ClientSwitch::AgeVerification(support) if on.contains(&support));
-            assert_eq!(verify_blur_support(on_switch), expected, "{on:?}");
+            assert_eq!(
+                verify_blur_support(|support| on.contains(&support)),
+                expected,
+                "{on:?}"
+            );
         }
     }
 }

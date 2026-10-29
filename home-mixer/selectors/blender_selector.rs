@@ -1,7 +1,7 @@
 use super::build_non_selected;
 use crate::ads::{
-    AdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender, SafeGapAdsBlender,
-    TimeGapAdsBlender, TimeGapConfig,
+    AdsBlender, LeastMovementAdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender,
+    SafeGapAdsBlender, SlotSpreadAdsBlender, TimeGapAdsBlender, TimeGapConfig,
 };
 use crate::frames;
 use crate::models::query::ScoredPostsQuery;
@@ -20,6 +20,8 @@ pub struct BlenderSelector {
     safe_gap_blender: SafeGapAdsBlender,
     partition_organic_blender: PartitionOrganicAdsBlender,
     multi_risk_blender: MultiRiskAdsBlender,
+    slot_spread_blender: SlotSpreadAdsBlender,
+    least_movement_blender: LeastMovementAdsBlender,
 }
 
 impl BlenderSelector {
@@ -28,6 +30,8 @@ impl BlenderSelector {
             safe_gap_blender: SafeGapAdsBlender::default(),
             partition_organic_blender: PartitionOrganicAdsBlender,
             multi_risk_blender: MultiRiskAdsBlender,
+            slot_spread_blender: SlotSpreadAdsBlender,
+            least_movement_blender: LeastMovementAdsBlender,
         }
     }
 }
@@ -58,6 +62,8 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             "partition_organic_low_risk" => &self.partition_organic_blender,
             "safe_gap" => &self.safe_gap_blender,
             "multi_risk" => &self.multi_risk_blender,
+            "slot_spread" => &self.slot_spread_blender,
+            "least_movement" => &self.least_movement_blender,
             "time_gap" => {
                 time_gap_blender = TimeGapAdsBlender {
                     config: TimeGapConfig {

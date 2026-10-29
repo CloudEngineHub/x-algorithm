@@ -1,11 +1,11 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, EdgeSet, FosnrReason, LabelInterstitial, LimitedActionType, LimitedEngagement,
-    LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason,
-    PostCandidate, PostEntity, SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures,
-    UserEntity, Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
-    Withholding,
+    AuthorFeatures, AuthorLabel, ClientCapability, ClientSwitch, ClientSwitchSet,
+    ConversationControlFeatures, Decided, DropReason, EdgeSet, FosnrReason, LabelInterstitial,
+    LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
+    Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::rules::RuleId;
 use std::collections::HashSet;
@@ -26,43 +26,46 @@ pub(crate) struct ClientClass {
 }
 
 pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
+    use ClientSwitch::{
+        CommunityViewerRemovedLimits, FosnrFallbackDrops, FosnrRules, GoreBlurIgnoresSettings,
+        ModernBlur,
+    };
     use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported};
     const RWEB: i64 = 3033300;
     const IPHONE: i64 = 129032;
     const ANDROID: i64 = 258901;
     const MAC: i64 = 557701;
+    const LEGACY: ClientSwitchSet = ClientSwitchSet::DEFAULT_ON;
+    const MODERN: ClientSwitchSet = LEGACY.with(ModernBlur).with(GoreBlurIgnoresSettings);
     const fn class(
         name: &'static str,
         app_id: i64,
         user_agent: &'static str,
         verify_blur_support: VerifyBlurSupport,
-        modern_blur: bool,
-        gore_blur_ignores_settings: bool,
+        switches_on: ClientSwitchSet,
     ) -> ClientClass {
+        let mut capability = ClientCapability {
+            verify_blur_support: Some(verify_blur_support),
+            switches_on,
+            ..ClientCapability::DEFAULT
+        };
+        if matches!(app_id, RWEB | IPHONE | ANDROID) {
+            capability = capability.with(CommunityViewerRemovedLimits);
+        }
         ClientClass {
             name,
             app_id,
             user_agent,
-            capability: ClientCapability {
-                verify_blur_support: Some(verify_blur_support),
-                modern_blur,
-                stale_tweet_limits: true,
-                community_viewer_removed_limits: matches!(app_id, RWEB | IPHONE | ANDROID),
-                gore_blur_ignores_settings,
-                fosnr_rules: true,
-                fosnr_fallback_drops: false,
-                soft_nsfw_new_user_drop: false,
-            },
+            capability,
         }
     }
     const fn android_9_82(class: ClientClass) -> ClientClass {
         ClientClass {
-            capability: ClientCapability {
-                fosnr_rules: false,
-                fosnr_fallback_drops: true,
-                community_viewer_removed_limits: false,
-                ..class.capability
-            },
+            capability: class
+                .capability
+                .without(FosnrRules)
+                .with(FosnrFallbackDrops)
+                .without(CommunityViewerRemovedLimits),
             ..class
         }
     }
@@ -73,24 +76,21 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             Supported,
-            true,
-            true,
+            MODERN,
         ),
         class(
             "ios_current",
             IPHONE,
             "Twitter-iPhone/11.11.5 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)",
             Supported,
-            true,
-            true,
+            MODERN,
         ),
         class(
             "ios_outdated",
             IPHONE,
             "Twitter-iPhone/11.11.4 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)",
             IosNeedsUpdate,
-            true,
-            true,
+            MODERN,
         ),
         class(
             "android_current",
@@ -98,8 +98,7 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
             "TwitterAndroid/11.11.0-release.00 (311110000-r-0) Pixel 7/14 \
              (Google;panther;google;panther;0;;1;2022)",
             Supported,
-            true,
-            true,
+            MODERN,
         ),
         class(
             "android_outdated",
@@ -107,8 +106,7 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
             "TwitterAndroid/11.10.9-release.00 (311109000-r-0) Pixel 7/14 \
              (Google;panther;google;panther;0;;1;2022)",
             AndroidNeedsUpdate,
-            true,
-            true,
+            MODERN,
         ),
         android_9_82(class(
             "android_without_fosnr",
@@ -116,24 +114,21 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
             "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
              (Google;panther;google;panther;0;;1;2022)",
             AndroidNeedsUpdate,
-            false,
-            false,
+            LEGACY,
         )),
         class(
             "mac_app",
             MAC,
             "Twitter-Mac/11.11.5 macOS/14.0 (Apple;Mac14,2)",
             Unsupported,
-            false,
-            false,
+            LEGACY,
         ),
         class(
             "third_party_client",
             0,
             "ThirdPartyClient/2.0",
             Unsupported,
-            false,
-            false,
+            LEGACY,
         ),
     ]
 };
@@ -560,7 +555,7 @@ impl CandidateBuilder {
     }
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
-        debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
+        debug_assert!(edge.is_viewer_edge(), "{edge:?} is not a viewer edge node");
         debug_assert!(
             !Hydrators::BLOCKED_BY_CONVERSATION_ROOT_AUTHOR.contains(edge),
             "{edge:?} is read through root_author_blocks_viewer()"

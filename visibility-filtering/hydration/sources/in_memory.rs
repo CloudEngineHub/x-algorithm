@@ -1,6 +1,6 @@
 use super::*;
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-use crate::hydration::fetcher::FetcherId;
+use crate::hydration::fetcher::{FetcherId, Owner};
 use crate::hydration::inventory::Source;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
@@ -607,12 +607,17 @@ impl Sources for InMemorySources {
         self.keyed(Source::ActorPhones, user_ids, &held).await
     }
 
-    async fn select_edges(&self, viewer_id: u64, queries: &[EdgeQuery]) -> Edges {
-        Ok(self.select(Source::Flock, Some(viewer_id), queries).await)
-    }
-
-    async fn select_pair_edges(&self, queries: &[EdgeQuery]) -> Edges {
-        Ok(self.select(Source::FlockUserPair, None, queries).await)
+    async fn select_edges(
+        &self,
+        owner: Owner,
+        viewer_id: Option<u64>,
+        queries: &[EdgeQuery],
+    ) -> Edges {
+        let fetcher = FetcherId {
+            source: Source::Flock,
+            owner,
+        };
+        Ok(self.select(fetcher, viewer_id, queries).await)
     }
 
     async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>> {

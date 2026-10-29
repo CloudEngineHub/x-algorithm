@@ -46,7 +46,7 @@ pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let listed = level.spec().rules().lists();
-        for entry in catalog_rules(listed.user).chain(catalog_rules(listed.post)) {
+        for entry in catalog_rules(&listed.user).chain(catalog_rules(&listed.post)) {
             match rules.iter_mut().find(|(other, _)| *other == entry) {
                 Some((_, levels)) => levels.push(level.into()),
                 None => rules.push((entry, vec![level.into()])),
@@ -165,7 +165,9 @@ mod tests {
             .iter()
             .flat_map(|level| {
                 let listed = level.spec().rules().lists();
-                viewer_gated_drop_rules(listed.user).chain(viewer_gated_drop_rules(listed.post))
+                viewer_gated_drop_rules(&listed.user)
+                    .chain(viewer_gated_drop_rules(&listed.post))
+                    .collect::<Vec<_>>()
             })
             .collect();
         let dashboard = crate::pinned::dashboard_tuple("VIEWER_GATED_DROP_RULES");

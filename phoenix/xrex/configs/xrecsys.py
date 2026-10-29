@@ -418,6 +418,18 @@ def _immersive_page_rl() -> dict:
     }
 
 
+def _immersive_page_rl_cread() -> dict:
+    base = _immersive_page_rl()
+    return {
+        **base,
+        "dwell_tweedie_loss_weight": 0.0,
+        "dwell_mae_loss_weight": 0.0,
+        "dwell_cread_loss_weight": 0.1,
+        "dwell_cread_immersive_loss_weight": 0.1,
+        "feature_prep": replace(base["feature_prep"], enable_dwell_bucket_table=True),
+    }
+
+
 MODEL_CFGS = {
     "xrecsys_seqpack": _make_cfg(
         {
@@ -486,6 +498,13 @@ MODEL_CFGS = {
     ),
     "immersive_page_rl": _make_cfg(
         _immersive_page_rl(),
+        user_vocab_size=100_000_000,
+        item_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+        ip_vocab_size=10_000_000,
+    ),
+    "immersive_page_rl_cread": _make_cfg(
+        _immersive_page_rl_cread(),
         user_vocab_size=100_000_000,
         item_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
@@ -740,6 +759,7 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
             metric_group=mparams.get("metric_group", "default"),
             enable_platform_metrics=mparams.get("enable_platform_metrics", False),
             metric_mask_keys=mparams.get("metric_mask_keys"),
+            metric_own_slice=mparams.get("metric_own_slice", False),
             metrics_ndcg_shared_sorts=mparams.get("metrics_ndcg_shared_sorts", False),
             conversion_delay_slice_thresholds_s=tuple(
                 mparams.get("conversion_delay_slice_thresholds_s", ())
@@ -946,6 +966,9 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 use_layer_stack=True,
                 unroll_layer_stack=mparams.get("unroll_layer_stack", False),
                 num_candidate_only_layers=mparams.get("num_candidate_only_layers", 0),
+                candidate_only_layers_update_user_token=mparams.get(
+                    "candidate_only_layers_update_user_token", False
+                ),
                 output_vocab_size=mparams["output_vocab_size"],
             ),
             hash_table=hash_table,

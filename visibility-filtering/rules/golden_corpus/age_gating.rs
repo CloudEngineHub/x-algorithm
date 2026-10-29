@@ -55,6 +55,14 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
+                    ImmersiveExpandedRecommendations,
+                    Role::As("underage", viewer_with_age(ViewerAge::Known(17))),
+                    nsfw_viewer_dropped(
+                        NsfwViewerDropReason::IsUnderage,
+                        "sensitive_viewer_underage/drop",
+                    ),
+                ),
+                (
                     TimelineHome,
                     Role::As("no_stated_age_in_us", no_stated_age_viewer("us")),
                     allow(),

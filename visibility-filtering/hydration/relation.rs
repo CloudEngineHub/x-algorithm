@@ -66,7 +66,7 @@ impl Relation {
             Relation::QuoteOuter => RelationSpec {
                 trigger: Trigger::QuoteEntry,
                 role: Role::Read,
-                fetch: Fetch::Shared,
+                fetch: Fetch::Own(&[Source::Flock]),
             },
         }
     }

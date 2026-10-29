@@ -838,7 +838,7 @@ mod tests {
     use super::*;
     use crate::hydration::Hydrator;
     use crate::models::{
-        ClientCapability, PostCandidate, VerifyBlurSupport, Viewer, ViewerFeatures,
+        ClientCapability, ClientSwitch, PostCandidate, VerifyBlurSupport, Viewer, ViewerFeatures,
     };
     use crate::rules::fixtures::{
         candidate, logged_out_viewer, viewer, viewer_with_profile, VIEWER_ID,
@@ -943,16 +943,12 @@ mod tests {
 
     #[test]
     fn the_client_checks_read_the_resolved_capability_and_are_never_unknown() {
+        use strum::VariantArray;
         use VerifyBlurSupport::{IosNeedsUpdate, Supported};
         let viewer = ViewerFeatures {
             client_capability: ClientCapability {
                 verify_blur_support: Some(IosNeedsUpdate),
-                modern_blur: true,
-                stale_tweet_limits: true,
-                community_viewer_removed_limits: true,
-                gore_blur_ignores_settings: true,
-                fosnr_rules: true,
-                fosnr_fallback_drops: true,
+                switches_on: ClientSwitch::VARIANTS.iter().copied().collect(),
                 soft_nsfw_new_user_drop: false,
             },
             ..viewer(VIEWER_ID)
@@ -964,10 +960,12 @@ mod tests {
             let check = Predicate::Request(ClientVerifyBlurSupportIs(support));
             assert_eq!(check.truth(&context), expected, "{support:?}");
         }
-        for check in
-            [ClientHasModernBlur, ClientHasCommunityViewerRemovedLimits].map(Predicate::Request)
-        {
-            assert_eq!(check.truth(&context), Truth::True, "{check:?}");
+        for switch in [
+            ClientSwitch::ModernBlur,
+            ClientSwitch::CommunityViewerRemovedLimits,
+        ] {
+            let check = Predicate::Request(ClientHas(switch));
+            assert_eq!(check.truth(&context), Truth::True, "{switch:?}");
         }
     }
 }

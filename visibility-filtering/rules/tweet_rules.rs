@@ -1,5 +1,6 @@
 use crate::models::{
-    LimitedActionType, LimitedEngagementReason, SafetyLabelType, TombstoneReason, VerifyBlurSupport,
+    ClientSwitch, LimitedActionType, LimitedEngagementReason, SafetyLabelType, TombstoneReason,
+    VerifyBlurSupport,
 };
 use crate::params::CountryList;
 use crate::rules::rule_spec::conditions::*;
@@ -170,7 +171,7 @@ pub(super) const FOSNR_ABUSE_INSULTS_NON_FOLLOWER_DROP_UNDESIRABLE: Rule = Rule 
     audience: NonFollowers,
     when: all![
         TweetHasLabel(SafetyLabelType::FOSNR_ABUSE_INSULTS),
-        ClientHasFosnrRules
+        ClientHas(ClientSwitch::FosnrRules)
     ],
     action: drop_post(DropAs::PossiblyUndesirable),
 };
@@ -181,7 +182,7 @@ pub(super) const FOSNR_ABUSE_INSULTS_FOLLOWER_SOFT_INTERVENTION_ABUSE: Rule = Ru
     when: all![
         TweetHasLabel(SafetyLabelType::FOSNR_ABUSE_INSULTS),
         ViewerFollowsAuthor,
-        ClientHasFosnrRules
+        ClientHas(ClientSwitch::FosnrRules)
     ],
     action: soft_intervention(
         SafetyLabelType::FOSNR_ABUSE_INSULTS,
@@ -193,14 +194,14 @@ pub(super) const FOSNR_ABUSE_INSULTS_FOLLOWER_SOFT_INTERVENTION_ABUSE: Rule = Ru
 pub(super) const FOSNR_AUTHOR_APPEALABLE: Rule = Rule {
     id: RuleId::FosnrAuthor,
     audience: OnlyAuthor,
-    when: all![ClientHasFosnrRules, HAS_FOSNR_LABEL],
+    when: all![ClientHas(ClientSwitch::FosnrRules), HAS_FOSNR_LABEL],
     action: appealable(&FOSNR_AUTHOR_VIOLATIONS),
 };
 
 pub(super) const FOSNR_FALLBACK_DROP_UNDESIRABLE: Rule = Rule {
     id: RuleId::FosnrFallback,
     audience: Everyone,
-    when: all![ClientNeedsFosnrFallbackDrops, HAS_FOSNR_LABEL],
+    when: all![ClientHas(ClientSwitch::FosnrFallbackDrops), HAS_FOSNR_LABEL],
     action: drop_post(DropAs::PossiblyUndesirable),
 };
 
@@ -226,7 +227,10 @@ pub(super) const STALE_TWEET_DROP_UNSPECIFIED: Rule = Rule {
 pub(super) const STALE_TWEET_LIMITED_ENGAGEMENT: Rule = Rule {
     id: RuleId::StaleTweet,
     audience: Everyone,
-    when: all![TweetIsSupersededEdit, ClientHasStaleTweetLimits],
+    when: all![
+        TweetIsSupersededEdit,
+        ClientHas(ClientSwitch::StaleTweetLimits)
+    ],
     action: limit(LimitedEngagementReason::StaleTweet),
 };
 
@@ -533,7 +537,7 @@ pub(super) const NSFW_HIGH_PRECISION_BLUR_SENSITIVE_ALL_USERS: Rule = Rule {
         TweetHasLabel(SafetyLabelType::NSFW_HIGH_PRECISION),
         !TweetCreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT),
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::Sensitive(true)),
 };
@@ -557,7 +561,7 @@ pub(super) const NSFW_HIGH_PRECISION_BLUR_NUDITY_ALL_USERS: Rule = Rule {
         TweetHasLabel(SafetyLabelType::NSFW_HIGH_PRECISION),
         TweetCreatedAfter(NSFW_HIGH_PRECISION_CHANGED_AT),
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::Nudity(true)),
 };
@@ -567,7 +571,7 @@ pub(super) const NSFW_HIGH_PRECISION_LEGACY_INTERSTITIAL: Rule = Rule {
     audience: Everyone,
     when: all![
         TweetHasLabel(SafetyLabelType::NSFW_HIGH_PRECISION),
-        !ClientHasModernBlur
+        !ClientHas(ClientSwitch::ModernBlur)
     ],
     action: legacy_nsfw_interstitial(),
 };
@@ -619,7 +623,7 @@ pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_BLUR_ALL_USERS: Rule = Rule {
     when: all![
         TweetHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::Violence(true)),
 };
@@ -629,7 +633,7 @@ pub(super) const GORE_AND_VIOLENCE_HIGH_PRECISION_LEGACY_INTERSTITIAL: Rule = Ru
     audience: Everyone,
     when: all![
         TweetHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-        !ClientHasModernBlur
+        !ClientHas(ClientSwitch::ModernBlur)
     ],
     action: legacy_nsfw_interstitial(),
 };
@@ -650,7 +654,7 @@ pub(super) const GORE_AND_VIOLENCE_IGNORING_SETTINGS_BLUR: Rule = Rule {
     audience: NonAuthors,
     when: all![
         TweetHasLabel(SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION),
-        ClientBlursGoreIgnoringSettings
+        ClientHas(ClientSwitch::GoreBlurIgnoresSettings)
     ],
     action: blur(InterstitialReason::Violence(true)),
 };
@@ -722,7 +726,7 @@ pub(super) const NSFW_CARD_IMAGE_BLUR_SENSITIVE_ALL_USERS: Rule = Rule {
     when: all![
         TweetHasLabel(SafetyLabelType::NSFW_CARD_IMAGE),
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::Sensitive(true)),
 };
@@ -732,7 +736,7 @@ pub(super) const NSFW_CARD_IMAGE_LEGACY_INTERSTITIAL: Rule = Rule {
     audience: Everyone,
     when: all![
         TweetHasLabel(SafetyLabelType::NSFW_CARD_IMAGE),
-        !ClientHasModernBlur
+        !ClientHas(ClientSwitch::ModernBlur)
     ],
     action: legacy_nsfw_interstitial(),
 };
@@ -763,7 +767,7 @@ pub(super) const NSFW_ADMIN_BLUR_SENSITIVE_ALL_USERS: Rule = Rule {
         TweetNsfwAdminFlag,
         TweetHasMedia,
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::Sensitive(true)),
 };
@@ -794,7 +798,7 @@ pub(super) const NSFW_USER_BLUR_SENSITIVE_USER_ALL_USERS: Rule = Rule {
         TweetNsfwUserFlag,
         TweetHasMedia,
         !ViewerAllowsSensitiveMedia,
-        ClientHasModernBlur
+        ClientHas(ClientSwitch::ModernBlur)
     ],
     action: blur(InterstitialReason::SensitiveUser(true)),
 };
@@ -842,7 +846,7 @@ pub(super) const NSFW_ACCOUNT_LEGACY_INTERSTITIAL: Rule = Rule {
         TWEET_IS_NSFW_FLAGGED,
         TweetHasMedia,
         !ViewerAllowsSensitiveMedia,
-        !ClientHasModernBlur
+        !ClientHas(ClientSwitch::ModernBlur)
     ],
     action: legacy_nsfw_interstitial(),
 };
@@ -1057,7 +1061,7 @@ pub(super) const COMMUNITY_TWEET_VIEWER_REMOVED_LIMITED_ENGAGEMENT: Rule = Rule 
     when: all![
         TweetIsCommunityTweet,
         ViewerIsRemovedFromCommunity,
-        ClientHasCommunityViewerRemovedLimits
+        ClientHas(ClientSwitch::CommunityViewerRemovedLimits)
     ],
     action: limit(LimitedEngagementReason::CommunityTweetViewerRemoved),
 };
@@ -1142,9 +1146,9 @@ mod tests {
     fn home_hydration_label_blurs_add_the_modern_blur_gate_to_the_timeline_home_conditions() {
         use crate::rules::levels::{TIMELINE_HOME, TIMELINE_HOME_HYDRATION};
         let label_blurs: Vec<&Rule> = TIMELINE_HOME
+            .lists()
             .post
-            .iter()
-            .copied()
+            .into_iter()
             .filter(|rule| {
                 matches!(rule.action.spec(), ActionSpec::MediaRestriction(_))
                     && rule
@@ -1157,15 +1161,16 @@ mod tests {
         assert!(!label_blurs.is_empty());
         for home in label_blurs {
             let mut gated = home.when.conjuncts().to_vec();
-            gated.push(ClientHasModernBlur.leaf());
+            gated.push(ClientHas(ClientSwitch::ModernBlur).leaf());
             assert!(
                 TIMELINE_HOME_HYDRATION
+                    .lists()
                     .post
                     .iter()
                     .any(|rule| rule.id == home.id
                         && rule.action == home.action
                         && rule.when.conjuncts() == gated.as_slice()),
-                "{} has no TimelineHomeHydration rule with its conditions and client_has_modern_blur",
+                "{} has no TimelineHomeHydration rule with its conditions and client_has(modern_blur)",
                 home.name()
             );
         }

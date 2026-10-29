@@ -364,6 +364,7 @@ class PostMapper:
             affiliated_business=AffiliatedBusiness(
                 name=user_metadata.affiliatedBusinessMetadata.name,
                 url=user_metadata.affiliatedBusinessMetadata.url,
+                badge_image_url=user_metadata.affiliatedBusinessMetadata.badgeImageUrl,
             )
             if user_metadata.affiliatedBusinessMetadata
             else None,

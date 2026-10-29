@@ -11,14 +11,14 @@ use super::*;
 use crate::hydration::inventory::Tier;
 use crate::hydration::Hydrator;
 use crate::models::{
-    ClientCapability, PostCandidate, SafetyLabelMap, SafetyLabelType, UserCandidate,
+    ClientCapability, ClientSwitch, PostCandidate, SafetyLabelMap, SafetyLabelType, UserCandidate,
     VerifyBlurSupport, ViewerFeatures,
 };
 use crate::params::CountryLists;
 use crate::rules::expansion::Expansion;
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 use crate::rules::golden_corpus::{corpus, Subject};
-use crate::rules::levels::PostRules;
+use crate::rules::levels::LevelLists;
 use crate::rules::SafetyLevel;
 use crate::rules::{placed_test_context, test_context, tweet_rules};
 use std::iter::once;
@@ -36,10 +36,10 @@ fn truths() -> Vec<Truth> {
     truths
 }
 
-fn wired<E: Engine>(list: fn(PostRules) -> &'static [&'static Rule<E>]) -> Vec<&'static Rule<E>> {
+fn wired<E: Engine>(list: fn(LevelLists) -> Vec<&'static Rule<E>>) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for &rule in list(level.spec().rules().lists()) {
+        for rule in list(level.spec().rules().lists()) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -455,76 +455,38 @@ fn the_conversation_root_exemption_is_whole() {
 #[test]
 fn every_client_capability_is_live() {
     let base = ClientCapability::default();
-    let ClientCapability {
-        verify_blur_support,
-        modern_blur,
-        stale_tweet_limits,
-        community_viewer_removed_limits,
-        gore_blur_ignores_settings,
-        fosnr_rules,
-        fosnr_fallback_drops,
-        soft_nsfw_new_user_drop,
-    } = base;
     let blur_supports = once(None)
         .chain(VerifyBlurSupport::VARIANTS.iter().copied().map(Some))
-        .filter(|&support| support != verify_blur_support)
+        .filter(|&support| support != base.verify_blur_support)
         .map(|support| ClientCapability {
             verify_blur_support: support,
             ..base
         })
         .collect();
-    let toggled: [(&str, Vec<ClientCapability>); 8] = [
+    let toggle = |switch| {
+        if base.has(switch) {
+            base.without(switch)
+        } else {
+            base.with(switch)
+        }
+    };
+    let toggled: Vec<(&str, Vec<ClientCapability>)> = [
         ("verify_blur_support", blur_supports),
-        (
-            "modern_blur",
-            vec![ClientCapability {
-                modern_blur: !modern_blur,
-                ..base
-            }],
-        ),
-        (
-            "stale_tweet_limits",
-            vec![ClientCapability {
-                stale_tweet_limits: !stale_tweet_limits,
-                ..base
-            }],
-        ),
-        (
-            "community_viewer_removed_limits",
-            vec![ClientCapability {
-                community_viewer_removed_limits: !community_viewer_removed_limits,
-                ..base
-            }],
-        ),
-        (
-            "gore_blur_ignores_settings",
-            vec![ClientCapability {
-                gore_blur_ignores_settings: !gore_blur_ignores_settings,
-                ..base
-            }],
-        ),
-        (
-            "fosnr_rules",
-            vec![ClientCapability {
-                fosnr_rules: !fosnr_rules,
-                ..base
-            }],
-        ),
-        (
-            "fosnr_fallback_drops",
-            vec![ClientCapability {
-                fosnr_fallback_drops: !fosnr_fallback_drops,
-                ..base
-            }],
-        ),
         (
             "soft_nsfw_new_user_drop",
             vec![ClientCapability {
-                soft_nsfw_new_user_drop: !soft_nsfw_new_user_drop,
+                soft_nsfw_new_user_drop: !base.soft_nsfw_new_user_drop,
                 ..base
             }],
         ),
-    ];
+    ]
+    .into_iter()
+    .chain(
+        ClientSwitch::VARIANTS
+            .iter()
+            .map(|&switch| (<&str>::from(switch), vec![toggle(switch)])),
+    )
+    .collect();
     let leaves = wired_leaves();
     let fetched = candidate().build();
     let holds = |client_capability: ClientCapability, leaf: Predicate| {
@@ -542,7 +504,7 @@ fn every_client_capability_is_live() {
         });
         assert!(
             live,
-            "no wired leaf reads ClientCapability::{field}: wire a rule that reads it, or delete it"
+            "no wired leaf reads the client's {field}: wire a rule that reads it, or delete it"
         );
     }
 }
@@ -551,7 +513,7 @@ fn every_client_capability_is_live() {
 fn only_the_quote_pass_reads_the_quote() {
     let mut readers = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules().lists();
+        let LevelLists { user, post } = level.spec().rules().lists();
         let mut read = Vec::new();
         for rule in user {
             rule.when.leaves(&mut read);
@@ -660,10 +622,10 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     };
     let mut shadowing = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules().lists();
+        let LevelLists { user, post } = level.spec().rules().lists();
         for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
             let severity = user_rule.action.spec().severity();
-            for &post_rule in post {
+            for &post_rule in &post {
                 if post_rule.action.spec().severity() > severity
                     && !disjoint(user_rule.audience, post_rule.audience)
                 {

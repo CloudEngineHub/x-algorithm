@@ -647,6 +647,16 @@ class CandidateOnlyAttention(MultiHeadAttention):
             if seqpack_layout is not None
             else {}
         )
+        num_candidates = segment_ids.shape[1] - history_states.shape[1]
+        num_user_rows = candidate_states.shape[1] - num_candidates
+        if num_user_rows:
+            assert candidate_region_kwargs, "User-token rows need seqpack_candidate_packing"
+            key_starts = candidate_region_kwargs["candidate_key_starts"]
+            assert key_starts.shape[1] == num_user_rows + 1, (key_starts.shape, num_user_rows)
+            candidate_region_kwargs["user_key_starts"] = key_starts.at[:, :-1].add(1)
+            candidate_region_kwargs["user_key_counts"] = (
+                candidate_region_kwargs["candidate_key_counts"] - 1
+            )
         attention = self._get_candidate_only_attn_impl()(
             config, self.scale_config, sharding_context=self.sharding_context
         )

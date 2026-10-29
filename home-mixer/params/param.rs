@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-27T16:00:37Z
+// mirrored from config feature-switch defaults; last sync 2026-10-28T16:00:35Z
 use xai_feature_switches::param;
 
 param!(
@@ -313,7 +313,7 @@ param!(
     EnablePageLogging,
     bool,
     "rust_home_mixer_enable_page_logging",
-    false
+    true
 );
 param!(
     PageLogTtlSeconds,
@@ -939,7 +939,7 @@ param!(
     EnableAdsBrandSafetyVerdictV2,
     bool,
     "rust_home_mixer_ads_bs_v2_exp_enabled",
-    true
+    false
 );
 
 param!(
@@ -1252,6 +1252,12 @@ param!(
     VideoCarouselImmersiveVqvWeight,
     f64,
     "rust_home_mixer_video_carousel_immersive_vqv_weight",
+    0.0
+);
+param!(
+    VideoCarouselOpenTimesImmersiveDwellWeight,
+    f64,
+    "rust_home_mixer_video_carousel_open_times_immersive_dwell_weight",
     0.0
 );
 param!(

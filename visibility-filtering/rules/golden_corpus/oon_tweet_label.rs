@@ -1,6 +1,8 @@
 use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
-use crate::models::{ClientCapability, SafetyLabelType, ViewerFeatures, ViewerProfile};
+use crate::models::{
+    ClientCapability, ClientSwitch, SafetyLabelType, ViewerFeatures, ViewerProfile,
+};
 use crate::rules::fixtures::{
     allow, appealed, blurred, candidate, controlled_root, dropped, labeled, noticed, on_client,
     viewer, viewer_in_country, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
@@ -21,15 +23,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "malicious_url/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "malicious_url/drop/undesirable",
@@ -37,6 +31,14 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
                 (TimelineHome, Role::NonFollower, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "malicious_url/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -45,15 +47,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::ContainNsfwMedia,
-                        "nsfw_high_recall/drop/nsfw_media",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::ContainNsfwMedia,
                         "nsfw_high_recall/drop/nsfw_media",
@@ -68,21 +62,21 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "do_not_amplify/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "do_not_amplify/drop/undesirable",
                     ),
                 ),
                 (TimelineHomeRecommendations, Role::Author, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "do_not_amplify/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -91,15 +85,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "spam_high_recall/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "spam_high_recall/drop/undesirable",
@@ -195,15 +181,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHomeRecommendations,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_abuse_insults/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeRecommendations,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_abuse_insults/drop/undesirable",
@@ -213,15 +191,7 @@ pub(super) fn rows() -> Vec<Row> {
                 (TimelineHome, Role::NonFollower, allow()),
                 (
                     TimelineHomeHydration,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_abuse_insults_non_follower/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHomeHydration,
-                    Role::LoggedOut,
+                    Role::each([Role::NonFollower, Role::LoggedOut]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_abuse_insults_non_follower/drop/undesirable",
@@ -346,11 +316,9 @@ pub(super) fn rows() -> Vec<Row> {
 
 fn client_without_fosnr(viewer_id: u64) -> ViewerFeatures {
     ViewerFeatures {
-        client_capability: ClientCapability {
-            fosnr_rules: false,
-            fosnr_fallback_drops: true,
-            ..ClientCapability::default()
-        },
+        client_capability: ClientCapability::DEFAULT
+            .without(ClientSwitch::FosnrRules)
+            .with(ClientSwitch::FosnrFallbackDrops),
         ..viewer(viewer_id)
     }
 }

@@ -32,7 +32,8 @@ use xai_x_thrift::safety_result::{
     FilteredReason as ThriftFilteredReason, SafetyResult as ThriftSafetyResult, SafetyResultReason,
 };
 use xai_x_thrift::tweet_service::{
-    TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
+    TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,
+    TweetFieldsResultState,
 };
 
 pub(crate) fn thrift_action(
@@ -775,7 +776,10 @@ pub(crate) fn evaluate_tweets_state(
 ) -> Option<TweetFieldsResultState> {
     match evaluation {
         Evaluation::Complete { verdict, .. } => Some(thrift_result_state(verdict, level, policies)),
-        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => None,
+        Evaluation::NotFound(_) => Some(TweetFieldsResultState::NotFound(
+            TweetFieldsResultNotFound::new(false, false, None),
+        )),
+        Evaluation::Partial { .. } | Evaluation::Failed(_) => None,
     }
 }
 
@@ -784,12 +788,8 @@ pub(crate) fn evaluate_tweets_label(
     level: SafetyLevel,
     policies: &LimitedActionsPolicies,
 ) -> Label {
-    if let Evaluation::NotFound(_) = evaluation {
-        label(Class::NotFound, NONE)
-    } else {
-        evaluate_tweets_state(evaluation, level, policies)
-            .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
-    }
+    evaluate_tweets_state(evaluation, level, policies)
+        .map_or_else(|| label(Class::Failed, NONE), |state| state_label(&state))
 }
 
 pub(crate) fn notification_result(
@@ -1721,6 +1721,8 @@ mod tests {
         let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
             ThriftFilteredReason::AuthorIsSuspended(true),
         ));
+        let not_found =
+            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(false, false, None));
         let cases = [
             (
                 Evaluation::complete(allow()),
@@ -1742,7 +1744,7 @@ mod tests {
             ),
             (
                 Evaluation::NotFound(Lookup::Author),
-                None,
+                Some(&not_found),
                 ("not_found", "none"),
             ),
             (Evaluation::Failed(Lookup::Tweet), None, ("failed", "none")),

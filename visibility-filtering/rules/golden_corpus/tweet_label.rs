@@ -5,7 +5,10 @@ use crate::models::{
 use crate::rules::fixtures::{
     allow, appealed, candidate, dropped, labeled, tombstoned, viewer_with_profile,
 };
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
@@ -65,6 +68,15 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
+                    Role::each([Role::NonFollower, Role::Follower, Role::Author]),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "for_emergency_use_only/drop/unspecified",
+                    ),
+                ),
+                (TimelineHomeHydration, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
                     Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
@@ -72,22 +84,13 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (
-                    TimelineHome,
-                    Role::Follower,
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "for_emergency_use_only/drop/unspecified",
                     ),
                 ),
-                (
-                    TimelineHome,
-                    Role::Author,
-                    dropped(
-                        FilteredReason::UnspecifiedReason,
-                        "for_emergency_use_only/drop/unspecified",
-                    ),
-                ),
-                (TimelineHomeHydration, Role::Author, allow()),
             ],
         },
         Row {
@@ -96,12 +99,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
                 ),
                 (TimelineHome, Role::Author, allow()),
@@ -111,6 +109,16 @@ pub(super) fn rows() -> Vec<Row> {
                     dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
                 ),
                 (TimelineHomeHydration, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(nsfw_high_precision_reason(), "pdna/drop/safety_result"),
+                ),
             ],
         },
         Row {
@@ -119,12 +127,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
                 ),
                 (TimelineHome, Role::Author, allow()),
@@ -149,6 +152,16 @@ pub(super) fn rows() -> Vec<Row> {
                     Role::InnerQuoted(Box::new(Role::Author)),
                     tombstoned(TombstoneReason::Bounced, "bounce_quoted/tombstone/bounced"),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::TweetIsBounced, "bounce/drop/bounced"),
+                ),
             ],
         },
         Row {
@@ -157,15 +170,20 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
+                    Role::each([Role::NonFollower, Role::Follower]),
+                    dropped(FilteredReason::PossiblyUndesirable, "spam/drop/undesirable"),
+                ),
+                (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
                     Role::NonFollower,
                     dropped(FilteredReason::PossiblyUndesirable, "spam/drop/undesirable"),
                 ),
                 (
-                    TimelineHome,
-                    Role::Follower,
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(FilteredReason::PossiblyUndesirable, "spam/drop/undesirable"),
                 ),
-                (TimelineHome, Role::Author, allow()),
             ],
         },
         Row {
@@ -195,15 +213,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_hateful_conduct/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_hateful_conduct/drop/undesirable",
@@ -221,6 +231,22 @@ pub(super) fn rows() -> Vec<Row> {
                         "fosnr_author/appealable",
                     ),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_hateful_conduct/drop/undesirable",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_hateful_conduct/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -229,15 +255,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_violent_speech/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_violent_speech/drop/undesirable",
@@ -255,6 +273,22 @@ pub(super) fn rows() -> Vec<Row> {
                         "fosnr_author/appealable",
                     ),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_violent_speech/drop/undesirable",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_violent_speech/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -263,15 +297,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_abuse/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_abuse/drop/undesirable",
@@ -297,6 +323,22 @@ pub(super) fn rows() -> Vec<Row> {
                         "fosnr_author/appealable",
                     ),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_abuse/drop/undesirable",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_abuse/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -305,15 +347,7 @@ pub(super) fn rows() -> Vec<Row> {
             expect: vec![
                 (
                     TimelineHome,
-                    Role::NonFollower,
-                    dropped(
-                        FilteredReason::PossiblyUndesirable,
-                        "fosnr_civic_integrity/drop/undesirable",
-                    ),
-                ),
-                (
-                    TimelineHome,
-                    Role::Follower,
+                    Role::each([Role::NonFollower, Role::Follower]),
                     dropped(
                         FilteredReason::PossiblyUndesirable,
                         "fosnr_civic_integrity/drop/undesirable",
@@ -337,6 +371,22 @@ pub(super) fn rows() -> Vec<Row> {
                         true,
                         false,
                         "fosnr_author/appealable",
+                    ),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_civic_integrity/drop/undesirable",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_civic_integrity/drop/undesirable",
                     ),
                 ),
             ],

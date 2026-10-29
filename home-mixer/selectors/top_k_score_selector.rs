@@ -1,6 +1,9 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{self, VideoCarouselImmersiveVqvWeight, VideoCarouselVideoOpenWeight};
+use crate::params::{
+    self, VideoCarouselImmersiveVqvWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
+    VideoCarouselVideoOpenWeight,
+};
 use crate::util::video_carousel;
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 
@@ -21,6 +24,7 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
                 params::VIDEO_CAROUSEL_EXTRA_CANDIDATES,
                 query.params.get(VideoCarouselVideoOpenWeight),
                 query.params.get(VideoCarouselImmersiveVqvWeight),
+                query.params.get(VideoCarouselOpenTimesImmersiveDwellWeight),
             ));
         }
         SelectResult {

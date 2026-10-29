@@ -315,12 +315,13 @@ fn record(metrics: &RequestMetrics, passes: &[QuotePass]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::Graph;
+    use crate::clients::socialgraph_client::{EdgeFrom, EdgeQuery, Graph};
     use crate::evaluate_tweets::EntryComparator;
     use crate::hydration::fallback_cache::FallbackCaches;
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{suspended, Fault, InMemorySources};
     use crate::hydration::tweet_fallback_cache;
+    use crate::hydration::Relation;
     use crate::metrics::families::PHASE_MS;
     use crate::metrics::{Metrics, Recording};
     use crate::models::{RequestViewer, TweetId};
@@ -335,6 +336,8 @@ mod tests {
     };
     use xai_visibility_filtering_proto as vf_pb;
     use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
+
+    const QUOTE_PAIRS: (Relation, Source) = (Relation::QuoteOuter, Source::Flock);
 
     const VIEWER: u64 = 50;
     const QUOTED_AUTHOR: u64 = 20;
@@ -682,7 +685,7 @@ mod tests {
                 world()
                     .user(QUOTED_AUTHOR, protected())
                     .edge(Graph::Follows, QUOTING_AUTHOR, QUOTED_AUTHOR)
-                    .fault(Source::FlockUserPair, Fault::Fails),
+                    .fault(QUOTE_PAIRS, Fault::Fails),
                 PassOutcome::FailedOpen,
             ),
             PassCase {
@@ -725,7 +728,7 @@ mod tests {
             )
             .await;
             assert!(no_passes.is_empty(), "{name}");
-            assert!(!world.calls().contains(&Source::FlockUserPair), "{name}");
+            assert!(world.starts(QUOTE_PAIRS).is_empty(), "{name}");
             assert!(!world.calls().contains(&Source::TesQuotedTweet), "{name}");
             let (shadow, passes) = serve(world, QuotePassMode::Shadow, viewer_id, tweets).await;
             assert_eq!(
@@ -774,7 +777,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_not_found_quoted_author_still_fails_the_served_inner() {
+    async fn a_not_found_quoted_author_sends_not_found_for_the_served_inner() {
+        use xai_x_thrift::tweet_service::{TweetFieldsResultNotFound, TweetFieldsResultState};
         let (served, _) = serve(
             Arc::new(live_inner_of_a_not_found_author()),
             QuotePassMode::Off,
@@ -786,7 +790,14 @@ mod tests {
             matches!(served[0], Outcome::ResultStateThriftCompact(_)),
             "{served:?}"
         );
-        assert_eq!(served[1], Outcome::Failed(vf_pb::Failed {}));
+        let not_found =
+            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(false, false, None));
+        assert_eq!(
+            served[1],
+            Outcome::ResultStateThriftCompact(
+                xai_x_thrift::serialize_compact(&not_found).unwrap().into()
+            )
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -819,9 +830,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_viewer_who_quotes_a_protected_author_asks_the_follow_as_viewer_and_as_quoting_author(
+    ) {
+        let world = Arc::new(world().user(QUOTED_AUTHOR, protected()).edge(
+            Graph::Follows,
+            QUOTING_AUTHOR,
+            QUOTED_AUTHOR,
+        ));
+        let (_, passes) = serve(
+            Arc::clone(&world),
+            QuotePassMode::Shadow,
+            Some(QUOTING_AUTHOR),
+            quote_with_outer(),
+        )
+        .await;
+        assert_eq!(
+            passes.iter().map(|pass| &pass.outcome).collect::<Vec<_>>(),
+            [&PassOutcome::Passed]
+        );
+        let follows_quoted_author = |from| EdgeQuery {
+            from,
+            ..EdgeQuery::forward(Graph::Follows, vec![QUOTED_AUTHOR])
+        };
+        let queries: Vec<EdgeQuery> = world.selects().into_iter().flatten().collect();
+        assert!(queries.contains(&follows_quoted_author(EdgeFrom::Viewer)));
+        assert!(queries.contains(&follows_quoted_author(EdgeFrom::User(QUOTING_AUTHOR))));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_hung_quote_pass_source_does_not_delay_the_served_response() {
-        let world = Arc::new(world().fault(Source::FlockUserPair, Fault::Hangs));
+        let world = Arc::new(world().fault(QUOTE_PAIRS, Fault::Hangs));
         let (off, _) = serve(
             Arc::clone(&world),
             QuotePassMode::Off,
@@ -864,7 +903,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_running_pass_holds_its_permit_until_it_ends() {
-        let world = Arc::new(world().fault(Source::FlockUserPair, Fault::Hangs));
+        let world = Arc::new(world().fault(QUOTE_PAIRS, Fault::Hangs));
         let mut served = Served::new(Arc::clone(&world), FallbackCaches::default(), one_permit());
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
         served.outcomes(Some(VIEWER), quote_with_outer()).await;
@@ -884,7 +923,7 @@ mod tests {
             [&PassOutcome::FailedOpen]
         );
         assert_eq!(
-            world.keys(Source::FlockUserPair).len(),
+            world.keys(QUOTE_PAIRS).len(),
             1,
             "the shed pass fetches nothing"
         );

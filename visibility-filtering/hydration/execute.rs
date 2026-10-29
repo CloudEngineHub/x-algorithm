@@ -355,23 +355,11 @@ impl HydrationPlan {
                 identity,
                 Reply::ActorPhones,
             ),
-            Source::Flock => {
-                let viewer_id = call.viewer_id?;
-                Box::pin(async move {
-                    let select = async {
-                        let edges = sources.select_edges(viewer_id, call.queries()).await?;
-                        let (edges, missing) = missing_sets_read_no_edge(edges);
-                        record_flock_missing_keys(metrics, timed.backend, timed.call, missing);
-                        Ok(edges)
-                    };
-                    let per_query = |failed| vec![failed; call.queries().len()];
-                    let edges = timed.run(select, per_query).await;
-                    (call, Reply::Select(edges))
-                })
-            }
-            Source::FlockUserPair => Box::pin(async move {
+            Source::Flock => Box::pin(async move {
                 let select = async {
-                    let edges = sources.select_pair_edges(call.queries()).await?;
+                    let edges = sources
+                        .select_edges(owner, call.viewer_id, call.queries())
+                        .await?;
                     let (edges, missing) = missing_sets_read_no_edge(edges);
                     record_flock_missing_keys(metrics, timed.backend, timed.call, missing);
                     Ok(edges)
@@ -517,8 +505,8 @@ mod tests {
     use crate::metrics::families::HYDRATOR_TWEET_IDS;
     use crate::metrics::{Endpoint, RequestLevel};
     use crate::models::{
-        ArticleLifecycle, AuthorId, ClientCapability, Evaluation, Placement, RetweetMerge,
-        SafetyLabelType, TweetId, Viewer, ViewerProfile,
+        ArticleLifecycle, AuthorId, ClientCapability, ClientSwitch, Evaluation, Placement,
+        RetweetMerge, SafetyLabelType, TweetId, Viewer, ViewerProfile,
     };
     use crate::rules::{RuleEngine, SafetyLevel};
     use crate::scenario::{InRequestOrder, Scenario, label_map, protected_user, raw, reaction_to};
@@ -538,10 +526,7 @@ mod tests {
         level: SafetyLevel,
         viewer_id: Option<u64>,
     ) -> Scenario<InMemorySources> {
-        let client = ClientCapability {
-            community_viewer_removed_limits: true,
-            ..ClientCapability::default()
-        };
+        let client = ClientCapability::DEFAULT.with(ClientSwitch::CommunityViewerRemovedLimits);
         Scenario::new(sources, level)
             .viewer(viewer_id)
             .country("US")

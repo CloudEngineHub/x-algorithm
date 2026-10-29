@@ -1,7 +1,7 @@
 use super::{Role, Row, Subject};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    ClientCapability, CommunityModeration, LimitedEngagementReason, PostCandidate, TweetFeatures,
+    ClientSwitch, CommunityModeration, LimitedEngagementReason, PostCandidate, TweetFeatures,
     Verdict, ViewerFeatures,
 };
 use crate::rules::fixtures::{
@@ -70,10 +70,9 @@ fn ios_before_viewer_removed_limits() -> Role {
     Role::As(
         "ios_10_15",
         ViewerFeatures {
-            client_capability: ClientCapability {
-                community_viewer_removed_limits: false,
-                ..ios.client_capability
-            },
+            client_capability: ios
+                .client_capability
+                .without(ClientSwitch::CommunityViewerRemovedLimits),
             ..ios
         },
     )

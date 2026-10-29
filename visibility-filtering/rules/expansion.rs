@@ -43,15 +43,15 @@ impl Expansion {
 
     #[expect(
         clippy::indexing_slicing,
-        reason = "the asserts bound every index: `parent` is non-empty and `N` is both lengths summed"
+        reason = "the assert bounds every index: `rules` is non-empty and `N` is both lengths summed"
     )]
     pub(super) const fn placed<const N: usize>(
         self,
-        parent: &'static [&'static Rule],
+        parent: &'static [&'static [&'static Rule]],
     ) -> [&'static Rule; N] {
         let rules = self.spec().rules;
-        assert!(!parent.is_empty() && parent.len() + rules.len() == N);
-        let mut placed = [parent[0]; N];
+        assert!(!rules.is_empty() && levels::rule_count(parent) + rules.len() == N);
+        let mut placed = [rules[0]; N];
         let mut at = 0;
         let mut i = 0;
         while i < rules.len() {
@@ -61,11 +61,15 @@ impl Expansion {
             }
             i += 1;
         }
-        i = 0;
-        while i < parent.len() {
-            placed[at] = parent[i];
-            at += 1;
-            i += 1;
+        let mut rest = parent;
+        while let [family, tail @ ..] = rest {
+            i = 0;
+            while i < family.len() {
+                placed[at] = family[i];
+                at += 1;
+                i += 1;
+            }
+            rest = tail;
         }
         i = 0;
         while i < rules.len() {

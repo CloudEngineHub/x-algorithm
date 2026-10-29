@@ -189,12 +189,11 @@ impl Store {
             .difference(unread)
             .iter()
             .filter(|&node| {
-                node.edge()
-                    .and_then(|edge| {
-                        let key = self.parent_key(node, row, position)?;
-                        self.edge_fetcher(edge)?.get(key).copied()
-                    })
-                    .unwrap_or(false)
+                node.is_viewer_edge()
+                    && self
+                        .parent_key(node, row, position)
+                        .and_then(|key| self.edge_holds(node, key))
+                        .unwrap_or(false)
             })
             .fold(EdgeSet::default(), EdgeSet::with)
     }

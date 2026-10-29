@@ -2,7 +2,7 @@ use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
-    VideoCarouselImmersiveVqvWeight,
+    VideoCarouselImmersiveVqvWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
 };
 use std::collections::HashSet;
 
@@ -18,7 +18,8 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
 pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)
-        && query.params.get(VideoCarouselImmersiveVqvWeight) != 0.0
+        && (query.params.get(VideoCarouselImmersiveVqvWeight) != 0.0
+            || query.params.get(VideoCarouselOpenTimesImmersiveDwellWeight) != 0.0)
         && !query.is_bottom_request
 }
 
@@ -27,6 +28,7 @@ pub(crate) fn select_videos<'a>(
     main_feed: &'a [PostCandidate],
     video_open_weight: f64,
     immersive_vqv_weight: f64,
+    open_times_immersive_dwell_weight: f64,
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
     embedding_dedupe_threshold: Option<f64>,
@@ -35,8 +37,14 @@ pub(crate) fn select_videos<'a>(
         .into_iter()
         .filter(|candidate| is_carousel_video(candidate) && is_vertical(candidate))
         .collect();
-    let score =
-        |video: &PostCandidate| carousel_score(video, video_open_weight, immersive_vqv_weight);
+    let score = |video: &PostCandidate| {
+        carousel_score(
+            video,
+            video_open_weight,
+            immersive_vqv_weight,
+            open_times_immersive_dwell_weight,
+        )
+    };
     videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
     let videos = take_distinct(
         videos,
@@ -132,12 +140,19 @@ pub(crate) fn take_videos_by_carousel_score(
     count: usize,
     video_open_weight: f64,
     immersive_vqv_weight: f64,
+    open_times_immersive_dwell_weight: f64,
 ) -> Vec<PostCandidate> {
     let (mut videos, rest): (Vec<_>, Vec<_>) = std::mem::take(candidates)
         .into_iter()
         .partition(is_carousel_video);
-    let score =
-        |video: &PostCandidate| carousel_score(video, video_open_weight, immersive_vqv_weight);
+    let score = |video: &PostCandidate| {
+        carousel_score(
+            video,
+            video_open_weight,
+            immersive_vqv_weight,
+            open_times_immersive_dwell_weight,
+        )
+    };
     videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
     let overflow = videos.split_off(count.min(videos.len()));
     *candidates = rest;
@@ -164,9 +179,13 @@ pub(crate) fn carousel_score(
     candidate: &PostCandidate,
     video_open_weight: f64,
     immersive_vqv_weight: f64,
+    open_times_immersive_dwell_weight: f64,
 ) -> f64 {
     video_open_weight * video_open_score(candidate)
         + immersive_vqv_weight * immersive_vqv_score(candidate)
+        + open_times_immersive_dwell_weight
+            * video_open_score(candidate)
+            * immersive_dwell_time(candidate)
 }
 
 fn video_open_score(candidate: &PostCandidate) -> f64 {
@@ -178,6 +197,14 @@ fn immersive_vqv_score(candidate: &PostCandidate) -> f64 {
         .immersive_scores
         .as_ref()
         .and_then(|scores| scores.vqv_score)
+        .unwrap_or(0.0)
+}
+
+fn immersive_dwell_time(candidate: &PostCandidate) -> f64 {
+    candidate
+        .immersive_scores
+        .as_ref()
+        .and_then(|scores| scores.dwell_time)
         .unwrap_or(0.0)
 }
 
@@ -221,7 +248,16 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 0, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                0.0,
+                false,
+                0,
+                None
+            )),
             vec![4, 5, 1]
         );
     }
@@ -248,7 +284,16 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, true, 0, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                0.0,
+                true,
+                0,
+                None
+            )),
             vec![1, 4, 5]
         );
     }
@@ -264,7 +309,16 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 2, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                0.0,
+                false,
+                2,
+                None
+            )),
             vec![1, 3, 4, 5]
         );
     }
@@ -283,7 +337,16 @@ mod tests {
             .collect();
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, true, 0, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                0.0,
+                true,
+                0,
+                None
+            )),
             vec![1, 4, 5, 6, 7]
         );
     }
@@ -296,7 +359,7 @@ mod tests {
             vertical(3, 20, &[], 0.7),
         ];
 
-        assert!(select_videos(&candidates, &[], 1.0, 0.0, true, 0, None).is_empty());
+        assert!(select_videos(&candidates, &[], 1.0, 0.0, 0.0, true, 0, None).is_empty());
     }
 
     fn with_immersive_vqv(candidate: PostCandidate, vqv: f64) -> PostCandidate {
@@ -319,7 +382,16 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 1.0, false, 0, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                1.0,
+                0.0,
+                false,
+                0,
+                None
+            )),
             vec![4, 2, 1, 3]
         );
     }
@@ -347,6 +419,7 @@ mod tests {
                 &candidates,
                 &[],
                 1.0,
+                0.0,
                 0.0,
                 false,
                 0,
@@ -376,7 +449,16 @@ mod tests {
         ];
 
         assert_eq!(
-            tweet_ids(&select_videos(&candidates, &[], 1.0, 0.0, false, 0, None)),
+            tweet_ids(&select_videos(
+                &candidates,
+                &[],
+                1.0,
+                0.0,
+                0.0,
+                false,
+                0,
+                None
+            )),
             vec![1, 4, 5]
         );
     }
@@ -400,6 +482,7 @@ mod tests {
                 &candidates,
                 &main_feed,
                 1.0,
+                0.0,
                 0.0,
                 false,
                 0,

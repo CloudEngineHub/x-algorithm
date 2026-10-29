@@ -394,6 +394,8 @@ class CutedslRankerCandidateOnlyAttention(CustomAttention):
             ranker_attention_varlen_candidate_only_fa4,
         )
 
+        has_user_rows = kwargs.get("user_key_starts") is not None
+
         def sharded_mha(
             q,
             k,
@@ -408,6 +410,47 @@ class CutedslRankerCandidateOnlyAttention(CustomAttention):
             del segment_ids_k, temp
             if candidate_region_args:
                 assert q.shape[0] == 1, "Seqpack varlen attention expects one packed row per shard."
+                if has_user_rows:
+                    (
+                        q,
+                        k,
+                        v,
+                        own_k,
+                        own_v,
+                        cu_seqlens,
+                        key_starts,
+                        key_counts,
+                        user_key_starts,
+                        user_key_counts,
+                    ) = (
+                        x[0]
+                        for x in (q, k, v, candidate_keys, candidate_values, *candidate_region_args)
+                    )
+                    num_users = user_key_counts.shape[0]
+                    region = q.shape[0] - num_users
+                    region_out = ranker_attention_varlen_candidate_only_fa4(
+                        q[:region],
+                        k,
+                        v,
+                        own_k[:region],
+                        own_v[:region],
+                        cu_seqlens,
+                        key_starts,
+                        key_counts,
+                        sm_scale,
+                    )
+                    user_out = ranker_attention_varlen_candidate_only_fa4(
+                        q[region:],
+                        k,
+                        v,
+                        own_k[region:],
+                        own_v[region:],
+                        jnp.arange(num_users + 1, dtype=jnp.int32),
+                        user_key_starts,
+                        user_key_counts,
+                        sm_scale,
+                    )
+                    return jnp.concatenate([region_out, user_out])[None], None
                 row_args = (
                     x[0]
                     for x in (q, k, v, candidate_keys, candidate_values, *candidate_region_args)
@@ -431,4 +474,6 @@ class CutedslRankerCandidateOnlyAttention(CustomAttention):
                 (name, _rep)
                 for name in ("candidate_cu_seqlens", "candidate_key_starts", "candidate_key_counts")
             )
+        if has_user_rows:
+            extras += (("user_key_starts", _rep), ("user_key_counts", _rep))
         return sharded_mha, extras

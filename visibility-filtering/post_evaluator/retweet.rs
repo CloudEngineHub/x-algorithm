@@ -243,9 +243,9 @@ mod tests {
     use crate::hydration::sources::{control, suspended, InMemorySources};
     use crate::hydration::{Hydrator, Lookup, Relation};
     use crate::models::{
-        ClientCapability, DropReason, LimitedEngagement, LimitedEngagementReason, MediaFeature,
-        MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate, SafetyLabelType,
-        TombstoneReason, TweetFeatures,
+        ClientCapability, ClientSwitch, DropReason, LimitedEngagement, LimitedEngagementReason,
+        MediaFeature, MediaInterstitial, MediaRestriction, NsfwFeature, Placement, RawCandidate,
+        SafetyLabelType, TombstoneReason, TweetFeatures,
     };
     use crate::rules::fixtures::{allow, legacy_interstitial, limited, noticed};
     use crate::rules::{RuleId, SafetyLevel};
@@ -1110,10 +1110,7 @@ Flock follows-rev[80] super_follows-fwd[] follows-fwd[] blocks-rev[80]",
 
     #[tokio::test]
     async fn a_viewer_removed_from_the_community_is_limited_on_any_retweet_of_its_post() {
-        let limits = ClientCapability {
-            community_viewer_removed_limits: true,
-            ..ClientCapability::default()
-        };
+        let limits = ClientCapability::DEFAULT.with(ClientSwitch::CommunityViewerRemovedLimits);
         let world = || {
             InMemorySources::default()
                 .retweet(1, 10, 5, Some(20))

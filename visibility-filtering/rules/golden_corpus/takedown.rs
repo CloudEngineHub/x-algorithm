@@ -3,7 +3,10 @@ use crate::models::{PostCandidate, TweetFeatures, ViewerFeatures};
 use crate::rules::fixtures::{
     allow, author_viewer, candidate, dropped, tweet_candidate, viewer_in_country,
 };
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use xai_core_entities::entities::TakedownReason;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -60,6 +63,22 @@ pub(super) fn rows() -> Vec<Row> {
                 ),
                 (
                     TimelineHome,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "legal_takedown/drop/unspecified",
+                    ),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "legal_takedown/drop/unspecified",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
                     Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
@@ -172,6 +191,22 @@ pub(super) fn rows() -> Vec<Row> {
                         },
                     ),
                     allow(),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::As("in_de", viewer_in_country("de")),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "local_laws_takedown/drop/unspecified",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::As("in_de", viewer_in_country("de")),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "local_laws_takedown/drop/unspecified",
+                    ),
                 ),
             ],
         },

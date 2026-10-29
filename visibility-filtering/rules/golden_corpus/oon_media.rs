@@ -24,6 +24,14 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::NonFollower, allow()),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "dmca_media/drop/unspecified",
+                    ),
+                ),
             ],
         },
         Row {
@@ -189,6 +197,14 @@ pub(super) fn rows() -> Vec<Row> {
                 (
                     TimelineHomeRecommendations,
                     Role::As("in_de", viewer_in_country("de")),
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "geo_restricted_media/drop/unspecified",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(
                         FilteredReason::UnspecifiedReason,
                         "geo_restricted_media/drop/unspecified",

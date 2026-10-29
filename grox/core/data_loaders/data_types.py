@@ -15,6 +15,7 @@ from strato_http.queries.data_types import (
 class AffiliatedBusiness(BaseModel):
     name: str | None = None
     url: str | None = None
+    badge_image_url: str | None = None
 
 
 BLUE_BADGE_SUBSCRIPTION_LEVELS = frozenset({"Premium", "PremiumPlus"})
@@ -99,6 +100,7 @@ class User(BaseModel):
             affiliated_business=AffiliatedBusiness(
                 name=author_metadata.affiliatedBusinessMetadata.name,
                 url=author_metadata.affiliatedBusinessMetadata.url,
+                badge_image_url=author_metadata.affiliatedBusinessMetadata.badgeImageUrl,
             )
             if author_metadata.affiliatedBusinessMetadata
             else None,

@@ -21,8 +21,8 @@ pub use verdict::{
 };
 pub(crate) use viewer::RequestViewer;
 pub use viewer::{
-    ClientCapability, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures,
-    ViewerProfile,
+    ClientCapability, ClientSwitch, ClientSwitchSet, NotificationFilters, VerifyBlurSupport,
+    Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
 };
 
 use crate::hydration::{Hydrator, Hydrators};

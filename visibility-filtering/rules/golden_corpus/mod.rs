@@ -30,7 +30,7 @@ use crate::models::{
 };
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
-use crate::rules::levels::{LevelRules, PostRules};
+use crate::rules::levels::{LevelLists, LevelRules};
 use crate::rules::rule_spec::engine::{Engine, UserEngine};
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::{placed_test_context, RuleEngine, SafetyLevel};
@@ -39,7 +39,7 @@ use prost::Message;
 use std::collections::BTreeSet;
 use std::iter::once;
 use strum::VariantArray;
-use SafetyLevel::{QuotedTweetRules, TimelineHomeHydration};
+use SafetyLevel::{TimelineHomeHydration, TimelineHomeRecommendations};
 
 enum Role {
     NonFollower,
@@ -49,6 +49,7 @@ enum Role {
     As(&'static str, ViewerFeatures),
     InnerQuoted(Box<Role>),
     RetweetSource(Box<Role>),
+    Each(Vec<Role>),
 }
 
 #[derive(Clone)]
@@ -95,43 +96,58 @@ impl Subject {
 }
 
 impl Role {
-    fn view(&self, subject: &mut Subject) -> (String, ViewerFeatures, Placement) {
-        let standalone = |name: &str, viewer| (name.to_owned(), viewer, Placement::Standalone);
+    fn each<const N: usize>(roles: [Role; N]) -> Role {
+        const { assert!(N > 0, "Role::each needs at least one role") };
+        Role::Each(roles.into())
+    }
+
+    fn views(&self, subject: &Subject) -> Vec<(String, ViewerFeatures, Placement, Subject)> {
+        let standalone = |name: &str, viewer, subject| {
+            vec![(name.to_owned(), viewer, Placement::Standalone, subject)]
+        };
+        let mut subject = subject.clone();
         match self {
-            Role::NonFollower => standalone("non_follower", viewer(VIEWER_ID)),
-            Role::Author => standalone("author", viewer(subject.author_id())),
+            Role::NonFollower => standalone("non_follower", viewer(VIEWER_ID), subject),
+            Role::Author => standalone("author", viewer(subject.author_id()), subject),
             Role::Follower => {
                 let edges = subject.edges_mut();
                 *edges = edges.with(Hydrator::Follows);
-                standalone("follower", viewer(VIEWER_ID))
+                standalone("follower", viewer(VIEWER_ID), subject)
             }
             Role::LoggedOut => {
                 *subject.edges_mut() = EdgeSet::default();
-                if let Subject::Post(post) = subject {
+                if let Subject::Post(post) = &mut subject {
                     post.post.conversation_root_author_blocks_viewer = false;
                 }
-                standalone("logged_out", logged_out_viewer())
+                standalone("logged_out", logged_out_viewer(), subject)
             }
-            Role::As(role_name, viewer) => standalone(role_name, viewer.clone()),
-            Role::InnerQuoted(role) => {
-                let (role_name, viewer, _) = role.view(subject);
-                (
-                    format!("inner_quoted_{role_name}"),
-                    viewer,
-                    Placement::InnerQuoted {
-                        outer: OUTER_TWEET_ID,
-                    },
-                )
-            }
+            Role::As(role_name, viewer) => standalone(role_name, viewer.clone(), subject),
+            Role::InnerQuoted(role) => role.placed(
+                &subject,
+                "inner_quoted",
+                Placement::InnerQuoted {
+                    outer: OUTER_TWEET_ID,
+                },
+            ),
             Role::RetweetSource(role) => {
-                let (role_name, viewer, _) = role.view(subject);
-                (
-                    format!("retweet_source_{role_name}"),
-                    viewer,
-                    Placement::RetweetSource,
-                )
+                role.placed(&subject, "retweet_source", Placement::RetweetSource)
             }
+            Role::Each(roles) => roles.iter().flat_map(|role| role.views(&subject)).collect(),
         }
+    }
+
+    fn placed(
+        &self,
+        subject: &Subject,
+        prefix: &str,
+        placement: Placement,
+    ) -> Vec<(String, ViewerFeatures, Placement, Subject)> {
+        self.views(subject)
+            .into_iter()
+            .map(|(role_name, viewer, _, subject)| {
+                (format!("{prefix}_{role_name}"), viewer, placement, subject)
+            })
+            .collect()
     }
 }
 
@@ -142,22 +158,22 @@ impl Row {
             subject,
             expect,
         } = self;
-        expect.into_iter().map(move |(level, role, expected)| {
+        expect.into_iter().flat_map(move |(level, role, expected)| {
             assert_eq!(
                 matches!(level.spec().rules(), LevelRules::UserOnly(_)),
                 matches!(subject, Subject::User(_)),
                 "{name}: {level:?} judges the other subject kind",
             );
-            let mut subject = subject.clone();
-            let (role_name, viewer, placement) = role.view(&mut subject);
-            CorpusCase {
-                name: format!("{name}/{level:?}/{role_name}"),
-                level,
-                viewer,
-                subject,
-                placement,
-                expected,
-            }
+            role.views(&subject)
+                .into_iter()
+                .map(move |(role_name, viewer, placement, subject)| CorpusCase {
+                    name: format!("{name}/{level:?}/{role_name}"),
+                    level,
+                    viewer,
+                    subject,
+                    placement,
+                    expected: expected.clone(),
+                })
         })
     }
 }
@@ -299,7 +315,7 @@ fn lifted(condition: RuleCond<UserEngine>) -> RuleCond {
     }
 }
 
-fn one_fold(PostRules { user, post }: PostRules) -> Policy {
+fn one_fold(LevelLists { user, post }: &LevelLists) -> Policy {
     let user = user.iter().map(|rule| Rule {
         id: rule.id,
         audience: rule.audience,
@@ -358,7 +374,7 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
     let mut diverged = Vec::new();
     for &level in SafetyLevel::VARIANTS {
         let rules = level.spec().rules().lists();
-        let reference = one_fold(rules);
+        let reference = one_fold(&rules);
         let used = rules
             .user
             .iter()
@@ -402,9 +418,53 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
     );
 }
 
+struct Preempted {
+    level: SafetyLevel,
+    rule: &'static str,
+    preempted_by: &'static [&'static str],
+}
+
+const PREEMPTED: [Preempted; 6] = [
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "nsfw_high_precision/blur/nudity",
+        preempted_by: &["nsfw_high_precision/drop/nsfw_media"],
+    },
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "nsfw_high_precision/blur/sensitive",
+        preempted_by: &["nsfw_high_precision/drop/nsfw_media"],
+    },
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "gore_and_violence_high_precision/blur",
+        preempted_by: &["gore_and_violence_high_precision/drop/nsfw_media"],
+    },
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "nsfw_card_image/blur/sensitive",
+        preempted_by: &["nsfw_card_image/drop/nsfw_media"],
+    },
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "nsfw_admin/blur/sensitive",
+        preempted_by: &[
+            "nsfw_admin_author/drop/nsfw_media",
+            "nsfw_admin_tweet_flag/drop/nsfw_media",
+        ],
+    },
+    Preempted {
+        level: TimelineHomeRecommendations,
+        rule: "nsfw_user/blur/sensitive_user",
+        preempted_by: &[
+            "nsfw_user_author/drop/nsfw_media",
+            "nsfw_user_tweet_flag/drop/nsfw_media",
+        ],
+    },
+];
+
 #[test]
-fn every_wired_rule_decides_a_corpus_case() {
-    const KEYED_BY_LEVEL: [SafetyLevel; 2] = [TimelineHomeHydration, QuotedTweetRules];
+fn every_wired_rule_decides_a_corpus_case_at_its_level() {
     let rule_engine = RuleEngine::for_tests();
     let decided: BTreeSet<(&'static str, &'static str)> = corpus()
         .iter()
@@ -423,18 +483,44 @@ fn every_wired_rule_decides_a_corpus_case() {
                 .into_iter()
                 .map(move |rule| (level, rule))
         })
+        .filter(|&(level, rule)| !decided.contains(&(level.into(), rule)))
         .filter(|&(level, rule)| {
-            if KEYED_BY_LEVEL.contains(&level) {
-                !decided.contains(&(<&'static str>::from(level), rule))
-            } else {
-                !decided.iter().any(|&(_, decider)| decider == rule)
-            }
+            !PREEMPTED
+                .iter()
+                .any(|preempted| (preempted.level, preempted.rule) == (level, rule))
         })
         .collect();
     assert!(
         missing.is_empty(),
-        "wired rules that decide no corpus case, at their own level for {KEYED_BY_LEVEL:?}: {missing:?}"
+        "wired rules that decide no corpus case at their own level: {missing:?}"
     );
+    for Preempted {
+        level,
+        rule,
+        preempted_by,
+    } in PREEMPTED
+    {
+        let at_level = <&'static str>::from(level);
+        let wired = rule_engine.wired_rule_names(level);
+        let position = |name| wired.iter().position(|&wired_name| wired_name == name);
+        let Some(rule_at) = position(rule) else {
+            panic!("{rule} is no longer wired at {level:?}");
+        };
+        assert!(
+            !decided.contains(&(at_level, rule)),
+            "{rule} decides a corpus case at {level:?}, so it is not preempted there"
+        );
+        for &by in preempted_by {
+            assert!(
+                position(by).is_some_and(|by_at| by_at < rule_at),
+                "{by}, which preempts {rule} at {level:?}, does not come before it in fold order"
+            );
+            assert!(
+                decided.contains(&(at_level, by)),
+                "{by}, which preempts {rule} at {level:?}, decides no corpus case there"
+            );
+        }
+    }
 }
 
 pub(super) fn corpus() -> Vec<CorpusCase> {

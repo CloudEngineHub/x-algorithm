@@ -2,7 +2,7 @@ use crate::clients::socialgraph_client::{EdgeDirection, Graph};
 use crate::hydration::fetcher::{FetcherId, Owner};
 use crate::hydration::inventory::{Source, Stake, Tier};
 use crate::hydration::relation::{Fetch, Relation};
-use crate::hydration::store::{KeyOrigin, Names};
+use crate::hydration::store::{ControlArms, KeyOrigin, Names};
 use crate::rules::Expansion;
 use strum::VariantArray;
 use xai_core_entities::gizmoduck_client::QueryFields;
@@ -115,7 +115,6 @@ pub(super) enum Part {
     Column,
     Fields(&'static [QueryFields]),
     Edge(Edge),
-    PairEdge(PairEdge),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, VariantArray)]
@@ -145,22 +144,6 @@ impl Edge {
             Edge::SuperFollows => Some((Graph::SuperFollows, Forward)),
             Edge::FollowedBy => Some((Graph::Follows, Reverse)),
             Edge::SecondDegree | Edge::TrustedFriends | Edge::OutsidePlace => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, VariantArray)]
-#[repr(u8)]
-pub(super) enum PairEdge {
-    AuthorBlocksOuterAuthor,
-    OuterAuthorFollowsAuthor,
-}
-
-impl PairEdge {
-    pub(super) const fn graph(self) -> Graph {
-        match self {
-            PairEdge::AuthorBlocksOuterAuthor => Graph::Blocks,
-            PairEdge::OuterAuthorFollowsAuthor => Graph::Follows,
         }
     }
 }
@@ -349,7 +332,7 @@ impl Hydrator {
             H::RootFollowsViewer => node(
                 S::Flock,
                 Part::Edge(Edge::FollowedBy),
-                K::CommunityOrMyNetworkRoot,
+                K::ControlRoot(ControlArms::CommunityOrMyNetwork),
                 CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
@@ -363,14 +346,14 @@ impl Hydrator {
             H::SuperFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::SuperFollows),
-                K::SubscribersRoot,
+                K::ControlRoot(ControlArms::Subscribers),
                 CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
             H::ViewerFollowsRoot => node(
                 S::Flock,
                 Part::Edge(Edge::Follows),
-                K::FollowersRoot,
+                K::ControlRoot(ControlArms::Followers),
                 CONVERSATION_ROOT_AUTHOR_EDGES,
                 BestEffort,
             ),
@@ -467,9 +450,9 @@ impl Hydrator {
             H::AuthorBlocksOuterAuthor => reads(
                 Relation::QuoteOuter,
                 node(
-                    S::FlockUserPair,
-                    Part::PairEdge(PairEdge::AuthorBlocksOuterAuthor),
-                    K::Pair(PairEdge::AuthorBlocksOuterAuthor),
+                    S::Flock,
+                    Part::Edge(Edge::Blocks),
+                    K::QuotedAuthorToQuotingAuthor,
                     QUOTE_AUTHOR_EDGES,
                     MustHave,
                 ),
@@ -477,9 +460,9 @@ impl Hydrator {
             H::OuterAuthorFollowsAuthor => reads(
                 Relation::QuoteOuter,
                 node(
-                    S::FlockUserPair,
-                    Part::PairEdge(PairEdge::OuterAuthorFollowsAuthor),
-                    K::Pair(PairEdge::OuterAuthorFollowsAuthor),
+                    S::Flock,
+                    Part::Edge(Edge::Follows),
+                    K::QuotingAuthorToProtectedQuotedAuthor,
                     QUOTE_AUTHOR_EDGES,
                     BestEffort,
                 ),
@@ -626,18 +609,19 @@ impl Hydrator {
     pub(super) const fn edge(self) -> Option<Edge> {
         match self.spec().part {
             Part::Edge(edge) => Some(edge),
-            Part::Column | Part::Fields(_) | Part::PairEdge(_) => None,
+            Part::Column | Part::Fields(_) => None,
         }
     }
 
-    pub(super) const fn pair_edge(self) -> Option<PairEdge> {
-        match self.spec().part {
-            Part::PairEdge(edge) => Some(edge),
-            Part::Column | Part::Fields(_) | Part::Edge(_) => None,
-        }
+    pub(super) const fn is_quote_pair_edge(self) -> bool {
+        self.is_edge() && self.spec().key.is_quote_pair()
     }
 
-    pub(crate) const fn is_edge(self) -> bool {
+    pub(crate) const fn is_viewer_edge(self) -> bool {
+        self.is_edge() && !self.spec().key.is_quote_pair()
+    }
+
+    pub(super) const fn is_edge(self) -> bool {
         self.edge().is_some()
     }
 
@@ -647,7 +631,7 @@ impl Hydrator {
             Some(relation) => relation.spec().trigger.needs_viewer(),
             None => false,
         };
-        self.is_edge() || spec.key.needs_viewer() || joins_for_viewer
+        self.is_viewer_edge() || spec.key.needs_viewer() || joins_for_viewer
     }
 }
 
@@ -745,7 +729,23 @@ const fn stakes_fit_their_nodes() -> bool {
     true
 }
 
+const fn quote_pair_edges_are_the_quote_outers_edges() -> bool {
+    let mut rest = Hydrator::VARIANTS;
+    while let [node, tail @ ..] = rest {
+        let quote_outer_owns = matches!(
+            node.spec().fetcher().owner,
+            Owner::Related(Relation::QuoteOuter)
+        );
+        if node.is_edge() && quote_outer_owns != node.is_quote_pair_edge() {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
 const _: () = assert!(inputs_precede_nodes());
+const _: () = assert!(quote_pair_edges_are_the_quote_outers_edges());
 const _: () = assert!(stakes_fit_their_nodes());
 const _: () = assert!(best_effort_inputs_key_only_best_effort_nodes());
 const _: () = assert!(owning_relations_read_owned_sources());

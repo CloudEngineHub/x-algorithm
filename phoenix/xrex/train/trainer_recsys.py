@@ -710,6 +710,33 @@ class RecsysTrainer(Trainer):
             return {}
         return self.model_config.value_head_ema_keys()
 
+    def _metric_ema_cells(self) -> list[tuple[str, str]]:
+        assert isinstance(self.model_config, RecsysAggregatedModelConfig)
+        from xrex.data.recsys.ads_head_masking import metric_head_mask_keys
+        from xrex.data.recsys.constants import engagement_to_ids
+        from xrex.models.recsys_model import build_metric_masks
+
+        dummy = jnp.zeros((1, 1))
+        dummy_3d = jnp.zeros((1, 1, self.model_config.model_config.output_vocab_size))
+        mask_keys = list(
+            build_metric_masks(
+                dummy,
+                dummy_3d,
+                dummy,
+                dummy,
+                trained_candidate_mask=dummy_3d,
+                ads_head_masking=self.model_config.ads_head_masking,
+                enable_platform_metrics=self.model_config.enable_platform_metrics,
+                metric_mask_keys=self.model_config.metric_mask_keys,
+            ).keys()
+        )
+        head_mask_keys = metric_head_mask_keys(
+            engagement_to_ids(self.model_config.metric_group),
+            mask_keys,
+            own_slice=self.model_config.metric_own_slice,
+        )
+        return [(e, m) for e, ms in head_mask_keys.items() for m in ms]
+
     def _conversion_delay_slice_ema_keys(self, state_size: int) -> dict[str, jax.Array]:
         if not isinstance(self.model_config, RecsysAggregatedModelConfig):
             return {}
@@ -804,29 +831,12 @@ class RecsysTrainer(Trainer):
         rep = self.dataset.num_kafka_partitions or 1
 
         rce_ema = None
+        cells: list[tuple[str, str]] = []
         if self.smoothing_windows and isinstance(self.model_config, RecsysAggregatedModelConfig):
-            from xrex.data.recsys.constants import engagement_to_ids
-            from xrex.models.recsys_model import build_metric_masks
-
-            eng_names = list(engagement_to_ids(self.model_config.metric_group).keys())
-            dummy = jnp.zeros((1, 1))
-            dummy_3d = jnp.zeros((1, 1, self.model_config.model_config.output_vocab_size))
-            mask_keys = list(
-                build_metric_masks(
-                    dummy,
-                    dummy_3d,
-                    dummy,
-                    dummy,
-                    trained_candidate_mask=dummy_3d,
-                    ads_head_masking=self.model_config.ads_head_masking,
-                    enable_platform_metrics=self.model_config.enable_platform_metrics,
-                    metric_mask_keys=self.model_config.metric_mask_keys,
-                ).keys()
-            )
+            cells = self._metric_ema_cells()
             rce_ema = {
                 f"{e}/{m}/{ws}": jnp.zeros((3,), dtype=jnp.float32)
-                for e in eng_names
-                for m in mask_keys
+                for e, m in cells
                 for ws in self.smoothing_windows
             }
             rce_ema.update(self._value_head_ema_keys())
@@ -836,8 +846,7 @@ class RecsysTrainer(Trainer):
         if rce_ema is not None:
             calib_ema = {
                 f"{e}/{m}/{ws}": jnp.zeros((2,), dtype=jnp.float32)
-                for e in eng_names
-                for m in mask_keys
+                for e, m in cells
                 for ws in self.smoothing_windows
             }
             calib_ema.update(self._conversion_delay_slice_ema_keys(2))
@@ -2703,8 +2712,6 @@ class RecsysTrainer(Trainer):
         ):
             if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):
                 raise ValueError("page_rl needs a dataset with page_records=True")
-            if self.seqpack_candidate_packing:
-                raise ValueError("page_rl does not support seqpack_candidate_packing")
         if self.model_config.model_config.fp8_gemms != Fp8Gemms.OFF and not self.forward_only:
             if not self.use_async_emb:
                 raise ValueError("fp8_gemms requires use_async_emb=True")
@@ -3205,34 +3212,16 @@ class RecsysTrainer(Trainer):
                         )
 
         if self.smoothing_windows and isinstance(self.model_config, RecsysAggregatedModelConfig):
-            from xrex.data.recsys.constants import engagement_to_ids
-            from xrex.models.recsys_model import build_metric_masks
-
-            eng_names = list(engagement_to_ids(self.model_config.metric_group).keys())
-            dummy = jnp.zeros((1, 1))
-            dummy_3d = jnp.zeros((1, 1, self.model_config.model_config.output_vocab_size))
-            mask_keys = list(
-                build_metric_masks(
-                    dummy,
-                    dummy_3d,
-                    dummy,
-                    dummy,
-                    trained_candidate_mask=dummy_3d,
-                    ads_head_masking=self.model_config.ads_head_masking,
-                    enable_platform_metrics=self.model_config.enable_platform_metrics,
-                    metric_mask_keys=self.model_config.metric_mask_keys,
-                ).keys()
-            )
+            cells = self._metric_ema_cells()
             loaded_rce = self.state.rce_ema
             reconciled_rce: dict[str, jax.Array] = {}
-            for e in eng_names:
-                for m in mask_keys:
-                    for ws in self.smoothing_windows:
-                        key = f"{e}/{m}/{ws}"
-                        if loaded_rce and key in loaded_rce and loaded_rce[key].shape == (3,):
-                            reconciled_rce[key] = loaded_rce[key]
-                        else:
-                            reconciled_rce[key] = jnp.zeros((3,), dtype=jnp.float32)
+            for e, m in cells:
+                for ws in self.smoothing_windows:
+                    key = f"{e}/{m}/{ws}"
+                    if loaded_rce and key in loaded_rce and loaded_rce[key].shape == (3,):
+                        reconciled_rce[key] = loaded_rce[key]
+                    else:
+                        reconciled_rce[key] = jnp.zeros((3,), dtype=jnp.float32)
             for key, zeros in {
                 **self._value_head_ema_keys(),
                 **self._conversion_delay_slice_ema_keys(3),
@@ -3244,14 +3233,13 @@ class RecsysTrainer(Trainer):
 
             loaded_calib = self.state.calib_ema
             reconciled_calib: dict[str, jax.Array] = {}
-            for e in eng_names:
-                for m in mask_keys:
-                    for ws in self.smoothing_windows:
-                        key = f"{e}/{m}/{ws}"
-                        if loaded_calib and key in loaded_calib and loaded_calib[key].shape == (2,):
-                            reconciled_calib[key] = loaded_calib[key]
-                        else:
-                            reconciled_calib[key] = jnp.zeros((2,), dtype=jnp.float32)
+            for e, m in cells:
+                for ws in self.smoothing_windows:
+                    key = f"{e}/{m}/{ws}"
+                    if loaded_calib and key in loaded_calib and loaded_calib[key].shape == (2,):
+                        reconciled_calib[key] = loaded_calib[key]
+                    else:
+                        reconciled_calib[key] = jnp.zeros((2,), dtype=jnp.float32)
             for key, zeros in self._conversion_delay_slice_ema_keys(2).items():
                 loaded = loaded_calib.get(key) if loaded_calib else None
                 reconciled_calib[key] = (

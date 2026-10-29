@@ -2,7 +2,10 @@ use super::{Role, Row, Subject};
 use crate::models::{AuthorFeatures, PostCandidate, SafetyLabelType, Verdict};
 use crate::rules::fixtures::{allow, appealed, author_candidate, candidate, dropped};
 use crate::rules::SafetyLevel;
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use xai_visibility_filtering::models::FilteredReason;
 use xai_x_thrift::action::AppealablePolicy;
 
@@ -52,6 +55,16 @@ pub(super) fn rows() -> Vec<Row> {
                     dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
                 ),
                 (TimelineHomeHydration, Role::Author, allow()),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::AuthorIsSuspended, "suspended_author/drop"),
+                ),
             ],
         },
         Row {
@@ -125,6 +138,22 @@ pub(super) fn rows() -> Vec<Row> {
                         "deactivated_author/drop",
                     ),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::AuthorIsDeactivated,
+                        "deactivated_author/drop",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::AuthorIsDeactivated,
+                        "deactivated_author/drop",
+                    ),
+                ),
             ],
         },
         Row {
@@ -178,6 +207,22 @@ pub(super) fn rows() -> Vec<Row> {
                         "erased_author/drop/inactive",
                     ),
                 ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::AuthorAccountIsInactive,
+                        "erased_author/drop/inactive",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::AuthorAccountIsInactive,
+                        "erased_author/drop/inactive",
+                    ),
+                ),
             ],
         },
         Row {
@@ -204,6 +249,22 @@ pub(super) fn rows() -> Vec<Row> {
                 (
                     TimelineHomeHydration,
                     Role::Follower,
+                    dropped(
+                        FilteredReason::AuthorAccountIsInactive,
+                        "offboarded_author/drop/inactive",
+                    ),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::AuthorAccountIsInactive,
+                        "offboarded_author/drop/inactive",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(
                         FilteredReason::AuthorAccountIsInactive,
                         "offboarded_author/drop/inactive",
@@ -237,6 +298,16 @@ pub(super) fn rows() -> Vec<Row> {
                 (
                     TimelineHomeHydration,
                     Role::LoggedOut,
+                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
                 ),
             ],

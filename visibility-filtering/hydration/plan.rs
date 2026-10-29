@@ -14,7 +14,7 @@ pub(crate) struct HydrationPlan {
     level: SafetyLevel,
     rows: RequestRows,
     groups: Vec<Group>,
-    edge_ceilings: Vec<(Edge, Duration)>,
+    edge_ceilings: Vec<(FetcherId, Edge, Duration)>,
     nodes: Hydrators,
     logged_out_nodes: Hydrators,
 }
@@ -79,17 +79,19 @@ impl HydrationPlan {
                     .collect()
             })
             .collect();
-        let edge_ceilings = Edge::VARIANTS
-            .iter()
-            .filter_map(|&edge| {
-                let longest = groups
-                    .iter()
-                    .filter(|group| group.nodes.iter().any(|node| node.edge() == Some(edge)))
-                    .map(Group::ceiling)
-                    .max()?;
-                Some((edge, longest))
-            })
-            .collect();
+        let mut edge_ceilings: Vec<(FetcherId, Edge, Duration)> = Vec::new();
+        for group in &groups {
+            for edge in group.nodes.iter().filter_map(Hydrator::edge) {
+                let ceiling = group.ceiling();
+                match edge_ceilings
+                    .iter_mut()
+                    .find(|(fetcher, read, _)| *fetcher == group.fetcher && *read == edge)
+                {
+                    Some((.., longest)) => *longest = (*longest).max(ceiling),
+                    None => edge_ceilings.push((group.fetcher, edge, ceiling)),
+                }
+            }
+        }
         for (group, readers) in groups.iter_mut().zip(readers) {
             group.edges = edges(group.nodes);
             group.fields = fields(group.fetcher, group.nodes, rows);
@@ -182,8 +184,8 @@ impl HydrationPlan {
             .filter_map(|edge| {
                 self.edge_ceilings
                     .iter()
-                    .find(|&&(read, _)| read == edge)
-                    .map(|&(_, ceiling)| ceiling)
+                    .find(|&&(fetcher, read, _)| fetcher == group.fetcher && read == edge)
+                    .map(|&(.., ceiling)| ceiling)
             })
             .fold(group.ceiling(), Duration::max)
     }
@@ -296,12 +298,6 @@ impl fmt::Display for HydrationPlan {
                     keys.join(",")
                 )?;
             }
-            for node in group.nodes.iter() {
-                if let Some(edge) = node.pair_edge() {
-                    let graph: &str = edge.graph().into();
-                    write!(f, " {graph}-fwd[{}]", node.key_at(self.rows))?;
-                }
-            }
             if group.nodes.iter().all(Hydrator::needs_viewer) {
                 f.write_str(" (skipped logged out)")?;
             }
@@ -395,22 +391,9 @@ mod tests {
                     }
                     let nodes = group.nodes.union(other.nodes);
                     assert!(
-                        nodes
-                            .iter()
-                            .all(|node| node.edge().is_some() || node.pair_edge().is_some()),
+                        nodes.iter().all(|node| node.edge().is_some()),
                         "{level:?} {:?}: two groups claim one fetcher's keys",
                         group.fetcher
-                    );
-                    assert!(
-                        group
-                            .nodes
-                            .iter()
-                            .filter_map(Hydrator::pair_edge)
-                            .all(|edge| !other
-                                .nodes
-                                .iter()
-                                .any(|node| node.pair_edge() == Some(edge))),
-                        "{level:?}: two groups read one pair edge"
                     );
                 }
             }

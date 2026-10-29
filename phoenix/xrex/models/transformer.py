@@ -17,7 +17,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
-from xrex.data.recsys.sequence_packing import SequencePackedLayout
+from xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions
 from xrex.models.attention import AttentionConfig
 from xrex.models.fp8 import Fp8Dot, Fp8Gemms
 from xrex.models.layers import (
@@ -84,6 +84,7 @@ class TransformerConfig(Config):
     use_layer_stack: bool = False
     unroll_layer_stack: bool = False
     num_candidate_only_layers: int = 0
+    candidate_only_layers_update_user_token: bool = False
 
     use_remat: bool = True
     remat_policy: RematType = RematType.WHOLE
@@ -747,6 +748,7 @@ class Transformer(hk.Module):
             seqpack_layout: SequencePackedLayout | None = None,
             history_states: jax.Array | None = None,
             fp8_gemms: Fp8Gemms = config.fp8_gemms,
+            positions: jax.Array | None = positions,
         ) -> DecoderOutput:
             return block_remat_fn(
                 DecoderLayer(
@@ -797,9 +799,34 @@ class Transformer(hk.Module):
                     "Otherwise set candidate_only_attn_impl=None."
                 )
 
+            update_user_token = config.candidate_only_layers_update_user_token
+            if update_user_token:
+                if seqpack_layout is not None:
+                    user_positions = jnp.asarray(
+                        packed_prefix_positions(seqpack_layout), dtype=jnp.int32
+                    )
+                elif use_candidate_only_kernel:
+                    raise ValueError(
+                        "candidate_only_layers_update_user_token with candidate_only_attn_impl "
+                        "needs seqpack_candidate_packing."
+                    )
+                else:
+                    user_positions = jnp.zeros((B, 1), dtype=jnp.int32)
+                rows = jnp.arange(B)[:, None]
+                is_candidate = is_candidate | jnp.zeros((B, T), bool).at[rows, user_positions].set(
+                    True
+                )
+
+                def take_user_rows(x: jax.Array) -> jax.Array:
+                    return jnp.take_along_axis(x, user_positions[:, :, None], axis=1)
+
             def split_history_and_candidates(
                 hidden_states: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
+                if use_candidate_only_kernel and update_user_token:
+                    history = hidden_states[:, :candidate_start]
+                    candidates = hidden_states[:, candidate_start:]
+                    return history, jnp.concatenate([candidates, take_user_rows(history)], axis=1)
                 if use_candidate_only_kernel:
                     return hidden_states[:, :candidate_start], hidden_states[:, candidate_start:]
                 return hidden_states, hidden_states
@@ -809,6 +836,12 @@ class Transformer(hk.Module):
             ) -> DecoderOutput:
                 run_layer = partial(run_decoder_layer, fp8_gemms=Fp8Gemms.OFF, **layer_kwargs)
                 if use_candidate_only_kernel:
+                    if update_user_token and positions is not None:
+                        user_token_positions = take_user_rows(positions)
+                        run_layer = partial(
+                            run_layer,
+                            positions=jnp.concatenate([positions, user_token_positions], axis=1),
+                        )
                     return run_layer(candidate_states, history_states=history_states)
 
                 decoder_output = run_layer(candidate_states)
@@ -822,6 +855,12 @@ class Transformer(hk.Module):
             if use_candidate_only_kernel:
                 num_candidates = T - candidate_start
                 candidate_only_stats_mask = padding_mask[:, candidate_start:] * (num_candidates / T)
+                if update_user_token:
+                    user_mask = take_user_rows(padding_mask[..., None])[..., 0]
+                    row_mask = jnp.concatenate(
+                        [padding_mask[:, candidate_start:], user_mask], axis=1
+                    )
+                    candidate_only_stats_mask = row_mask * (row_mask.shape[1] / T)
             else:
                 candidate_only_stats_mask = padding_mask * is_candidate
 
@@ -888,6 +927,11 @@ class Transformer(hk.Module):
                 history_states, candidate_states = hidden_states
 
                 if use_candidate_only_kernel:
+                    if update_user_token:
+                        candidate_states, user_states = jnp.split(
+                            candidate_states, [T - candidate_start], axis=1
+                        )
+                        history_states = history_states.at[rows, user_positions].set(user_states)
                     hidden_states = jnp.concatenate([history_states, candidate_states], axis=1)
                 else:
                     hidden_states = candidate_states

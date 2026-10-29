@@ -53,7 +53,7 @@ pub(crate) enum LevelSpec {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct UserRules(&'static [&'static UserRule]);
+pub(crate) struct UserRules(&'static [&'static [&'static UserRule]]);
 
 pub(crate) struct PostLevel {
     proto: Option<vf_pb::SafetyLevel>,

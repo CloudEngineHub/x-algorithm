@@ -4,7 +4,7 @@ use crate::hydration::decode::author::{AuthorNotFound, DecodedActor, DecodedAuth
 use crate::hydration::decode::viewer::DecodedViewer;
 use crate::hydration::execute::Reply;
 use crate::hydration::fetcher::{AnyFetcher, Fetcher, FetcherId, Fetchers, Owner};
-use crate::hydration::hydrator::{Edge, NodeSpec, PairEdge, RequestRows};
+use crate::hydration::hydrator::{Edge, NodeSpec, RequestRows, UserPair};
 use crate::hydration::inventory::{Answer, Effect, Source, Stake, claimed_answer_fails, classify};
 use crate::hydration::plan::Group;
 use crate::hydration::relation::{Related, Relation, Role, Trigger};
@@ -17,7 +17,7 @@ use crate::models::{
     ArticleLifecycle, AuthorId, ClientCapability, CommunityModeration, NotificationFilters,
     PureCore, RawCandidate, RetweetMerge, TweetFeatures, TweetId, Viewer, ViewerFeatures,
 };
-pub(super) use key_origin::{KeyOrigin, Names};
+pub(super) use key_origin::{ControlArms, KeyOrigin, Names};
 use quotes::Quotes;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering_proto as vf_pb;
 
 mod conversation_root;
+mod edges;
 mod key_origin;
 mod quotes;
 mod resolve;
@@ -68,16 +69,10 @@ pub(super) struct CallRequest<'p> {
     pub(super) keys: Vec<u64>,
     pub(super) key_count: usize,
     queries: Vec<EdgeQuery>,
-    queried_edges: Vec<QueriedEdge>,
+    queried_edges: Vec<Edge>,
     pub(super) community_posts: Vec<CommunityPost>,
     pub(super) viewer_id: Option<u64>,
         pub(super) candidate_count_by_claimed_key: FxHashMap<u64, usize>,
-}
-
-#[derive(Clone, Copy)]
-enum QueriedEdge {
-    Viewer(Edge),
-    Pair(PairEdge),
 }
 
 impl CallRequest<'_> {
@@ -85,7 +80,7 @@ impl CallRequest<'_> {
         &self.queries
     }
 
-    fn edge_queries(&self) -> impl Iterator<Item = (QueriedEdge, &EdgeQuery)> {
+    fn edge_queries(&self) -> impl Iterator<Item = (Edge, &EdgeQuery)> {
         debug_assert_eq!(self.queried_edges.len(), self.queries.len());
         self.queried_edges.iter().copied().zip(&self.queries)
     }
@@ -93,10 +88,7 @@ impl CallRequest<'_> {
     pub(super) fn claimed_edges(&self) -> impl Iterator<Item = Edge> + '_ {
         self.edge_queries()
             .filter(|(_, query)| !query.destination_ids.is_empty())
-            .filter_map(|(queried, _)| match queried {
-                QueriedEdge::Viewer(edge) => Some(edge),
-                QueriedEdge::Pair(_) => None,
-            })
+            .map(|(edge, _)| edge)
     }
 }
 
@@ -134,7 +126,7 @@ pub(super) struct Store {
     actors: Fetcher<DecodedActor>,
     actor_emails: Fetcher<bool>,
     actor_phones: Fetcher<bool>,
-    edges: [Fetcher<bool>; Edge::VARIANTS.len()],
+    edges: [Fetchers<bool, UserPair>; Edge::VARIANTS.len()],
     has_called: Vec<bool>,
     viewer_country: Fetcher<Arc<str>>,
     community_moderations: Fetcher<CommunityModeration>,
@@ -321,32 +313,24 @@ impl Store {
 
     fn claim(&mut self, nodes: Hydrators) -> Vec<u64> {
         let keys = self.keys(nodes);
-        match nodes.iter().next().and_then(|node| self.fetcher_mut(node)) {
+        let Some(node) = nodes.iter().next() else {
+            return Vec::new();
+        };
+        if node.is_edge() {
+            return self.claim_viewer_edge(node, keys);
+        }
+        match self.fetcher_mut(node) {
             Some(fetcher) => fetcher.claim(keys),
             None => Vec::new(),
         }
     }
 
-    fn edge_fetcher(&self, edge: Edge) -> Option<&Fetcher<bool>> {
-        self.edges.get(usize::from(edge as u8))
-    }
-
-    fn edge_fetcher_mut(&mut self, edge: Edge) -> Option<&mut Fetcher<bool>> {
-        self.edges.get_mut(usize::from(edge as u8))
-    }
-
     fn fetcher(&self, node: Hydrator) -> Option<&dyn AnyFetcher> {
-        match node.edge() {
-            Some(edge) => Some(self.edge_fetcher(edge)?),
-            None => self.fetcher_by_id(self.spec(node).fetcher()),
-        }
+        self.fetcher_by_id(self.spec(node).fetcher())
     }
 
     fn fetcher_mut(&mut self, node: Hydrator) -> Option<&mut dyn AnyFetcher> {
-        match node.edge() {
-            Some(edge) => Some(self.edge_fetcher_mut(edge)?),
-            None => self.fetcher_by_id_mut(self.spec(node).fetcher()),
-        }
+        self.fetcher_by_id_mut(self.spec(node).fetcher())
     }
 
     fn fetcher_by_id(&self, FetcherId { source, owner }: FetcherId) -> Option<&dyn AnyFetcher> {
@@ -368,11 +352,9 @@ impl Store {
             Source::ArticleLifecycle => &self.article_lifecycles,
             Source::ArticleMediaEntities => &self.article_media_entities,
             Source::ArticleCoverMedia => &self.article_cover_media,
-            Source::Flock
-            | Source::Wingman
-            | Source::TrustedFriends
-            | Source::UserLocation
-            | Source::FlockUserPair => return None,
+            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
+                return None;
+            }
         };
         Some(fetcher)
     }
@@ -399,11 +381,9 @@ impl Store {
             Source::ArticleLifecycle => &mut self.article_lifecycles,
             Source::ArticleMediaEntities => &mut self.article_media_entities,
             Source::ArticleCoverMedia => &mut self.article_cover_media,
-            Source::Flock
-            | Source::Wingman
-            | Source::TrustedFriends
-            | Source::UserLocation
-            | Source::FlockUserPair => return None,
+            Source::Flock | Source::Wingman | Source::TrustedFriends | Source::UserLocation => {
+                return None;
+            }
         };
         Some(fetcher)
     }
@@ -442,17 +422,21 @@ impl Store {
         let mut queries = Vec::new();
         let mut queried_edges = Vec::new();
         for &(edge, graph, direction, nodes) in group.edges() {
-            queried_edges.push(QueriedEdge::Viewer(edge));
-            queries.push(EdgeQuery {
+            let query = |from, destination_ids| EdgeQuery {
                 graph,
                 direction,
-                from: EdgeFrom::Viewer,
-                destination_ids: self.claim(nodes),
-            });
-        }
-        for (edge, query) in self.claim_pairs(group.nodes) {
-            queried_edges.push(QueriedEdge::Pair(edge));
-            queries.push(query);
+                from,
+                destination_ids,
+            };
+            if nodes.iter().any(Hydrator::is_quote_pair_edge) {
+                for (source, destination_ids) in self.claim_quote_pairs(nodes) {
+                    queried_edges.push(edge);
+                    queries.push(query(EdgeFrom::User(source), destination_ids));
+                }
+            } else {
+                queried_edges.push(edge);
+                queries.push(query(EdgeFrom::Viewer, self.claim(nodes)));
+            }
         }
         let keys = if queries.is_empty() {
             self.claim(group.nodes)
@@ -473,7 +457,6 @@ impl Store {
             | Source::GizmoduckViewer
             | Source::GizmoduckAuthor
             | Source::Flock
-            | Source::FlockUserPair
             | Source::ViewerCountry
             | Source::Wingman
             | Source::CommunityModerator
@@ -558,20 +541,15 @@ impl Store {
             Reply::ActorPhones(phones) => self.actor_phones.land(keys, phones),
             Reply::Select(answers) => {
                 debug_assert_eq!(answers.len(), call.queries.len(), "one answer per query");
-                for ((queried, query), answer) in call.edge_queries().zip(answers) {
-                    match queried {
-                        QueriedEdge::Viewer(edge) => {
-                            if let Some(fetcher) = self.edge_fetcher_mut(edge) {
-                                fetcher.land(&query.destination_ids, answer);
-                            }
-                        }
-                        QueriedEdge::Pair(edge) => self.quotes.land_pair(edge, query, answer),
+                for ((edge, query), answer) in call.edge_queries().zip(answers) {
+                    if let Some(source) = query.from.id(call.viewer_id) {
+                        self.land_edge(owner, edge, source, &query.destination_ids, answer);
                     }
                 }
             }
             Reply::Edge(edge, answers) => {
-                if let Some(fetcher) = self.edge_fetcher_mut(edge) {
-                    fetcher.land(keys, answers);
+                if let Some(source) = call.viewer_id {
+                    self.land_edge(owner, edge, source, keys, answers);
                 }
             }
             Reply::ViewerCountry(country) => self.viewer_country.land(keys, country),
@@ -749,9 +727,8 @@ impl Store {
             .iter()
             .filter(|&node| self.origin(node).names() == Names::Viewer)
             .filter(|&node| {
-                self.fetcher(node).is_some_and(|fetcher| {
-                    claimed_answer_fails(self.stake(node), fetcher.answer(viewer_id))
-                })
+                self.answer(node, viewer_id)
+                    .is_some_and(|answer| claimed_answer_fails(self.stake(node), answer))
             })
             .fold(Hydrators::empty(), Hydrators::with)
     }
@@ -768,10 +745,9 @@ impl Store {
             let Some(key) = self.parent_key(node, row, position) else {
                 continue;
             };
-            let Some(fetcher) = self.fetcher(node) else {
+            let Some(answer) = self.answer(node, key) else {
                 continue;
             };
-            let answer = fetcher.answer(key);
             if answer == Answer::Unclaimed {
                 if !has_joined_retweet_sources {
                     continue;
@@ -831,10 +807,7 @@ mod tests {
                 .iter()
                 .filter(|node| node.spec().source == source)
                 .collect();
-            !readers.is_empty()
-                && readers
-                    .iter()
-                    .all(|node| node.is_edge() || node.pair_edge().is_some())
+            !readers.is_empty() && readers.iter().all(|node| node.is_edge())
         };
         let mut fetchers = Vec::new();
         for id in FetcherId::all() {

@@ -2,7 +2,7 @@ use super::inputs::Inputs;
 use super::spelled_label;
 use super::Truth;
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::{AuthorLabel, PostCandidate, SafetyLabelType, VerifyBlurSupport};
+use crate::models::{AuthorLabel, ClientSwitch, PostCandidate, SafetyLabelType, VerifyBlurSupport};
 use crate::params::CountryList;
 use crate::rules::context::{At, CoreFacts};
 use crate::rules::rule_spec::engine::Candidate;
@@ -135,6 +135,12 @@ impl Payload for ConversationControlArm {
     }
 }
 
+impl Payload for ClientSwitch {
+    fn spelled(self) -> String {
+        <&str>::from(self).to_owned()
+    }
+}
+
 impl Payload for VerifyBlurSupport {
     fn spelled(self) -> String {
         format!("{self:?}")
@@ -205,8 +211,8 @@ impl<const N: u8> EdgeFeature<N> {
 impl<const N: u8> Feature for EdgeFeature<N> {
     const REQUIRED: Hydrators = {
         assert!(
-            Self::NODE.is_edge(),
-            "EdgeFeature<N> names a node that is not an edge"
+            Self::NODE.is_viewer_edge(),
+            "EdgeFeature<N> names a node that is not a viewer edge"
         );
         Hydrators::of(Self::NODE)
     };

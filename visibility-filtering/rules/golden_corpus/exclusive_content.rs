@@ -2,7 +2,10 @@ use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
 use crate::models::{PostCandidate, SafetyLabelType};
 use crate::rules::fixtures::{allow, candidate, dropped, CandidateBuilder};
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use xai_visibility_filtering::models::FilteredReason;
 
 pub(super) fn rows() -> Vec<Row> {
@@ -20,6 +23,16 @@ pub(super) fn rows() -> Vec<Row> {
                 (
                     TimelineHome,
                     Role::LoggedOut,
+                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
                     dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
                 ),
             ],

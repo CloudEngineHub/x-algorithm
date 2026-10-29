@@ -1,12 +1,15 @@
 use super::{Role, Row, Subject};
 use crate::models::{
-    AuthorFeatures, ClientCapability, LimitedEngagementReason, PostCandidate, TweetFeatures,
-    ViewerFeatures,
+    AuthorFeatures, ClientCapability, ClientSwitch, LimitedEngagementReason, PostCandidate,
+    TweetFeatures, ViewerFeatures,
 };
 use crate::rules::fixtures::{
     allow, candidate, dropped, limited, tweet_candidate, viewer, VIEWER_ID,
 };
-use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
+use crate::rules::SafetyLevel::{
+    ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
+    TimelineHomeRecommendations,
+};
 use std::num::NonZeroU64;
 use xai_visibility_filtering::models::FilteredReason;
 
@@ -24,6 +27,11 @@ pub(super) fn rows() -> Vec<Row> {
                 (
                     TimelineHome,
                     Role::Author,
+                    dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
                     dropped(FilteredReason::TweetIsNullcast, "nullcasted_tweet/drop"),
                 ),
             ],
@@ -119,14 +127,28 @@ pub(super) fn rows() -> Vec<Row> {
                     Role::As(
                         "client_without_stale_tweet_limits",
                         ViewerFeatures {
-                            client_capability: ClientCapability {
-                                stale_tweet_limits: false,
-                                ..ClientCapability::default()
-                            },
+                            client_capability: ClientCapability::DEFAULT
+                                .without(ClientSwitch::StaleTweetLimits),
                             ..viewer(VIEWER_ID)
                         },
                     ),
                     allow(),
+                ),
+                (
+                    TimelineHomeRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "stale_tweet/drop/unspecified",
+                    ),
+                ),
+                (
+                    ImmersiveExpandedRecommendations,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::UnspecifiedReason,
+                        "stale_tweet/drop/unspecified",
+                    ),
                 ),
             ],
         },

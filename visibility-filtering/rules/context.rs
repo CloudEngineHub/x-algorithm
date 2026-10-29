@@ -125,7 +125,7 @@ impl<'a, C: Candidate> At<'_, 'a, C> {
 
     #[inline]
     pub(super) fn edge(self, node: Hydrator) -> bool {
-        debug_assert!(node.is_edge(), "{node:?} is not an edge node");
+        debug_assert!(node.is_viewer_edge(), "{node:?} is not a viewer edge node");
         self.0.candidate.edges().contains(node)
     }
 }

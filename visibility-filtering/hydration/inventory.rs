@@ -79,7 +79,6 @@ pub(crate) enum Source {
     GizmoduckViewer,
     GizmoduckAuthor,
     Flock,
-    FlockUserPair,
     ViewerCountry,
     Wingman,
     CommunityModeration,
@@ -107,7 +106,6 @@ impl Source {
             | Source::SafetyLabels
             | Source::GizmoduckViewer
             | Source::Flock
-            | Source::FlockUserPair
             | Source::ViewerCountry
             | Source::Wingman
             | Source::CommunityModeration

@@ -128,12 +128,12 @@ impl fmt::Debug for FetcherId {
     }
 }
 
-pub(super) struct Fetchers<V> {
-    request: Fetcher<V>,
-    related: [Fetcher<V>; Relation::VARIANTS.len()],
+pub(super) struct Fetchers<V, K = u64> {
+    request: Fetcher<V, K>,
+    related: [Fetcher<V, K>; Relation::VARIANTS.len()],
 }
 
-impl<V> Default for Fetchers<V> {
+impl<V, K> Default for Fetchers<V, K> {
     fn default() -> Self {
         Self {
             request: Fetcher::default(),
@@ -142,8 +142,8 @@ impl<V> Default for Fetchers<V> {
     }
 }
 
-impl<V> Fetchers<V> {
-    pub(super) fn request(&self) -> &Fetcher<V> {
+impl<V, K> Fetchers<V, K> {
+    pub(super) fn request(&self) -> &Fetcher<V, K> {
         &self.request
     }
 
@@ -151,7 +151,7 @@ impl<V> Fetchers<V> {
         clippy::indexing_slicing,
         reason = "Relation::VARIANTS sizes the array, so every Relation indexes it"
     )]
-    pub(super) fn of(&self, owner: Owner) -> &Fetcher<V> {
+    pub(super) fn of(&self, owner: Owner) -> &Fetcher<V, K> {
         match owner {
             Owner::Request => &self.request,
             Owner::Related(relation) => &self.related[relation as usize],
@@ -162,7 +162,7 @@ impl<V> Fetchers<V> {
         clippy::indexing_slicing,
         reason = "Relation::VARIANTS sizes the array, so every Relation indexes it"
     )]
-    pub(super) fn of_mut(&mut self, owner: Owner) -> &mut Fetcher<V> {
+    pub(super) fn of_mut(&mut self, owner: Owner) -> &mut Fetcher<V, K> {
         match owner {
             Owner::Request => &mut self.request,
             Owner::Related(relation) => &mut self.related[relation as usize],

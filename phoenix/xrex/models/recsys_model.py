@@ -24,6 +24,7 @@ from xrex.data.recsys.ads_head_masking import (
     EARLY_RELABEL_STREAM_ID,
     FRESH_STREAM_ID,
     LATE_SPLIT_STREAM_ID,
+    metric_head_mask_keys,
 )
 from xrex.data.recsys.ads_late_window import (
     ADS_LATE_WINDOW_TWIN_HEAD_INDICES,
@@ -1195,6 +1196,8 @@ class RecsysAggregatedModelConfig(Config):
             raise ValueError("ads_pixel_head_masking requires ads_head_masking")
         if self.ads_pixel_head_masking and self.use_seqpack:
             raise ValueError("ads_pixel_head_masking is not supported with use_seqpack")
+        if self.metric_own_slice and not self.ads_head_masking:
+            raise ValueError("metric_own_slice requires ads_head_masking")
 
     continuous_action_hidden_dim: int = 64
 
@@ -1235,6 +1238,7 @@ class RecsysAggregatedModelConfig(Config):
     metric_group: str = "default"
 
     metric_mask_keys: list[str] | None = None
+    metric_own_slice: bool = False
     metrics_ndcg_shared_sorts: bool = False
 
     conversion_delay_slice_thresholds_s: tuple[int, ...] = ()
@@ -1328,13 +1332,28 @@ class RecsysAggregatedModelConfig(Config):
                 "and is only wired on the legacy (feature_prep_enabled=False) path"
             )
 
-        if self.model_config.num_candidate_only_layers and (
-            self.transformer_output_only or self.page_rl.enabled
-        ):
-            raise ValueError(
-                "transformer_output_only and page_rl read the history's final hidden states, "
-                "which candidate-only layers do not update. Set num_candidate_only_layers=0."
-            )
+        if self.model_config.num_candidate_only_layers:
+            if self.transformer_output_only:
+                raise ValueError(
+                    "transformer_output_only reads every final hidden state, but candidate-only "
+                    "layers update only the candidates."
+                )
+            if (
+                self.page_rl.enabled
+                and not self.model_config.candidate_only_layers_update_user_token
+            ):
+                raise ValueError(
+                    "page_rl reads each user's first prefix token; set "
+                    "candidate_only_layers_update_user_token=True to update it in candidate-only "
+                    "layers."
+                )
+            if (
+                self.model_config.candidate_only_layers_update_user_token
+                and self.model_config.num_candidate_only_layers > 1
+            ):
+                raise ValueError(
+                    "candidate_only_layers_update_user_token supports one candidate-only layer."
+                )
 
         if self.feature_prep_enabled:
             fp = self.feature_prep
@@ -2468,35 +2487,60 @@ class RecsysAggregatedModel(hk.Module):
                 * jnp.stack([per_head_eligible[eng_name] for eng_name in eng_names])[:, None]
             )
 
-        metrics_calc(
-            p_list,
-            y_list,
-            eng_names,
+        head_mask_keys = metric_head_mask_keys(
+            engagement_to_ids(self.config.metric_group),
             mask_keys,
-            mask_values,
-            stats,
-            per_head_mask_values=per_head_mask_values,
-            ndcg_shared_sorts=self.config.metrics_ndcg_shared_sorts,
+            own_slice=self.config.metric_own_slice,
         )
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for eng_idx, eng_name in enumerate(eng_names):
+            groups.setdefault(tuple(head_mask_keys[eng_name]), []).append(eng_idx)
+        for group_keys, eng_idxs in groups.items():
+            if not group_keys:
+                continue
+            full_grid = list(group_keys) == mask_keys and len(eng_idxs) == len(eng_names)
+            if full_grid:
+                group_mask_values, group_per_head = mask_values, per_head_mask_values
+            else:
+                mask_idxs = [mask_keys.index(k) for k in group_keys]
+                group_mask_values = [mask_values[j] for j in mask_idxs]
+                group_per_head = (
+                    None
+                    if per_head_mask_values is None
+                    else per_head_mask_values[jnp.array(eng_idxs)][:, jnp.array(mask_idxs)]
+                )
+            metrics_calc(
+                [p_list[i] for i in eng_idxs],
+                [y_list[i] for i in eng_idxs],
+                [eng_names[i] for i in eng_idxs],
+                list(group_keys),
+                group_mask_values,
+                stats,
+                per_head_mask_values=group_per_head,
+                ndcg_shared_sorts=self.config.metrics_ndcg_shared_sorts,
+            )
 
         metrics_calc_global_num_tokens(masks, stats)
 
         for mask_key, mval in zip(mask_keys, mask_values):
             stats[f"{mask_key}_effective_num_tokens"] = mval.sum()
 
-        cells: list[tuple[str, str, jax.Array, jax.Array]]
-        if per_head_mask_values is None:
-            cells = [
-                (eng_name, mask_key, mask_val, stats[f"{mask_key}_effective_num_tokens"])
-                for eng_name in eng_names
-                for mask_key, mask_val in zip(mask_keys, mask_values)
-            ]
-        else:
-            cells = [
-                (eng_name, mask_key, mask_val, mask_val.sum())
-                for eng_idx, eng_name in enumerate(eng_names)
-                for mask_key, mask_val in zip(mask_keys, per_head_mask_values[eng_idx])
-            ]
+        cells: list[tuple[str, str, jax.Array, jax.Array]] = []
+        for eng_idx, eng_name in enumerate(eng_names):
+            for mask_key in head_mask_keys[eng_name]:
+                j = mask_keys.index(mask_key)
+                if per_head_mask_values is None:
+                    cells.append(
+                        (
+                            eng_name,
+                            mask_key,
+                            mask_values[j],
+                            stats[f"{mask_key}_effective_num_tokens"],
+                        )
+                    )
+                else:
+                    mask_val = per_head_mask_values[eng_idx][j]
+                    cells.append((eng_name, mask_key, mask_val, mask_val.sum()))
         slices = self.config.conversion_delay_slices()
         if slices and conversion_delay_base is not None and conversion_delay_ms is not None:
             slice_masks = conversion_delay_slice_metrics(

@@ -68,6 +68,7 @@ GROUP_IDS: dict[str, str] = {
     "home_direct_packed_gb300": "user_action_sequence_home_direct_packed",
     "home_direct_packed_nano": "user_action_sequence_home_direct_packed_nano",
     "immersive_page_rl": "user_action_sequence_immersive_page_rl",
+    "immersive_page_rl_cread": "user_action_sequence_immersive_page_rl_cread",
     "xrecsys_two_tower": "user_action_sequence_xrecsys_two_tower",
     "xrecsys_two_tower_combined": "user_action_sequence_xrecsys_two_tower_combined",
     "xrecsys_two_tower_combined_gb300": "user_action_sequence_xrecsys_two_tower_combined",

@@ -140,8 +140,8 @@ mod tests {
         let mut named = Vec::new();
         for &level in SafetyLevel::VARIANTS {
             let rules = level.spec().rules().lists();
-            named.extend(leaf_sets(rules.user));
-            named.extend(leaf_sets(rules.post));
+            named.extend(leaf_sets(&rules.user));
+            named.extend(leaf_sets(&rules.post));
         }
         for (index, (name, leaves)) in named.iter().enumerate() {
             for (other, other_leaves) in &named[..index] {

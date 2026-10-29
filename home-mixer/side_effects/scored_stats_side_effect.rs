@@ -4,7 +4,6 @@ use crate::params::{
     EnablePhoenixRetrievalStatsExperimentBucket, EnablePhoenixScoreStatsExperimentBucket,
     PhoenixRetrievalInferenceClusterId, PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
 };
-use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::value_model;
 use crate::sources::phoenix_source::PhoenixSource;
 
@@ -138,7 +137,6 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                         &input.selected_candidates,
                         &input.non_selected_candidates,
                         &format!("{:?}", PhoenixSource::resolve_cluster(&input.query)),
-                        &format!("{:?}", PhoenixScorer::resolve_cluster(&input.query)),
                         &experiment_buckets,
                     );
                 }
@@ -226,7 +224,6 @@ fn record_retrieval_source_contribution(
     selected_candidates: &[PostCandidate],
     non_selected_candidates: &[PostCandidate],
     retrieval_cluster: &str,
-    ranker_cluster: &str,
     experiment_buckets: &[&ExperimentBucket],
 ) {
     let empty_bucket = ExperimentBucket::new("", "");
@@ -278,7 +275,6 @@ fn record_retrieval_source_contribution(
     for b in buckets {
         let common = [
             ("retrieval_cluster", retrieval_cluster),
-            ("ranker_cluster", ranker_cluster),
             ("ddg", b.experiment.as_str()),
             ("bucket", b.bucket.as_str()),
         ];

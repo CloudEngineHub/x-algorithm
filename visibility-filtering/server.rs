@@ -278,11 +278,13 @@ mod tests {
         };
         let deleted =
             || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));
+        let not_found =
+            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(false, false, None));
         let cases = [
             (tweet_data(1, None), found(), Some(found())),
             (tweet_data(1, None), protected(), Some(protected())),
             (tweet_data(1, Some(2)), found(), None),
-            (tweet_data(2, None), found(), None),
+            (tweet_data(2, None), found(), Some(not_found)),
             (tweet_data(2, None), deleted(), Some(deleted())),
         ];
         let home = client
