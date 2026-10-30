@@ -1,13 +1,10 @@
 use crate::models::candidate::CandidateHelpers;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{
-    EnableVideoCarouselCandidatesLogging, VideoCarouselImmersiveVqvWeight,
-    VideoCarouselOpenTimesImmersiveDwellWeight, VideoCarouselVideoOpenWeight,
-};
+use crate::params::EnableVideoCarouselCandidatesLogging;
 use crate::side_effects::phoenix_experiments_side_effect::{
     build_logged_scored_candidate, insert_cluster_scores,
 };
-use crate::util::video_carousel;
+use crate::util::video_carousel::CarouselScoring;
 use futures::future::join_all;
 use prost::Message;
 use std::collections::HashMap;
@@ -79,10 +76,7 @@ fn served_carousel_candidates(
     let Some(videos) = query.video_carousel.get().filter(|_| carousel_served) else {
         return Vec::new();
     };
-    let video_open_weight = query.params.get(VideoCarouselVideoOpenWeight);
-    let immersive_vqv_weight = query.params.get(VideoCarouselImmersiveVqvWeight);
-    let open_times_immersive_dwell_weight =
-        query.params.get(VideoCarouselOpenTimesImmersiveDwellWeight);
+    let scoring = CarouselScoring::from_query(query);
     videos
         .iter()
         .enumerate()
@@ -92,15 +86,7 @@ fn served_carousel_candidates(
             if let Some(immersive_scores) = &video.immersive_scores {
                 insert_cluster_scores(&mut prediction_scores, "immersive", immersive_scores);
             }
-            prediction_scores.insert(
-                "video_carousel.score".to_string(),
-                video_carousel::carousel_score(
-                    video,
-                    video_open_weight,
-                    immersive_vqv_weight,
-                    open_times_immersive_dwell_weight,
-                ),
-            );
+            prediction_scores.insert("video_carousel.score".to_string(), scoring.score(video));
             LoggedScoredCandidate {
                 post_id: video.get_original_tweet_id() as i64,
                 author_id: Some(video.get_original_author_id() as i64),

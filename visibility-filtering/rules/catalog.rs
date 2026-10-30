@@ -45,11 +45,14 @@ fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = 
 pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let listed = level.spec().rules().lists();
-        for entry in catalog_rules(&listed.user).chain(catalog_rules(&listed.post)) {
-            match rules.iter_mut().find(|(other, _)| *other == entry) {
-                Some((_, levels)) => levels.push(level.into()),
-                None => rules.push((entry, vec![level.into()])),
+        let level_name: &'static str = level.into();
+        for listed in level.spec().rule_lists() {
+            for entry in catalog_rules(&listed.user).chain(catalog_rules(&listed.post)) {
+                match rules.iter_mut().find(|(other, _)| *other == entry) {
+                    Some((_, levels)) if levels.last() == Some(&level_name) => {}
+                    Some((_, levels)) => levels.push(level_name),
+                    None => rules.push((entry, vec![level_name])),
+                }
             }
         }
     }
@@ -101,14 +104,24 @@ pub(super) fn catalog() -> String {
     doc.push_str(
         "\n## Levels\n\n\
          Each level's rules in fold order: the user list, then the post list, each under its\n\
-         actions in precedence order.\n",
+         actions in precedence order. A notification level's post kinds follow it, each as\n\
+         `<level>_<kind>`.\n",
     );
     let rule_engine = RuleEngine::for_tests();
     for &level in SafetyLevel::VARIANTS {
-        writeln!(doc, "\n### {}\n", <&str>::from(level)).unwrap();
-        let (user, post) = rule_engine.fold_order(level);
-        write_wired(&mut doc, "user", &user);
-        write_wired(&mut doc, "post", &post);
+        let level_name: &str = level.into();
+        let post_kinds = rule_engine
+            .post_kind_fold_orders(level)
+            .into_iter()
+            .map(|(kind, fold_order)| (format!("{level_name}_{}", <&str>::from(kind)), fold_order));
+        for (heading, (user, post)) in
+            std::iter::once((level_name.to_owned(), rule_engine.fold_order(level)))
+                .chain(post_kinds)
+        {
+            writeln!(doc, "\n### {heading}\n").unwrap();
+            write_wired(&mut doc, "user", &user);
+            write_wired(&mut doc, "post", &post);
+        }
     }
     doc
 }

@@ -398,6 +398,8 @@ def _embed_scalar_times_vector(
 
 
 DWELL_TIME_DEFAULT_SENTINEL_SEC = 2.0
+MIN_VALID_DWELL_SEC = 0.0
+MAX_VALID_DWELL_SEC = 86_400.0
 
 DWELL_TABLE_PARAM_NAME = "hist_dwell_time_table"
 

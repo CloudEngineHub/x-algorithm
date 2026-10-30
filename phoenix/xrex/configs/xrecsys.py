@@ -746,6 +746,8 @@ def make_trainer(config_name: str, mparams: dict, dataset_type: str) -> RecsysTr
                 "concat_history_web_conv_time_on_site", False
             ),
             add_history_web_conv_value=mparams.get("add_history_web_conv_value", False),
+            wallclock_recency=mparams.get("wallclock_recency", False),
+            ads_counts_emb_dim=mparams.get("ads_counts_emb_dim", 0),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
             purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
             purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),

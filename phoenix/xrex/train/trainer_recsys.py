@@ -493,6 +493,8 @@ class RecsysTrainer(Trainer):
     _forward_only_first_metrics_s: float | None = field(default=None, init=False, repr=False)
     _forward_only_progress_written_s: float | None = field(default=None, init=False, repr=False)
 
+    data_prefetch_factor: int = 2
+
     _async_emb_context: AsyncEmbContextHandle | None = field(default=None, init=False, repr=False)
     _emb_hash_vocab: int = field(default=0, init=False, repr=False)
     _first_step_embedding_lookup_start_jit: typing.Any = field(default=None, init=False, repr=False)
@@ -1484,6 +1486,7 @@ class RecsysTrainer(Trainer):
             )
             == 0,
             skip_rows=skip_rows,
+            prefetch_factor=self.data_prefetch_factor,
             resume_position=resume_position,
         )
         self._eval_dataset = train_dataset

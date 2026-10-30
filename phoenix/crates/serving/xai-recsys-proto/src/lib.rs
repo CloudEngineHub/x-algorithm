@@ -19,6 +19,8 @@ pub const SAFETY_BIT_TWEET_NSFW: u64 = 1 << 3;
 pub const SAFETY_BIT_TWEET_NSFW_HIGH_RECALL: u64 = 1 << 4;
 pub const SAFETY_BIT_TWEET_SOFT_NSFW: u64 = 1 << 5;
 
+pub const AD_TARGETING_MAX_INTEREST_CATEGORY_IDS: usize = 8;
+
 pub fn timezone_string_to_enum(tz: &str) -> Timezone {
     match tz {
         "" | "unknown" => Timezone::Unknown,

@@ -830,6 +830,7 @@ pub async fn download_embedding_table(
         buf,
         rate_limit_bytes_per_sec,
         max_concurrent_downloads,
+        false,
     )
     .await
     .map(|(checksum, _)| checksum)
@@ -842,6 +843,7 @@ pub async fn download_embedding_table_with_layout(
     buf: &mut [u8],
     rate_limit_bytes_per_sec: Option<u64>,
     max_concurrent_downloads: Option<usize>,
+    replicas: bool,
 ) -> Result<(u32, ShardLayout), CopyPortError> {
     download_embedding_table_with_conns(
         path,
@@ -852,6 +854,7 @@ pub async fn download_embedding_table_with_layout(
         max_concurrent_downloads,
         crate::emb_table::peer_conns_per_source(),
         crate::emb_table::trainer_conns_per_source(),
+        replicas,
     )
     .await
 }
@@ -865,11 +868,15 @@ async fn download_embedding_table_with_conns(
     max_concurrent_downloads: Option<usize>,
     peer_conns_per_source: usize,
     trainer_conns_per_source: usize,
+    replicas: bool,
 ) -> Result<(u32, ShardLayout), CopyPortError> {
     let prefix = checkpoint_prefix_from_path(path)?;
     let resolved = resolve_copy_urls(urls).await?;
     let (mut channels, entries, endpoints) = connect_and_list(&resolved, prefix.clone()).await?;
-    let layout = ShardedLayout::from_listing(name, &entries)?;
+    let mut layout = ShardedLayout::from_listing(name, &entries)?;
+    if replicas {
+        layout.ownership = layout.ownership.into_replicas();
+    }
     layout.check_buffer_size(name, buf.len())?;
     let shard_layout = ShardLayout {
         piece_bytes: layout.piece_bytes,
@@ -1049,6 +1056,20 @@ pub(crate) enum ShardOwnership {
     Replicated {
         total_pieces: usize,
     },
+}
+
+impl ShardOwnership {
+    fn into_replicas(self) -> ShardOwnership {
+        match self {
+            ShardOwnership::Sharded {
+                owner,
+                pieces_per_rank,
+            } if pieces_per_rank == owner.len() => ShardOwnership::Replicated {
+                total_pieces: owner.len(),
+            },
+            other => other,
+        }
+    }
 }
 
 pub(crate) fn classify_shard_ownership(
@@ -2500,6 +2521,7 @@ mod trainer_e2e_tests {
                 Some(2),
                 16,
                 2,
+                false,
             )
             .await;
             assert_eq!(traffic.active.load(Ordering::SeqCst), 0);
@@ -2513,6 +2535,40 @@ mod trainer_e2e_tests {
                 sockets.lock().unwrap().len(),
                 if fault == 1 { 1 } else { 2 }
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(copy_tls_env)]
+    async fn single_peer_downloads_as_a_replica() {
+        for (replicas, sends_from) in [(false, 1), (true, 4)] {
+            let traffic = Arc::new(Traffic::default());
+            let (url, sockets, _server) =
+                serve(tensor("emb_table", 0..4, 7), traffic.clone(), None).await;
+            let mut buf = vec![255; 28];
+            let (checksum, layout) = download_embedding_table_with_conns(
+                PREFIX,
+                &url,
+                "emb_table",
+                &mut buf,
+                None,
+                Some(4),
+                4,
+                1,
+                replicas,
+            )
+            .await
+            .unwrap();
+            assert_eq!((0..28).collect::<Vec<u8>>(), buf);
+            assert_eq!(simd_adler32::adler32(&buf.as_slice()), checksum);
+            assert_eq!(
+                ShardLayout {
+                    piece_bytes: 7,
+                    pieces: 4
+                },
+                layout
+            );
+            assert_eq!(sends_from, sockets.lock().unwrap().len());
         }
     }
 }
@@ -2601,6 +2657,7 @@ mod p2p_e2e_tests {
             None,
             2,
             1,
+            true,
         )
         .await
         .unwrap();
@@ -2661,6 +2718,7 @@ mod p2p_e2e_tests {
             None,
             2,
             1,
+            true,
         )
         .await
         .unwrap();
@@ -2821,6 +2879,7 @@ mod p2p_e2e_tests {
             &mut buf,
             None,
             None,
+            true,
         )
         .await
         .unwrap();

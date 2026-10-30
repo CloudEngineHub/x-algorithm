@@ -58,7 +58,7 @@ fn high_row() -> ActionControlRecord {
             None,
             None,
             ControlMode::Live,
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
         )
     }
 }

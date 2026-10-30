@@ -18,6 +18,13 @@ pub(super) const FILTER_ALL_DROP_UNSPECIFIED: Rule = Rule {
     action: drop_post(DropAs::UnspecifiedReason),
 };
 
+pub(super) const ONLY_PEOPLE_I_FOLLOW_OUTSIDE_COMMUNITY_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::OnlyPeopleIFollowOutsideCommunity,
+    audience: NonFollowers,
+    when: all![ViewerMentionFilterIsFollowing, !TweetIsCommunityTweet],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
 pub(super) const PDNA_DROP_SAFETY_RESULT: Rule = Rule {
     id: RuleId::Pdna,
     audience: NonAuthors,
@@ -949,6 +956,67 @@ pub(super) const BRAZIL_ELECTION_LEGAL_DROP_UNDESIRABLE: Rule = Rule {
         RequestCountryIs("br")
     ],
     action: drop_post(DropAs::PossiblyUndesirable),
+};
+
+pub(super) const LOW_QUALITY_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::LowQuality,
+    audience: NonAuthors,
+    when: all![
+        TweetHasLabel(SafetyLabelType::LOW_QUALITY),
+        !TweetCreatedAfter(PUBLIC_INTEREST_LABELS_START)
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const DUPLICATE_CONTENT_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::DuplicateContent,
+    audience: NonAuthors,
+    when: all![TweetHasLabel(SafetyLabelType::DUPLICATE_CONTENT)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const SMYTE_SPAM_TWEET_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::SmyteSpamTweet,
+    audience: NonAuthors,
+    when: all![TweetHasLabel(SafetyLabelType::SMYTE_SPAM_TWEET)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const DUPLICATE_MENTION_UQF_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::DuplicateMentionUqf,
+    audience: NonFollowers,
+    when: all![
+        TweetHasLabel(SafetyLabelType::DUPLICATE_MENTION),
+        ViewerHasUqfEnabled
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const ABUSIVE_UQF_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::AbusiveUqf,
+    audience: NonFollowers,
+    when: all![TweetHasLabel(SafetyLabelType::ABUSIVE), ViewerHasUqfEnabled],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const UNTRUSTED_URL_UQF_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::UntrustedUrlUqf,
+    audience: NonFollowers,
+    when: all![
+        TweetHasLabel(SafetyLabelType::UNTRUSTED_URL),
+        ViewerHasUqfEnabled
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const DOWNRANK_SPAM_REPLY_UQF_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::DownrankSpamReplyUqf,
+    audience: NonFollowers,
+    when: all![
+        TweetHasLabel(SafetyLabelType::DOWNRANK_SPAM_REPLY),
+        ViewerHasUqfEnabled
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
 };
 
 pub(super) const BLOCKED_VIEWER_LIMITED_ENGAGEMENT: UserRule = Rule {

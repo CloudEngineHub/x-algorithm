@@ -16,6 +16,7 @@ use std::time::Instant;
 use xai_visibility_filtering_proto as vf_pb;
 
 mod author;
+mod notification;
 mod retweet;
 
 pub(crate) use author::AuthorJudgement;

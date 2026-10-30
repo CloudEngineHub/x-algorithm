@@ -121,7 +121,7 @@ mod tests {
 
     fn view(head: &str, c: Option<&str>, b: Option<&str>, mode: ControlMode) -> ActionControlView {
         let actions = if mode == ControlMode::Live {
-            vec![PageAction::Suspend {}]
+            vec![PageAction::SUSPEND]
         } else {
             vec![]
         };

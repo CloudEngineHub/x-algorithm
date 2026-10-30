@@ -42,6 +42,7 @@ pub(crate) enum RuleId {
     NoNewUsers,
     NoNotFollowedBy,
     OnlyPeopleIFollow,
+    OnlyPeopleIFollowOutsideCommunity,
 
     Pdna,
     Bounce,
@@ -102,6 +103,13 @@ pub(crate) enum RuleId {
     MaliciousUrl,
     SpamHighRecall,
     BrazilElectionLegal,
+    LowQuality,
+    DuplicateContent,
+    SmyteSpamTweet,
+    DuplicateMentionUqf,
+    AbusiveUqf,
+    UntrustedUrlUqf,
+    DownrankSpamReplyUqf,
 
     NsfwHighRecallUserLabel,
     NsfwHighPrecisionUserLabel,

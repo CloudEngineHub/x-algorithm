@@ -1,10 +1,10 @@
-use super::{Role, Row, Subject};
+use super::{CorpusCase, Role, Row, Subject};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    AuthorLabel, AuthorProfile, EdgeSet, NotificationFilters, UserCandidate, UserEntity, Verdict,
-    Viewer, ViewerFeatures, ViewerProfile,
+    AuthorLabel, AuthorProfile, EdgeSet, NotificationFilters, NotificationKind, Placement,
+    PostCandidate, UserCandidate, UserEntity, Verdict, Viewer, ViewerFeatures, ViewerProfile,
 };
-use crate::rules::fixtures::{allow, dropped, AUTHOR_ID, VIEWER_ID};
+use crate::rules::fixtures::{allow, candidate, dropped, AUTHOR_ID, VIEWER_ID};
 use crate::rules::SafetyLevel::{self, NotificationsFollow, NotificationsWriterV2};
 use std::iter::once;
 use xai_visibility_filtering::models::FilteredReason;
@@ -41,7 +41,7 @@ fn filtering(set: fn(&mut NotificationFilters)) -> ViewerProfile {
     }
 }
 
-fn recipient(id: u64, profile: ViewerProfile) -> ViewerFeatures {
+pub(super) fn recipient(id: u64, profile: ViewerProfile) -> ViewerFeatures {
     ViewerFeatures {
         viewer: Viewer::LoggedIn {
             id,
@@ -101,7 +101,10 @@ fn non_author_drop(
     }
 }
 
-fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
+fn cases(
+    protected_non_follower: fn(Verdict) -> Verdict,
+    only_people_i_follow: &'static str,
+) -> Vec<Case> {
     let clean = ViewerProfile::default;
     let mut cases = vec![
         Case {
@@ -267,7 +270,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
                 mention_filter_is_following: true,
                 ..clean()
             },
-            "only_people_i_follow/drop/unspecified",
+            only_people_i_follow,
         ),
         Case {
             name: "unfiltered_actor",
@@ -420,9 +423,55 @@ pub(super) fn rows() -> Vec<Row> {
     ]
     .into_iter()
     .flat_map(|(level, protected_non_follower)| {
-        cases(protected_non_follower)
-            .into_iter()
-            .flat_map(move |case| case.rows(level))
+        cases(
+            protected_non_follower,
+            "only_people_i_follow/drop/unspecified",
+        )
+        .into_iter()
+        .flat_map(move |case| case.rows(level))
+    })
+    .collect()
+}
+
+pub(super) fn post_kind_cases(kind: NotificationKind) -> Vec<CorpusCase> {
+    cases(
+        |_| dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+        "only_people_i_follow_outside_community/drop/unspecified",
+    )
+    .into_iter()
+    .flat_map(|case| {
+        let post = |edges| {
+            Subject::Post(PostCandidate {
+                author: case.actor.clone(),
+                edges,
+                ..candidate().build()
+            })
+        };
+        let as_recipient = |role, id, edges, expected| CorpusCase {
+            name: format!("{}/{NotificationsWriterV2:?}/{kind:?}/{role}", case.name),
+            level: NotificationsWriterV2,
+            kind: Some(kind),
+            viewer: recipient(id, case.recipient.clone()),
+            subject: post(edges),
+            placement: Placement::Standalone,
+            expected,
+        };
+        let follower = case.edges.with(Hydrator::Follows);
+        let mut cases = vec![
+            as_recipient(
+                "non_follower",
+                VIEWER_ID,
+                case.edges,
+                case.non_follower.clone(),
+            ),
+            as_recipient("follower", VIEWER_ID, follower, case.follower.clone()),
+        ];
+        cases.extend(
+            case.actor_self
+                .clone()
+                .map(|verdict| as_recipient("self", AUTHOR_ID, case.edges, verdict)),
+        );
+        cases
     })
     .collect()
 }

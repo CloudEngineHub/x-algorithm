@@ -238,7 +238,13 @@ pub fn check_message(
 
 pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool {
     actions.iter().all(|a| match a {
-        PageAction::Suspend {} | PageAction::SuspendAuthor {} => account.suspended,
+        PageAction::Suspend {
+            permanent: false, ..
+        }
+        | PageAction::SuspendAuthor {} => account.suspended,
+        PageAction::Suspend {
+            permanent: true, ..
+        } => false,
         PageAction::SpamHighRecall { .. } => account.labels.iter().any(|l| l == "SpamHighRecall"),
         PageAction::PhoenixSkip { .. } => account
             .labels
@@ -825,7 +831,7 @@ impl Backfill {
             ));
         }
         let rec = BackfillRunRecord {
-            v: BACKFILL_RUN_RECORD_VERSION,
+            v: run_record_version(&req.actions),
             run_id: req.run_id,
             entity: req.entity,
             head: req.head,
@@ -1330,7 +1336,7 @@ pub(crate) mod test_support {
             levels: vec![LevelRow::Missing],
             window_start_ms: now_ms - 86_400_000,
             window_end_ms: now_ms,
-            actions: vec![PageAction::Suspend {}],
+            actions: vec![PageAction::SUSPEND],
             rate_per_sec: 200,
             expected_count: 10,
             left_out: vec![],
@@ -1350,7 +1356,7 @@ pub(crate) mod test_support {
     ) -> BackfillRunRecord {
         let now = crate::now_millis();
         let rec = BackfillRunRecord {
-            v: BACKFILL_RUN_RECORD_VERSION,
+            v: run_record_version(&actions),
             run_id: run_id.into(),
             entity: actions.first().map_or(ControlEntity::User, |a| a.entity()),
             head: head.into(),
@@ -1728,7 +1734,7 @@ mod tests {
             &store,
             "run-00000001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![],
         );
         assert_eq!(
@@ -1859,7 +1865,7 @@ mod tests {
                     &self.inner,
                     "run-other001",
                     "H",
-                    vec![PageAction::Suspend {}],
+                    vec![PageAction::SUSPEND],
                     vec![LevelRow::Missing],
                 );
             }
@@ -2216,7 +2222,7 @@ mod tests {
                         &self.inner,
                         "run-zzzz0001",
                         "H",
-                        vec![PageAction::Suspend {}],
+                        vec![PageAction::SUSPEND],
                         vec![LevelRow::Missing],
                     );
                     rival.created_at_ms = NOW + 5;
@@ -2346,7 +2352,7 @@ mod tests {
             (
                 "duplicate_actions",
                 BackfillRunStartRequest {
-                    actions: vec![PageAction::Suspend {}, PageAction::Suspend {}],
+                    actions: vec![PageAction::SUSPEND, PageAction::SUSPEND],
                     ..base.clone()
                 },
             ),
@@ -2453,7 +2459,7 @@ mod tests {
                 None,
                 None,
                 ControlMode::Live,
-                vec![PageAction::Suspend {}],
+                vec![PageAction::SUSPEND],
             )
         });
     }
@@ -2781,7 +2787,7 @@ mod tests {
             &store,
             "run-other001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![LevelRow::Missing],
         );
         assert!(matches!(
@@ -3095,7 +3101,7 @@ mod tests {
             &store,
             "run-00000001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![LevelRow::Mid],
         )
     }
@@ -3113,8 +3119,8 @@ mod tests {
         let shr = PageAction::SpamHighRecall {
             lifetime: xai_abuse_enforcement_types::action_control::Lifetime::Days7,
         };
-        assert!(already_applied(&[PageAction::Suspend {}], &suspended));
-        assert!(!already_applied(&[PageAction::Suspend {}], &labelled));
+        assert!(already_applied(&[PageAction::SUSPEND], &suspended));
+        assert!(!already_applied(&[PageAction::SUSPEND], &labelled));
         assert!(already_applied(&[shr], &labelled));
         assert!(!already_applied(
             &[shr, PageAction::LivenessCheck {}],

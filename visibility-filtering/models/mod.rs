@@ -97,11 +97,25 @@ pub enum RetweetMerge {
     Unmerged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum NotificationKind {
     Follow,
     FollowRequestAccepted,
+    Mention,
+    Reply,
+    MediaTagged,
 }
 
 #[derive(Clone, Copy, Debug)]

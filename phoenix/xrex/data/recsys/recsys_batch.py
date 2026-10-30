@@ -28,6 +28,9 @@ from xrex.data.recsys.constants import (
     action_type_map_raw,
 )
 from xrex.data.recsys.feature_config import (
+    ADS_COUNT_BUCKETS,
+    ADS_COUNT_FAMILIES,
+    ADS_COUNT_WINDOWS,
     ADS_PRODUCT_KEY_HASH_BIAS,
     ADS_PRODUCT_KEY_HASH_BIAS_2,
     ADS_PRODUCT_KEY_HASH_MODULUS,
@@ -39,6 +42,7 @@ from xrex.data.recsys.feature_config import (
     CATEGORICAL_FEATURES,
     FLOAT_FEATURES,
     INT64_FEATURES,
+    NUM_ADS_COUNT_FEATURES,
     STALE_POST_14D_TTL_SEC,
     STALE_POST_30D_TTL_SEC,
     BoolFeature,
@@ -348,6 +352,7 @@ class PostSeq(TypedDict):
     bool_features: npt.NDArray[np.bool_]
     post_creation_ts_sec: npt.NDArray[np.int32]
     post_sids: npt.NDArray[np.uint16] | None
+    ads_count_buckets: NotRequired[npt.NDArray[np.uint8]]
     rl_served_slot: NotRequired[npt.NDArray[np.int32]]
     rl_weighted_score: NotRequired[npt.NDArray[np.float32]]
     rl_final_score: NotRequired[npt.NDArray[np.float32]]
@@ -713,6 +718,44 @@ def _warn_once_on_zeroed_history_ads(arrays: history_id_lists.HistoryArrays) -> 
         )
 
 
+ADS_COUNT_COLUMNS: tuple[str, ...] = tuple(
+    f"{level}{family}Count{window}Seq"
+    for level in ("ads", "userAdvertiser")
+    for family in ADS_COUNT_FAMILIES
+    for window in ADS_COUNT_WINDOWS
+)
+USER_ADS_COUNT_COLUMNS: tuple[str, ...] = tuple(
+    f"userAds{family}Count{window}" for family in ADS_COUNT_FAMILIES for window in ADS_COUNT_WINDOWS
+)
+assert len(ADS_COUNT_COLUMNS) + len(USER_ADS_COUNT_COLUMNS) == NUM_ADS_COUNT_FEATURES
+
+
+def ads_count_bucket(counts: npt.ArrayLike) -> npt.NDArray[np.uint8]:
+    x = np.asarray(counts, dtype=np.float64)
+    out = np.zeros(x.shape, dtype=np.uint8)
+    nz = x > 0
+    out[nz] = np.minimum(np.floor(np.log2(x[nz])) + 1, ADS_COUNT_BUCKETS - 1).astype(np.uint8)
+    return out
+
+
+def read_ads_count_buckets(
+    record_batch: pa.RecordBatch, batch_size: int, num_slots: int
+) -> npt.NDArray[np.uint8]:
+    out = np.zeros((batch_size, num_slots, NUM_ADS_COUNT_FEATURES), dtype=np.uint8)
+    names = set(record_batch.schema.names)
+    for j, col in enumerate(ADS_COUNT_COLUMNS):
+        if col in names:
+            values = _list_values(record_batch.column(col)).fill_null(0)
+            values = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1)
+            width = min(values.shape[1], num_slots)
+            out[:, :width, j] = ads_count_bucket(values[:, :width])
+    for j, col in enumerate(USER_ADS_COUNT_COLUMNS):
+        if col in names:
+            values = record_batch.column(col).fill_null(0).to_numpy(zero_copy_only=False)
+            out[:, :, len(ADS_COUNT_COLUMNS) + j] = ads_count_bucket(values)[:, None]
+    return out
+
+
 def from_record_batch(
     record_batch: pa.RecordBatch,
     max_history_post_action_pairs: int,
@@ -746,10 +789,17 @@ def from_record_batch(
     history_url_embedding_dim: int = 0,
     history_url_embedding_fn: HistoryUrlEmbeddingFn | None = None,
     dump_keep_rate_per_10000: int | None = None,
+    read_ads_engagement_counts: bool = False,
     *,
     alloc: ArrayAllocator,
     aux_value_events: tuple[str, ...] = (),
 ) -> RecsysFeaturesBatch:
+    if read_ads_engagement_counts and (
+        num_negatives_per_example or num_global_negatives_per_example
+    ):
+        raise ValueError(
+            "read_ads_engagement_counts aligns count slots with candidates; negatives are unsupported"
+        )
     start = time.time()
     batch_size = record_batch.num_rows
 
@@ -1594,6 +1644,10 @@ def from_record_batch(
                 break
 
     rank_logger.debug(f"from_record_batch took: {time.time() - start}")
+    if read_ads_engagement_counts:
+        candidate_seq_with_negatives["ads_count_buckets"] = read_ads_count_buckets(
+            record_batch, batch_size, max_candidate_post_action_pairs
+        )
     batch = RecsysFeaturesBatch(
         user_hashes=hash_table.get_user_hash(user_ids),
         user_ip_hashes=hash_table.get_ip_hash(user_ip_ids),

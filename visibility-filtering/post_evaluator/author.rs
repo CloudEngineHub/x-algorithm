@@ -9,7 +9,7 @@ use crate::rules::{LevelSpec, SafetyLevel};
 use std::collections::HashMap;
 use tracing::warn;
 
-const VIEWER_LOOKUPS: Hydrators = Hydrators::of(Hydrator::ViewerProfile)
+pub(super) const VIEWER_LOOKUPS: Hydrators = Hydrators::of(Hydrator::ViewerProfile)
     .with(Hydrator::ViewerLabels)
     .with(Hydrator::ViewerNotificationFilters);
 

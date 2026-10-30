@@ -3,7 +3,9 @@ use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
     EnableVideoCarousel, VIDEO_CAROUSEL_MAX_VIDEOS, VIDEO_CAROUSEL_MIN_VIDEOS,
     VideoCarouselImmersiveVqvWeight, VideoCarouselOpenTimesImmersiveDwellWeight,
+    VideoCarouselVideoOpenWeight, VideoCarouselWeightedScoreWeight,
 };
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 const MAX_VERTICAL_ASPECT_RATIO: f32 = 1.0;
@@ -18,17 +20,54 @@ pub(crate) fn is_enabled(query: &ScoredPostsQuery) -> bool {
 pub(crate) fn ranks_by_immersive_scores(query: &ScoredPostsQuery) -> bool {
     query.request_type == RequestType::ForYou
         && query.params.get(EnableVideoCarousel)
-        && (query.params.get(VideoCarouselImmersiveVqvWeight) != 0.0
-            || query.params.get(VideoCarouselOpenTimesImmersiveDwellWeight) != 0.0)
+        && CarouselScoring::from_query(query).needs_immersive_scores()
         && !query.is_bottom_request
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CarouselScoring {
+    video_open_weight: f64,
+    immersive_vqv_weight: f64,
+    open_times_immersive_dwell_weight: f64,
+    weighted_score_weight: f64,
+}
+
+impl CarouselScoring {
+    pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
+        Self {
+            video_open_weight: query.params.get(VideoCarouselVideoOpenWeight),
+            immersive_vqv_weight: query.params.get(VideoCarouselImmersiveVqvWeight),
+            open_times_immersive_dwell_weight: query
+                .params
+                .get(VideoCarouselOpenTimesImmersiveDwellWeight),
+            weighted_score_weight: query.params.get(VideoCarouselWeightedScoreWeight),
+        }
+    }
+
+    pub(crate) fn score(&self, candidate: &PostCandidate) -> f64 {
+        self.video_open_weight * video_open_score(candidate)
+            + self.immersive_vqv_weight * immersive_vqv_score(candidate)
+            + self.open_times_immersive_dwell_weight
+                * video_open_score(candidate)
+                * immersive_dwell_time(candidate)
+            + self.weighted_score_weight * candidate.weighted_score.unwrap_or(0.0)
+    }
+
+    pub(crate) fn needs_immersive_scores(&self) -> bool {
+        self.immersive_vqv_weight != 0.0 || self.open_times_immersive_dwell_weight != 0.0
+    }
+
+    fn rank(&self, a: &PostCandidate, b: &PostCandidate) -> Ordering {
+        self.score(b)
+            .total_cmp(&self.score(a))
+            .then_with(|| video_open_score(b).total_cmp(&video_open_score(a)))
+    }
 }
 
 pub(crate) fn select_videos<'a>(
     candidates: impl IntoIterator<Item = &'a PostCandidate>,
     main_feed: &'a [PostCandidate],
-    video_open_weight: f64,
-    immersive_vqv_weight: f64,
-    open_times_immersive_dwell_weight: f64,
+    scoring: &CarouselScoring,
     dedupe_by_author: bool,
     semantic_id_dedupe_levels: usize,
     embedding_dedupe_threshold: Option<f64>,
@@ -37,15 +76,7 @@ pub(crate) fn select_videos<'a>(
         .into_iter()
         .filter(|candidate| is_carousel_video(candidate) && is_vertical(candidate))
         .collect();
-    let score = |video: &PostCandidate| {
-        carousel_score(
-            video,
-            video_open_weight,
-            immersive_vqv_weight,
-            open_times_immersive_dwell_weight,
-        )
-    };
-    videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
+    videos.sort_by(|a, b| scoring.rank(a, b));
     let videos = take_distinct(
         videos,
         main_feed,
@@ -138,22 +169,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 pub(crate) fn take_videos_by_carousel_score(
     candidates: &mut Vec<PostCandidate>,
     count: usize,
-    video_open_weight: f64,
-    immersive_vqv_weight: f64,
-    open_times_immersive_dwell_weight: f64,
+    scoring: &CarouselScoring,
 ) -> Vec<PostCandidate> {
     let (mut videos, rest): (Vec<_>, Vec<_>) = std::mem::take(candidates)
         .into_iter()
         .partition(is_carousel_video);
-    let score = |video: &PostCandidate| {
-        carousel_score(
-            video,
-            video_open_weight,
-            immersive_vqv_weight,
-            open_times_immersive_dwell_weight,
-        )
-    };
-    videos.sort_by(|a, b| score(b).total_cmp(&score(a)));
+    videos.sort_by(|a, b| scoring.rank(a, b));
     let overflow = videos.split_off(count.min(videos.len()));
     *candidates = rest;
     candidates.extend(overflow);
@@ -173,19 +194,6 @@ fn is_vertical(candidate: &PostCandidate) -> bool {
     candidate
         .video_aspect_ratio
         .is_some_and(|ratio| ratio < MAX_VERTICAL_ASPECT_RATIO)
-}
-
-pub(crate) fn carousel_score(
-    candidate: &PostCandidate,
-    video_open_weight: f64,
-    immersive_vqv_weight: f64,
-    open_times_immersive_dwell_weight: f64,
-) -> f64 {
-    video_open_weight * video_open_score(candidate)
-        + immersive_vqv_weight * immersive_vqv_score(candidate)
-        + open_times_immersive_dwell_weight
-            * video_open_score(candidate)
-            * immersive_dwell_time(candidate)
 }
 
 fn video_open_score(candidate: &PostCandidate) -> f64 {
@@ -211,6 +219,15 @@ fn immersive_dwell_time(candidate: &PostCandidate) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scoring(video_open_weight: f64, immersive_vqv_weight: f64) -> CarouselScoring {
+        CarouselScoring {
+            video_open_weight,
+            immersive_vqv_weight,
+            open_times_immersive_dwell_weight: 0.0,
+            weighted_score_weight: 0.0,
+        }
+    }
     use crate::models::candidate::PhoenixScores;
 
     fn video(tweet_id: u64, aspect_ratio: f32, video_open: f64) -> PostCandidate {
@@ -251,9 +268,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 false,
                 0,
                 None
@@ -287,9 +302,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 true,
                 0,
                 None
@@ -312,9 +325,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 false,
                 2,
                 None
@@ -340,9 +351,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 true,
                 0,
                 None
@@ -359,7 +368,7 @@ mod tests {
             vertical(3, 20, &[], 0.7),
         ];
 
-        assert!(select_videos(&candidates, &[], 1.0, 0.0, 0.0, true, 0, None).is_empty());
+        assert!(select_videos(&candidates, &[], &scoring(1.0, 0.0), true, 0, None).is_empty());
     }
 
     fn with_immersive_vqv(candidate: PostCandidate, vqv: f64) -> PostCandidate {
@@ -385,9 +394,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                1.0,
-                0.0,
+                &scoring(1.0, 1.0),
                 false,
                 0,
                 None
@@ -418,9 +425,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 false,
                 0,
                 Some(0.72)
@@ -452,9 +457,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &[],
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 false,
                 0,
                 None
@@ -481,9 +484,7 @@ mod tests {
             tweet_ids(&select_videos(
                 &candidates,
                 &main_feed,
-                1.0,
-                0.0,
-                0.0,
+                &scoring(1.0, 0.0),
                 false,
                 0,
                 None

@@ -49,6 +49,7 @@ pub(crate) enum LevelSpec {
         thrift: ThriftLevel,
         kind: NotificationKind,
         rules: UserRules,
+        post_kinds: &'static [(NotificationKind, PostRules)],
     },
 }
 
@@ -148,11 +149,26 @@ impl SafetyLevel {
                 thrift: ThriftLevel::NOTIFICATIONS_FOLLOW,
                 kind: NotificationKind::Follow,
                 rules: UserRules(levels::NOTIFICATIONS_FOLLOW),
+                post_kinds: &[],
             },
             SafetyLevel::NotificationsWriterV2 => LevelSpec::Notifications {
                 thrift: ThriftLevel::NOTIFICATIONS_WRITER_V2,
                 kind: NotificationKind::FollowRequestAccepted,
                 rules: UserRules(levels::NOTIFICATIONS_WRITER_V2),
+                post_kinds: &[
+                    (
+                        NotificationKind::Mention,
+                        levels::NOTIFICATIONS_WRITER_V2_MENTION,
+                    ),
+                    (
+                        NotificationKind::Reply,
+                        levels::NOTIFICATIONS_WRITER_V2_REPLY,
+                    ),
+                    (
+                        NotificationKind::MediaTagged,
+                        levels::NOTIFICATIONS_WRITER_V2_MEDIA_TAGGED,
+                    ),
+                ],
             },
         }
     }
@@ -173,17 +189,32 @@ impl SafetyLevel {
         }
     }
 
-    pub(crate) fn notification_level(number: i32) -> Result<(Self, NotificationKind), LevelError> {
+    pub(crate) fn notification_level(number: i32) -> Result<Self, LevelError> {
         let number = known_thrift(number)?;
-        Self::VARIANTS
-            .iter()
-            .find_map(|&level| match level.spec() {
-                LevelSpec::Notifications { thrift, kind, .. } => {
-                    (thrift == number).then_some((level, kind))
+        Self::served_where(|spec| match spec {
+            LevelSpec::Notifications { thrift, .. } => *thrift == number,
+            LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => false,
+        })
+    }
+
+    pub(crate) fn notification_rows(self, kind: NotificationKind) -> Option<RequestRows> {
+        match self.spec() {
+            LevelSpec::Notifications {
+                kind: user_kind,
+                post_kinds,
+                ..
+            } => {
+                if kind == user_kind {
+                    Some(RequestRows::Users)
+                } else {
+                    post_kinds
+                        .iter()
+                        .any(|&(post_kind, _)| post_kind == kind)
+                        .then_some(RequestRows::ActorPosts)
                 }
-                LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => None,
-            })
-            .ok_or(LevelError::NotServed)
+            }
+            LevelSpec::Posts(_) | LevelSpec::QuotePass { .. } => None,
+        }
     }
 
     fn served_where(serves: impl Fn(&LevelSpec) -> bool) -> Result<Self, LevelError> {
@@ -224,6 +255,19 @@ impl LevelSpec {
                 ..
             } => LevelRules::UserOnly(rules),
         }
+    }
+
+    pub(super) const fn post_kinds(&self) -> &'static [(NotificationKind, PostRules)] {
+        match self {
+            Self::Notifications { post_kinds, .. } => post_kinds,
+            Self::Posts(_) | Self::QuotePass { .. } => &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn rule_lists(&self) -> impl Iterator<Item = levels::LevelLists> + use<> {
+        std::iter::once(self.rules().lists())
+            .chain(self.post_kinds().iter().map(|&(_, rules)| rules.lists()))
     }
 
     pub(crate) const fn rows(&self) -> RequestRows {

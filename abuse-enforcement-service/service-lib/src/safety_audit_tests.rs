@@ -66,7 +66,7 @@ async fn absent_action_control_config_keeps_page_live_records_recording_only() {
             None,
             None,
             ControlMode::Live,
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
         )],
     })
     .await;

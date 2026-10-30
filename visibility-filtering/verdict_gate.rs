@@ -10,7 +10,10 @@ use xai_visibility_filtering::evaluated::EvaluationResult;
 use xai_visibility_filtering::vf_client::XaiVfClient;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
+use xai_x_thrift::action::{Action, InterstitialAction, MediaInterstitial};
+use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
 use xai_x_thrift::safety_level::SafetyLevel;
+use xai_x_thrift::safety_result::FilteredReason;
 
 pub const GRPC_PORT: u16 = 50051;
 
@@ -26,13 +29,24 @@ struct CaseFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseSpec {
-    viewer: String,
+    #[serde(default)]
+    viewer: Option<String>,
     post: String,
+    #[serde(default = "us")]
+    country: String,
+    #[serde(default)]
+    client: Client,
     #[serde(default)]
     quoted_in: Option<String>,
     expect: VerdictFields,
     #[serde(default)]
     filter_tweets: BTreeMap<FilterLevel, VerdictFields>,
+}
+
+const US: &str = "us";
+
+fn us() -> String {
+    US.to_string()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, strum::IntoStaticStr)]
@@ -65,8 +79,10 @@ pub struct VerdictFields {
 
 pub struct Case {
     name: String,
-    viewer_id: u64,
+    viewer_id: Option<u64>,
     post_id: u64,
+    country: String,
+    client: Client,
     quoted_in: Option<u64>,
     filter_tweets_at: Option<FilterLevel>,
     expect: VerdictFields,
@@ -82,18 +98,29 @@ pub fn parse_cases(json: &str) -> anyhow::Result<Vec<Case>> {
     };
     let mut calls = Vec::new();
     for case in &file.cases {
-        let name = match &case.quoted_in {
-            Some(outer) => format!("{} x {} quoted in {outer}", case.viewer, case.post),
-            None => format!("{} x {}", case.viewer, case.post),
+        let viewer = case.viewer.as_deref().unwrap_or("logged_out");
+        let country = case.country.to_ascii_lowercase();
+        let quote_suffix = case
+            .quoted_in
+            .as_ref()
+            .map(|outer| format!(" quoted in {outer}"))
+            .unwrap_or_default();
+        let origin_suffix = if country == US && case.client == Client::Web {
+            String::new()
+        } else {
+            format!(" from {country} on {:?}", case.client)
         };
+        let name = format!("{viewer} x {}{quote_suffix}{origin_suffix}", case.post);
         if case.quoted_in.is_some() && !case.filter_tweets.is_empty() {
             bail!("{name}: FilterTweets carries no quote");
         }
         let call = |name: String, filter_tweets_at, expect: &VerdictFields| {
             anyhow::Ok(Case {
                 name,
-                viewer_id: id(&case.viewer)?,
+                viewer_id: case.viewer.as_deref().map(id).transpose()?,
                 post_id: id(&case.post)?,
+                country: country.clone(),
+                client: case.client,
                 quoted_in: case.quoted_in.as_deref().map(id).transpose()?,
                 filter_tweets_at,
                 expect: expect.clone(),
@@ -170,7 +197,7 @@ impl Case {
         vf_pb::EvaluateTweetsRequest {
             safety_level: SafetyLevel::TIMELINE_HOME_HYDRATION.0,
             tweets: std::iter::once(post).chain(outer).collect(),
-            viewer_id: Some(self.viewer_id),
+            viewer_id: self.viewer_id,
         }
     }
 
@@ -181,13 +208,13 @@ impl Case {
                 tweet_id: self.post_id,
                 author_id: None,
             }],
-            viewer_id: Some(self.viewer_id),
-            country_code: Some("US".to_string()),
+            viewer_id: self.viewer_id,
+            country_code: Some(self.country.to_ascii_uppercase()),
         }
     }
 
     fn metadata(&self) -> anyhow::Result<MetadataMap> {
-        let context = Client::Web.context(Some(self.viewer_id), Some("us"));
+        let context = self.client.context(self.viewer_id, Some(&self.country));
         let mut metadata = MetadataMap::new();
         metadata.insert(
             "twittercontext",
@@ -209,7 +236,7 @@ impl Case {
         let result = match answer {
             Answer::EvaluateTweets(answer) => {
                 match answer.as_ref().map(|results| results.first()) {
-                    Ok(Some(EvaluationResult::Evaluated(state))) => verdict(state_label(state)),
+                    Ok(Some(EvaluationResult::Evaluated(state))) => verdict(gate_label(state)),
                     Ok(Some(EvaluationResult::NotEvaluated)) => {
                         verdict(("not_evaluated".to_string(), NONE.to_string()))
                     }
@@ -230,6 +257,40 @@ impl Case {
             result,
         }
     }
+}
+
+fn gate_label(state: &TweetFieldsResultState) -> Label {
+    let (class, reason) = state_label(state);
+    if offers_age_verification(state) {
+        (class, format!("{reason}/age_prompt"))
+    } else {
+        (class, reason)
+    }
+}
+
+fn offers_age_verification(state: &TweetFieldsResultState) -> bool {
+    let TweetFieldsResultState::Found(found) = state else {
+        return false;
+    };
+    let Some(FilteredReason::SafetyResult(result)) = &found.suppress_reason else {
+        return false;
+    };
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "Action is a generated Thrift union; only these two carry a media blur"
+    )]
+    let media = match &result.action {
+        Action::ComposedMediaVisibilityResults(media) => Some(media),
+        Action::TweetInterstitial(interstitial) => {
+            interstitial.all_media_visibility_results.as_ref()
+        }
+        _ => None,
+    };
+    media
+        .and_then(|media| media.media_interstitial.as_deref())
+        .is_some_and(|MediaInterstitial::BlurredImageInterstitial(blur)| {
+            blur.interstitial_action == Some(InterstitialAction::AGE_VERIFICATION_PROMPT)
+        })
 }
 
 fn filter_label(result: &vf_pb::TweetVisibilityResult) -> Label {
@@ -253,8 +314,6 @@ impl CaseLine<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xai_x_thrift::get_tweet_fields::TweetFieldsResultState;
-    use xai_x_thrift::safety_result::FilteredReason;
     use xai_x_thrift::tweet_service::TweetFieldsResultFiltered;
 
     fn read(path: &str) -> String {
@@ -283,8 +342,10 @@ mod tests {
     fn case(quoted_in: Option<u64>) -> Case {
         Case {
             name: "viewer x post".to_string(),
-            viewer_id: 1,
+            viewer_id: Some(1),
             post_id: 2,
+            country: us(),
+            client: Client::Web,
             quoted_in,
             filter_tweets_at: None,
             expect: fields("drop", "author_is_suspended"),
@@ -375,6 +436,49 @@ mod tests {
     }
 
     #[test]
+    fn a_case_sends_its_country_and_client_and_no_viewer_when_it_names_none() {
+        let text = r#"{"fixtures": {"v": 1, "p": 2}, "cases": [
+            {"viewer": "v", "post": "p", "expect": {"class": "allow", "reason": "none"},
+             "filter_tweets": {"timeline_home": {"class": "allow", "reason": "none"}}},
+            {"post": "p", "country": "GB", "client": "ios_outdated",
+             "expect": {"class": "allow", "reason": "none"},
+             "filter_tweets": {"timeline_home": {"class": "allow", "reason": "none"}}}]}"#;
+        let calls = parse_cases(text).unwrap();
+        let sent: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                let filter_country = call
+                    .filter_tweets_at
+                    .and_then(|level| call.filter_request(level).country_code);
+                (
+                    call.name.as_str(),
+                    call.request().viewer_id,
+                    filter_country,
+                    (call.country.as_str(), call.client),
+                )
+            })
+            .collect();
+        let us_web = ("us", Client::Web);
+        let gb_ios = ("gb", Client::IosOutdated);
+        let gb_case = "logged_out x p from gb on IosOutdated";
+        let gb_filter = format!("{gb_case} on filter_tweets/timeline_home");
+        assert_eq!(
+            sent,
+            [
+                ("v x p", Some(1), None, us_web),
+                (
+                    "v x p on filter_tweets/timeline_home",
+                    Some(1),
+                    Some("US".to_string()),
+                    us_web
+                ),
+                (gb_case, None, None, gb_ios),
+                (gb_filter.as_str(), None, Some("GB".to_string()), gb_ios),
+            ]
+        );
+    }
+
+    #[test]
     fn request_sends_level_82_with_a_quote_s_outer_after_the_post() {
         assert_eq!(case(None).request().safety_level, 82);
         let tweets = case(Some(3)).request().tweets;
@@ -417,6 +521,46 @@ mod tests {
                 CaseResult::Wrong { got }
             );
         }
+    }
+
+    #[test]
+    fn a_blur_offering_age_verification_labels_its_reason_age_prompt() {
+        use xai_x_thrift::action::{
+            BlurredImageInterstitial, ComposedMediaVisibilityActions, InterstitialReason,
+        };
+        use xai_x_thrift::safety_result::SafetyResult;
+        use xai_x_thrift::tweet_service::TweetFieldsResultFound;
+        let blur = |interstitial_action| {
+            let media = ComposedMediaVisibilityActions {
+                media_interstitial: Some(Box::new(MediaInterstitial::BlurredImageInterstitial(
+                    BlurredImageInterstitial {
+                        reason: Some(InterstitialReason::Nudity(true)),
+                        opacity: None,
+                        interstitial_action,
+                        available_verification_options: None,
+                    },
+                ))),
+            };
+            let result = SafetyResult {
+                reason: None,
+                action: Action::ComposedMediaVisibilityResults(media),
+            };
+            EvaluationResult::Evaluated(Box::new(TweetFieldsResultState::Found(
+                TweetFieldsResultFound::new(FilteredReason::SafetyResult(result)),
+            )))
+        };
+        let got = |answer| match case(None).judge(&evaluated(vec![answer])).result {
+            CaseResult::Wrong { got } | CaseResult::Pass { got } => got,
+            CaseResult::CallFailed { error } => panic!("{error}"),
+        };
+        assert_eq!(
+            got(blur(Some(InterstitialAction::AGE_VERIFICATION_PROMPT))),
+            fields("composed_media_visibility_results", "nudity/age_prompt")
+        );
+        assert_eq!(
+            got(blur(None)),
+            fields("composed_media_visibility_results", "nudity")
+        );
     }
 
     #[test]

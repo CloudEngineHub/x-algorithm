@@ -1,10 +1,11 @@
 use crate::hydration::{Hydration, HydrationPlan, Hydrators, RequestRows};
 use crate::models::{
-    AuthorId, Decided, Evaluation, LimitedEngagement, MediaRestriction, Notice, Placement,
-    PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
+    AuthorId, Decided, Evaluation, LimitedEngagement, MediaRestriction, Notice, NotificationKind,
+    Placement, PostCandidate, TweetId, UserCandidate, Verdict, ViewerFeatures,
 };
 use crate::params::CountryLists;
 use crate::rules::defaults::{Bucket, Defaults, Effect};
+use crate::rules::levels::PostRules;
 use crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};
 use crate::rules::rule_spec::inputs::EvaluateInputs;
 use crate::rules::rule_spec::observed::{self, NoTrace, Observer, PolicyTrace, Total};
@@ -379,6 +380,12 @@ struct Level {
     policy: PostPolicy,
     plan: HydrationPlan,
     reads_soft_nsfw_new_user_drop: bool,
+    post_kinds: Option<PostKinds>,
+}
+
+struct PostKinds {
+    policies: Vec<(NotificationKind, PostPolicy)>,
+    plan: HydrationPlan,
 }
 
 impl Level {
@@ -391,6 +398,33 @@ impl Level {
                 || policy.post.reads(soft_nsfw_new_user_drop),
             policy,
             plan,
+            post_kinds: None,
+        }
+    }
+}
+
+impl PostKinds {
+    fn new(
+        level: SafetyLevel,
+        kinds: &[(NotificationKind, PostRules)],
+        names: &mut Vec<(RuleId, RuleAction, &'static str)>,
+    ) -> Self {
+        let policies: Vec<(NotificationKind, PostPolicy)> = kinds
+            .iter()
+            .map(|&(kind, rules)| {
+                let rules = rules.lists();
+                let user = named(names, &rules.user);
+                (kind, PostPolicy::new(user, named(names, &rules.post)))
+            })
+            .collect();
+        let hydrators = policies
+            .iter()
+            .fold(Hydrators::empty(), |hydrators, (_, policy)| {
+                hydrators.union(policy.hydrators)
+            });
+        Self {
+            plan: HydrationPlan::with_rows(level, RequestRows::ActorPosts, hydrators),
+            policies,
         }
     }
 }
@@ -425,7 +459,7 @@ fn interned_name(
 
 fn plans_from_its_rows(plan: &HydrationPlan) -> bool {
     match plan.rows() {
-        RequestRows::Posts => !plan.keys_a_node_only_user_rows_give(),
+        RequestRows::Posts | RequestRows::ActorPosts => !plan.keys_a_node_only_user_rows_give(),
         RequestRows::Users => plan.keys_only_user_rows_or_viewer(),
     }
 }
@@ -578,16 +612,25 @@ impl RuleEngine {
         let levels = SafetyLevel::VARIANTS
             .iter()
             .map(|&level| {
-                let rules = level.spec().rules().lists();
+                let spec = level.spec();
+                let rules = spec.rules().lists();
                 let policy = PostPolicy::new(
                     named(&mut names, &rules.user),
                     named(&mut names, &rules.post),
                 );
-                let entry = Level::new(level, policy);
+                let mut entry = Level::new(level, policy);
                 assert!(
                     plans_from_its_rows(&entry.plan),
                     "{level:?} plans keys its request rows cannot give"
                 );
+                if !spec.post_kinds().is_empty() {
+                    let post_kinds = PostKinds::new(level, spec.post_kinds(), &mut names);
+                    assert!(
+                        plans_from_its_rows(&post_kinds.plan),
+                        "{level:?} plans keys its actor post rows cannot give"
+                    );
+                    entry.post_kinds = Some(post_kinds);
+                }
                 entry
             })
             .collect();
@@ -602,7 +645,33 @@ impl RuleEngine {
         level: SafetyLevel,
         hydration: &'a Hydration,
     ) -> Option<Admitted<'a>> {
-        let missing = self.unplanned_inputs(level, hydration);
+        self.admit_under(self.policy(level), level, hydration)
+    }
+
+    pub(crate) fn admit_post_kind<'a>(
+        &'a self,
+        level: SafetyLevel,
+        kind: NotificationKind,
+        hydration: &'a Hydration,
+    ) -> Option<Admitted<'a>> {
+        self.admit_under(self.post_kind(level, kind)?, level, hydration)
+    }
+
+    fn post_kind(&self, level: SafetyLevel, kind: NotificationKind) -> Option<&PostPolicy> {
+        let post_kinds = self.level(level).post_kinds.as_ref()?;
+        post_kinds
+            .policies
+            .iter()
+            .find_map(|(judged, policy)| (*judged == kind).then_some(policy))
+    }
+
+    fn admit_under<'a>(
+        &'a self,
+        policy: &'a PostPolicy,
+        level: SafetyLevel,
+        hydration: &'a Hydration,
+    ) -> Option<Admitted<'a>> {
+        let missing = Self::unplanned_inputs(policy, hydration);
         if !missing.is_empty() {
             warn!(
                 ?missing,
@@ -613,7 +682,7 @@ impl RuleEngine {
         }
         Some(Admitted {
             level: AdmittedLevel {
-                policy: self.policy(level),
+                policy,
                 viewer: hydration.viewer(),
                 country_lists: &self.country_lists,
             },
@@ -621,9 +690,9 @@ impl RuleEngine {
         })
     }
 
-    fn unplanned_inputs(&self, level: SafetyLevel, hydration: &Hydration) -> Hydrators {
+    fn unplanned_inputs(policy: &PostPolicy, hydration: &Hydration) -> Hydrators {
         let logged_in = hydration.viewer().viewer.user_id().is_some();
-        self.policy(level)
+        policy
             .hydrators
             .iter()
             .filter(|&node| logged_in || !node.needs_viewer())
@@ -634,13 +703,13 @@ impl RuleEngine {
     #[cfg(test)]
     fn admit_user<'a>(
         &'a self,
-        level: SafetyLevel,
+        policy: &'a PostPolicy,
         viewer: &'a ViewerFeatures,
         user: UserCandidate,
         placement: Placement,
     ) -> AdmittedUser<'a> {
         AdmittedLevel {
-            policy: self.policy(level),
+            policy,
             viewer,
             country_lists: &self.country_lists,
         }
@@ -655,25 +724,48 @@ impl RuleEngine {
         candidate: &PostCandidate,
         placement: Placement,
     ) -> Evaluation {
-        self.fold(level, viewer, candidate, placement, &mut NoTrace)
+        self.fold(
+            self.policy(level),
+            viewer,
+            candidate,
+            placement,
+            &mut NoTrace,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_post_kind(
+        &self,
+        level: SafetyLevel,
+        kind: NotificationKind,
+        viewer: &ViewerFeatures,
+        candidate: &PostCandidate,
+        placement: Placement,
+    ) -> Evaluation {
+        let policy = self.post_kind_policy(level, kind);
+        self.fold(policy, viewer, candidate, placement, &mut NoTrace)
+    }
+
+    #[cfg(test)]
+    fn post_kind_policy(&self, level: SafetyLevel, kind: NotificationKind) -> &PostPolicy {
+        self.post_kind(level, kind)
+            .unwrap_or_else(|| panic!("{level:?} judges no {kind:?}"))
     }
 
     #[cfg(test)]
     fn fold<O: Observer<UserEngine> + Observer<PostEngine>>(
         &self,
-        level: SafetyLevel,
+        policy: &PostPolicy,
         viewer: &ViewerFeatures,
         candidate: &PostCandidate,
         placement: Placement,
         observer: &mut O,
     ) -> Evaluation {
         let author = UserCandidate {
-            failed: candidate
-                .failed
-                .intersection(self.policy(level).user.hydrators),
+            failed: candidate.failed.intersection(policy.user.hydrators),
             ..UserCandidate::author_of(candidate)
         };
-        self.admit_user(level, viewer, author, placement)
+        self.admit_user(policy, viewer, author, placement)
             .fold(candidate, observer)
     }
 
@@ -685,7 +777,7 @@ impl RuleEngine {
         user: &UserCandidate,
         placement: Placement,
     ) -> Evaluation {
-        self.admit_user(level, viewer, user.clone(), placement)
+        self.admit_user(self.policy(level), viewer, user.clone(), placement)
             .evaluate()
     }
 
@@ -707,6 +799,10 @@ impl RuleEngine {
         &self.level(level).plan
     }
 
+    pub(crate) fn post_kinds_plan(&self, level: SafetyLevel) -> Option<&HydrationPlan> {
+        Some(&self.level(level).post_kinds.as_ref()?.plan)
+    }
+
     pub(crate) fn reads_soft_nsfw_new_user_drop(&self, level: SafetyLevel) -> bool {
         self.level(level).reads_soft_nsfw_new_user_drop
     }
@@ -714,6 +810,15 @@ impl RuleEngine {
     #[cfg(test)]
     pub(crate) fn wired_rule_names(&self, level: SafetyLevel) -> Vec<&'static str> {
         self.policy(level).rule_names()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_kind_rule_names(
+        &self,
+        level: SafetyLevel,
+        kind: NotificationKind,
+    ) -> Vec<&'static str> {
+        self.post_kind_policy(level, kind).rule_names()
     }
 }
 
@@ -734,6 +839,24 @@ pub(super) struct WiredRule<'a, E: Engine = PostEngine> {
 }
 
 #[cfg(test)]
+pub(super) type FoldOrder<'a> = (Vec<WiredRule<'a, UserEngine>>, Vec<WiredRule<'a>>);
+
+#[cfg(test)]
+fn fold_order(policy: &PostPolicy) -> FoldOrder<'_> {
+    fn wired<'a, E: Engine>(rules: &'a [(&'static str, Rule<E>)]) -> Vec<WiredRule<'a, E>> {
+        rules
+            .iter()
+            .map(|&(name, ref rule)| WiredRule {
+                name,
+                action: rule.action.spec(),
+                when: rule.when,
+            })
+            .collect()
+    }
+    (wired(&policy.user.rules), wired(&policy.post.rules))
+}
+
+#[cfg(test)]
 impl RuleEngine {
     pub(super) fn trace(
         &self,
@@ -742,26 +865,30 @@ impl RuleEngine {
         candidate: &PostCandidate,
     ) -> PolicyTrace {
         let mut total = Total::default();
-        let evaluation = self.fold(level, viewer, candidate, Placement::Standalone, &mut total);
+        let evaluation = self.fold(
+            self.policy(level),
+            viewer,
+            candidate,
+            Placement::Standalone,
+            &mut total,
+        );
         total.into_trace(evaluation)
     }
 
-    pub(super) fn fold_order(
+    pub(super) fn fold_order(&self, level: SafetyLevel) -> FoldOrder<'_> {
+        fold_order(self.policy(level))
+    }
+
+    pub(super) fn post_kind_fold_orders(
         &self,
         level: SafetyLevel,
-    ) -> (Vec<WiredRule<'_, UserEngine>>, Vec<WiredRule<'_>>) {
-        fn wired<'a, E: Engine>(rules: &'a [(&'static str, Rule<E>)]) -> Vec<WiredRule<'a, E>> {
-            rules
-                .iter()
-                .map(|&(name, ref rule)| WiredRule {
-                    name,
-                    action: rule.action.spec(),
-                    when: rule.when,
-                })
-                .collect()
-        }
-        let policy = self.policy(level);
-        (wired(&policy.user.rules), wired(&policy.post.rules))
+    ) -> Vec<(NotificationKind, FoldOrder<'_>)> {
+        self.level(level)
+            .post_kinds
+            .iter()
+            .flat_map(|post_kinds| &post_kinds.policies)
+            .map(|(kind, policy)| (*kind, fold_order(policy)))
+            .collect()
     }
 
     pub(super) fn with_level_for_tests(
@@ -961,8 +1088,18 @@ country_specific_nsfw_content_gating:
             HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Posts, nodes)
         };
         assert!(plans_from_its_rows(&post_rows(user_and_viewer_keyed)));
+        let actor_keyed = Hydrators::of(Hydrator::AuthorProfile)
+            .with(Hydrator::AuthorConfirmedEmail)
+            .with(Hydrator::AuthorVerifiedPhone);
         assert!(!plans_from_its_rows(&post_rows(
             user_and_viewer_keyed.with(Hydrator::AuthorProfile)
+        )));
+        assert!(plans_from_its_rows(&HydrationPlan::with_rows(
+            SafetyLevel::NotificationsWriterV2,
+            RequestRows::ActorPosts,
+            user_and_viewer_keyed
+                .union(actor_keyed)
+                .with(Hydrator::Tweet),
         )));
     }
 
@@ -1959,7 +2096,10 @@ country_specific_nsfw_content_gating:
             assert!(rule_engine
                 .admit(SafetyLevel::TimelineHome, &unplanned)
                 .is_none());
-            let missing = rule_engine.unplanned_inputs(SafetyLevel::TimelineHome, &unplanned);
+            let missing = RuleEngine::unplanned_inputs(
+                rule_engine.policy(SafetyLevel::TimelineHome),
+                &unplanned,
+            );
             assert!(
                 missing.contains(Hydrator::Follows) && missing.contains(Hydrator::AuthorSafety),
                 "{missing:?}"
@@ -1998,7 +2138,10 @@ country_specific_nsfw_content_gating:
                 .admit(SafetyLevel::FilterAll, &unplanned)
                 .is_none());
             assert_eq!(
-                rule_engine.unplanned_inputs(SafetyLevel::FilterAll, &unplanned),
+                RuleEngine::unplanned_inputs(
+                    rule_engine.policy(SafetyLevel::FilterAll),
+                    &unplanned
+                ),
                 Hydrators::of(Hydrator::Follows)
             );
             let planned = hydrate(rule_engine.plan(SafetyLevel::FilterAll)).await;

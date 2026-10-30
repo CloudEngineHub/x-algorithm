@@ -49,6 +49,7 @@ from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.constants import CONVERSION_DELAY_NONE
 from xrex.data.recsys.recsys_batch import (
     EMBEDDING_CONFIG,
+    NUM_ADS_COUNT_FEATURES,
     NUM_USER_INSTALLED_APPS,
     PAGE_RECORD_COLUMNS,
     POST_INT64_FEATURE_SIZE,
@@ -279,6 +280,46 @@ class LazyRecordBatchIterator:
         return False
 
 
+class PrereadRecordBatchIterator:
+    def __init__(self, batch_iterator, batches: list[pa.RecordBatch]) -> None:
+        self._batches = deque(batches)
+        self.fname: str = batch_iterator.fname
+
+    def read(self) -> pa.RecordBatch:
+        if not self._batches:
+            raise StopIteration
+        return self._batches.popleft()
+
+    def skip_batch(self) -> bool:
+        if not self._batches:
+            return False
+        self._batches.popleft()
+        return True
+
+
+class RowSplitRecordBatchIterator:
+    def __init__(
+        self,
+        partition_batch_iterator: LazyRecordBatchIterator,
+        shards_per_partition: int,
+        rank_in_partition: int,
+    ):
+        assert 0 <= rank_in_partition < shards_per_partition
+        self._partition_batch_iterator = partition_batch_iterator
+        self._shards_per_partition = shards_per_partition
+        self._rank_in_partition = rank_in_partition
+        self.fname: str = partition_batch_iterator.fname
+
+    def read(self) -> pa.RecordBatch:
+        batch = self._partition_batch_iterator.read()
+        usable = batch.num_rows - batch.num_rows % self._shards_per_partition
+        rows = np.arange(self._rank_in_partition, usable, self._shards_per_partition)
+        return batch.take(pa.array(rows))
+
+    def skip_batch(self) -> bool:
+        return self._partition_batch_iterator.skip_batch()
+
+
 def _resolve_file_path(base_path: str, file_entry: str) -> str:
     if os.path.isabs(file_entry):
         return file_entry
@@ -385,6 +426,18 @@ def _block_shuffle_order(
         range(window_blocks),
         key=lambda j: (hashlib.blake2b(f"{tag}:{j}".encode(), digest_size=8).digest(), j),
     )
+
+
+_BLOCK_LOOKAHEAD_FILES = 4
+
+
+def _block_lookahead_plan(files_per_batch_id: int) -> list[int]:
+    files_per_batch_id = max(1, files_per_batch_id)
+    plan, budget = [], max(0, _BLOCK_LOOKAHEAD_FILES)
+    while budget > 0:
+        plan.append(min(files_per_batch_id, budget))
+        budget -= plan[-1]
+    return plan
 
 
 def _block_shuffle_fingerprint(
@@ -816,7 +869,7 @@ class InterleavingRecordBatchProvider:
                 raise ValueError("block_shuffle requires metadata mode (.valid_batches.json)")
             if continuous:
                 raise ValueError("block_shuffle is not supported with continuous=True")
-            if num_kafka_partitions % num_shards:
+            if num_kafka_partitions % num_shards and num_shards % num_kafka_partitions:
                 rank_logger.warning(
                     "block_shuffle: %d partitions over %d shards gives shards unequal file "
                     "counts, so they drift apart and resume from one checkpoint is approximate",
@@ -860,6 +913,22 @@ class InterleavingRecordBatchProvider:
         self._num_shards = num_shards
         self._shard_index = shard_index
         self._interleave_k = interleave_k
+        self._shards_per_partition = 1
+        if num_kafka_partitions and num_shards > num_kafka_partitions:
+            if num_shards % num_kafka_partitions:
+                raise ValueError(
+                    f"{num_shards} shards over {num_kafka_partitions} partitions: the shard "
+                    "count must be a multiple of the partition count"
+                )
+            if shuffle_mode != ShuffleMode.BLOCK_SHUFFLE:
+                raise ValueError(
+                    f"{num_shards} shards over {num_kafka_partitions} partitions splits rows, "
+                    "which only shuffle_mode=block_shuffle supports"
+                )
+            self._shards_per_partition = num_shards // num_kafka_partitions
+        self._num_partition_owners = num_shards // self._shards_per_partition
+        self._partition_owner_index = shard_index // self._shards_per_partition
+        self._rank_in_partition = shard_index % self._shards_per_partition
         self._date_range = date_range
         self._continuous = continuous
         self._poll_interval_s = poll_interval_s
@@ -1033,7 +1102,7 @@ class InterleavingRecordBatchProvider:
             my_files = [
                 _batch_path(self._topic_dir, p, bid)
                 for p in range(num_partitions)
-                if p % self._num_shards == self._shard_index
+                if p % self._num_partition_owners == self._partition_owner_index
             ]
             ready.append(my_files)
             self._next_batch_id = bid + 1
@@ -1083,7 +1152,8 @@ class InterleavingRecordBatchProvider:
                 my_files = [
                     f
                     for f in files_for_batch
-                    if (_extract_partition_id(f) or 0) % self._num_shards == self._shard_index
+                    if (_extract_partition_id(f) or 0) % self._num_partition_owners
+                    == self._partition_owner_index
                 ]
                 ready.append(my_files)
                 self._next_batch_id = bid + 1
@@ -1092,16 +1162,18 @@ class InterleavingRecordBatchProvider:
 
         return ready
 
-    def _open_file(self, file: str, pool: ThreadPoolExecutor, active: deque) -> None:
+    def _open_file(
+        self, file: str, pool: ThreadPoolExecutor, active: deque, read_all: bool = False
+    ) -> None:
         rank_logger.info(f"Worker {self._shard_index}/{self._num_shards} opening file {file}")
         path = _resolve_file_path(self._path, file)
 
         def _impl():
             try:
                 pf = ParquetFile(path)
-                return LazyRecordBatchIterator(
+                holder = LazyRecordBatchIterator(
                     pf,
-                    self._batch_size,
+                    self._batch_size * self._shards_per_partition,
                     path,
                     self._conversion_delay_columns,
                     self._include_action_delay_columns,
@@ -1110,6 +1182,16 @@ class InterleavingRecordBatchProvider:
                     id_list_sidecar_strict=self._id_list_sidecar_strict,
                     id_list_sources=self._id_list_sources,
                 )
+                if self._shards_per_partition > 1:
+                    holder = RowSplitRecordBatchIterator(
+                        holder, self._shards_per_partition, self._rank_in_partition
+                    )
+                if read_all:
+                    batches = []
+                    while (batch := self._safe_read(holder)) is not None:
+                        batches.append(batch)
+                    return PrereadRecordBatchIterator(holder, batches)
+                return holder
             except Exception as e:
                 if "No such file or directory" in str(e):
                     rank_logger.warning(f"Skipping missing file {file}")
@@ -1138,6 +1220,7 @@ class InterleavingRecordBatchProvider:
         pending: deque[Future[LazyRecordBatchIterator | None]] = deque()
         ready: deque[LazyRecordBatchIterator] = deque()
         active: deque[LazyRecordBatchIterator] = deque()
+        read_ahead: dict[int, Future[pa.RecordBatch | None]] = {}
         file_idx = 0
 
         def _submit_opens() -> None:
@@ -1168,6 +1251,7 @@ class InterleavingRecordBatchProvider:
         if prefetched:
             pending.extend(prefetched)
             file_idx = len(prefetched)
+            _submit_opens()
             _fill_active_blocking()
 
             if prefetched_batches:
@@ -1200,7 +1284,9 @@ class InterleavingRecordBatchProvider:
                 continue
 
             holders = list(active)
-            futures = [pool.submit(self._safe_read, h) for h in holders]
+            futures = [
+                read_ahead.pop(id(h), None) or pool.submit(self._safe_read, h) for h in holders
+            ]
             active.clear()
 
             for holder, fut in zip(holders, futures):
@@ -1208,6 +1294,7 @@ class InterleavingRecordBatchProvider:
                 if batch is not None:
                     self._reads_in_current_batch += 1
                     active.append(holder)
+                    read_ahead[id(holder)] = pool.submit(self._safe_read, holder)
                     yield batch
 
             _submit_opens()
@@ -1326,7 +1413,7 @@ class InterleavingRecordBatchProvider:
                     (bid, _batch_path(self._topic_dir, p, bid))
                     for bid in range(window_start, window_end)
                     for p in range(meta["num_partitions"])
-                    if p % self._num_shards == self._shard_index
+                    if p % self._num_partition_owners == self._partition_owner_index
                 ]
                 rng = np.random.default_rng((self._shuffle_seed, self._shard_index, window_start))
                 order = rng.permutation(len(entries))
@@ -1368,8 +1455,14 @@ class InterleavingRecordBatchProvider:
         resume = self._block_resume
         window_start = resume[0] if resume else (self._next_batch_id // window) * window
 
+        files_per_batch_id = max(1, self._interleave_k)
         pool = ThreadPoolExecutor(
-            max_workers=max(1, self._interleave_k), thread_name_prefix="block_shuffle_parquet"
+            max_workers=files_per_batch_id, thread_name_prefix="block_shuffle_parquet"
+        )
+        lookahead_plan = _block_lookahead_plan(files_per_batch_id)
+        lookahead_pool = ThreadPoolExecutor(
+            max_workers=max(1, sum(lookahead_plan)),
+            thread_name_prefix="block_shuffle_lookahead",
         )
         try:
             while True:
@@ -1452,13 +1545,31 @@ class InterleavingRecordBatchProvider:
                     lo=lo,
                     hi=hi,
                 )
-                for bid in sequence:
-                    if bid in done:
-                        continue
+                pending_bids = [bid for bid in sequence if bid not in done]
+                prefetched_by_position: dict[
+                    int, deque[Future[LazyRecordBatchIterator | None]]
+                ] = {}
+                for position, bid in enumerate(pending_bids):
                     if carry:
                         self._remaining_skips, carry = carry, 0
+                    for offset, files_to_read in enumerate(lookahead_plan, start=1):
+                        ahead = position + offset
+                        if ahead >= len(pending_bids):
+                            break
+                        if ahead not in prefetched_by_position:
+                            opened: deque[Future[LazyRecordBatchIterator | None]] = deque()
+                            files = self._files_for_batch_id(pending_bids[ahead], num_partitions)
+                            for file in files[:files_to_read]:
+                                self._open_file(file, lookahead_pool, opened, read_all=True)
+                            prefetched_by_position[ahead] = opened
+                    prefetched = prefetched_by_position.pop(position, None)
                     block_log.batch_id(bid)
-                    yield from self._drain_batch_id(bid, num_partitions, pool)
+                    yield from self._drain_batch_id(
+                        bid,
+                        num_partitions,
+                        pool,
+                        prefetched=prefetched if self._remaining_skips == 0 else None,
+                    )
                     segments[-1][2] += 1
                     self._reads_in_current_batch = 0
                 if hi < window_start + window and _block_window_grew(
@@ -1470,18 +1581,26 @@ class InterleavingRecordBatchProvider:
                 self._next_batch_id = window_start
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+            lookahead_pool.shutdown(wait=False, cancel_futures=True)
 
-    def _drain_batch_id(
-        self, bid: int, num_partitions: int, pool: ThreadPoolExecutor
-    ) -> Iterator[pa.RecordBatch]:
-        files = [
+    def _files_for_batch_id(self, bid: int, num_partitions: int) -> list[str]:
+        return [
             _batch_path(self._topic_dir, p, bid)
             for p in range(num_partitions)
-            if p % self._num_shards == self._shard_index
+            if p % self._num_partition_owners == self._partition_owner_index
         ]
+
+    def _drain_batch_id(
+        self,
+        bid: int,
+        num_partitions: int,
+        pool: ThreadPoolExecutor,
+        prefetched: deque[Future[LazyRecordBatchIterator | None]] | None = None,
+    ) -> Iterator[pa.RecordBatch]:
+        files = self._files_for_batch_id(bid, num_partitions)
         self._current_drain_batch_id = bid
         self._reads_in_current_batch = 0
-        yield from self._drain_files(files, pool=pool)
+        yield from self._drain_files(files, pool=pool, prefetched=prefetched)
 
     def set_end_batch_id(self, end_batch_id: int) -> None:
         if self._end_batch_id is not None and end_batch_id < self._end_batch_id:
@@ -1681,6 +1800,8 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         for key in VALUE_LABEL_DTYPES:
             if (value_labels := post_seq.get(key)) is not None:
                 padded[key] = pad_array(value_labels)
+        if (ads_counts := post_seq.get("ads_count_buckets")) is not None:
+            padded["ads_count_buckets"] = pad_array(ads_counts)
         if (delays := post_seq.get("conversion_delay_ms")) is not None:
             padded["conversion_delay_ms"] = np.pad(
                 delays,
@@ -1819,6 +1940,7 @@ class PhoenixDataset(Dataset):
     dump_keep_rate_per_10000: int | None = None
     ads_pixel_head_masking: bool = False
     page_records: bool = False
+    read_ads_engagement_counts: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -1920,7 +2042,13 @@ class PhoenixDataset(Dataset):
 
         manifest = load_batch_manifest(topic_dir) if self._counts_steps_from_manifest() else None
         num_partitions = meta["num_partitions"]
-        files_per_shard = (self.num_kafka_partitions or 0) // num_shards
+        partitions = self.num_kafka_partitions or num_partitions
+        shards_per_partition = 1
+        if partitions and num_shards > partitions and num_shards % partitions == 0:
+            shards_per_partition = num_shards // partitions
+        num_partition_owners = num_shards // shards_per_partition
+        rows_per_step = batch_size * shards_per_partition
+        files_per_shard = (self.num_kafka_partitions or 0) // num_partition_owners
 
         if (
             self.shuffle_window_time_slices > 0
@@ -1976,15 +2104,18 @@ class PhoenixDataset(Dataset):
         ):
             if manifest is not None:
                 rows = manifest.rows_matrix(topic_dir, start_bid, end_bid, num_partitions)
-                full, tail = np.divmod(rows, batch_size)
-                steps = full + ((tail > 0) & (tail * 2 >= batch_size))
-                shard_of = np.arange(num_partitions) % num_shards
-                per_bid = [steps[:, shard_of == s].sum(axis=1) for s in range(num_shards)]
+                full, tail = np.divmod(rows, rows_per_step)
+                kept_tail = tail // shards_per_partition
+                steps = full + ((kept_tail > 0) & (kept_tail * 2 >= batch_size))
+                owner_of = np.arange(num_partitions) % num_partition_owners
+                per_bid = [steps[:, owner_of == o].sum(axis=1) for o in range(num_partition_owners)]
                 source = "batch manifest, block shuffle"
             else:
                 dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
-                uniform = np.full(end_bid - start_bid, files_per_shard * (dump_rows // batch_size))
-                per_bid = [uniform] * num_shards
+                uniform = np.full(
+                    end_bid - start_bid, files_per_shard * (dump_rows // rows_per_step)
+                )
+                per_bid = [uniform] * num_partition_owners
                 source = f"{dump_rows}-row sample file, block shuffle"
             block = self.block_shuffle_block_time_slices
             remaining = None
@@ -1997,7 +2128,7 @@ class PhoenixDataset(Dataset):
                     shard=shard if self.block_shuffle_order_per_shard else None,
                     segments=block_resume.segments,
                 )
-                counts = per_bid[shard]
+                counts = per_bid[shard // shards_per_partition]
                 left_steps = sum(
                     int(counts[b - start_bid])
                     for b in range(max(start_bid, block_resume.window_start), end_bid)
@@ -2019,17 +2150,18 @@ class PhoenixDataset(Dataset):
                     topic_dir,
                     manifest,
                     num_partitions=num_partitions,
-                    num_shards=num_shards,
+                    num_shards=num_partition_owners,
                     batch_size=batch_size,
                     start_batch_id=start_bid,
                     end_batch_id=end_bid,
                     resume_batch_id=resume_bid,
                     resume_reads_in_batch=adjusted_reads,
+                    shards_per_partition=shards_per_partition,
                 )
                 source = "batch manifest"
             else:
                 dump_rows = pq.ParquetFile(_batch_path(topic_dir, 0, start_bid)).metadata.num_rows
-                batches_per_bid = files_per_shard * (dump_rows // batch_size)
+                batches_per_bid = files_per_shard * (dump_rows // rows_per_step)
                 total_batches = (end_bid - start_bid) * batches_per_bid
                 consumed = 0
                 if resume_bid is not None and resume_bid >= start_bid:
@@ -2170,11 +2302,14 @@ class PhoenixDataset(Dataset):
                     )
 
                 assert self.num_kafka_partitions is not None
-                assert self.num_kafka_partitions % num_shards == 0, (
+                assert (
+                    self.num_kafka_partitions % num_shards == 0
+                    or num_shards % self.num_kafka_partitions == 0
+                ), (
                     self.num_kafka_partitions,
                     num_shards,
                 )
-                interleave_k = self.num_kafka_partitions // num_shards
+                interleave_k = max(1, self.num_kafka_partitions // num_shards)
 
                 topic_dir = self.path
                 metadata_path = str(Path(topic_dir) / ".valid_batches.json")
@@ -2341,6 +2476,7 @@ class PhoenixDataset(Dataset):
                         page_records=self.page_records,
                         id_list_specs=id_list_specs,
                         history_url_embedding_dim=self.history_url_embedding_dim,
+                        read_ads_engagement_counts=self.read_ads_engagement_counts,
                         alloc=self._alloc,
                         aux_value_events=self.aux_value_events,
                     )
@@ -2628,6 +2764,10 @@ class PhoenixDataset(Dataset):
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
             sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
+        if self.read_ads_engagement_counts:
+            batch["candidate_seq"]["ads_count_buckets"] = np.zeros(
+                (batch_size, candidate_seq_len, NUM_ADS_COUNT_FEATURES), dtype=np.uint8
+            )
         if specs := self.id_list_specs:
             ids, batch["user_id_list_mask"] = id_lists.empty_arrays(batch_size, specs)
             batch["user_id_list_hashes"] = id_lists.hash_id_lists(

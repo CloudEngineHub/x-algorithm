@@ -642,7 +642,16 @@ async fn run_enforcement_inner(
             }
             if control.page_driven() {
                 let account = facts.user();
-                let skip = if account.suspended {
+                let upgrades = control.page_actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        action_control::PageAction::Suspend {
+                            permanent: true,
+                            ..
+                        }
+                    )
+                });
+                let skip = if account.suspended && !upgrades {
                     Some(ALREADY_SUSPENDED)
                 } else if account.deactivated {
                     Some("already_deactivated")

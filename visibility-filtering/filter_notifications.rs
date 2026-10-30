@@ -1,10 +1,12 @@
-use crate::ingress;
-use crate::metrics::{self, Endpoint, RequestLevel};
-use crate::models::{AuthorId, Evaluation};
+use crate::ingress::{self, NotificationPost, NotificationRequest, Notifications};
+use crate::metrics::{self, Endpoint, RequestLevel, RequestMetrics};
+use crate::models::{AuthorId, Evaluation, NotificationKind, TweetId};
 use crate::post_evaluator::PostEvaluator;
+use crate::rules::SafetyLevel;
 use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
+use strum::VariantArray;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
@@ -22,7 +24,7 @@ impl FilterNotificationsEndpoint {
         request: Request<vf_pb::FilterNotificationsRequest>,
     ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {
         let level = ingress::notification_level(request.get_ref().safety_level);
-        let request_level = RequestLevel::of(level.as_ref().ok().map(|&(level, _)| level));
+        let request_level = RequestLevel::of(level.as_ref().ok().copied());
         metrics::observe_request(
             self.post_evaluator.metrics(),
             Endpoint::FilterNotifications,
@@ -32,47 +34,107 @@ impl FilterNotificationsEndpoint {
                 metrics::record_batch_size(&request_metrics, request.get_ref().notifications.len());
                 let (level, notifications) =
                     ingress::filter_notifications(request.get_ref(), level)?;
-                let mut actors = notifications.ids.clone();
-                actors.sort_unstable_by_key(|actor| actor.0);
-                actors.dedup();
-                let by_actor: HashMap<AuthorId, Option<Evaluation>> = if actors.is_empty() {
-                    HashMap::new()
-                } else {
-                    context
-                        .scope(self.post_evaluator.evaluate_users(
-                            level,
-                            notifications.recipient,
-                            actors,
+                let response = match notifications {
+                    NotificationRequest::Users(users) => {
+                        let by_actor = context
+                            .scope(self.users(level, &users, &request_metrics))
+                            .await;
+                        respond(
                             &request_metrics,
-                        ))
-                        .await
+                            users.rows.iter().map(|&(kind, actor)| {
+                                (kind, by_actor.get(&actor).and_then(Option::as_ref))
+                            }),
+                        )
+                    }
+                    NotificationRequest::Posts(posts) => {
+                        let by_post = context
+                            .scope(self.posts(level, &posts, &request_metrics))
+                            .await;
+                        respond(
+                            &request_metrics,
+                            posts
+                                .rows
+                                .iter()
+                                .map(|&(kind, NotificationPost { post, actor })| {
+                                    (
+                                        kind,
+                                        by_post.get(&(post, kind, actor)).and_then(Option::as_ref),
+                                    )
+                                }),
+                        )
+                    }
                 };
-                let evaluation = |actor: &AuthorId| by_actor.get(actor).and_then(Option::as_ref);
-                metrics::record_sent(
-                    &request_metrics,
-                    notifications.ids.iter().filter_map(evaluation),
-                    notifications
-                        .ids
-                        .iter()
-                        .filter(|&actor| evaluation(actor).is_none())
-                        .count(),
-                );
-                let results: Vec<_> = notifications
-                    .ids
-                    .iter()
-                    .map(|actor| treatment::notification_result(evaluation(actor)))
-                    .collect();
-                metrics::record_notification_results(
-                    &request_metrics,
-                    notifications.kind.into(),
-                    results.iter().map(|&(_, labels)| labels),
-                );
-                Ok(Response::new(vf_pb::FilterNotificationsResponse {
-                    results: results.into_iter().map(|(result, _)| result).collect(),
-                }))
+                Ok(Response::new(response))
             },
         )
         .await
+    }
+
+    async fn users(
+        &self,
+        level: SafetyLevel,
+        notifications: &Notifications<AuthorId>,
+        metrics: &RequestMetrics,
+    ) -> HashMap<AuthorId, Option<Evaluation>> {
+        let mut actors: Vec<AuthorId> =
+            notifications.rows.iter().map(|&(_, actor)| actor).collect();
+        actors.sort_unstable_by_key(|actor| actor.0);
+        actors.dedup();
+        if actors.is_empty() {
+            return HashMap::new();
+        }
+        self.post_evaluator
+            .evaluate_users(level, notifications.recipient, actors, metrics)
+            .await
+    }
+
+    async fn posts(
+        &self,
+        level: SafetyLevel,
+        notifications: &Notifications<NotificationPost>,
+        metrics: &RequestMetrics,
+    ) -> HashMap<(TweetId, NotificationKind, AuthorId), Option<Evaluation>> {
+        let mut posts: Vec<_> = notifications
+            .rows
+            .iter()
+            .map(|&(kind, NotificationPost { post, actor })| (post, kind, actor))
+            .collect();
+        posts.sort_unstable_by_key(|&(post, kind, actor)| (post, kind, actor.0));
+        posts.dedup();
+        self.post_evaluator
+            .evaluate_post_notifications(level, notifications.recipient, &posts, metrics)
+            .await
+    }
+}
+
+fn respond<'a>(
+    metrics: &RequestMetrics,
+    rows: impl Iterator<Item = (NotificationKind, Option<&'a Evaluation>)>,
+) -> vf_pb::FilterNotificationsResponse {
+    let rows: Vec<_> = rows.collect();
+    metrics::record_sent(
+        metrics,
+        rows.iter().filter_map(|&(_, evaluation)| evaluation),
+        rows.iter()
+            .filter(|(_, evaluation)| evaluation.is_none())
+            .count(),
+    );
+    let results: Vec<_> = rows
+        .into_iter()
+        .map(|(kind, evaluation)| (kind, treatment::notification_result(evaluation)))
+        .collect();
+    for &kind in NotificationKind::VARIANTS {
+        let mut labels = results
+            .iter()
+            .filter(|&&(row_kind, _)| row_kind == kind)
+            .map(|&(_, (_, labels))| labels)
+            .peekable();
+        if labels.peek().is_some() {
+            metrics::record_notification_results(metrics, kind.into(), labels);
+        }
+    }
+    vf_pb::FilterNotificationsResponse {
+        results: results.into_iter().map(|(_, (result, _))| result).collect(),
     }
 }
 
@@ -83,8 +145,8 @@ mod tests {
     use crate::hydration::inventory::Source;
     use crate::hydration::sources::{found_user, suspended, Fault, InMemorySources};
     use crate::metrics::families::{
-        EVALUATED_CANDIDATES, REQUESTS, REQUESTS_BY_CALLER, UNRESOLVED_TWEETS, VERDICTS,
-        VERDICTS_BY_RULE,
+        EVALUATED_CANDIDATES, NOTIFICATION_RESULTS, REQUESTS, REQUESTS_BY_CALLER,
+        UNRESOLVED_TWEETS, VERDICTS, VERDICTS_BY_RULE,
     };
     use crate::metrics::Metrics;
     use crate::rules::RuleEngine;
@@ -102,6 +164,10 @@ mod tests {
     const OTHER_ACTOR: u64 = 2;
     const SUSPENDED_ACTOR: u64 = 3;
     const MISSING_ACTOR: u64 = 4;
+    const POST: u64 = 100;
+    const OTHER_POST: u64 = 101;
+    const SUSPENDED_POST: u64 = 102;
+    const MISSING_POST: u64 = 999;
 
     #[derive(Debug, PartialEq, Eq)]
     enum Seen {
@@ -124,6 +190,38 @@ mod tests {
                 vf_pb::FollowRequestAccepted {},
             )),
         }
+    }
+
+    fn mention(actor_id: u64, post_id: u64) -> vf_pb::Notification {
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(vf_pb::notification::Kind::Mention(vf_pb::Mention {
+                post_id,
+            })),
+        }
+    }
+
+    fn reply(actor_id: u64, post_id: u64) -> vf_pb::Notification {
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(vf_pb::notification::Kind::Reply(vf_pb::Reply { post_id })),
+        }
+    }
+
+    fn media_tagged(actor_id: u64, post_id: u64) -> vf_pb::Notification {
+        vf_pb::Notification {
+            actor_id,
+            kind: Some(vf_pb::notification::Kind::MediaTagged(vf_pb::MediaTagged {
+                post_id,
+            })),
+        }
+    }
+
+    fn posts_world() -> InMemorySources {
+        world()
+            .tweet(POST, ACTOR)
+            .tweet(OTHER_POST, OTHER_ACTOR)
+            .tweet(SUSPENDED_POST, SUSPENDED_ACTOR)
     }
 
     fn recipient(filters: GizmoduckAdvancedFilters) -> GizmoduckUser {
@@ -254,6 +352,24 @@ mod tests {
             ),
             (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![follow(ACTOR)]),
             (9_999, RECIPIENT, vec![follow(ACTOR)]),
+            (FOLLOW, RECIPIENT, vec![mention(ACTOR, POST)]),
+            (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![mention(ACTOR, 0)]),
+            (FOLLOW_REQUEST_ACCEPTED, RECIPIENT, vec![reply(ACTOR, 0)]),
+            (
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![media_tagged(0, POST)],
+            ),
+            (
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![mention(ACTOR, POST), accepted(OTHER_ACTOR)],
+            ),
+            (
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![accepted(OTHER_ACTOR), media_tagged(ACTOR, POST)],
+            ),
         ] {
             let (seen, sources) = filter(world(), level, recipient_id, notifications).await;
             assert_eq!(seen, Err(tonic::Code::InvalidArgument), "level {level}");
@@ -690,6 +806,317 @@ mod tests {
         assert_eq!(
             follows(sources, &[ACTOR, SUSPENDED_ACTOR]).await,
             [Seen::Allowed, Seen::Dropped(DropReason::ActorSuspended)]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_post_notification_judges_its_post_author_in_order_on_one_post_lookup() {
+        const ACTORLESS_POST: u64 = 103;
+        let sources = posts_world().tweet(ACTORLESS_POST, MISSING_ACTOR).edge(
+            Graph::Blocks,
+            RECIPIENT,
+            OTHER_ACTOR,
+        );
+        let (seen, sources) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                mention(ACTOR, POST),
+                mention(OTHER_ACTOR, POST),
+                reply(SUSPENDED_ACTOR, SUSPENDED_POST),
+                media_tagged(OTHER_ACTOR, OTHER_POST),
+                mention(ACTOR, MISSING_POST),
+                reply(OTHER_ACTOR, POST),
+                media_tagged(ACTOR, POST),
+                mention(MISSING_ACTOR, ACTORLESS_POST),
+                mention(ACTOR, POST),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            Ok(vec![
+                Seen::Allowed,
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Dropped(DropReason::ActorSuspended),
+                Seen::Dropped(DropReason::RecipientBlocksActor),
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Dropped(DropReason::PostNotFound),
+                Seen::Allowed,
+                Seen::Dropped(DropReason::ActorNotFound),
+                Seen::Allowed,
+            ])
+        );
+        assert_eq!(
+            sources.keys(Source::TesPureCoreData),
+            [vec![
+                POST,
+                OTHER_POST,
+                SUSPENDED_POST,
+                ACTORLESS_POST,
+                MISSING_POST
+            ]]
+        );
+        assert_eq!(
+            sources.keys(Source::GizmoduckActor),
+            [vec![ACTOR, OTHER_ACTOR, SUSPENDED_ACTOR, MISSING_ACTOR]]
+        );
+        assert_eq!(sources.keys(Source::GizmoduckViewer), [vec![RECIPIENT]]);
+        assert!(!sources.calls().contains(&Source::GizmoduckAuthor));
+    }
+
+    #[tokio::test]
+    async fn a_post_author_s_email_lookup_runs_only_for_a_recipient_filtering_on_it() {
+        let filters = GizmoduckAdvancedFilters {
+            filter_no_confirmed_email: true,
+            ..Default::default()
+        };
+        for landing_last in [Source::GizmoduckViewer, Source::TesPureCoreData] {
+            let sources = posts_world()
+                .viewer(RECIPIENT, recipient(filters.clone()))
+                .confirmed_email(ACTOR)
+                .latency(landing_last, std::time::Duration::from_millis(20));
+            let (seen, sources) = filter(
+                sources,
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![mention(ACTOR, POST), reply(OTHER_ACTOR, OTHER_POST)],
+            )
+            .await;
+            assert_eq!(
+                seen,
+                Ok(vec![Seen::Allowed, Seen::Dropped(DropReason::Unspecified)]),
+                "{landing_last:?}"
+            );
+            assert_eq!(
+                sources.keys(Source::ActorEmails),
+                [vec![ACTOR, OTHER_ACTOR]],
+                "{landing_last:?}"
+            );
+        }
+        let (_, unfiltered) = filter(
+            posts_world(),
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![mention(ACTOR, POST)],
+        )
+        .await;
+        assert!(!unfiltered.calls().contains(&Source::ActorEmails));
+    }
+
+    #[tokio::test]
+    async fn failed_lookups_fail_only_the_post_notifications_whose_verdict_read_them() {
+        let email_filter = GizmoduckAdvancedFilters {
+            filter_no_confirmed_email: true,
+            ..Default::default()
+        };
+        for (name, sources, expected) in [
+            (
+                "post",
+                posts_world().fail_key(Source::TesPureCoreData, POST),
+                [Seen::Failed, Seen::Allowed],
+            ),
+            (
+                "actor",
+                posts_world().fail_key(Source::GizmoduckActor, ACTOR),
+                [Seen::Failed, Seen::Allowed],
+            ),
+            (
+                "recipient",
+                posts_world().fault(Source::GizmoduckViewer, Fault::Fails),
+                [Seen::Failed, Seen::Failed],
+            ),
+            (
+                "email",
+                posts_world()
+                    .viewer(RECIPIENT, recipient(email_filter.clone()))
+                    .confirmed_email(OTHER_ACTOR)
+                    .fail_key(Source::ActorEmails, ACTOR),
+                [Seen::Failed, Seen::Allowed],
+            ),
+            (
+                "flock",
+                posts_world().fail_graph(Graph::Blocks),
+                [Seen::Failed, Seen::Failed],
+            ),
+        ] {
+            let (seen, _) = filter(
+                sources,
+                FOLLOW_REQUEST_ACCEPTED,
+                RECIPIENT,
+                vec![mention(ACTOR, POST), reply(OTHER_ACTOR, OTHER_POST)],
+            )
+            .await;
+            assert_eq!(seen, Ok(expected.into()), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_post_notification_counts_under_its_kind() {
+        let (metrics, recording) = Metrics::recording();
+        let (seen, _) = filter_with(
+            metrics,
+            posts_world(),
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                mention(ACTOR, POST),
+                reply(OTHER_ACTOR, POST),
+                media_tagged(ACTOR, MISSING_POST),
+                mention(SUSPENDED_ACTOR, SUSPENDED_POST),
+            ],
+        )
+        .await;
+        assert!(seen.is_ok());
+        let mut recorded: Vec<(String, String, String, f64)> = recording
+            .take(&NOTIFICATION_RESULTS.family)
+            .into_iter()
+            .map(|sample| {
+                let label = |name| sample.label(name).unwrap().to_owned();
+                (
+                    label("notification_type"),
+                    label("outcome"),
+                    label("reason"),
+                    sample.value,
+                )
+            })
+            .collect();
+        recorded.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let row = |kind: &str, outcome: &str, reason: &str| {
+            (kind.to_owned(), outcome.to_owned(), reason.to_owned(), 1.0)
+        };
+        assert_eq!(
+            recorded,
+            [
+                row("media_tagged", "dropped", "post_not_found"),
+                row("mention", "allowed", "none"),
+                row("mention", "dropped", "actor_suspended"),
+                row("reply", "dropped", "post_not_found"),
+            ]
+        );
+        let mut by_rule: Vec<(String, String, f64)> = recording
+            .take(&VERDICTS_BY_RULE.family)
+            .into_iter()
+            .map(|sample| {
+                let label = |name| sample.label(name).unwrap().to_owned();
+                (label("rule"), label("safety_level"), sample.value)
+            })
+            .collect();
+        by_rule.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let level = "notifications_writer_v2".to_owned();
+        assert_eq!(
+            by_rule,
+            [
+                ("not_found".to_owned(), level.clone(), 2.0),
+                ("suspended_author/drop".to_owned(), level, 1.0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mention_and_a_reply_meet_level_79_s_drops_and_a_media_tag_does_not() {
+        use crate::models::SafetyLabelType;
+        use crate::scenario::label_map;
+        let sources = posts_world().labels(POST, label_map(SafetyLabelType::SPAM));
+        let (seen, _) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                mention(ACTOR, POST),
+                reply(ACTOR, POST),
+                media_tagged(ACTOR, POST),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            Ok(vec![
+                Seen::Dropped(DropReason::Unspecified),
+                Seen::Dropped(DropReason::Unspecified),
+                Seen::Allowed,
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_country_takedown_spares_a_post_notification() {
+        use crate::models::TweetFeatures;
+        use xai_core_entities::entities::TakedownReason;
+        let taken_down = |reason| TweetFeatures {
+            takedown_reasons: vec![reason],
+            ..TweetFeatures::default()
+        };
+        let sources = posts_world()
+            .country(RECIPIENT, "de")
+            .tweet_features(
+                POST,
+                taken_down(TakedownReason::BystanderReport {
+                    country_code: "de".to_owned(),
+                }),
+            )
+            .tweet_features(
+                OTHER_POST,
+                taken_down(TakedownReason::LegalRequest {
+                    country_code: "xx".to_owned(),
+                }),
+            );
+        let (seen, _) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![mention(ACTOR, POST), mention(OTHER_ACTOR, OTHER_POST)],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            Ok(vec![Seen::Allowed, Seen::Dropped(DropReason::Unspecified)])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_label_read_fails_a_mention_and_spares_a_media_tag_of_the_same_post() {
+        let sources = posts_world().fail_key(Source::SafetyLabels, POST);
+        let (seen, _) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![mention(ACTOR, POST), media_tagged(ACTOR, POST)],
+        )
+        .await;
+        assert_eq!(seen, Ok(vec![Seen::Failed, Seen::Allowed]));
+    }
+
+    #[tokio::test]
+    async fn only_people_i_follow_exempts_a_post_notification_in_a_community() {
+        const COMMUNITY_POST: u64 = 103;
+        let mut viewer = recipient(GizmoduckAdvancedFilters::default());
+        viewer.account.mention_filter = Some(MentionFilter::Following);
+        let sources = posts_world()
+            .viewer(RECIPIENT, viewer)
+            .tweet(COMMUNITY_POST, ACTOR)
+            .community_post(COMMUNITY_POST, 7);
+        let (seen, _) = filter(
+            sources,
+            FOLLOW_REQUEST_ACCEPTED,
+            RECIPIENT,
+            vec![
+                mention(ACTOR, POST),
+                mention(ACTOR, COMMUNITY_POST),
+                media_tagged(ACTOR, POST),
+                media_tagged(ACTOR, COMMUNITY_POST),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            Ok(vec![
+                Seen::Dropped(DropReason::Unspecified),
+                Seen::Allowed,
+                Seen::Dropped(DropReason::Unspecified),
+                Seen::Allowed,
+            ])
         );
     }
 }

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 5;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 6;
+pub const SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 6;
+pub const AUTHOR_SKIPS_RECORD_VERSION: u32 = 5;
 pub const ROLLOUT_RECORD_VERSION: u32 = 4;
 pub const ROWS_RECORD_VERSION: u32 = 3;
 pub const BAND_RECORD_VERSION: u32 = 1;
@@ -191,11 +193,48 @@ impl Lifetime {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SuspensionPolicy {
+    #[default]
+    PlatformManipulation,
+    Cse,
+}
+
+impl SuspensionPolicy {
+    pub const ALL: [SuspensionPolicy; 2] = [
+        SuspensionPolicy::PlatformManipulation,
+        SuspensionPolicy::Cse,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuspensionPolicy::PlatformManipulation => "PlatformManipulation",
+            SuspensionPolicy::Cse => "Cse",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == SuspensionPolicy::default()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageAction {
-        Suspend {},
+        Suspend {
+        #[serde(default, skip_serializing_if = "is_false")]
+        permanent: bool,
+        #[serde(default, skip_serializing_if = "SuspensionPolicy::is_default")]
+        policy: SuspensionPolicy,
+    },
         LivenessCheck {},
         SpamHighRecall { lifetime: Lifetime },
             PhoenixSkip { lifetime: Lifetime },
@@ -222,9 +261,18 @@ impl ControlEntity {
 }
 
 impl PageAction {
+        pub const SUSPEND: PageAction = PageAction::Suspend {
+        permanent: false,
+        policy: SuspensionPolicy::PlatformManipulation,
+    };
+
+        pub fn uses_suspension_options(self) -> bool {
+        matches!(self, PageAction::Suspend { permanent, policy } if permanent || !policy.is_default())
+    }
+
     pub fn entity(self) -> ControlEntity {
         match self {
-            PageAction::Suspend {}
+            PageAction::Suspend { .. }
             | PageAction::LivenessCheck {}
             | PageAction::SpamHighRecall { .. }
             | PageAction::PhoenixSkip { .. } => ControlEntity::User,
@@ -236,28 +284,35 @@ impl PageAction {
 
                 pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
         match entity {
-            ControlEntity::User => vec![
-                PageAction::Suspend {},
-                PageAction::LivenessCheck {},
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Days7,
-                },
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Days30,
-                },
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Permanent,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Days7,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Days30,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Permanent,
-                },
-            ],
+            ControlEntity::User => [false, true]
+                .into_iter()
+                .flat_map(|permanent| {
+                    SuspensionPolicy::ALL
+                        .into_iter()
+                        .map(move |policy| PageAction::Suspend { permanent, policy })
+                })
+                .chain([
+                    PageAction::LivenessCheck {},
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Days7,
+                    },
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Days30,
+                    },
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Permanent,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Days7,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Days30,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Permanent,
+                    },
+                ])
+                .collect(),
             ControlEntity::Post => vec![
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Days30,
@@ -288,7 +343,7 @@ impl PageAction {
                     lifetime: Lifetime::Days7,
                 },
             ],
-            (ControlEntity::User, LevelRow::High) => vec![PageAction::Suspend {}],
+            (ControlEntity::User, LevelRow::High) => vec![PageAction::SUSPEND],
             (ControlEntity::Post, LevelRow::Mid) => vec![PageAction::PostSpamHighRecall {
                 lifetime: Lifetime::Days30,
             }],
@@ -301,7 +356,7 @@ impl PageAction {
 
             pub fn kind(self) -> &'static str {
         match self {
-            PageAction::Suspend {} => "suspend",
+            PageAction::Suspend { .. } => "suspend",
             PageAction::LivenessCheck {} => "liveness_check",
             PageAction::SpamHighRecall { .. } => "spam_high_recall",
             PageAction::PhoenixSkip { .. } => "phoenix_skip",
@@ -383,13 +438,19 @@ impl ActionControlRecord {
             || self.mode == ControlMode::Rows
     }
 
+            pub fn uses_suspension_options(&self) -> bool {
+        self.actions.iter().any(|a| a.uses_suspension_options())
+    }
+
         pub fn sets_author_skips(&self) -> bool {
         self.follower_threshold.is_some() || self.skip_high_credibility.is_some()
     }
 
-                    pub fn schema_version(&self) -> u32 {
-        if self.sets_author_skips() {
-            ACTION_CONTROL_RECORD_VERSION
+                            pub fn schema_version(&self) -> u32 {
+        if self.uses_suspension_options() {
+            SUSPENSION_OPTIONS_RECORD_VERSION
+        } else if self.sets_author_skips() {
+            AUTHOR_SKIPS_RECORD_VERSION
         } else if self.rollout_bp.is_some() {
             ROLLOUT_RECORD_VERSION
         } else if self.uses_confidence() {
@@ -739,7 +800,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
-                PageAction::Suspend {},
+                PageAction::SUSPEND,
                 PageAction::LivenessCheck {},
                 PageAction::SpamHighRecall {
                     lifetime: Lifetime::Days7
@@ -779,10 +840,88 @@ mod tests {
     }
 
     #[test]
+    fn a_suspend_writes_its_options_only_when_they_differ_from_the_default() {
+        let plain: PageAction = serde_json::from_str(r#"{"kind":"suspend"}"#).unwrap();
+        assert_eq!(plain, PageAction::SUSPEND);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"kind":"suspend"}"#
+        );
+        let spelled: PageAction = serde_json::from_str(
+            r#"{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}"#,
+        )
+        .unwrap();
+        assert_eq!(spelled, PageAction::SUSPEND);
+        assert!(!spelled.uses_suspension_options());
+        let perm: PageAction =
+            serde_json::from_str(r#"{"kind":"suspend","permanent":true,"policy":"Cse"}"#).unwrap();
+        assert_eq!(
+            perm,
+            PageAction::Suspend {
+                permanent: true,
+                policy: SuspensionPolicy::Cse
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&perm).unwrap(),
+            r#"{"kind":"suspend","permanent":true,"policy":"Cse"}"#
+        );
+        assert!(perm.uses_suspension_options());
+        assert_eq!(perm.kind(), "suspend");
+        assert_eq!(perm.entity(), ControlEntity::User);
+    }
+
+    #[test]
+    fn the_user_menu_offers_each_suspension_once_and_the_post_menu_none() {
+        let user = PageAction::menu(ControlEntity::User);
+        let suspends: Vec<&PageAction> = user.iter().filter(|a| a.kind() == "suspend").collect();
+        assert_eq!(suspends.len(), 2 * SuspensionPolicy::ALL.len());
+        assert_eq!(suspends[0], &PageAction::SUSPEND);
+        let mut seen = std::collections::HashSet::new();
+        assert!(suspends.iter().all(|a| seen.insert(**a)));
+        assert!(
+            PageAction::menu(ControlEntity::Post)
+                .iter()
+                .all(|a| !a.uses_suspension_options())
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_suspension_option_is_refused_by_older_images() {
+        let old = r#"{"v":3,"entity_type":"user","head":"H","mode":"live","actions":[{"kind":"suspend"}],"version":1,"confidence":"high","rollout_bp":1000}"#;
+        let mut r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            ROLLOUT_RECORD_VERSION,
+            "a plain suspend keeps its version"
+        );
+        r.actions = vec![PageAction::Suspend {
+            permanent: true,
+            policy: SuspensionPolicy::PlatformManipulation,
+        }];
+        assert_eq!(r.schema_version(), 6);
+        assert_eq!(r.schema_version(), SUSPENSION_OPTIONS_RECORD_VERSION);
+        r.actions = vec![PageAction::Suspend {
+            permanent: false,
+            policy: SuspensionPolicy::Cse,
+        }];
+        assert_eq!(r.schema_version(), SUSPENSION_OPTIONS_RECORD_VERSION);
+        assert!(r.schema_version() > AUTHOR_SKIPS_RECORD_VERSION);
+        let value = serde_json::to_value(r.actions[0]).unwrap();
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter().any(|k| *k == "policy"),
+            "an older image's deny_unknown_fields refuses the action itself too"
+        );
+    }
+
+    #[test]
     fn actions_outside_the_menu_do_not_parse() {
         for bad in [
             r#"{"kind":"suspend","perm":true}"#,
-            r#"{"kind":"suspend","policy":"Cse"}"#,
+            r#"{"kind":"suspend","policy":"Spam"}"#,
+            r#"{"kind":"suspend","permanent":"yes"}"#,
+            r#"{"kind":"suspend_author","permanent":true}"#,
             r#"{"kind":"spam_high_recall","lifetime":"90d"}"#,
             r#"{"kind":"label","labels":["SpamHighRecall"]}"#,
             r#"{"kind":"arkose"}"#,
@@ -916,7 +1055,7 @@ mod tests {
             h.follower_threshold = threshold;
             h.skip_high_credibility = credibility;
             assert_eq!(h.schema_version(), 5);
-            assert_eq!(h.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+            assert_eq!(h.schema_version(), AUTHOR_SKIPS_RECORD_VERSION);
             h.v = h.schema_version();
             let json = serde_json::to_string(&h).unwrap();
             let back = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
@@ -1174,7 +1313,7 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(user(High), vec![PageAction::Suspend {}]);
+        assert_eq!(user(High), vec![PageAction::SUSPEND]);
         assert!(post(Low).is_empty());
         for l in LevelRow::ALL {
             for (e, a) in [

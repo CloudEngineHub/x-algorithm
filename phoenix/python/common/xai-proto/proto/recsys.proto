@@ -485,7 +485,7 @@ enum ActionName {
   CLIENT_TWEET_TRANSLATE_CLICK = 41;
   CLIENT_TWEET_NOT_RELEVANT = 42;
   CLIENT_TWEET_UNDO_NOT_RELEVANT = 43;
-  SERVER_TWEET_REACT_WITH_VIDEO = 44;
+  SERVER_TWEET_POST_VIDEO = 44;
   CLIENT_TWEET_SHOW_MORE_EXPAND = 45;
   CLIENT_TWEET_CLICK_GROK_ANALYZE = 46;
   CLIENT_TWEET_VIDEO_OPEN = 47;
@@ -1710,6 +1710,15 @@ message AdInfo {
   repeated int64 post_video_media_ids = 26;
 
   string url_domain = 27;
+
+  AdTargeting targeting = 28;
+}
+
+message AdTargeting {
+  repeated int64 interest_category_ids = 1;
+  repeated LanguageCode languages = 2;
+  optional Gender gender = 3;
+  repeated int32 os_types = 4;
 }
 
 message UserAdActionMeta {
@@ -1932,7 +1941,7 @@ enum UserActionAggregationType {
   IMMERSIVE_LONG_DWELL = 29;
   DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
   IMMERSIVE_LONG_DWELL_CREATED_POSTS = 31;
-  PLACEHOLDER_32 = 32;
+  DENSE_WITH_LONG_DWELL_FAIR_VIEW = 32;
 }
 
 message UserActionAggregationResponse {

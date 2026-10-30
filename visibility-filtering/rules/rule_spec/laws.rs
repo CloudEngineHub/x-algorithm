@@ -39,7 +39,7 @@ fn truths() -> Vec<Truth> {
 fn wired<E: Engine>(list: fn(LevelLists) -> Vec<&'static Rule<E>>) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for rule in list(level.spec().rules().lists()) {
+        for rule in level.spec().rule_lists().flat_map(list) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -212,6 +212,11 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         FAILS_THE_NOTIFICATION,
     ),
     (
+        "only_people_i_follow_outside_community/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
         "not_graduated_user_label/drop/unspecified",
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
@@ -233,6 +238,26 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
     ),
     (
         "downrank_spam_reply_user_label/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "duplicate_mention_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "abusive_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "untrusted_url_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "downrank_spam_reply_uqf/drop/unspecified",
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
     ),

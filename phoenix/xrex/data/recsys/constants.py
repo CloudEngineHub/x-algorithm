@@ -83,8 +83,8 @@ primary_engagement_to_action_types = {
     "IsPostUnexplored": [
         "ServerTweetPostUnexplored",
     ],
-    "IsReactedWithVideo": [
-        "ServerTweetReactWithVideo",
+    "IsPostedVideo": [
+        "ServerTweetPostVideo",
     ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",

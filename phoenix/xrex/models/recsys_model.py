@@ -45,6 +45,7 @@ from xrex.data.recsys.constants import (
     engagement_to_ids,
 )
 from xrex.data.recsys.feature_config import (
+    ADS_COUNT_BUCKETS,
     ADS_PRODUCT_KEY_TABLE_SIZE,
     ENGAGEMENT_COUNT_BUCKET_MAP,
     BoolFeature,
@@ -96,6 +97,8 @@ from xrex.models.recsys_embedding import (
 )
 from xrex.models.recsys_feature_prep import (
     DWELL_TIME_DEFAULT_SENTINEL_SEC,
+    MAX_VALID_DWELL_SEC,
+    MIN_VALID_DWELL_SEC,
     FeaturePrepConfig,
     build_feature_prep_inputs,
 )
@@ -169,6 +172,18 @@ ANDROID_CLIENT_APP_IDS = (
     4959597,
     5778172,
 )
+
+RECENCY_ACTIONS = (
+    recsys_pb2.ActionName.CLIENT_TWEET_OPEN_LINK,
+    recsys_pb2.ActionName.CLIENT_TWEET_EXTERNAL_LINK_LONG_DWELLED,
+)
+RECENCY_LOG_DT_SCALE = 15.0
+RECENCY_FOURIER = 8
+
+
+def recency_time_features(x: jax.Array, k: int = RECENCY_FOURIER) -> jax.Array:
+    freqs = jnp.arange(1, k + 1, dtype=jnp.float32) * jnp.pi
+    return jnp.concatenate([x, jnp.sin(x * freqs), jnp.cos(x * freqs)], axis=-1)
 
 
 _DPA_PRODUCT_KEY_SLOTS: list[int] = [
@@ -1199,6 +1214,14 @@ class RecsysAggregatedModelConfig(Config):
         if self.metric_own_slice and not self.ads_head_masking:
             raise ValueError("metric_own_slice requires ads_head_masking")
 
+    @property
+    def has_side_inputs(self) -> bool:
+        return bool(self.ads_counts_emb_dim or self.wallclock_recency)
+
+    def validate_side_inputs(self) -> None:
+        if self.has_side_inputs and self.feature_prep_enabled:
+            raise ValueError("ads_counts_emb_dim / wallclock_recency need feature_prep off")
+
     continuous_action_hidden_dim: int = 64
 
     final_logit_cap: float = -1.0
@@ -1218,6 +1241,9 @@ class RecsysAggregatedModelConfig(Config):
     pad_candidates_to_128: bool = True
 
     use_seqpack: bool = False
+
+    ads_counts_emb_dim: int = 0
+    wallclock_recency: bool = False
 
     effective_sequence_len: int | None = None
 
@@ -1319,6 +1345,7 @@ class RecsysAggregatedModelConfig(Config):
         self.validate_purchase_value()
         self.validate_aux_value_heads()
         self.validate_ads_head_masking()
+        self.validate_side_inputs()
         if (
             not (self.pad_candidates_to_128 or self.use_seqpack)
             and self.model_config.attn_config.attn_impl != "cutedsl_ranker_attn"
@@ -1517,6 +1544,8 @@ def compute_continuous_metrics(
     pred_in_original_units: jnp.ndarray,
     valid_mask: jnp.ndarray,
     loss_mask: jnp.ndarray,
+    pred_mask: jnp.ndarray,
+    num_out_of_range: jnp.ndarray | None,
     loss: jnp.ndarray,
     loss_weight: float,
     metric_name: str,
@@ -1569,6 +1598,8 @@ def compute_continuous_metrics(
     stats[f"{name}-r-squared"] = r_squared
     stats[f"{name}-calib"] = calib
     stats[f"{name}-num-loss-samples"] = num_loss_samples
+    if num_out_of_range is not None:
+        stats[f"{name}-num-out-of-range"] = num_out_of_range
 
     stats[f"{name}-gt-min"] = jnp.where(
         n > 0, jnp.min(jnp.where(loss_mask, gt_clamped, jnp.inf)), 0.0
@@ -1577,13 +1608,15 @@ def compute_continuous_metrics(
     stats[f"{name}-gt-max"] = jnp.where(
         n > 0, jnp.max(jnp.where(loss_mask, gt_clamped, -jnp.inf)), 0.0
     )
-    pred_mean = jnp.sum(pred_f32 * mask_f32) / jnp.maximum(n, 1.0)
+    pred_mask_f32 = pred_mask.astype(jnp.float32)
+    n_pred = jnp.sum(pred_mask_f32)
+    pred_mean = jnp.sum(pred_f32 * pred_mask_f32) / jnp.maximum(n_pred, 1.0)
     stats[f"{name}-pred-min"] = jnp.where(
-        n > 0, jnp.min(jnp.where(loss_mask, pred_in_original_units, jnp.inf)), 0.0
+        n_pred > 0, jnp.min(jnp.where(pred_mask, pred_in_original_units, jnp.inf)), 0.0
     )
-    stats[f"{name}-pred-mean"] = jnp.where(n > 0, pred_mean, 0.0)
+    stats[f"{name}-pred-mean"] = jnp.where(n_pred > 0, pred_mean, 0.0)
     stats[f"{name}-pred-max"] = jnp.where(
-        n > 0, jnp.max(jnp.where(loss_mask, pred_in_original_units, -jnp.inf)), 0.0
+        n_pred > 0, jnp.max(jnp.where(pred_mask, pred_in_original_units, -jnp.inf)), 0.0
     )
 
 
@@ -3613,6 +3646,115 @@ class RecsysAggregatedModel(hk.Module):
             return user_embeddings, user_padding_mask
 
     @hk.transparent
+    def _add_side_inputs(
+        self,
+        batch: RecsysFeaturesBatch,
+        history_embeddings: jax.Array,
+        candidate_embeddings: jax.Array,
+        layout: SequencePackedLayout | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        cfg = self.config
+        D = cfg.emb_table_width
+        scale = cfg.embed_init_scale
+        lr_multiplier_func = cfg.model_config.scale_config.emb_lr_multiplier
+        f32 = jnp.float32
+
+        def add(emb: jax.Array, feat: jax.Array, name: str) -> jax.Array:
+            din = feat.shape[-1]
+            w = get_parameter(
+                name,
+                [din, D],
+                dtype=f32,
+                init=hk.initializers.Constant(0.0),
+                pspec=P(None, None),
+                lr_multiplier=lr_multiplier_func(din),
+            )
+            return emb + jnp.dot(feat.astype(w.dtype), w).astype(emb.dtype)
+
+        if cfg.ads_counts_emb_dim > 0:
+            counts = batch["candidate_seq"].get("ads_count_buckets")
+            assert counts is not None, (
+                "ads_counts_emb_dim needs the dataset flag read_ads_engagement_counts=True"
+            )
+            counts = cast_jax(counts).astype(jnp.int32)
+            num_feats = counts.shape[-1]
+            dim = cfg.ads_counts_emb_dim
+            table = get_parameter(
+                "ads_counts_table",
+                shape=[num_feats * ADS_COUNT_BUCKETS, dim],
+                init=hk.initializers.VarianceScaling(scale, mode="fan_out"),
+                dtype=f32,
+                pspec=P(),
+            )
+            offsets = jnp.arange(num_feats, dtype=jnp.int32) * ADS_COUNT_BUCKETS
+            emb = jnp.take(table, counts + offsets, axis=0).astype(DTYPE_BY_NAME[cfg.fprop_dtype])
+            emb = emb.reshape(*emb.shape[:-2], num_feats * dim)
+            pad = candidate_embeddings.shape[1] - emb.shape[1]
+            if pad > 0:
+                emb = jnp.pad(emb, ((0, 0), (0, pad), (0, 0)))
+            candidate_embeddings = add(candidate_embeddings, emb, "ads_counts_proj")
+
+        if cfg.wallclock_recency:
+            hist_impr = batch["history_seq"]["impr_ts"]
+            cand_impr = batch["candidate_seq"]["impr_ts"]
+            hist_act = batch["history_seq"]["actions"]
+            assert hist_impr is not None and cand_impr is not None and hist_act is not None, (
+                "wallclock_recency needs impression timestamps and history actions"
+            )
+            hist_ts = cast_jax(hist_impr).astype(jnp.int32)
+            cand_ts = cast_jax(cand_impr).astype(jnp.int32)
+            rows = hist_ts.shape[0]
+            if layout is None:
+                num_users = 1
+                hist_user = jnp.zeros(hist_ts.shape, jnp.int32)
+            else:
+                cu = cast_jax(layout.cu_seqlens).astype(jnp.int32)
+                num_users = cu.shape[1] - 1
+                pos = cast_jax(layout.history_positions).astype(jnp.int32)
+                hist_user = jax.vmap(lambda c, p: jnp.searchsorted(c[1:], p, side="right"))(cu, pos)
+                hist_user = jnp.clip(hist_user, 0, num_users - 1).astype(jnp.int32)
+            t_req = jnp.max(cand_ts.reshape(rows, num_users, -1), axis=2)
+            t_tok = jnp.take_along_axis(t_req, hist_user, axis=1)
+            hist_valid = (hist_ts > 0) & (t_tok > 0) & (hist_ts <= t_tok + 60)
+            dt = jnp.where(hist_valid, jnp.maximum(t_tok - hist_ts, 0), 0).astype(f32)
+            x = (jnp.log1p(dt) / RECENCY_LOG_DT_SCALE)[..., None]
+            hist_feat = recency_time_features(x) * hist_valid[..., None].astype(f32)
+            history_embeddings = add(history_embeddings, hist_feat, "recency_hist_proj")
+
+            owner = hist_user[..., None] == jnp.arange(num_users, dtype=jnp.int32)
+
+            def per_user_max(v: jax.Array) -> jax.Array:
+                return jnp.max(jnp.where(owner, v[..., None], jnp.asarray(-1, v.dtype)), axis=1)
+
+            def per_user_sum(v: jax.Array) -> jax.Array:
+                return jnp.sum(jnp.where(owner, v[..., None], jnp.asarray(0, v.dtype)), axis=1)
+
+            def since(mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+                last = per_user_max(jnp.where(mask, hist_ts, -1))[..., None]
+                has = last > 0
+                age = jnp.maximum(t_req[..., None] - last, 0).astype(f32)
+                gap = jnp.where(has, jnp.log1p(age) / RECENCY_LOG_DT_SCALE, 1.0)
+                return gap, has.astype(f32)
+
+            hist_actions = cast_jax(hist_act)
+            gap_any, has_any = since(hist_valid)
+            parts = [gap_any, recency_time_features(gap_any, 4), has_any]
+            for idx in RECENCY_ACTIONS:
+                g, h = since(hist_valid & hist_actions[:, :, idx].astype(jnp.bool_))
+                parts += [g, h]
+            for window_s in (300.0, 3600.0, 86400.0):
+                n = per_user_sum((hist_valid & (dt <= window_s)).astype(jnp.int32))
+                parts.append(jnp.log1p(n.astype(f32))[..., None] / math.log(1024.0))
+            sess = jnp.concatenate(parts, axis=-1)
+            per_user = candidate_embeddings.shape[1] // num_users
+            sess = jnp.broadcast_to(
+                sess[:, :, None, :], (rows, num_users, per_user, sess.shape[-1])
+            ).reshape(rows, num_users * per_user, sess.shape[-1])
+            candidate_embeddings = add(candidate_embeddings, sess, "recency_cand_proj")
+
+        return history_embeddings, candidate_embeddings
+
+    @hk.transparent
     def _maybe_add_dpa_input_embedding(
         self,
         candidate_embeddings: jax.Array,
@@ -3941,6 +4083,10 @@ class RecsysAggregatedModel(hk.Module):
             candidate_embeddings = self._maybe_add_dpa_input_embedding(
                 candidate_embeddings, recsys_features_batch
             )
+            if _config.has_side_inputs:
+                history_embeddings, candidate_embeddings = self._add_side_inputs(
+                    recsys_features_batch, history_embeddings, candidate_embeddings, layout=layout
+                )
 
             user_features_token = None
             if _config.user_features.has_user_features:
@@ -4117,6 +4263,10 @@ class RecsysAggregatedModel(hk.Module):
             candidate_embeddings = self._maybe_add_dpa_input_embedding(
                 candidate_embeddings, recsys_features_batch
             )
+            if _config.has_side_inputs:
+                history_embeddings, candidate_embeddings = self._add_side_inputs(
+                    recsys_features_batch, history_embeddings, candidate_embeddings
+                )
 
             if _config.user_features.has_user_features:
                 feature_parts = build_user_feature_parts(
@@ -4456,6 +4606,14 @@ class RecsysAggregatedModel(hk.Module):
                         if loss_config.product_surfaces or loss_config.exclude_product_surfaces:
                             head_surface_mask = _get_surface_mask(loss_config, product_surface)
                             head_valid_mask = head_valid_mask * head_surface_mask.astype(
+                                head_valid_mask.dtype
+                            )
+                        if loss_config.action_index == recsys_pb2.ContinuousActionName.DWELL_TIME:
+                            dwell = candidate_continuous_actions[:, :, loss_config.action_index]
+                            in_range = (dwell >= MIN_VALID_DWELL_SEC) & (
+                                dwell <= MAX_VALID_DWELL_SEC
+                            )
+                            head_valid_mask = head_valid_mask * in_range.astype(
                                 head_valid_mask.dtype
                             )
                         continuous_heads[index] = (head_valid_mask, head_surface_mask)
@@ -5301,6 +5459,15 @@ class RecsysAggregatedModel(hk.Module):
                         & (head["gt_raw"] != 0.0)
                         & (head["gt_raw"] != DWELL_TIME_DEFAULT_SENTINEL_SEC)
                     )
+                pred_mask = variant_loss_mask
+                num_out_of_range = None
+                if loss_config.action_index == recsys_pb2.ContinuousActionName.DWELL_TIME:
+                    in_range = (head["gt_raw"] >= MIN_VALID_DWELL_SEC) & (
+                        head["gt_raw"] <= MAX_VALID_DWELL_SEC
+                    )
+                    num_out_of_range = jnp.sum(pred_mask & ~in_range)
+                    head_variant_mask = head_variant_mask * in_range.astype(head_variant_mask.dtype)
+                    variant_loss_mask = variant_loss_mask & in_range
                 n_variant = jnp.sum(variant_loss_mask)
                 variant_loss = jnp.sum(head["per_element_loss"] * variant_loss_mask) / jnp.maximum(
                     n_variant, 1.0
@@ -5312,6 +5479,8 @@ class RecsysAggregatedModel(hk.Module):
                     pred_in_original_units=head["pred"],
                     valid_mask=head_variant_mask,
                     loss_mask=variant_loss_mask,
+                    pred_mask=pred_mask,
+                    num_out_of_range=num_out_of_range,
                     loss=variant_loss,
                     loss_weight=loss_config.loss_weight,
                     metric_name=loss_config.metric_name,

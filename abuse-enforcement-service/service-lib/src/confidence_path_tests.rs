@@ -14,7 +14,7 @@ use crate::replay_tests::{
     ACTION_CONTROL_INFO_KEYS, BAKED_POST_RULES, BAKED_USER_RULES, HEADS, SWITCHED_OFF_HEAD,
 };
 
-const SUSPEND: PageAction = PageAction::Suspend {};
+const SUSPEND: PageAction = PageAction::SUSPEND;
 const LIVENESS: PageAction = PageAction::LivenessCheck {};
 const SHR7: PageAction = PageAction::SpamHighRecall {
     lifetime: Lifetime::Days7,

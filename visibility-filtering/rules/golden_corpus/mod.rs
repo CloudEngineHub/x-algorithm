@@ -15,6 +15,7 @@ mod notifications;
 mod oon_media;
 mod oon_tweet_label;
 mod oon_user_label;
+mod post_notifications;
 mod quoted_tweet_rules;
 mod reaction_video;
 mod relationship;
@@ -25,8 +26,8 @@ mod tweet_state;
 
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    Decided, EdgeSet, Evaluation, Notice, Placement, PostCandidate, TweetId, UserCandidate,
-    Verdict, ViewerFeatures, Withholding,
+    Decided, EdgeSet, Evaluation, Notice, NotificationKind, Placement, PostCandidate, TweetId,
+    UserCandidate, Verdict, ViewerFeatures, Withholding,
 };
 use crate::rules::engine::Policy;
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
@@ -71,6 +72,7 @@ struct Row {
 pub(super) struct CorpusCase {
     name: String,
     level: SafetyLevel,
+    kind: Option<NotificationKind>,
     pub(super) viewer: ViewerFeatures,
     pub(super) subject: Subject,
     pub(super) placement: Placement,
@@ -169,6 +171,7 @@ impl Row {
                 .map(move |(role_name, viewer, placement, subject)| CorpusCase {
                     name: format!("{name}/{level:?}/{role_name}"),
                     level,
+                    kind: None,
                     viewer,
                     subject,
                     placement,
@@ -180,11 +183,18 @@ impl Row {
 
 impl CorpusCase {
     fn evaluate(&self, rule_engine: &RuleEngine) -> Evaluation {
-        match &self.subject {
-            Subject::Post(candidate) => {
+        match (&self.subject, self.kind) {
+            (Subject::Post(candidate), None) => {
                 rule_engine.evaluate(self.level, &self.viewer, candidate, self.placement)
             }
-            Subject::User(user) => {
+            (Subject::Post(candidate), Some(kind)) => rule_engine.evaluate_post_kind(
+                self.level,
+                kind,
+                &self.viewer,
+                candidate,
+                self.placement,
+            ),
+            (Subject::User(user), _) => {
                 rule_engine.evaluate_user(self.level, &self.viewer, user, self.placement)
             }
         }
@@ -372,8 +382,15 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
     let rule_engine = RuleEngine::for_tests();
     let cases = corpus();
     let mut diverged = Vec::new();
-    for &level in SafetyLevel::VARIANTS {
-        let rules = level.spec().rules().lists();
+    let policies = SafetyLevel::VARIANTS.iter().flat_map(|&level| {
+        let spec = level.spec();
+        once((level, None, spec.rules().lists())).chain(
+            spec.post_kinds()
+                .iter()
+                .map(move |&(kind, rules)| (level, Some(kind), rules.lists())),
+        )
+    });
+    for (level, kind, rules) in policies {
         let reference = one_fold(&rules);
         let used = rules
             .user
@@ -394,7 +411,16 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
                     failed,
                     ..fetched.clone()
                 };
-                let gate = rule_engine.evaluate(level, &case.viewer, &candidate, case.placement);
+                let gate = match kind {
+                    None => rule_engine.evaluate(level, &case.viewer, &candidate, case.placement),
+                    Some(kind) => rule_engine.evaluate_post_kind(
+                        level,
+                        kind,
+                        &case.viewer,
+                        &candidate,
+                        case.placement,
+                    ),
+                };
                 let fold = reference.evaluate(&placed_test_context(
                     &case.viewer,
                     &candidate,
@@ -402,7 +428,7 @@ fn the_user_gate_keeps_the_outcome_of_one_severity_sorted_fold() {
                 ));
                 if outcome(&gate) != outcome(&fold) {
                     diverged.push(format!(
-                        "{level:?} {} with {:?} failed:\n  gate {gate:?}\n  fold {fold:?}",
+                        "{level:?} {kind:?} {} with {:?} failed:\n  gate {gate:?}\n  fold {fold:?}",
                         case.name,
                         failed.iter().collect::<Vec<Hydrator>>()
                     ));
@@ -466,25 +492,38 @@ const PREEMPTED: [Preempted; 6] = [
 #[test]
 fn every_wired_rule_decides_a_corpus_case_at_its_level() {
     let rule_engine = RuleEngine::for_tests();
-    let decided: BTreeSet<(&'static str, &'static str)> = corpus()
+    let cases = corpus();
+    let decided: BTreeSet<(&'static str, Option<NotificationKind>, &'static str)> = cases
         .iter()
         .flat_map(|c| {
-            let level = <&'static str>::from(c.level);
+            let (level, kind) = (<&'static str>::from(c.level), c.kind);
             deciders(&c.expected)
                 .into_iter()
-                .map(move |rule| (level, rule))
+                .map(move |rule| (level, kind, rule))
         })
         .collect();
-    let missing: Vec<(SafetyLevel, &'static str)> = SafetyLevel::VARIANTS
+    let missing: Vec<(SafetyLevel, Option<NotificationKind>, &'static str)> = SafetyLevel::VARIANTS
         .iter()
         .flat_map(|&level| {
+            let rule_engine = &rule_engine;
+            let post_kinds = level
+                .spec()
+                .post_kinds()
+                .iter()
+                .flat_map(move |&(kind, _)| {
+                    rule_engine
+                        .post_kind_rule_names(level, kind)
+                        .into_iter()
+                        .map(move |rule| (level, Some(kind), rule))
+                });
             rule_engine
                 .wired_rule_names(level)
                 .into_iter()
-                .map(move |rule| (level, rule))
+                .map(move |rule| (level, None, rule))
+                .chain(post_kinds)
         })
-        .filter(|&(level, rule)| !decided.contains(&(level.into(), rule)))
-        .filter(|&(level, rule)| {
+        .filter(|&(level, kind, rule)| !decided.contains(&(level.into(), kind, rule)))
+        .filter(|&(level, _, rule)| {
             !PREEMPTED
                 .iter()
                 .any(|preempted| (preempted.level, preempted.rule) == (level, rule))
@@ -492,7 +531,7 @@ fn every_wired_rule_decides_a_corpus_case_at_its_level() {
         .collect();
     assert!(
         missing.is_empty(),
-        "wired rules that decide no corpus case at their own level: {missing:?}"
+        "wired rules that decide no corpus case at their own level and post kind: {missing:?}"
     );
     for Preempted {
         level,
@@ -507,7 +546,7 @@ fn every_wired_rule_decides_a_corpus_case_at_its_level() {
             panic!("{rule} is no longer wired at {level:?}");
         };
         assert!(
-            !decided.contains(&(at_level, rule)),
+            !decided.contains(&(at_level, None, rule)),
             "{rule} decides a corpus case at {level:?}, so it is not preempted there"
         );
         for &by in preempted_by {
@@ -516,7 +555,7 @@ fn every_wired_rule_decides_a_corpus_case_at_its_level() {
                 "{by}, which preempts {rule} at {level:?}, does not come before it in fold order"
             );
             assert!(
-                decided.contains(&(at_level, by)),
+                decided.contains(&(at_level, None, by)),
                 "{by}, which preempts {rule} at {level:?}, decides no corpus case there"
             );
         }
@@ -524,7 +563,11 @@ fn every_wired_rule_decides_a_corpus_case_at_its_level() {
 }
 
 pub(super) fn corpus() -> Vec<CorpusCase> {
-    rows().into_iter().flat_map(Row::expand).collect()
+    rows()
+        .into_iter()
+        .flat_map(Row::expand)
+        .chain(post_notifications::cases())
+        .collect()
 }
 
 pub(super) fn post_cases() -> Vec<(SafetyLevel, ViewerFeatures, PostCandidate)> {

@@ -13,7 +13,7 @@ use crate::replay_tests::{
     factory_message, message, on_config, scenarios, switched_off,
 };
 
-const SUSPEND: PageAction = PageAction::Suspend {};
+const SUSPEND: PageAction = PageAction::SUSPEND;
 const LIVENESS: PageAction = PageAction::LivenessCheck {};
 const SHR7: PageAction = PageAction::SpamHighRecall {
     lifetime: Lifetime::Days7,
@@ -999,7 +999,7 @@ fn as_page_actions(specs: &serde_json::Value, entity: EntityType) -> Option<Vec<
             ("suspend", EntityType::User)
                 if !permanent && s.get("policy")?.as_str()? == "PlatformManipulation" =>
             {
-                PageAction::Suspend {}
+                PageAction::SUSPEND
             }
             ("suspend", EntityType::Post)
                 if !permanent && s.get("policy")?.as_str()? == "PlatformManipulation" =>
@@ -2219,4 +2219,116 @@ async fn the_follower_ceiling_stops_every_decision() {
             );
         }
     }
+}
+
+
+const SUSPEND_PERMANENT_CSE: PageAction = PageAction::Suspend {
+    permanent: true,
+    policy: crate::action_control::SuspensionPolicy::Cse,
+};
+
+fn suspending(actions: Vec<PageAction>) -> Vec<ActionControlRecord> {
+    vec![
+        on_rows(ControlEntity::User),
+        ActionControlRecord {
+            confidence: Some(LevelRow::Missing),
+            ..of_entity(ControlEntity::User, live(REPLY_HEAD, None, actions))
+        },
+    ]
+}
+
+fn suspend_body(t: &Trace) -> serde_json::Value {
+    t.ais
+        .iter()
+        .find_map(|(_, r)| {
+            let actions: Vec<&serde_json::Value> = match r.get("actions") {
+                Some(serde_json::Value::Array(a)) => a.iter().collect(),
+                _ => r.get("action").into_iter().collect(),
+            };
+            actions
+                .into_iter()
+                .find_map(|a| a.get("suspendUser").cloned())
+        })
+        .expect("a suspendUser call")
+}
+
+#[tokio::test]
+async fn a_permanent_policy_suspend_reaches_ais_as_set_and_upgrades_a_suspended_account() {
+    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+    let b = bed(suspending(vec![SUSPEND_PERMANENT_CSE]), false).await;
+    for account in [Account::Clean, Account::Suspended] {
+        let t = b
+            .run_admitted(
+                &user_topic(&b),
+                &message(
+                    EntityType::User,
+                    REPLY_HEAD,
+                    REPLY_MODEL,
+                    &[REPLY_LABEL],
+                    account,
+                ),
+            )
+            .await;
+        assert_eq!(t.status, "success", "{account:?}: {:?}", t.outcomes);
+        let body = suspend_body(&t);
+        assert_eq!(body["perm"], true, "{account:?}");
+        assert_eq!(body["policy"], "Cse", "{account:?}");
+        assert_eq!(
+            info(&t)["action_specs"],
+            r#"[{"kind":"suspend","permanent":true,"policy":"Cse"}]"#
+        );
+        assert!(
+            t.dedup_calls.iter().any(|c| c.contains("class=4")),
+            "{:?}",
+            t.dedup_calls
+        );
+    }
+    let t = b
+        .run_admitted(
+            &user_topic(&b),
+            &message(
+                EntityType::User,
+                REPLY_HEAD,
+                REPLY_MODEL,
+                &[REPLY_LABEL],
+                Account::Deactivated,
+            ),
+        )
+        .await;
+    assert_eq!(t.status, "already_deactivated");
+    assert!(t.ais.is_empty());
+
+    b.set_records(&suspending(vec![SUSPEND])).await;
+    let t = b
+        .run_admitted(
+            &user_topic(&b),
+            &message(
+                EntityType::User,
+                REPLY_HEAD,
+                REPLY_MODEL,
+                &[REPLY_LABEL],
+                Account::Suspended,
+            ),
+        )
+        .await;
+    assert_eq!(t.status, ALREADY_SUSPENDED);
+    assert!(t.ais.is_empty());
+    let t = b
+        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))
+        .await;
+    assert_eq!(t.status, "success");
+    let body = suspend_body(&t);
+    assert_eq!(
+        (body["perm"].clone(), body["policy"].clone()),
+        (
+            serde_json::json!(false),
+            serde_json::json!("PlatformManipulation")
+        ),
+        "a plain suspend is the temporary PlatformManipulation one, as before"
+    );
+    assert!(
+        t.dedup_calls.iter().any(|c| c.contains("class=3")),
+        "{:?}",
+        t.dedup_calls
+    );
 }

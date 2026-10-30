@@ -5,7 +5,7 @@ use crate::hydration::fetcher::Fetcher;
 use crate::hydration::inventory::Stake;
 use crate::hydration::relation::Relation;
 use crate::hydration::{
-    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,
+    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, RequestRows, Unresolved,
 };
 use crate::models::{
     AuthorId, ConversationControlFeatures, EdgeSet, PostCandidate, PostEntity, SafetyLabelMap,
@@ -174,11 +174,11 @@ impl Store {
             profile,
             lacks_confirmed_email: lacks(
                 &self.actor_emails,
-                KeyOrigin::UserIfViewerFiltersNoConfirmedEmail,
+                self.origin(Hydrator::AuthorConfirmedEmail),
             ),
             lacks_verified_phone: lacks(
                 &self.actor_phones,
-                KeyOrigin::UserIfViewerFiltersNoConfirmedPhone,
+                self.origin(Hydrator::AuthorVerifiedPhone),
             ),
         }
     }
@@ -209,7 +209,10 @@ impl Store {
         let id = tweet_id.0;
         let edges = self.edges(row, position);
         PostCandidate {
-            author: self.author(author_id),
+            author: match self.request_rows {
+                RequestRows::ActorPosts => self.actor(row, author_id),
+                RequestRows::Posts | RequestRows::Users => self.author(author_id),
+            },
             edges,
             post: PostEntity {
                 tweet_id: id,

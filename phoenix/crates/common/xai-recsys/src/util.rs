@@ -174,6 +174,45 @@ pub const EXACT_PHRASE_CATEGORICAL_IDX: usize = EXACT_PHRASE_SEQ;
 
 const AUTHOR_NSFW_BIT: u64 = 2;
 
+pub mod ads_counts {
+    use xai_recsys_proto as pb;
+
+    pub const COUNTERS: [i32; 7] = [1, 2, 14, 3, 4, 5, 8];
+    pub const WINDOWS_SECS: [u32; 8] = [
+        3_600, 10_800, 43_200, 86_400, 259_200, 604_800, 1_209_600, 2_419_200,
+    ];
+    pub const PER_GROUP: usize = COUNTERS.len() * WINDOWS_SECS.len();
+    pub const NUM_FEATURES: usize = 3 * PER_GROUP;
+    pub const NUM_BUCKETS: usize = 33;
+
+    pub fn bucket(count: u32) -> u8 {
+        (u32::BITS - count.leading_zeros()) as u8
+    }
+
+    pub fn fill_group(counts: Option<&pb::EngagementCounts>, out: &mut [u8]) {
+        let Some(c) = counts.filter(|c| c.present) else {
+            return;
+        };
+        for (w, secs) in WINDOWS_SECS.iter().enumerate() {
+            let Some(col) = c.window_secs.iter().position(|s| s == secs) else {
+                continue;
+            };
+            for (f, counter) in COUNTERS.iter().enumerate() {
+                if !c.collected_actions.is_empty() && !c.collected_actions.contains(counter) {
+                    continue;
+                }
+                let count = c
+                    .rows
+                    .iter()
+                    .find(|r| r.action == *counter)
+                    .and_then(|r| r.counts.get(col).copied())
+                    .unwrap_or(0);
+                out[f * WINDOWS_SECS.len() + w] = bucket(count);
+            }
+        }
+    }
+}
+
 fn exact_phrase_categorical(lexical_match: Option<&pb::SearchLexicalMatch>) -> i32 {
     match lexical_match {
         Some(m) => 1 + m.exact_phrase as i32,
@@ -474,6 +513,7 @@ pub struct InputBuffer {
     pub candidate_conversion_dense_features: Vec<f32>,
     pub user_conversion_history_hashes: Vec<i32>,
     pub candidate_account_hashes: Vec<i32>,
+    pub candidate_ads_count_buckets: Vec<u8>,
     pub history_post_ids: Vec<i64>,
     pub history_web_conv_url_ids: Vec<(u32, i64)>,
     pub history_semantic_ids: Vec<u16>,
@@ -502,6 +542,37 @@ impl InputBuffer {
             .take(cap)
             .take_while(|ch| ch.first().is_some_and(|&h| h != 0))
             .count()
+    }
+
+    pub fn stamp_ads_count_buckets(
+        &mut self,
+        model_config: &ModelConfig,
+        candidate_set: &pb::CandidateSet,
+        user_counts: Option<&pb::EngagementCounts>,
+    ) {
+        use ads_counts::{NUM_FEATURES, PER_GROUP, fill_group};
+        if !model_config.hash_table.ads_count_features {
+            return;
+        }
+        let mut user = [0u8; PER_GROUP];
+        fill_group(user_counts, &mut user);
+        let c = model_config.candidate_seq_len;
+        let mut out = vec![0u8; c * NUM_FEATURES];
+        for (row, candidate) in out
+            .chunks_exact_mut(NUM_FEATURES)
+            .zip(candidate_set.candidates.iter())
+        {
+            let ad = candidate.ad_info.as_ref();
+            let (ad_row, rest) = row.split_at_mut(PER_GROUP);
+            let (user_advertiser_row, user_row) = rest.split_at_mut(PER_GROUP);
+            fill_group(ad.and_then(|a| a.engagement_counts.as_ref()), ad_row);
+            fill_group(
+                ad.and_then(|a| a.viewer_advertiser_engagement_counts.as_ref()),
+                user_advertiser_row,
+            );
+            user_row.copy_from_slice(&user);
+        }
+        self.candidate_ads_count_buckets = out;
     }
 }
 
@@ -1210,6 +1281,7 @@ impl InputBuffer {
             candidate_conversion_dense_features,
             user_conversion_history_hashes,
             candidate_account_hashes,
+            candidate_ads_count_buckets: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids: Vec::new(),
             history_semantic_ids,
@@ -1376,6 +1448,7 @@ impl InputBuffer {
                     candidate_conversion_dense_features,
                     user_conversion_history_hashes,
                     candidate_account_hashes,
+                    candidate_ads_count_buckets: Vec::new(),
                     history_post_ids: vec![0i64; history_seq_len],
                     history_web_conv_url_ids: Vec::new(),
                     history_semantic_ids: vec![0u16; history_seq_len * sid_num_levels],
@@ -1671,6 +1744,7 @@ impl InputBuffer {
             candidate_conversion_dense_features,
             user_conversion_history_hashes,
             candidate_account_hashes,
+            candidate_ads_count_buckets: Vec::new(),
             history_post_ids,
             history_web_conv_url_ids,
             history_semantic_ids,
@@ -1864,6 +1938,7 @@ mod tests {
                 num_post_int64_features: 0,
                 enable_stale_post: false,
                 enable_stale_post_30d: false,
+                ads_count_features: false,
             },
             history_seq_len: 4,
             candidate_seq_len: 3,

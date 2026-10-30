@@ -48,8 +48,10 @@ from xrex.data.recsys.feature_config import (
     REQUIRED_COLUMNS,
 )
 from xrex.data.recsys.recsys_batch import (
+    ADS_COUNT_COLUMNS,
     EMBEDDING_CONFIG,
     HISTORY_URL_ID_COLUMN,
+    USER_ADS_COUNT_COLUMNS,
     CandidateNegativeMode,
     EmbeddingType,
     RecsysFeaturesBatch,
@@ -1200,6 +1202,8 @@ class PhoenixKafkaDataset(PhoenixDataset):
             )
         if self.id_list_specs:
             optional_columns = [*optional_columns, id_list_features.COLUMN]
+        if self.read_ads_engagement_counts:
+            optional_columns = [*optional_columns, *ADS_COUNT_COLUMNS, *USER_ADS_COUNT_COLUMNS]
         embedding_col_name: str | None = None
         if self.multimodal_embedding_type is not None:
             embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
@@ -1272,6 +1276,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             id_list_specs=self.id_list_specs or None,
             history_url_embedding_dim=self.history_url_embedding_dim,
             history_url_embedding_fn=history_url_lookup,
+            read_ads_engagement_counts=self.read_ads_engagement_counts,
             alloc=self._alloc,
         )
 

@@ -1,3 +1,4 @@
+use crate::hydration::RequestRows;
 use crate::models::{
     AuthorId, ClientCapability, NotificationKind, PlacedCandidate, Placement, RawCandidate,
     RequestViewer, RetweetMerge, TweetId,
@@ -19,18 +20,32 @@ pub(crate) enum Entry {
     NotJudged,
 }
 
-pub(crate) struct Actors {
-    pub(crate) kind: NotificationKind,
+pub(crate) struct Notifications<S> {
     pub(crate) recipient: u64,
-    pub(crate) ids: Vec<AuthorId>,
+    pub(crate) rows: Vec<(NotificationKind, S)>,
+}
+
+pub(crate) enum NotificationRequest {
+    Users(Notifications<AuthorId>),
+    Posts(Notifications<NotificationPost>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NotificationPost {
+    pub(crate) post: TweetId,
+    pub(crate) actor: AuthorId,
 }
 
 impl NotificationKind {
-    fn parse(kind: Option<&vf_pb::notification::Kind>) -> Result<Self, Status> {
+    fn parse(kind: Option<&vf_pb::notification::Kind>) -> Result<(Self, Option<u64>), Status> {
+        use vf_pb::notification::Kind;
         match kind {
-            Some(vf_pb::notification::Kind::Follow(_)) => Ok(Self::Follow),
-            Some(vf_pb::notification::Kind::FollowRequestAccepted(_)) => {
-                Ok(Self::FollowRequestAccepted)
+            Some(Kind::Follow(_)) => Ok((Self::Follow, None)),
+            Some(Kind::FollowRequestAccepted(_)) => Ok((Self::FollowRequestAccepted, None)),
+            Some(Kind::Mention(vf_pb::Mention { post_id })) => Ok((Self::Mention, Some(*post_id))),
+            Some(Kind::Reply(vf_pb::Reply { post_id })) => Ok((Self::Reply, Some(*post_id))),
+            Some(Kind::MediaTagged(vf_pb::MediaTagged { post_id })) => {
+                Ok((Self::MediaTagged, Some(*post_id)))
             }
             None => Err(Status::invalid_argument(
                 "a notification has no kind VF serves",
@@ -54,7 +69,7 @@ pub(crate) fn level(wire: WireLevel) -> Result<SafetyLevel, Status> {
     SafetyLevel::parse(wire).map_err(|error| refused(rpc, error))
 }
 
-pub(crate) fn notification_level(number: i32) -> Result<(SafetyLevel, NotificationKind), Status> {
+pub(crate) fn notification_level(number: i32) -> Result<SafetyLevel, Status> {
     SafetyLevel::notification_level(number)
         .map_err(|error| refused(LevelRpc::FilterNotifications, error))
 }
@@ -112,34 +127,63 @@ pub(crate) fn evaluate_tweets(
 
 pub(crate) fn filter_notifications(
     request: &vf_pb::FilterNotificationsRequest,
-    level: Result<(SafetyLevel, NotificationKind), Status>,
-) -> Result<(SafetyLevel, Actors), Status> {
+    level: Result<SafetyLevel, Status>,
+) -> Result<(SafetyLevel, NotificationRequest), Status> {
     if request.recipient_id == 0 {
         return Err(Status::invalid_argument(
             "FilterNotifications needs a recipient",
         ));
     }
-    let (level, kind) = level?;
-    let ids = request
-        .notifications
-        .iter()
-        .map(|notification| {
-            if NotificationKind::parse(notification.kind.as_ref())? != kind {
+    let level = level?;
+    let mut users = Vec::new();
+    let mut posts = Vec::new();
+    for notification in &request.notifications {
+        let (kind, post) = NotificationKind::parse(notification.kind.as_ref())?;
+        let actor = AuthorId(notification.actor_id);
+        let rows = level.notification_rows(kind);
+        match post {
+            None if rows == Some(RequestRows::Users) => users.push((kind, actor)),
+            Some(0) => {
+                return Err(Status::invalid_argument(
+                    "a post notification names no post",
+                ));
+            }
+            Some(_) if actor.0 == 0 => {
+                return Err(Status::invalid_argument(
+                    "a post notification names no actor",
+                ));
+            }
+            Some(post) if rows == Some(RequestRows::ActorPosts) => posts.push((
+                kind,
+                NotificationPost {
+                    post: TweetId(post),
+                    actor,
+                },
+            )),
+            None | Some(_) => {
                 return Err(Status::invalid_argument(
                     "the safety level does not serve this notification kind",
                 ));
             }
-            Ok(AuthorId(notification.actor_id))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok((
-        level,
-        Actors {
-            kind,
-            recipient: request.recipient_id,
-            ids,
-        },
-    ))
+        }
+    }
+    let recipient = request.recipient_id;
+    let request = match (users.is_empty(), posts.is_empty()) {
+        (false, false) => {
+            return Err(Status::invalid_argument(
+                "a request mixes user and post notifications",
+            ));
+        }
+        (true, false) => NotificationRequest::Posts(Notifications {
+            recipient,
+            rows: posts,
+        }),
+        (_, true) => NotificationRequest::Users(Notifications {
+            recipient,
+            rows: users,
+        }),
+    };
+    Ok((level, request))
 }
 
 fn refused(rpc: LevelRpc, error: LevelError) -> Status {
@@ -206,7 +250,6 @@ mod tests {
     #[test]
     fn each_rpc_refuses_an_unknown_and_an_unserved_level_with_its_code_and_message() {
         const UNKNOWN: i32 = 9_999;
-        let notification = |number| notification_level(number).map(|(level, _)| level);
         for (name, result, code, message) in [
             (
                 "filter_tweets unknown",
@@ -236,19 +279,19 @@ mod tests {
             ),
             (
                 "filter_notifications unknown",
-                notification(UNKNOWN),
+                notification_level(UNKNOWN),
                 InvalidArgument,
                 "not a notification safety level",
             ),
             (
                 "filter_notifications 8",
-                notification(ThriftLevel::TIMELINE_HOME.0),
+                notification_level(ThriftLevel::TIMELINE_HOME.0),
                 Unimplemented,
                 "FilterNotifications does not serve this safety level",
             ),
             (
                 "filter_notifications 247",
-                notification(ThriftLevel::IMMERSIVE_EXPANDED_RECOMMENDATIONS.0),
+                notification_level(ThriftLevel::IMMERSIVE_EXPANDED_RECOMMENDATIONS.0),
                 Unimplemented,
                 "FilterNotifications does not serve this safety level",
             ),

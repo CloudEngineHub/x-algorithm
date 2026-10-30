@@ -76,7 +76,7 @@ where
                 client,
                 attempt, "Client init skipped; init deadline exhausted"
             );
-            return Err("init deadline exhausted before attempt".to_string());
+            return Err(format!("{client}: init deadline exhausted before attempt"));
         }
         let error = match tokio::time::timeout(CLIENT_INIT_ATTEMPT_TIMEOUT, build()).await {
             Ok(Ok(t)) => {
@@ -98,7 +98,7 @@ where
                 error = %error,
                 "Client init failed; retry budget exhausted"
             );
-            return Err(error);
+            return Err(format!("{client}: {error}"));
         }
         warn!(
             client,
@@ -272,10 +272,7 @@ impl ServerDeps {
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
+#[expect(clippy::panic, reason = "startup fail-fast: init failure is fatal")]
 pub(crate) async fn prod_sources(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
@@ -284,81 +281,62 @@ pub(crate) async fn prod_sources(
     cache_warming: CacheWarming,
     label_metrics: &LabelMetrics,
 ) -> (ProdSources, Arc<SafetyLabelSource>) {
-    let tes_client = Arc::new(
-        init_client_with_retry("tes", init_deadline, || async move {
+    let tes = init_client_with_retry("tes", init_deadline, || async move {
+        let strato = build_xds_strato(
+            XdsStratoParams {
+                name: "tes-xds",
+                xds_listener: "tweet-entity-service.prod.tweet-entity-service:fed-grpc",
+                tls_domain: format!(
+                    "tweet-entity-service.tweet-entity-service.prod.{datacenter}.s2s.twttr.net"
+                ),
+                lb_policy: LbPolicy::penalized_peak_ewma(),
+                client_id: S2S_CLIENT_ID.clone(),
+                retry_config: Some(RetryConfig::for_idempotent()),
+                max_batch_size: TESRpcConstants::max_batch_size(),
+                metadata: metadata.cloned(),
+            },
+            deterministic_aperture,
+        )
+        .await?;
+        anyhow::Ok(ProdTESClient {
+            grpc_client: Arc::new(strato),
+        })
+    });
+
+    let gizmoduck_client_id = crate::config::gizmoduck_client_id();
+    let gizmoduck = init_client_with_retry("gizmoduck", init_deadline, || {
+        let client_id = gizmoduck_client_id.clone();
+        async move {
             let strato = build_xds_strato(
                 XdsStratoParams {
-                    name: "tes-xds",
-                    xds_listener: "tweet-entity-service.prod.tweet-entity-service:fed-grpc",
-                    tls_domain: format!(
-                        "tweet-entity-service.tweet-entity-service.prod.{datacenter}.s2s.twttr.net"
-                    ),
-                    lb_policy: LbPolicy::penalized_peak_ewma(),
-                    client_id: S2S_CLIENT_ID.clone(),
-                    retry_config: Some(RetryConfig::for_idempotent()),
-                    max_batch_size: TESRpcConstants::max_batch_size(),
+                    name: "gizmoduck-xds",
+                    xds_listener: "gizmoduck.prod.gizmoduck:fed-grpc",
+                    tls_domain: format!("gizmoduck.gizmoduck.prod.{datacenter}.s2s.twttr.net"),
+                    lb_policy: LbPolicy::least_request(),
+                    client_id,
+                    retry_config: None,
+                    max_batch_size: GizmoduckRpcConstants::max_batch_size(),
                     metadata: metadata.cloned(),
                 },
                 deterministic_aperture,
             )
             .await?;
-            anyhow::Ok(ProdTESClient {
+            anyhow::Ok(ProdGizmoduckClient {
                 grpc_client: Arc::new(strato),
             })
-        })
-        .await
-        .expect("Failed to initialize TES client"),
-    );
+        }
+    });
 
-    let gizmoduck_client_id = crate::config::gizmoduck_client_id();
-    let gizmoduck_client: Arc<
-        dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
-    > = Arc::new(
-        init_client_with_retry("gizmoduck", init_deadline, || {
-            let client_id = gizmoduck_client_id.clone();
-            async move {
-                let strato = build_xds_strato(
-                    XdsStratoParams {
-                        name: "gizmoduck-xds",
-                        xds_listener: "gizmoduck.prod.gizmoduck:fed-grpc",
-                        tls_domain: format!("gizmoduck.gizmoduck.prod.{datacenter}.s2s.twttr.net"),
-                        lb_policy: LbPolicy::least_request(),
-                        client_id,
-                        retry_config: None,
-                        max_batch_size: GizmoduckRpcConstants::max_batch_size(),
-                        metadata: metadata.cloned(),
-                    },
-                    deterministic_aperture,
-                )
-                .await?;
-                anyhow::Ok(ProdGizmoduckClient {
-                    grpc_client: Arc::new(strato),
-                })
-            }
-        })
-        .await
-        .expect("Failed to initialize Gizmoduck client"),
-    );
-    info!(
-        deterministic_aperture,
-        "TES and Gizmoduck clients ready over xDS"
-    );
-
-    let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
-        Arc::new(
-            init_client_with_retry("socialgraph", init_deadline, || {
-                ProdSocialgraphClient::new(
-                    datacenter,
-                    &S2S_CHAIN_PATH,
-                    &S2S_CRT_PATH,
-                    &S2S_KEY_PATH,
-                    deterministic_aperture,
-                    metadata.cloned(),
-                )
-            })
-            .await
-            .expect("Failed to initialize SocialGraph client"),
-        );
+    let socialgraph = init_client_with_retry("socialgraph", init_deadline, || {
+        ProdSocialgraphClient::new(
+            datacenter,
+            &S2S_CHAIN_PATH,
+            &S2S_CRT_PATH,
+            &S2S_KEY_PATH,
+            deterministic_aperture,
+            metadata.cloned(),
+        )
+    });
 
     let stratoserver = init_client_with_retry("stratoserver", init_deadline, || {
         build_xds_strato(
@@ -374,28 +352,14 @@ pub(crate) async fn prod_sources(
             },
             deterministic_aperture,
         )
-    })
-    .await
-    .expect("Failed to initialize the stratoserver client");
-    let communities = CommunitySource {
-        grpc_client: stratoserver.clone(),
-    };
-    let about_this_account_client = AboutThisAccountClient::new(stratoserver.clone());
-    let trusted_friends_client = TrustedFriendsClient::new(stratoserver.clone());
-    let user_location_client = UserLocationClient::new(stratoserver.clone());
-    let article_client = ArticleClient::new(stratoserver.clone());
-    let user_devices_client = UserDevicesClient::new(stratoserver.clone());
+    });
 
-    let wingman_client = Arc::new(
-        init_client_with_retry("wingman", init_deadline, || {
-            ProdWingmanClient::new(datacenter)
-        })
-        .await
-        .expect("Failed to initialize Wingman client"),
-    );
+    let wingman = init_client_with_retry("wingman", init_deadline, || {
+        ProdWingmanClient::new(datacenter)
+    });
 
-    let mh_label_client: Arc<dyn ManhattanLabelFetcher> = Arc::new(
-        init_client_with_retry("manhattan", init_deadline, || {
+    let manhattan = async {
+        let manhattan = init_client_with_retry("manhattan", init_deadline, || {
             let s2s = xai_manhattan::s2s::S2sConfig {
                 client_cert_path: S2S_CRT_PATH.clone(),
                 client_key_path: S2S_KEY_PATH.clone(),
@@ -403,13 +367,14 @@ pub(crate) async fn prod_sources(
             };
             MhLabelClient::new(datacenter, s2s, deterministic_aperture)
         })
-        .await
-        .expect("Failed to initialize MhLabelClient"),
-    );
+        .await?;
+        warm_manhattan(&manhattan).await;
+        Ok::<_, String>(manhattan)
+    };
 
     let twemcache_client_name = crate::config::twemcache_client_name();
-    let twemcache = Arc::new(
-        init_client_with_retry("twemcache", init_deadline, || {
+    let twemcache = async {
+        let twemcache = init_client_with_retry("twemcache", init_deadline, || {
             let name = twemcache_client_name.clone();
             let zone = datacenter.to_string();
             async move {
@@ -432,19 +397,87 @@ pub(crate) async fn prod_sources(
                     .await
             }
         })
-        .await
-        .expect("Failed to create twemcache client"),
-    );
-    let start = Instant::now();
-    let server_count = twemcache.warm_up().await;
-    info!(
-        server_count,
-        latency_ms = elapsed_ms(start),
-        "Cache client connected to {CACHE_PATH}"
-    );
+        .await?;
+        let start = Instant::now();
+        let server_count = twemcache.warm_up().await;
+        info!(
+            server_count,
+            latency_ms = elapsed_ms(start),
+            "Cache client connected to {CACHE_PATH}"
+        );
+        warm_cache(&twemcache).await;
+        Ok::<_, String>(twemcache)
+    };
 
-    warm_cache(&twemcache).await;
-    warm_manhattan(mh_label_client.as_ref()).await;
+    let connecting = Box::pin(async {
+        tokio::join!(
+            tes,
+            gizmoduck,
+            socialgraph,
+            stratoserver,
+            wingman,
+            manhattan,
+            twemcache
+        )
+    });
+    let (tes, gizmoduck, socialgraph, stratoserver, wingman, manhattan, twemcache) =
+        match connecting.await {
+            (
+                Ok(tes),
+                Ok(gizmoduck),
+                Ok(socialgraph),
+                Ok(stratoserver),
+                Ok(wingman),
+                Ok(manhattan),
+                Ok(twemcache),
+            ) => (
+                tes,
+                gizmoduck,
+                socialgraph,
+                stratoserver,
+                wingman,
+                manhattan,
+                twemcache,
+            ),
+            (tes, gizmoduck, socialgraph, stratoserver, wingman, manhattan, twemcache) => {
+                let failures: Vec<String> = [
+                    tes.err(),
+                    gizmoduck.err(),
+                    socialgraph.err(),
+                    stratoserver.err(),
+                    wingman.err(),
+                    manhattan.err(),
+                    twemcache.err(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                panic!(
+                    "Failed to initialize backend clients: {}",
+                    failures.join("; ")
+                )
+            }
+        };
+    info!(deterministic_aperture, "Backend clients ready");
+
+    let tes_client = Arc::new(tes);
+    let gizmoduck_client: Arc<
+        dyn xai_core_entities::gizmoduck_client::GizmoduckClient + Send + Sync,
+    > = Arc::new(gizmoduck);
+    let sg_client: Arc<dyn crate::clients::socialgraph_client::SocialgraphClient + Send + Sync> =
+        Arc::new(socialgraph);
+    let wingman_client = Arc::new(wingman);
+    let mh_label_client: Arc<dyn ManhattanLabelFetcher> = Arc::new(manhattan);
+    let twemcache = Arc::new(twemcache);
+
+    let communities = CommunitySource {
+        grpc_client: stratoserver.clone(),
+    };
+    let about_this_account_client = AboutThisAccountClient::new(stratoserver.clone());
+    let trusted_friends_client = TrustedFriendsClient::new(stratoserver.clone());
+    let user_location_client = UserLocationClient::new(stratoserver.clone());
+    let article_client = ArticleClient::new(stratoserver.clone());
+    let user_devices_client = UserDevicesClient::new(stratoserver.clone());
 
     let cache_warmer = cache_warming.warmer(|| build_cache_warmer(stratoserver, label_metrics));
 
@@ -722,7 +755,7 @@ mod tests {
             })
             .await;
 
-        assert_eq!(result, Err("discovery timed out".to_string()));
+        assert_eq!(result, Err("test: discovery timed out".to_string()));
         assert!(attempts.get() > 1);
         assert!(start.elapsed() < budget);
         assert!(start.elapsed() >= budget - CLIENT_INIT_MAX_BACKOFF);
@@ -742,7 +775,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Err("init deadline exhausted before attempt".to_string())
+            Err("test: init deadline exhausted before attempt".to_string())
         );
         assert_eq!(attempts.get(), 0);
     }
@@ -764,7 +797,7 @@ mod tests {
         assert_eq!(
             result,
             Err(format!(
-                "init attempt timed out after {}s",
+                "test: init attempt timed out after {}s",
                 CLIENT_INIT_ATTEMPT_TIMEOUT.as_secs()
             ))
         );

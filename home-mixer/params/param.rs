@@ -469,9 +469,9 @@ param!(
     0.015
 );
 param!(
-    ReactWithVideoWeight,
+    PostVideoWeight,
     f64,
-    "rust_home_mixer_react_with_video_weight",
+    "rust_home_mixer_post_video_weight",
     0.0
 );
 param!(
@@ -1261,6 +1261,12 @@ param!(
     0.0
 );
 param!(
+    VideoCarouselWeightedScoreWeight,
+    f64,
+    "rust_home_mixer_video_carousel_weighted_score_weight",
+    0.0
+);
+param!(
     VideoCarouselImmersiveClusterId,
     String,
     "rust_home_mixer_video_carousel_immersive_cluster_id",
@@ -1271,6 +1277,12 @@ param!(
     String,
     "rust_home_mixer_video_carousel_immersive_aggregation_type",
     "IMMERSIVE_LONG_DWELL"
+);
+param!(
+    VideoCarouselExtraCandidates,
+    usize,
+    "rust_home_mixer_video_carousel_extra_candidates",
+    30
 );
 
 param!(

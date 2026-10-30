@@ -265,9 +265,13 @@ fn direction_label(direction: EdgeDirection) -> &'static str {
 
 impl fmt::Display for HydrationPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows = match self.rows {
+            RequestRows::ActorPosts => " actor post rows",
+            RequestRows::Posts | RequestRows::Users => "",
+        };
         writeln!(
             f,
-            "{}: {} calls",
+            "{}{rows}: {} calls",
             <&str>::from(self.level),
             self.groups.len()
         )?;
@@ -336,14 +340,21 @@ mod tests {
         let engine = RuleEngine::for_tests();
         let plans: String = SafetyLevel::VARIANTS
             .iter()
-            .map(|&level| engine.plan(level).to_string())
+            .flat_map(|&level| {
+                std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level))
+            })
+            .map(ToString::to_string)
             .collect();
         crate::pinned::assert_pinned("tests/fixtures/plans.txt", &plans);
     }
 
     #[test]
     fn every_node_of_a_call_carries_the_calls_label() {
-        for rows in [RequestRows::Posts, RequestRows::Users] {
+        for rows in [
+            RequestRows::Posts,
+            RequestRows::Users,
+            RequestRows::ActorPosts,
+        ] {
             let plan = HydrationPlan::with_rows(SafetyLevel::FilterAll, rows, Hydrators::all());
             for group in plan.groups() {
                 for node in group.nodes.iter() {
@@ -363,11 +374,12 @@ mod tests {
         let engine = RuleEngine::for_tests();
         let mut shared = Vec::new();
         for &level in SafetyLevel::VARIANTS {
-            let plan = engine.plan(level);
-            let labels: Vec<(&str, &str)> = plan.groups().map(Group::label).collect();
-            for (position, &label) in labels.iter().enumerate() {
-                if labels[..position].contains(&label) {
-                    shared.push((level, label));
+            for plan in std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level)) {
+                let labels: Vec<(&str, &str)> = plan.groups().map(Group::label).collect();
+                for (position, &label) in labels.iter().enumerate() {
+                    if labels[..position].contains(&label) {
+                        shared.push((level, label));
+                    }
                 }
             }
         }
@@ -382,19 +394,20 @@ mod tests {
     fn groups_of_one_fetcher_claim_each_others_keys_only_through_an_edge() {
         let engine = RuleEngine::for_tests();
         for &level in SafetyLevel::VARIANTS {
-            let plan = engine.plan(level);
-            let groups: Vec<_> = plan.groups().collect();
-            for (position, group) in groups.iter().enumerate() {
-                for other in groups.iter().skip(position + 1) {
-                    if other.fetcher != group.fetcher {
-                        continue;
+            for plan in std::iter::once(engine.plan(level)).chain(engine.post_kinds_plan(level)) {
+                let groups: Vec<_> = plan.groups().collect();
+                for (position, group) in groups.iter().enumerate() {
+                    for other in groups.iter().skip(position + 1) {
+                        if other.fetcher != group.fetcher {
+                            continue;
+                        }
+                        let nodes = group.nodes.union(other.nodes);
+                        assert!(
+                            nodes.iter().all(|node| node.edge().is_some()),
+                            "{level:?} {:?}: two groups claim one fetcher's keys",
+                            group.fetcher
+                        );
                     }
-                    let nodes = group.nodes.union(other.nodes);
-                    assert!(
-                        nodes.iter().all(|node| node.edge().is_some()),
-                        "{level:?} {:?}: two groups claim one fetcher's keys",
-                        group.fetcher
-                    );
                 }
             }
         }

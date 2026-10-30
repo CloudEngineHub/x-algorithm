@@ -1,3 +1,4 @@
+use crate::hydration::Lookup;
 use crate::models::{
     Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
     LimitedActionType, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
@@ -821,7 +822,12 @@ pub(crate) fn notification_result(
             Verdict::Withheld(Decided { id, .. }) => dropped(notification_drop_reason(*id)),
             Verdict::Shown { .. } => (Outcome::Allowed(vf_pb::Allowed {}), ("allowed", "none")),
         },
-        Some(Evaluation::NotFound(_)) => dropped(NotificationDropReason::ActorNotFound),
+        Some(Evaluation::NotFound(Lookup::Author | Lookup::SharedAuthor)) => {
+            dropped(NotificationDropReason::ActorNotFound)
+        }
+        Some(Evaluation::NotFound(Lookup::Tweet | Lookup::SharedTweet)) => {
+            dropped(NotificationDropReason::PostNotFound)
+        }
         Some(Evaluation::Complete { .. } | Evaluation::Partial { .. } | Evaluation::Failed(_))
         | None => (Outcome::Failed(vf_pb::Failed {}), ("failed", "none")),
     };
@@ -867,6 +873,7 @@ fn notification_reason_label(reason: NotificationDropReason) -> &'static str {
         NotificationDropReason::ActorProtected => "actor_protected",
         NotificationDropReason::RecipientBlocksActor => "recipient_blocks_actor",
         NotificationDropReason::RecipientMutesActor => "recipient_mutes_actor",
+        NotificationDropReason::PostNotFound => "post_not_found",
     }
 }
 
@@ -894,7 +901,7 @@ mod tests {
 
     #[test]
     fn decided_by_names_the_deciding_rule_or_why_the_rules_never_ran() {
-        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::hydration::{Hydrator, Hydrators};
         use crate::rules::fixtures::allow;
         let suspended = dropped(FilteredReason::AuthorIsSuspended, "rule");
         for (evaluation, rule) in [
@@ -1715,7 +1722,7 @@ mod tests {
 
     #[test]
     fn each_evaluation_sends_and_labels_as_vf_counts_it() {
-        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::hydration::{Hydrator, Hydrators};
         use crate::rules::fixtures::allow;
         let shown = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
         let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(

@@ -38,6 +38,8 @@ pub(in crate::hydration) enum KeyOrigin {
     OuterOfMissingQuote,
     UserIfViewerFiltersNoConfirmedEmail,
     UserIfViewerFiltersNoConfirmedPhone,
+    AuthorIfViewerFiltersNoConfirmedEmail,
+    AuthorIfViewerFiltersNoConfirmedPhone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +451,30 @@ impl KeyOrigin {
                         .filter(|_| store.viewer_filters(|filters| filters.no_confirmed_phone))
                 }),
             },
+            K::AuthorIfViewerFiltersNoConfirmedEmail => Spec {
+                label: "author:viewer_filters_no_confirmed_email",
+                input: Some(H::PureCore),
+                also_reads: Hydrators::of(H::ViewerNotificationFilters),
+                names: Names::Author,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| {
+                    store
+                        .key(K::PureCoreAuthor, row)
+                        .filter(|_| store.viewer_filters(|filters| filters.no_confirmed_email))
+                }),
+            },
+            K::AuthorIfViewerFiltersNoConfirmedPhone => Spec {
+                label: "author:viewer_filters_no_confirmed_phone",
+                input: Some(H::PureCore),
+                also_reads: Hydrators::of(H::ViewerNotificationFilters),
+                names: Names::Author,
+                needs_viewer: false,
+                keyed_by: KeyedBy::Row(|store, row| {
+                    store
+                        .key(K::PureCoreAuthor, row)
+                        .filter(|_| store.viewer_filters(|filters| filters.no_confirmed_phone))
+                }),
+            },
         }
     }
 
@@ -491,6 +517,13 @@ impl KeyOrigin {
     pub(in crate::hydration) const fn at(self, rows: RequestRows) -> Self {
         match (rows, self) {
             (RequestRows::Users, KeyOrigin::PureCoreAuthor) => KeyOrigin::RequestUsers,
+            (RequestRows::ActorPosts, KeyOrigin::RequestUsers) => KeyOrigin::PureCoreAuthor,
+            (RequestRows::ActorPosts, KeyOrigin::UserIfViewerFiltersNoConfirmedEmail) => {
+                KeyOrigin::AuthorIfViewerFiltersNoConfirmedEmail
+            }
+            (RequestRows::ActorPosts, KeyOrigin::UserIfViewerFiltersNoConfirmedPhone) => {
+                KeyOrigin::AuthorIfViewerFiltersNoConfirmedPhone
+            }
             _ => self,
         }
     }

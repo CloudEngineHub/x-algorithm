@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Result};
@@ -32,6 +33,35 @@ impl Notification {
                     vf_pb::FollowRequestAccepted {},
                 )),
             },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostNotification {
+    pub kind: PostKind,
+    pub actor_id: u64,
+    pub post_id: NonZeroU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostKind {
+    Mention,
+    Reply,
+    MediaTagged,
+}
+
+impl PostNotification {
+    fn into_proto(self) -> vf_pb::Notification {
+        use vf_pb::notification::Kind;
+        let post_id = self.post_id.get();
+        vf_pb::Notification {
+            actor_id: self.actor_id,
+            kind: Some(match self.kind {
+                PostKind::Mention => Kind::Mention(vf_pb::Mention { post_id }),
+                PostKind::Reply => Kind::Reply(vf_pb::Reply { post_id }),
+                PostKind::MediaTagged => Kind::MediaTagged(vf_pb::MediaTagged { post_id }),
+            }),
         }
     }
 }
@@ -83,12 +113,25 @@ impl NotificationsClient {
         recipient_id: u64,
         notifications: &[Notification],
     ) -> Result<Vec<NotificationOutcome>> {
-        let request_metrics = RequestMetrics::start(ClientRpc::FilterNotifications);
         self.filter_notifications_recording(
             safety_level,
             recipient_id,
-            notifications,
-            request_metrics,
+            notifications.iter().map(|n| n.into_proto()).collect(),
+            RequestMetrics::start(ClientRpc::FilterNotifications),
+        )
+        .await
+    }
+
+    pub async fn filter_post_notifications(
+        &self,
+        recipient_id: u64,
+        notifications: &[PostNotification],
+    ) -> Result<Vec<NotificationOutcome>> {
+        self.filter_notifications_recording(
+            SafetyLevel::NOTIFICATIONS_WRITER_V2,
+            recipient_id,
+            notifications.iter().map(|n| n.into_proto()).collect(),
+            RequestMetrics::start(ClientRpc::FilterNotifications),
         )
         .await
     }
@@ -97,13 +140,14 @@ impl NotificationsClient {
         &self,
         safety_level: SafetyLevel,
         recipient_id: u64,
-        notifications: &[Notification],
+        notifications: Vec<vf_pb::Notification>,
         mut request_metrics: RequestMetrics,
     ) -> Result<Vec<NotificationOutcome>> {
+        let sent = notifications.len();
         let mut rpc = tonic::Request::new(vf_pb::FilterNotificationsRequest {
             safety_level: safety_level.0,
             recipient_id,
-            notifications: notifications.iter().map(|n| n.into_proto()).collect(),
+            notifications,
         });
         rpc.set_timeout(self.timeout);
         let mut client = self.client.clone();
@@ -117,7 +161,7 @@ impl NotificationsClient {
                 batch_start.elapsed(),
                 response.as_ref().err().map(tonic::Status::code),
             );
-            decode_response(notifications.len(), response?.into_inner())
+            decode_response(sent, response?.into_inner())
         })
         .await;
         match &outcomes {
@@ -210,11 +254,13 @@ mod tests {
         }
     }
 
-    async fn filter_against<S: VisibilityFilteringService>(
+    async fn serve<S: VisibilityFilteringService>(
         stub: S,
         timeout_ms: u64,
-        notifications: &[Notification],
-    ) -> (Result<Vec<NotificationOutcome>>, Arc<RecordingReceiver>) {
+    ) -> (
+        NotificationsClient,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(
@@ -236,6 +282,15 @@ mod tests {
             client: make_vf_client(channel),
             timeout: Duration::from_millis(timeout_ms),
         };
+        (client, server)
+    }
+
+    async fn filter_against<S: VisibilityFilteringService>(
+        stub: S,
+        timeout_ms: u64,
+        notifications: &[Notification],
+    ) -> (Result<Vec<NotificationOutcome>>, Arc<RecordingReceiver>) {
+        let (client, server) = serve(stub, timeout_ms).await;
         let sr = Arc::new(RecordingReceiver::default());
         let request_metrics =
             RequestMetrics::with_receiver(ClientRpc::FilterNotifications, Some(sr.clone()));
@@ -243,7 +298,7 @@ mod tests {
             .filter_notifications_recording(
                 SafetyLevel::NOTIFICATIONS_FOLLOW,
                 RECIPIENT,
-                notifications,
+                notifications.iter().map(|n| n.into_proto()).collect(),
                 request_metrics,
             )
             .await;
@@ -275,15 +330,62 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_request_accepted_sends_its_own_kind() {
+    fn follow_request_accepted_encodes_its_own_message() {
         assert_eq!(
             Notification::FollowRequestAccepted { actor_id: 10 }.into_proto(),
             vf_pb::Notification {
                 actor_id: 10,
                 kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(
-                    vf_pb::FollowRequestAccepted {},
+                    vf_pb::FollowRequestAccepted {}
                 )),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn post_notifications_go_out_at_level_72_each_kind_as_its_own_message() {
+        use vf_pb::notification::Kind;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (client, server) = serve(
+            AnswerStub {
+                requests: requests.clone(),
+                answer: by_actor,
+            },
+            1_000,
+        )
+        .await;
+        let post = |kind| PostNotification {
+            kind,
+            actor_id: 10,
+            post_id: NonZeroU64::new(20).unwrap(),
+        };
+        let outcomes = client
+            .filter_post_notifications(
+                RECIPIENT,
+                &[
+                    post(PostKind::Mention),
+                    post(PostKind::Reply),
+                    post(PostKind::MediaTagged),
+                ],
+            )
+            .await;
+        server.abort();
+        assert_eq!(outcomes.unwrap(), vec![NotificationOutcome::Allowed; 3]);
+        let sent = |kind| vf_pb::Notification {
+            actor_id: 10,
+            kind: Some(kind),
+        };
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![vf_pb::FilterNotificationsRequest {
+                safety_level: 72,
+                recipient_id: RECIPIENT,
+                notifications: vec![
+                    sent(Kind::Mention(vf_pb::Mention { post_id: 20 })),
+                    sent(Kind::Reply(vf_pb::Reply { post_id: 20 })),
+                    sent(Kind::MediaTagged(vf_pb::MediaTagged { post_id: 20 })),
+                ],
+            }]
         );
     }
 

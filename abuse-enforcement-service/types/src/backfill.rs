@@ -2,7 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::action_control::{ControlEntity, LevelRow, PageAction};
 
-pub const BACKFILL_RUN_RECORD_VERSION: u32 = 1;
+pub const BACKFILL_RUN_RECORD_VERSION: u32 = 2;
+
+pub fn run_record_version(actions: &[PageAction]) -> u32 {
+    if actions.iter().any(|a| a.uses_suspension_options()) {
+        2
+    } else {
+        1
+    }
+}
 
 pub const MAX_WINDOW_MS: i64 = 30 * 86_400_000;
 
@@ -219,7 +227,7 @@ mod tests {
             levels: vec![LevelRow::Mid],
             window_start_ms: 1,
             window_end_ms: 2,
-            actions: vec![PageAction::Suspend {}],
+            actions: vec![PageAction::SUSPEND],
             rate_per_sec: 200,
             expected_count: 3,
             left_out: vec![],

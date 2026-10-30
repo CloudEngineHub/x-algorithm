@@ -61,6 +61,7 @@ pub(crate) enum RequestRows {
     #[default]
     Posts,
     Users,
+    ActorPosts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -547,7 +548,19 @@ impl Hydrator {
                 label: ACTORS,
                 ..spec
             },
-            (RequestRows::Posts | RequestRows::Users, _) => NodeSpec {
+            (
+                RequestRows::ActorPosts,
+                FetcherId {
+                    source: Source::GizmoduckAuthor,
+                    owner: Owner::Request,
+                },
+            ) => NodeSpec {
+                source: Source::GizmoduckActor,
+                key: KeyOrigin::PureCoreAuthor,
+                label: ACTORS,
+                ..spec
+            },
+            (RequestRows::Posts | RequestRows::Users | RequestRows::ActorPosts, _) => NodeSpec {
                 key: spec.key.at(rows),
                 ..spec
             },
@@ -667,7 +680,8 @@ const fn inputs_precede_nodes() -> bool {
     while let [node, tail @ ..] = rest {
         let inputs = node
             .closed_over_at(RequestRows::Posts)
-            .union(node.closed_over_at(RequestRows::Users));
+            .union(node.closed_over_at(RequestRows::Users))
+            .union(node.closed_over_at(RequestRows::ActorPosts));
         let mut others = Hydrator::VARIANTS;
         while let [other, others_tail @ ..] = others {
             if inputs.contains(*other) && *other as u8 >= *node as u8 {
@@ -717,7 +731,8 @@ const fn stakes_fit_their_nodes() -> bool {
     while let [node, tail @ ..] = rest {
         let spec = node.spec();
         let derives_exists = matches!(spec.stake(), Stake::Exists)
-            || matches!(node.spec_at(RequestRows::Users).stake(), Stake::Exists);
+            || matches!(node.spec_at(RequestRows::Users).stake(), Stake::Exists)
+            || matches!(node.spec_at(RequestRows::ActorPosts).stake(), Stake::Exists);
         let fits = !matches!(spec.declared, Stake::Exists)
             && (!derives_exists || matches!(spec.declared, Stake::MustHave))
             && (spec.relation.is_none() || !derives_exists);
@@ -754,7 +769,7 @@ const _: () = assert!(Hydrator::VARIANTS.len() <= u64::BITS as usize);
 impl Hydrators {
     pub(crate) const fn closed(self, rows: RequestRows) -> Self {
         let mut closed = match rows {
-            RequestRows::Posts => self.with(Hydrator::PureCore),
+            RequestRows::Posts | RequestRows::ActorPosts => self.with(Hydrator::PureCore),
             RequestRows::Users => self,
         };
         let mut rest = Hydrator::VARIANTS;
